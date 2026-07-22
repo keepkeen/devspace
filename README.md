@@ -111,7 +111,7 @@ This fork is not published under the upstream npm package name. Build it from
 source:
 
 ```bash
-git clone https://github.com/keepkeen/devspace.git
+git clone --branch codex/persistent-secure-workspaces https://github.com/keepkeen/devspace.git
 cd devspace
 npm ci
 npm run build
@@ -529,7 +529,7 @@ separate browser-persistence, security-hardening, latency, and administration
 change set.
 
 - Upstream: [Waishnav/devspace](https://github.com/Waishnav/devspace)
-- Fork: [keepkeen/devspace](https://github.com/keepkeen/devspace)
+- Fork branch: [keepkeen/devspace · `codex/persistent-secure-workspaces`](https://github.com/keepkeen/devspace/tree/codex/persistent-secure-workspaces)
 - Baseline commit: [`80423b5`](https://github.com/Waishnav/devspace/commit/80423b5)
 
 If a change is broadly useful and compatible with upstream direction, consider

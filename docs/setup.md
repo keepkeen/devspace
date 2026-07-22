@@ -18,7 +18,7 @@ ngrok, Pinggy, Tailscale Funnel, or your own HTTPS reverse proxy.
 ## Install This Fork
 
 ```bash
-git clone https://github.com/keepkeen/devspace.git
+git clone --branch codex/persistent-secure-workspaces https://github.com/keepkeen/devspace.git
 cd devspace
 npm ci
 npm run build
