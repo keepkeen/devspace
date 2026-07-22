@@ -89,7 +89,7 @@ reuse another client's MCP session, workspace, or process identifiers.
 
 | Variable | Default | Purpose |
 | --- | ---: | --- |
-| `DEVSPACE_MCP_SESSION_IDLE_TIMEOUT_SECONDS` | `86400` | Close inactive MCP transports. |
+| `DEVSPACE_MCP_SESSION_IDLE_TIMEOUT_SECONDS` | `1800` | Close inactive MCP transports. Workspace state is unaffected. |
 | `DEVSPACE_MCP_SESSION_CLOSE_TIMEOUT_SECONDS` | `5` | Maximum wait for one transport to close. |
 | `DEVSPACE_RESOURCE_CLEANUP_INTERVAL_SECONDS` | `300` | Sweep interval for idle resources. |
 | `DEVSPACE_MAX_MCP_SESSIONS` | `64` | Maximum live MCP transports. |

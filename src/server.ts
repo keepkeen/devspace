@@ -2575,7 +2575,10 @@ export function createServer(config = loadConfig()): RunningServer {
 
         transport.onclose = () => {
           const closedSessionId = transport?.sessionId;
-          if (closedSessionId && transports.remove(closedSessionId)) {
+          if (
+            closedSessionId &&
+            transports.removeOnTransportClose(closedSessionId) === "unexpected"
+          ) {
             logEvent(config.logging, "info", "mcp_session_closed", {
               reason: "transport_close",
               sessionIdPrefix: sessionIdPrefix(closedSessionId),

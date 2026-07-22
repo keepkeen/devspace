@@ -76,7 +76,7 @@ assert.deepEqual(loadConfig(baseEnv).logging, {
 });
 
 assert.deepEqual(loadConfig(baseEnv).resources, {
-  mcpSessionIdleTimeoutMs: 86_400_000,
+  mcpSessionIdleTimeoutMs: 1_800_000,
   mcpSessionCloseTimeoutMs: 5_000,
   cleanupIntervalMs: 300_000,
   maxMcpSessions: 64,

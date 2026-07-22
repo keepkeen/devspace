@@ -39,7 +39,13 @@ assert.equal(registry.get("stale", ownerClientId), undefined);
 assert.equal(registry.get("active", ownerClientId), activeTransport);
 
 const closeError = new Error("close failed");
-const failingTransport = createTransport(closeError);
+const failingTransport: FakeTransport = {
+  closeCalls: 0,
+  async close() {
+    this.closeCalls += 1;
+    if (this.closeCalls === 1) throw closeError;
+  },
+};
 registry.register("failing", ownerClientId, failingTransport);
 now = 10_000;
 
@@ -50,7 +56,9 @@ assert.equal(failingResults.find((result) => result.sessionId === "failing")?.er
 assert.equal(failingTransport.closeCalls, 1);
 assert.equal(registry.size, 1);
 assert.equal(registry.get("failing", ownerClientId), undefined);
-registry.remove("failing");
+assert.deepEqual(await registry.closeIdle(1), [{ sessionId: "failing" }]);
+assert.equal(failingTransport.closeCalls, 2);
+assert.equal(registry.size, 0);
 
 const first = createTransport();
 const second = createTransport();
@@ -89,6 +97,35 @@ finishDelayedClose?.();
 await delayedClose;
 assert.equal(delayedCloseResolved, true);
 assert.equal(delayedRegistry.size, 0);
+
+const transportCloseRegistry = new McpSessionRegistry<FakeTransport>();
+transportCloseRegistry.register("unexpected-close", ownerClientId, createTransport());
+assert.equal(
+  transportCloseRegistry.removeOnTransportClose("unexpected-close"),
+  "unexpected",
+);
+assert.equal(transportCloseRegistry.removeOnTransportClose("unexpected-close"), undefined);
+
+let finishIntentionalClose: (() => void) | undefined;
+const intentionalCloseTransport: FakeTransport = {
+  closeCalls: 0,
+  close() {
+    this.closeCalls += 1;
+    return new Promise<void>((resolve) => {
+      finishIntentionalClose = resolve;
+    });
+  },
+};
+transportCloseRegistry.register("intentional-close", ownerClientId, intentionalCloseTransport);
+const intentionalClose = transportCloseRegistry.closeIdle(0);
+await Promise.resolve();
+assert.equal(
+  transportCloseRegistry.removeOnTransportClose("intentional-close"),
+  "intentional",
+);
+finishIntentionalClose?.();
+assert.deepEqual(await intentionalClose, [{ sessionId: "intentional-close" }]);
+assert.equal(intentionalCloseTransport.closeCalls, 1);
 
 const limited = new McpSessionRegistry<FakeTransport>({ maxSessions: 1 });
 const limitedReservation = limited.tryReserve();
@@ -138,7 +175,13 @@ assert.equal(allActiveTransport.closeCalls, 0);
 
 const failedReclaim = new McpSessionRegistry<FakeTransport>({ maxSessions: 1 });
 const failedReclaimError = new Error("cannot close for reclaim");
-const failedReclaimTransport = createTransport(failedReclaimError);
+const failedReclaimTransport: FakeTransport = {
+  closeCalls: 0,
+  async close() {
+    this.closeCalls += 1;
+    if (this.closeCalls === 1) throw failedReclaimError;
+  },
+};
 failedReclaim.register("failed-reclaim", ownerClientId, failedReclaimTransport);
 const failedReservation = await failedReclaim.reserveWithIdleReclaim(ownerClientId);
 assert.equal(failedReservation.reservation, undefined);
@@ -146,6 +189,12 @@ assert.equal(failedReservation.reclaimed?.sessionId, "failed-reclaim");
 assert.equal(failedReservation.reclaimed?.error, failedReclaimError);
 assert.equal(failedReclaim.size, 1);
 assert.equal(failedReclaim.get("failed-reclaim", ownerClientId), undefined);
+assert.equal(failedReclaim.tryReserve(), undefined);
+const retriedReclaim = await failedReclaim.reserveWithIdleReclaim(ownerClientId);
+assert(retriedReclaim.reservation);
+assert.equal(retriedReclaim.reclaimed?.error, undefined);
+assert.equal(failedReclaimTransport.closeCalls, 2);
+failedReclaim.releaseReservation(retriedReclaim.reservation);
 
 let finishFirstReclaim: (() => void) | undefined;
 let finishSecondReclaim: (() => void) | undefined;
@@ -204,6 +253,36 @@ activeRegistry.release("in-flight", ownerClientId);
 activeNow = 2_000;
 assert.deepEqual(await activeRegistry.closeIdle(1), [{ sessionId: "in-flight" }]);
 
+let finishConcurrentClose: (() => void) | undefined;
+const closeRaceRegistry = new McpSessionRegistry<FakeTransport>({ now: () => 1_000 });
+let closeRaceDisposition: "intentional" | "unexpected" | undefined;
+const closeRaceTransport: FakeTransport = {
+  closeCalls: 0,
+  close() {
+    this.closeCalls += 1;
+    closeRaceDisposition = closeRaceRegistry.removeOnTransportClose("close-race");
+    return new Promise<void>((resolve) => {
+      finishConcurrentClose = resolve;
+    });
+  },
+};
+closeRaceRegistry.register("close-race", ownerClientId, closeRaceTransport);
+const idleClose = closeRaceRegistry.closeIdle(0);
+await Promise.resolve();
+assert.equal(closeRaceDisposition, "intentional");
+const shutdownClose = closeRaceRegistry.closeAll();
+let shutdownCloseResolved = false;
+void shutdownClose.then(() => {
+  shutdownCloseResolved = true;
+});
+await Promise.resolve();
+assert.equal(closeRaceTransport.closeCalls, 1);
+assert.equal(shutdownCloseResolved, false);
+finishConcurrentClose?.();
+assert.deepEqual(await idleClose, [{ sessionId: "close-race" }]);
+assert.deepEqual(await shutdownClose, []);
+assert.equal(closeRaceRegistry.size, 0);
+
 const hungRegistry = new McpSessionRegistry<FakeTransport>({ closeTimeoutMs: 10 });
 hungRegistry.register("hung", ownerClientId, {
   closeCalls: 0,
@@ -217,3 +296,50 @@ assert.equal(hungResults.length, 1);
 assert.match(String(hungResults[0]?.error), /Timed out closing MCP session/);
 assert.equal(hungRegistry.size, 1);
 assert.equal(hungRegistry.get("hung", ownerClientId), undefined);
+
+let finishHungIdle: (() => void) | undefined;
+const hungIdleRegistry = new McpSessionRegistry<FakeTransport>({
+  closeTimeoutMs: 10,
+  maxSessions: 1,
+});
+hungIdleRegistry.register("hung-idle", ownerClientId, {
+  closeCalls: 0,
+  close() {
+    this.closeCalls += 1;
+    return new Promise<void>((resolve) => {
+      finishHungIdle = resolve;
+    });
+  },
+});
+const hungIdleResults = await hungIdleRegistry.closeIdle(0);
+assert.match(String(hungIdleResults[0]?.error), /Timed out closing MCP session/);
+assert.equal(hungIdleRegistry.size, 1);
+assert.equal(hungIdleRegistry.tryReserve(), undefined);
+finishHungIdle?.();
+await Promise.resolve();
+await Promise.resolve();
+assert.equal(hungIdleRegistry.size, 0);
+const afterHungIdle = hungIdleRegistry.tryReserve();
+assert(afterHungIdle);
+hungIdleRegistry.releaseReservation(afterHungIdle);
+
+const detachedHungRegistry = new McpSessionRegistry<FakeTransport>({
+  closeTimeoutMs: 10,
+  maxSessions: 1,
+});
+let detachedHungDisposition: "intentional" | "unexpected" | undefined;
+detachedHungRegistry.register("detached-hung", ownerClientId, {
+  closeCalls: 0,
+  close() {
+    this.closeCalls += 1;
+    detachedHungDisposition = detachedHungRegistry.removeOnTransportClose("detached-hung");
+    return new Promise<void>(() => undefined);
+  },
+});
+const detachedHungResults = await detachedHungRegistry.closeIdle(0);
+assert.equal(detachedHungDisposition, "intentional");
+assert.match(String(detachedHungResults[0]?.error), /Timed out closing MCP session/);
+assert.equal(detachedHungRegistry.size, 1);
+assert.equal(detachedHungRegistry.tryReserve(), undefined);
+assert.deepEqual(await detachedHungRegistry.closeAll(), []);
+assert.equal(detachedHungRegistry.size, 1);

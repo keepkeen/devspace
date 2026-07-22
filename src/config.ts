@@ -203,7 +203,7 @@ function parseResourceLimits(
   configured: DevspaceUserConfig["resources"],
 ): ResourceLimitsConfig {
   const limits = {
-    mcpSessionIdleTimeoutMs: seconds(env.DEVSPACE_MCP_SESSION_IDLE_TIMEOUT_SECONDS, 24 * 60 * 60, "DEVSPACE_MCP_SESSION_IDLE_TIMEOUT_SECONDS"),
+    mcpSessionIdleTimeoutMs: seconds(env.DEVSPACE_MCP_SESSION_IDLE_TIMEOUT_SECONDS, 30 * 60, "DEVSPACE_MCP_SESSION_IDLE_TIMEOUT_SECONDS"),
     mcpSessionCloseTimeoutMs: seconds(env.DEVSPACE_MCP_SESSION_CLOSE_TIMEOUT_SECONDS, 5, "DEVSPACE_MCP_SESSION_CLOSE_TIMEOUT_SECONDS"),
     cleanupIntervalMs: seconds(env.DEVSPACE_RESOURCE_CLEANUP_INTERVAL_SECONDS, 5 * 60, "DEVSPACE_RESOURCE_CLEANUP_INTERVAL_SECONDS"),
     maxMcpSessions: parsePositiveInteger(

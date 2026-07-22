@@ -23,6 +23,11 @@ interface McpSessionEntry<TTransport> {
   lastActivityAt: number;
   activeRequests: number;
   closing: boolean;
+  closePromise?: Promise<McpSessionCloseResult>;
+}
+
+interface McpSessionCloseAttempt {
+  underlying: Promise<void>;
 }
 
 export interface McpSessionRegistryOptions {
@@ -33,6 +38,7 @@ export interface McpSessionRegistryOptions {
 
 export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
   private readonly sessions = new Map<string, McpSessionEntry<TTransport>>();
+  private readonly inFlightClosings = new Map<string, McpSessionCloseAttempt>();
   private readonly now: () => number;
   private readonly maxSessions: number;
   private readonly reservations = new Set<McpSessionReservation>();
@@ -46,7 +52,11 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
   }
 
   get size(): number {
-    return this.sessions.size;
+    let size = this.sessions.size;
+    for (const sessionId of this.inFlightClosings.keys()) {
+      if (!this.sessions.has(sessionId)) size += 1;
+    }
+    return size;
   }
 
   tryReserve(): McpSessionReservation | undefined {
@@ -66,22 +76,12 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
     const candidate = this.oldestInactiveSession(ownerClientId);
     if (!candidate) return {};
 
-    candidate.entry.closing = true;
     const reservation = {
       id: Symbol("mcp-session-reclaim-reservation"),
       reclaimsSessionId: candidate.sessionId,
     };
     this.reservations.add(reservation);
-    const [reclaimed] = await closeSessions(
-      [{ sessionId: candidate.sessionId, transport: candidate.entry.transport }],
-      this.closeTimeoutMs,
-    );
-    if (!reclaimed) {
-      this.reservations.delete(reservation);
-      return {};
-    }
-
-    this.finishClosing([reclaimed]);
+    const reclaimed = await this.beginClosing(candidate.sessionId, candidate.entry).promise;
     if (reclaimed.error || this.sealed || !this.reservations.has(reservation)) {
       this.reservations.delete(reservation);
       return { reclaimed };
@@ -152,44 +152,91 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
     return this.sessions.delete(sessionId);
   }
 
+  removeOnTransportClose(sessionId: string): "intentional" | "unexpected" | undefined {
+    const entry = this.sessions.get(sessionId);
+    if (!entry) return undefined;
+    this.sessions.delete(sessionId);
+    return entry.closing ? "intentional" : "unexpected";
+  }
+
   async closeIdle(idleTimeoutMs: number): Promise<McpSessionCloseResult[]> {
     const cutoff = this.now() - idleTimeoutMs;
-    const idleSessions: Array<{ sessionId: string; transport: TTransport }> = [];
+    const idleClosings: Array<Promise<McpSessionCloseResult>> = [];
 
     for (const [sessionId, entry] of this.sessions) {
-      if (entry.closing || entry.activeRequests > 0 || entry.lastActivityAt > cutoff) continue;
-
-      entry.closing = true;
-      idleSessions.push({ sessionId, transport: entry.transport });
+      if (
+        entry.closePromise ||
+        entry.activeRequests > 0 ||
+        (!entry.closing && entry.lastActivityAt > cutoff)
+      ) {
+        continue;
+      }
+      const closing = this.beginClosing(sessionId, entry);
+      if (closing.initiated) idleClosings.push(closing.promise);
     }
 
-    const results = await closeSessions(idleSessions, this.closeTimeoutMs);
-    this.finishClosing(results);
-    return results;
+    return Promise.all(idleClosings);
   }
 
   async closeAll(): Promise<McpSessionCloseResult[]> {
     this.seal();
-    const sessions = Array.from(this.sessions, ([sessionId, entry]) => {
-      entry.closing = true;
-      return {
-        sessionId,
-        transport: entry.transport,
-      };
-    });
-    const results = await closeSessions(sessions, this.closeTimeoutMs);
-    this.finishClosing(results);
-    return results;
+    const allClosings = new Set<Promise<McpSessionCloseResult>>();
+    for (const [sessionId, closing] of this.inFlightClosings) {
+      allClosings.add(closeSession(sessionId, closing.underlying, this.closeTimeoutMs));
+    }
+    const initiatedClosings: Array<Promise<McpSessionCloseResult>> = [];
+
+    for (const [sessionId, entry] of this.sessions) {
+      const closing = this.beginClosing(sessionId, entry);
+      allClosings.add(closing.promise);
+      if (closing.initiated) initiatedClosings.push(closing.promise);
+    }
+
+    await Promise.all([...allClosings]);
+    return Promise.all(initiatedClosings);
   }
 
-  private finishClosing(results: McpSessionCloseResult[]): void {
-    for (const result of results) {
-      const entry = this.sessions.get(result.sessionId);
-      if (!entry) continue;
-      if (!result.error) {
-        this.sessions.delete(result.sessionId);
-      }
+  private beginClosing(
+    sessionId: string,
+    entry: McpSessionEntry<TTransport>,
+  ): { promise: Promise<McpSessionCloseResult>; initiated: boolean } {
+    if (entry.closePromise) return { promise: entry.closePromise, initiated: false };
+
+    const existingClose = this.inFlightClosings.get(sessionId);
+    if (existingClose) {
+      return {
+        promise: closeSession(sessionId, existingClose.underlying, this.closeTimeoutMs),
+        initiated: false,
+      };
     }
+
+    entry.closing = true;
+    const underlyingClose = Promise.resolve().then(() => entry.transport.close());
+    const promise = closeSession(sessionId, underlyingClose, this.closeTimeoutMs);
+    entry.closePromise = promise;
+    const attempt = { underlying: underlyingClose };
+    this.inFlightClosings.set(sessionId, attempt);
+
+    void underlyingClose.then(
+      () => {
+        if (this.sessions.get(sessionId) === entry) this.sessions.delete(sessionId);
+        if (this.inFlightClosings.get(sessionId) === attempt) {
+          this.inFlightClosings.delete(sessionId);
+        }
+      },
+      () => {
+        if (this.inFlightClosings.get(sessionId) === attempt) {
+          this.inFlightClosings.delete(sessionId);
+        }
+      },
+    );
+    void promise.then((result) => {
+      if (!result.error && this.sessions.get(sessionId) === entry) {
+        this.sessions.delete(sessionId);
+      }
+      if (entry.closePromise === promise) entry.closePromise = undefined;
+    });
+    return { promise, initiated: true };
   }
 
   private oldestInactiveSession(ownerClientId: string): {
@@ -200,7 +247,7 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
     let oldestGlobal: { sessionId: string; entry: McpSessionEntry<TTransport> } | undefined;
 
     for (const [sessionId, entry] of this.sessions) {
-      if (entry.closing || entry.activeRequests > 0) continue;
+      if (entry.closePromise || entry.activeRequests > 0) continue;
       if (!oldestGlobal || entry.lastActivityAt < oldestGlobal.entry.lastActivityAt) {
         oldestGlobal = { sessionId, entry };
       }
@@ -216,12 +263,13 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
   }
 
   private occupiedSlots(excludedReservation?: McpSessionReservation): number {
-    let occupied = this.sessions.size;
+    let occupied = this.size;
     for (const reservation of this.reservations) {
       if (reservation === excludedReservation) continue;
       if (
         reservation.reclaimsSessionId &&
-        this.sessions.has(reservation.reclaimsSessionId)
+        (this.sessions.has(reservation.reclaimsSessionId) ||
+          this.inFlightClosings.has(reservation.reclaimsSessionId))
       ) {
         continue;
       }
@@ -231,31 +279,28 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
   }
 }
 
-async function closeSessions<TTransport extends ClosableMcpTransport>(
-  sessions: Array<{ sessionId: string; transport: TTransport }>,
+async function closeSession(
+  sessionId: string,
+  underlyingClose: Promise<void>,
   closeTimeoutMs: number,
-): Promise<McpSessionCloseResult[]> {
-  return Promise.all(
-    sessions.map(async ({ sessionId, transport }) => {
-      try {
-        let timer: NodeJS.Timeout | undefined;
-        try {
-          await Promise.race([
-            transport.close(),
-            new Promise<never>((_resolve, reject) => {
-              timer = setTimeout(
-                () => reject(new Error(`Timed out closing MCP session after ${closeTimeoutMs}ms.`)),
-                closeTimeoutMs,
-              );
-            }),
-          ]);
-        } finally {
-          if (timer) clearTimeout(timer);
-        }
-        return { sessionId };
-      } catch (error) {
-        return { sessionId, error };
-      }
-    }),
-  );
+): Promise<McpSessionCloseResult> {
+  try {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        underlyingClose,
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(
+            () => reject(new Error(`Timed out closing MCP session after ${closeTimeoutMs}ms.`)),
+            closeTimeoutMs,
+          );
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+    return { sessionId };
+  } catch (error) {
+    return { sessionId, error };
+  }
 }
