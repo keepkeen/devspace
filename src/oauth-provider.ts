@@ -260,6 +260,10 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     this.oauthStore.close();
   }
 
+  isReady(): boolean {
+    return this.oauthStore.isReady();
+  }
+
   private validCodeRecord(
     client: OAuthClientInformationFull,
     authorizationCode: string,

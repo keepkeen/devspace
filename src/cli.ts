@@ -40,7 +40,7 @@ import {
 import { expandHomePath } from "./roots.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
 
-type Command = "serve" | "init" | "doctor" | "config" | "agents" | "help" | "version";
+type Command = "serve" | "admin" | "init" | "doctor" | "config" | "agents" | "help" | "version";
 const require = createRequire(import.meta.url);
 const SUPPORTED_NODE_RANGE = ">=20.12 <27";
 
@@ -54,6 +54,10 @@ async function main(argv: string[]): Promise<void> {
     case "serve":
       await ensureConfigured();
       await serve();
+      return;
+    case "admin":
+      await ensureConfigured();
+      await runAdmin(args);
       return;
     case "init":
       await runInit({ force: args.includes("--force") });
@@ -78,7 +82,7 @@ async function main(argv: string[]): Promise<void> {
 
 function normalizeCommand(command: string | undefined): Command {
   if (!command || command === "serve" || command === "start") return "serve";
-  if (command === "init" || command === "doctor" || command === "config" || command === "agents") return command;
+  if (command === "admin" || command === "init" || command === "doctor" || command === "config" || command === "agents") return command;
   if (command === "help" || command === "--help" || command === "-h") return "help";
   if (command === "version" || command === "--version" || command === "-v") return "version";
   throw new Error(`Unknown command: ${command}`);
@@ -157,6 +161,7 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
     }));
 
     const config: DevspaceUserConfig = {
+      ...files.config,
       host: files.config.host ?? "127.0.0.1",
       port,
       allowedRoots,
@@ -213,12 +218,13 @@ async function serve(): Promise<void> {
 
   const { createServer } = await import("./server.js");
   const config = loadConfig();
-  const { app, close, localAgentProviders } = createServer(config);
+  const { app, beginClose, close, localAgentProviders } = createServer(config);
   const httpServer = app.listen(config.port, config.host, () => {
     console.log(`devspace listening on http://${config.host}:${config.port}/mcp`);
     console.log(`public base url: ${config.publicBaseUrl}`);
     console.log(`allowed roots: ${config.allowedRoots.join(", ")}`);
     console.log(`allowed hosts: ${config.allowedHosts.join(", ")}`);
+    console.log(`tool mode: ${config.toolMode}`);
     if (config.allowedHosts.includes("*")) {
       console.warn("warning: Host header allowlist is disabled because DEVSPACE_ALLOWED_HOSTS=*");
     }
@@ -233,7 +239,8 @@ async function serve(): Promise<void> {
   const shutdown = async () => {
     if (shuttingDown) return;
     shuttingDown = true;
-    await shutdownHttpServer(httpServer, close);
+    await beginClose();
+    await shutdownHttpServer(httpServer, close, config.resources.httpDrainTimeoutMs);
     process.exit(0);
   };
   const handleShutdown = () => {
@@ -244,6 +251,60 @@ async function serve(): Promise<void> {
   };
   process.once("SIGINT", handleShutdown);
   process.once("SIGTERM", handleShutdown);
+}
+
+async function runAdmin(args: string[]): Promise<void> {
+  let port = 0;
+  let openBrowser = true;
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index];
+    if (argument === "--no-open") {
+      openBrowser = false;
+      continue;
+    }
+    if (argument === "--port") {
+      const value = args[index + 1];
+      if (!value || !/^\d+$/.test(value)) {
+        throw new Error("`devspace admin --port` requires a port number.");
+      }
+      port = Number(value);
+      if (port < 1 || port > 65_535) throw new Error(`Invalid admin port: ${value}`);
+      index += 1;
+      continue;
+    }
+    throw new Error(`Unknown admin option: ${argument}`);
+  }
+
+  const { startAdminServer } = await import("./admin-server.js");
+  const admin = await startAdminServer({ port });
+  console.log(`DevSpace local admin: ${admin.url}`);
+  console.log("Keep this terminal open while using the panel. Press Ctrl-C to stop it.");
+  if (openBrowser) openLocalUrl(admin.url);
+
+  let shuttingDown = false;
+  const shutdown = (): void => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    void admin.close().finally(() => process.exit(0));
+  };
+  process.once("SIGINT", shutdown);
+  process.once("SIGTERM", shutdown);
+}
+
+function openLocalUrl(url: string): void {
+  const command = process.platform === "darwin"
+    ? { executable: "open", args: [url] }
+    : process.platform === "win32"
+      ? { executable: "cmd", args: ["/c", "start", "", url] }
+      : { executable: "xdg-open", args: [url] };
+  const child = spawn(command.executable, command.args, {
+    detached: true,
+    stdio: "ignore",
+  });
+  child.once("error", (error) => {
+    console.warn(`Could not open the browser automatically: ${error.message}`);
+  });
+  child.unref();
 }
 
 async function runDoctor(): Promise<void> {
@@ -264,6 +325,7 @@ async function runDoctor(): Promise<void> {
     console.log(`Public MCP URL: ${new URL("/mcp", config.publicBaseUrl).toString()}`);
     console.log(`Allowed roots: ${config.allowedRoots.join(", ")}`);
     console.log(`Allowed hosts: ${config.allowedHosts.join(", ")}`);
+    console.log(`Tool mode: ${config.toolMode}`);
   } catch (error) {
     console.log(`Config status: ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -281,20 +343,27 @@ function runConfigCommand(args: string[]): void {
   if (subcommand !== "set") {
     throw new Error(`Unknown config command: ${subcommand}`);
   }
-  if (key !== "publicBaseUrl") {
-    throw new Error("Only `devspace config set publicBaseUrl <url|null>` is supported right now.");
-  }
-
   const value = rest.join(" ").trim();
-  if (!value) {
-    throw new Error("Missing publicBaseUrl value.");
+  if (key === "publicBaseUrl") {
+    if (!value) throw new Error("Missing publicBaseUrl value.");
+    writeDevspaceConfig({
+      ...files.config,
+      publicBaseUrl: normalizeOptionalPublicBaseUrl(value),
+    });
+    console.log(`Updated ${files.configPath}`);
+    return;
   }
 
-  writeDevspaceConfig({
-    ...files.config,
-    publicBaseUrl: normalizeOptionalPublicBaseUrl(value),
-  });
-  console.log(`Updated ${files.configPath}`);
+  if (key === "toolMode") {
+    if (value !== "minimal" && value !== "full" && value !== "codex") {
+      throw new Error("toolMode must be one of: codex, full, minimal.");
+    }
+    writeDevspaceConfig({ ...files.config, toolMode: value });
+    console.log(`Updated ${files.configPath}`);
+    return;
+  }
+
+  throw new Error("Supported config keys: publicBaseUrl, toolMode.");
 }
 
 function printHelp(): void {
@@ -305,10 +374,13 @@ function printHelp(): void {
       "Usage:",
       "  devspace                 Run first-time setup if needed, then start the server",
       "  devspace serve           Start the server",
+      "  devspace admin           Open the local-only management panel",
+      "  devspace admin --no-open Print the panel URL without opening a browser",
       "  devspace init            Create or update ~/.devspace/config.json and auth.json",
       "  devspace doctor          Show config, runtime, and native dependency status",
       "  devspace config get      Print persisted config",
       "  devspace config set publicBaseUrl <url|null>",
+      "  devspace config set toolMode <codex|full|minimal>",
       "  devspace agents ls       List subagent sessions",
       "  devspace agents run <profile-or-provider-or-id> [--model <model>] <prompt>",
       "  devspace agents show <id>",

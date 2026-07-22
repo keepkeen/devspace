@@ -19,6 +19,43 @@ for (const flag of ["-v", "--version"]) {
   assert.equal(output, packageJson.version);
 }
 
+const configCommandDir = mkdtempSync(join(tmpdir(), "devspace-cli-config-test-"));
+writeFileSync(
+  join(configCommandDir, "config.json"),
+  JSON.stringify({
+    allowedRoots: [process.cwd()],
+    publicBaseUrl: "https://devspace.example.com",
+    toolMode: "codex",
+  }),
+);
+execFileSync(
+  "node",
+  ["--import", "tsx", "src/cli.ts", "config", "set", "toolMode", "full"],
+  {
+    encoding: "utf8",
+    env: { ...process.env, DEVSPACE_CONFIG_DIR: configCommandDir },
+  },
+);
+const updatedConfig = JSON.parse(
+  readFileSync(join(configCommandDir, "config.json"), "utf8"),
+) as { allowedRoots: string[]; publicBaseUrl: string; toolMode: string };
+assert.equal(updatedConfig.toolMode, "full");
+assert.deepEqual(updatedConfig.allowedRoots, [process.cwd()]);
+assert.equal(updatedConfig.publicBaseUrl, "https://devspace.example.com");
+assert.throws(
+  () => execFileSync(
+    "node",
+    ["--import", "tsx", "src/cli.ts", "config", "set", "toolMode", "browser"],
+    {
+      encoding: "utf8",
+      env: { ...process.env, DEVSPACE_CONFIG_DIR: configCommandDir },
+      stdio: "pipe",
+    },
+  ),
+  /Command failed/,
+);
+rmSync(configCommandDir, { recursive: true, force: true });
+
 const root = mkdtempSync(join(tmpdir(), "devspace-cli-agents-test-"));
 try {
   const configDir = join(root, ".devspace");

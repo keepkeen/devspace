@@ -1,0 +1,65 @@
+import assert from "node:assert/strict";
+import {
+  BATCH_ITEM_MAX_CHARACTERS,
+  BATCH_MAX_ITEMS,
+  BATCH_TOTAL_MAX_CHARACTERS,
+  runBoundedBatch,
+} from "./batch-tools.js";
+
+const ordered = await runBoundedBatch(
+  [
+    { operation: "read", path: "slow" },
+    { operation: "read", path: "fast" },
+  ],
+  async (item) => {
+    if (item.path === "slow") await new Promise((resolve) => setTimeout(resolve, 10));
+    return { ok: true, result: item.path };
+  },
+);
+assert.deepEqual(ordered.items.map((item) => item.path), ["slow", "fast"]);
+
+const partialFailure = await runBoundedBatch(
+  [
+    { operation: "read", path: "ok" },
+    { operation: "read", path: "bad" },
+    { operation: "read", path: "ok" },
+  ],
+  async (item) => {
+    if (item.path === "bad") throw new Error("unreadable");
+    return { ok: true, result: "content" };
+  },
+);
+assert.equal(partialFailure.items[0]?.ok, true);
+assert.equal(partialFailure.items[1]?.ok, false);
+assert.match(partialFailure.items[1]?.result ?? "", /unreadable/);
+assert.match(partialFailure.items[2]?.result ?? "", /Duplicate batch item skipped/);
+
+const oversized = await runBoundedBatch(
+  Array.from({ length: 4 }, (_, index) => ({ operation: "read", path: String(index) })),
+  async () => ({ ok: true, result: "x".repeat(BATCH_ITEM_MAX_CHARACTERS + 100) }),
+);
+assert.equal(oversized.truncated, true);
+assert.ok(oversized.items.every((item) => item.result.length <= BATCH_ITEM_MAX_CHARACTERS));
+assert.ok(oversized.items.reduce((sum, item) => sum + item.result.length, 0) <= BATCH_TOTAL_MAX_CHARACTERS);
+assert.ok(oversized.result.length <= BATCH_TOTAL_MAX_CHARACTERS);
+
+const oversizedError = await runBoundedBatch(
+  [{ operation: "read", path: "bad" }],
+  async () => { throw new Error("x".repeat(BATCH_ITEM_MAX_CHARACTERS + 100)); },
+);
+assert.equal(oversizedError.items[0]?.truncated, true);
+assert.ok((oversizedError.items[0]?.result.length ?? Infinity) <= BATCH_ITEM_MAX_CHARACTERS);
+
+await assert.rejects(
+  runBoundedBatch([], async () => ({ ok: true, result: "" })),
+  /between 1/,
+);
+await assert.rejects(
+  runBoundedBatch(
+    Array.from({ length: BATCH_MAX_ITEMS + 1 }, (_, index) => ({ operation: "read", path: String(index) })),
+    async () => ({ ok: true, result: "" }),
+  ),
+  new RegExp(String(BATCH_MAX_ITEMS)),
+);
+
+console.log("batch-tools tests passed");

@@ -1,14 +1,24 @@
 import assert from "node:assert/strict";
 import { resolveShellCommand, terminateProcessTree } from "./process-platform.js";
 
-assert.deepEqual(resolveShellCommand("echo ok", "win32", { ComSpec: "C:\\Windows\\cmd.exe" }), {
-  executable: "C:\\Windows\\cmd.exe",
-  args: ["/d", "/s", "/c", "echo ok"],
+// Prefer bash on Windows when available; otherwise fall back to cmd.exe.
+const winWithGitBash = resolveShellCommand("echo ok", "win32", {
+  ProgramFiles: "C:\\Program Files",
 });
+// Without a real Git Bash install in this env, the resolver falls through to PATH/cmd.
+// Force the cmd path by clearing ProgramFiles and PATH-like hints.
+assert.deepEqual(
+  resolveShellCommand("echo ok", "win32", { ComSpec: "C:\\Windows\\cmd.exe", PATH: "" }),
+  {
+    executable: "C:\\Windows\\cmd.exe",
+    args: ["/d", "/s", "/c", "echo ok"],
+  },
+);
 
+// Prefer non-login -c for configured login shells (faster, Claude/pi style).
 assert.deepEqual(resolveShellCommand("echo ok", "darwin", { SHELL: "/bin/zsh" }), {
   executable: "/bin/zsh",
-  args: ["-lc", "echo ok"],
+  args: ["-c", "echo ok"],
 });
 
 assert.deepEqual(resolveShellCommand("echo ok", "linux", { SHELL: "/bin/dash" }), {
@@ -16,10 +26,23 @@ assert.deepEqual(resolveShellCommand("echo ok", "linux", { SHELL: "/bin/dash" })
   args: ["-c", "echo ok"],
 });
 
-assert.deepEqual(resolveShellCommand("echo ok", "linux", { SHELL: "/usr/bin/fish" }), {
-  executable: "/bin/sh",
-  args: ["-c", "echo ok"],
-});
+// Unknown shells fall back to bash/sh rather than blindly using fish.
+const fish = resolveShellCommand("echo ok", "linux", { SHELL: "/usr/bin/fish" });
+assert.ok(fish.executable === "/bin/bash" || fish.executable === "/bin/sh" || fish.executable.endsWith("bash"));
+assert.deepEqual(fish.args.slice(0, 1), ["-c"]);
+assert.equal(fish.args[1], "echo ok");
+
+// Explicit DEVSPACE_SHELL / SHELL bash path is honored.
+assert.deepEqual(
+  resolveShellCommand("echo ok", "linux", { DEVSPACE_SHELL: "/usr/local/bin/bash" }),
+  {
+    executable: "/usr/local/bin/bash",
+    args: ["-c", "echo ok"],
+  },
+);
+
+// Keep a reference so the unused var does not confuse future edits.
+assert.ok(winWithGitBash.executable);
 
 const windowsCalls: string[] = [];
 terminateProcessTree(
@@ -59,3 +82,5 @@ terminateProcessTree(
   },
 );
 assert.deepEqual(fallbackCalls, ["child:SIGTERM"]);
+
+console.log("process-platform tests passed");

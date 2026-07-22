@@ -1,10 +1,13 @@
-import { index, integer, primaryKey, sqliteTable, text } from "drizzle-orm/sqlite-core";
+import { sql } from "drizzle-orm";
+import { index, integer, primaryKey, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 
 export const workspaceSessions = sqliteTable(
   "workspace_sessions",
   {
     id: text("id").primaryKey(),
+    ownerClientId: text("owner_client_id").notNull().default("__legacy_unowned__"),
     root: text("root").notNull(),
+    canonicalRoot: text("canonical_root"),
     status: text("status").notNull().default("active"),
     mode: text("mode").notNull().default("checkout"),
     sourceRoot: text("source_root"),
@@ -17,6 +20,10 @@ export const workspaceSessions = sqliteTable(
   (table) => [
     index("workspace_sessions_root_idx").on(table.root, table.lastUsedAt),
     index("workspace_sessions_status_idx").on(table.status, table.lastUsedAt),
+    index("workspace_sessions_owner_status_idx").on(table.ownerClientId, table.status, table.lastUsedAt),
+    uniqueIndex("workspace_sessions_active_checkout_owner_canonical_root_uq")
+      .on(table.ownerClientId, table.canonicalRoot)
+      .where(sql`${table.canonicalRoot} is not null and ${table.mode} = 'checkout' and ${table.status} = 'active'`),
   ],
 );
 

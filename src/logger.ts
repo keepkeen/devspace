@@ -1,4 +1,5 @@
 import type { Request } from "express";
+import { createHash } from "node:crypto";
 
 export type LogLevel = "silent" | "error" | "warn" | "info" | "debug";
 export type LogFormat = "json" | "pretty";
@@ -70,6 +71,21 @@ export function requestPath(req: Request): string {
 
 export function sessionIdPrefix(sessionId: string | undefined): string | undefined {
   return sessionId ? sessionId.slice(0, 8) : undefined;
+}
+
+export function identifierHash(identifier: string | undefined): string | undefined {
+  return identifier
+    ? createHash("sha256").update(identifier).digest("hex").slice(0, 12)
+    : undefined;
+}
+
+export function errorFields(error: unknown): Record<string, unknown> {
+  if (!(error instanceof Error)) return { error: String(error) };
+  return {
+    error: error.message,
+    errorName: error.name,
+    errorStack: error.stack,
+  };
 }
 
 export function commandPreview(command: string): string {

@@ -77,6 +77,15 @@ Prefer adding Cloudflare Access, Tailscale identity controls, or equivalent
 protection in front of public tunnels. DevSpace OAuth still protects the MCP
 endpoint, but the tunnel URL should not be treated as a secret.
 
+## Local Admin Panel
+
+The management panel runs as a separate `devspace admin` process bound to
+`127.0.0.1` on its own port. Never proxy that port through Cloudflare or another
+tunnel. Each launch uses a one-time URL-fragment capability, an HttpOnly local
+session cookie, strict Host/Origin checks, and CSRF protection. The panel does
+not expose OAuth owner tokens or tunnel credentials and does not restart the MCP
+service automatically.
+
 ## Shell Access
 
 The shell tool is powerful by design. It is meant for tests, builds, git, and

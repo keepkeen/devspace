@@ -3,12 +3,39 @@ import { join, resolve } from "node:path";
 import { expandHomePath } from "./roots.js";
 import type { LoggingConfig, LogFormat, LogLevel } from "./logger.js";
 import type { OAuthConfig } from "./oauth-provider.js";
-import { devspaceAgentsDir, devspaceSkillsDir, loadDevspaceFiles } from "./user-config.js";
+import { MAX_TIMER_MS, RESOURCE_LIMIT_MAXIMUMS } from "./resource-limits.js";
+import {
+  devspaceAgentsDir,
+  devspaceSkillsDir,
+  loadDevspaceFiles,
+  type DevspaceUserConfig,
+} from "./user-config.js";
 
 export type ToolMode = "minimal" | "full" | "codex";
 export type WidgetMode = "off" | "changes" | "full";
 const DEFAULT_OAUTH_ACCESS_TOKEN_TTL_SECONDS = 60 * 60;
 const DEFAULT_OAUTH_REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
+
+export interface ResourceLimitsConfig {
+  mcpSessionIdleTimeoutMs: number;
+  mcpSessionCloseTimeoutMs: number;
+  cleanupIntervalMs: number;
+  maxMcpSessions: number;
+  maxProcessSessions: number;
+  maxProcessSessionsPerWorkspace: number;
+  maxCommandRuntimeMs: number;
+  processShutdownGraceMs: number;
+  httpDrainTimeoutMs: number;
+  workspaceIdleTtlMs: number;
+  maxResidentWorkspaces: number;
+  maxManagedWorktrees: number;
+}
+
+export interface InstructionScanConfig {
+  maxDepth: number;
+  maxEntries: number;
+  deadlineMs: number;
+}
 
 export interface ServerConfig {
   host: string;
@@ -28,6 +55,8 @@ export interface ServerConfig {
   subagents: boolean;
   agentDir: string;
   logging: LoggingConfig;
+  resources: ResourceLimitsConfig;
+  instructionScan: InstructionScanConfig;
 }
 
 function parsePort(value: string | number | undefined): number {
@@ -77,19 +106,32 @@ function normalizeAllowedHosts(rawHosts: string[], derivedHosts: string[]): stri
   return Array.from(new Set(hosts.map((host) => host.trim()).filter(Boolean)));
 }
 
-function parseBoolean(value: string | undefined): boolean {
-  return ["1", "true", "yes", "on"].includes(value?.toLowerCase() ?? "");
+function parseBoolean(value: string | undefined, name: string): boolean {
+  if (value === undefined) return false;
+
+  const normalized = value.toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  throw new Error(`Invalid ${name}: ${value} (expected boolean)`);
 }
 
-function parseToolMode(env: NodeJS.ProcessEnv): ToolMode {
+function parseToolMode(
+  env: NodeJS.ProcessEnv,
+  configuredMode: ToolMode | undefined,
+): ToolMode {
   const mode = env.DEVSPACE_TOOL_MODE;
   if (mode === "minimal" || mode === "full" || mode === "codex") return mode;
   if (mode) throw new Error(`Invalid DEVSPACE_TOOL_MODE: ${mode}`);
 
   if (env.DEVSPACE_MINIMAL_TOOLS !== undefined) {
-    return parseBoolean(env.DEVSPACE_MINIMAL_TOOLS) ? "minimal" : "full";
+    return parseBoolean(env.DEVSPACE_MINIMAL_TOOLS, "DEVSPACE_MINIMAL_TOOLS") ? "minimal" : "full";
   }
-  return "minimal";
+  if (configuredMode) return configuredMode;
+  // Default to the Codex-style unified exec surface (exec_command + write_stdin),
+  // which best fits browser MCP hosts like ChatGPT that have no per-command
+  // approval surface. Set DEVSPACE_TOOL_MODE=full or minimal to use the
+  // dedicated read/write/edit/grep/glob/ls/bash tools instead.
+  return "codex";
 }
 
 function parseLogLevel(value: string | undefined): LogLevel {
@@ -124,11 +166,16 @@ function parseStringList(value: string | undefined, fallback: string[]): string[
   return entries && entries.length > 0 ? entries : fallback;
 }
 
-function parsePositiveInteger(value: string | undefined, fallback: number, name: string): number {
+function parsePositiveInteger(
+  value: string | undefined,
+  fallback: number,
+  name: string,
+  maximum = Number.MAX_SAFE_INTEGER,
+): number {
   if (!value) return fallback;
 
   const parsed = Number(value);
-  if (!Number.isInteger(parsed) || parsed < 1) {
+  if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > maximum) {
     throw new Error(`Invalid ${name}: ${value}`);
   }
 
@@ -139,16 +186,85 @@ function parseLoggingConfig(env: NodeJS.ProcessEnv): LoggingConfig {
   return {
     level: parseLogLevel(env.DEVSPACE_LOG_LEVEL),
     format: parseLogFormat(env.DEVSPACE_LOG_FORMAT),
-    requests: env.DEVSPACE_LOG_REQUESTS === undefined ? true : parseBoolean(env.DEVSPACE_LOG_REQUESTS),
-    assets: parseBoolean(env.DEVSPACE_LOG_ASSETS),
-    toolCalls: env.DEVSPACE_LOG_TOOL_CALLS === undefined ? true : parseBoolean(env.DEVSPACE_LOG_TOOL_CALLS),
-    shellCommands: parseBoolean(env.DEVSPACE_LOG_SHELL_COMMANDS),
-    trustProxy: parseBoolean(env.DEVSPACE_TRUST_PROXY),
+    requests: env.DEVSPACE_LOG_REQUESTS === undefined ? true : parseBoolean(env.DEVSPACE_LOG_REQUESTS, "DEVSPACE_LOG_REQUESTS"),
+    assets: parseBoolean(env.DEVSPACE_LOG_ASSETS, "DEVSPACE_LOG_ASSETS"),
+    toolCalls: env.DEVSPACE_LOG_TOOL_CALLS === undefined ? true : parseBoolean(env.DEVSPACE_LOG_TOOL_CALLS, "DEVSPACE_LOG_TOOL_CALLS"),
+    shellCommands: parseBoolean(env.DEVSPACE_LOG_SHELL_COMMANDS, "DEVSPACE_LOG_SHELL_COMMANDS"),
+    trustProxy: parseBoolean(env.DEVSPACE_TRUST_PROXY, "DEVSPACE_TRUST_PROXY"),
   };
 }
 
-function parseWidgetMode(value: string | undefined): WidgetMode {
-  if (!value || value === "full") return "full";
+function seconds(value: string | undefined, fallback: number, name: string): number {
+  return parsePositiveInteger(value, fallback, name, Math.floor(MAX_TIMER_MS / 1_000)) * 1_000;
+}
+
+function parseResourceLimits(
+  env: NodeJS.ProcessEnv,
+  configured: DevspaceUserConfig["resources"],
+): ResourceLimitsConfig {
+  const limits = {
+    mcpSessionIdleTimeoutMs: seconds(env.DEVSPACE_MCP_SESSION_IDLE_TIMEOUT_SECONDS, 24 * 60 * 60, "DEVSPACE_MCP_SESSION_IDLE_TIMEOUT_SECONDS"),
+    mcpSessionCloseTimeoutMs: seconds(env.DEVSPACE_MCP_SESSION_CLOSE_TIMEOUT_SECONDS, 5, "DEVSPACE_MCP_SESSION_CLOSE_TIMEOUT_SECONDS"),
+    cleanupIntervalMs: seconds(env.DEVSPACE_RESOURCE_CLEANUP_INTERVAL_SECONDS, 5 * 60, "DEVSPACE_RESOURCE_CLEANUP_INTERVAL_SECONDS"),
+    maxMcpSessions: parsePositiveInteger(
+      env.DEVSPACE_MAX_MCP_SESSIONS,
+      configured?.maxMcpSessions ?? 64,
+      "DEVSPACE_MAX_MCP_SESSIONS",
+      RESOURCE_LIMIT_MAXIMUMS.maxMcpSessions,
+    ),
+    maxProcessSessions: parsePositiveInteger(
+      env.DEVSPACE_MAX_PROCESS_SESSIONS,
+      configured?.maxProcessSessions ?? 32,
+      "DEVSPACE_MAX_PROCESS_SESSIONS",
+      RESOURCE_LIMIT_MAXIMUMS.maxProcessSessions,
+    ),
+    maxProcessSessionsPerWorkspace: parsePositiveInteger(
+      env.DEVSPACE_MAX_PROCESS_SESSIONS_PER_WORKSPACE,
+      configured?.maxProcessSessionsPerWorkspace ?? 8,
+      "DEVSPACE_MAX_PROCESS_SESSIONS_PER_WORKSPACE",
+      RESOURCE_LIMIT_MAXIMUMS.maxProcessSessionsPerWorkspace,
+    ),
+    maxCommandRuntimeMs: env.DEVSPACE_MAX_COMMAND_RUNTIME_SECONDS === undefined
+      ? configured?.maxCommandRuntimeMs ?? 60 * 60 * 1_000
+      : seconds(env.DEVSPACE_MAX_COMMAND_RUNTIME_SECONDS, 60 * 60, "DEVSPACE_MAX_COMMAND_RUNTIME_SECONDS"),
+    processShutdownGraceMs: seconds(env.DEVSPACE_PROCESS_SHUTDOWN_GRACE_SECONDS, 5, "DEVSPACE_PROCESS_SHUTDOWN_GRACE_SECONDS"),
+    httpDrainTimeoutMs: seconds(env.DEVSPACE_HTTP_DRAIN_TIMEOUT_SECONDS, 30, "DEVSPACE_HTTP_DRAIN_TIMEOUT_SECONDS"),
+    workspaceIdleTtlMs: seconds(env.DEVSPACE_WORKSPACE_IDLE_TTL_SECONDS, 7 * 24 * 60 * 60, "DEVSPACE_WORKSPACE_IDLE_TTL_SECONDS"),
+    maxResidentWorkspaces: parsePositiveInteger(
+      env.DEVSPACE_MAX_RESIDENT_WORKSPACES,
+      configured?.maxResidentWorkspaces ?? 256,
+      "DEVSPACE_MAX_RESIDENT_WORKSPACES",
+      RESOURCE_LIMIT_MAXIMUMS.maxResidentWorkspaces,
+    ),
+    maxManagedWorktrees: parsePositiveInteger(
+      env.DEVSPACE_MAX_MANAGED_WORKTREES,
+      configured?.maxManagedWorktrees ?? 64,
+      "DEVSPACE_MAX_MANAGED_WORKTREES",
+      RESOURCE_LIMIT_MAXIMUMS.maxManagedWorktrees,
+    ),
+  };
+  return limits;
+}
+
+function assertResourceLimits(resources: ResourceLimitsConfig): void {
+  if (resources.maxProcessSessionsPerWorkspace > resources.maxProcessSessions) {
+    throw new Error(
+      "DEVSPACE_MAX_PROCESS_SESSIONS_PER_WORKSPACE cannot exceed DEVSPACE_MAX_PROCESS_SESSIONS",
+    );
+  }
+}
+
+function parseInstructionScan(env: NodeJS.ProcessEnv): InstructionScanConfig {
+  return {
+    maxDepth: parsePositiveInteger(env.DEVSPACE_INSTRUCTION_SCAN_MAX_DEPTH, 32, "DEVSPACE_INSTRUCTION_SCAN_MAX_DEPTH", 256),
+    maxEntries: parsePositiveInteger(env.DEVSPACE_INSTRUCTION_SCAN_MAX_ENTRIES, 100_000, "DEVSPACE_INSTRUCTION_SCAN_MAX_ENTRIES", 1_000_000),
+    deadlineMs: parsePositiveInteger(env.DEVSPACE_INSTRUCTION_SCAN_DEADLINE_MS, 5_000, "DEVSPACE_INSTRUCTION_SCAN_DEADLINE_MS", MAX_TIMER_MS),
+  };
+}
+
+function parseWidgetMode(value: string | undefined, configuredMode?: WidgetMode): WidgetMode {
+  if (!value) return configuredMode ?? "full";
+  if (value === "full") return "full";
   if (value === "off" || value === "changes") return value;
 
   throw new Error(`Invalid DEVSPACE_WIDGETS: ${value}`);
@@ -200,6 +316,13 @@ function defaultAgentDir(): string {
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
+  const config = loadConfigForAdmin(env);
+  assertResourceLimits(config.resources);
+  return config;
+}
+
+/** Loads individually valid effective values without rejecting repairable cross-field conflicts. */
+export function loadConfigForAdmin(env: NodeJS.ProcessEnv = process.env): ServerConfig {
   const files = loadDevspaceFiles(env);
   const host = env.HOST ?? files.config.host ?? "127.0.0.1";
   const port = parsePort(env.PORT ?? files.config.port);
@@ -222,20 +345,22 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     allowedRoots: parseAllowedRoots(env.DEVSPACE_ALLOWED_ROOTS ?? files.config.allowedRoots),
     allowedHosts: parseAllowedHosts(env.DEVSPACE_ALLOWED_HOSTS, derivedAllowedHosts),
     publicBaseUrl,
-    toolMode: parseToolMode(env),
-    widgets: parseWidgetMode(env.DEVSPACE_WIDGETS),
+    toolMode: parseToolMode(env, files.config.toolMode),
+    widgets: parseWidgetMode(env.DEVSPACE_WIDGETS, files.config.widgets),
     stateDir: resolve(expandHomePath(env.DEVSPACE_STATE_DIR ?? files.config.stateDir ?? defaultStateDir())),
     worktreeRoot: resolve(expandHomePath(env.DEVSPACE_WORKTREE_ROOT ?? files.config.worktreeRoot ?? defaultWorktreeRoot())),
-    skillsEnabled: env.DEVSPACE_SKILLS === undefined ? true : parseBoolean(env.DEVSPACE_SKILLS),
+    skillsEnabled: env.DEVSPACE_SKILLS === undefined ? true : parseBoolean(env.DEVSPACE_SKILLS, "DEVSPACE_SKILLS"),
     skillPaths: parsePathList(env.DEVSPACE_SKILL_PATHS),
     devspaceSkillsDir: devspaceSkillsDir(env),
     devspaceAgentsDir: devspaceAgentsDir(env),
     subagents:
       env.DEVSPACE_SUBAGENTS === undefined
         ? files.config.subagents === true
-        : parseBoolean(env.DEVSPACE_SUBAGENTS),
+        : parseBoolean(env.DEVSPACE_SUBAGENTS, "DEVSPACE_SUBAGENTS"),
     agentDir: resolve(expandHomePath(env.DEVSPACE_AGENT_DIR ?? files.config.agentDir ?? defaultAgentDir())),
     logging: parseLoggingConfig(env),
+    resources: parseResourceLimits(env, files.config.resources),
+    instructionScan: parseInstructionScan(env),
   };
 }
 

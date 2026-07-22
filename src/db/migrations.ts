@@ -22,6 +22,16 @@ const migrations: Migration[] = [
     name: "local-agent-sessions",
     up: migrateLocalAgentSessions,
   },
+  {
+    version: 4,
+    name: "workspace-oauth-ownership",
+    up: migrateWorkspaceOwnership,
+  },
+  {
+    version: 5,
+    name: "workspace-checkout-reuse",
+    up: migrateWorkspaceCheckoutReuse,
+  },
 ];
 
 export function migrateDatabase(sqlite: Database.Database): void {
@@ -172,6 +182,30 @@ function migrateLocalAgentSessions(sqlite: Database.Database): void {
   `);
 
   addColumnIfMissing(sqlite, "local_agent_sessions", "thinking", "text");
+}
+
+function migrateWorkspaceOwnership(sqlite: Database.Database): void {
+  addColumnIfMissing(
+    sqlite,
+    "workspace_sessions",
+    "owner_client_id",
+    "text not null default '__legacy_unowned__'",
+  );
+  sqlite.exec(`
+    create index if not exists workspace_sessions_owner_status_idx
+      on workspace_sessions(owner_client_id, status, last_used_at desc);
+  `);
+}
+
+function migrateWorkspaceCheckoutReuse(sqlite: Database.Database): void {
+  // Keep existing rows nullable so duplicate legacy checkout sessions remain
+  // intact. New sessions populate canonical_root and participate in the index.
+  addColumnIfMissing(sqlite, "workspace_sessions", "canonical_root", "text");
+  sqlite.exec(`
+    create unique index if not exists workspace_sessions_active_checkout_owner_canonical_root_uq
+      on workspace_sessions(owner_client_id, canonical_root)
+      where canonical_root is not null and mode = 'checkout' and status = 'active';
+  `);
 }
 
 function addColumnIfMissing(

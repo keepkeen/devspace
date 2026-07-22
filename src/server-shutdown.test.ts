@@ -12,20 +12,17 @@ const drainingHttpServer = {
 
 const drainingShutdown = shutdownHttpServer(drainingHttpServer, async () => {
   applicationCloseStarted = true;
-  assert.ok(
-    finishHttpClose,
-    "HTTP draining must start before application cleanup",
-  );
-  finishHttpClose();
 });
 
 await Promise.resolve();
 assert.equal(
   applicationCloseStarted,
-  true,
-  "application cleanup must start while the HTTP server is draining",
+  false,
+  "application cleanup must wait until in-flight HTTP requests drain",
 );
+finishHttpClose?.();
 await drainingShutdown;
+assert.equal(applicationCloseStarted, true);
 
 let finishApplicationClose: (() => void) | undefined;
 let shutdownResolved = false;
@@ -50,11 +47,15 @@ void delayedShutdown.then(() => {
 });
 
 await Promise.resolve();
+for (let attempt = 0; attempt < 5 && !finishApplicationClose; attempt += 1) {
+  await Promise.resolve();
+}
 assert.equal(
   shutdownResolved,
   false,
   "shutdown must wait for asynchronous application cleanup",
 );
+assert.ok(finishApplicationClose);
 finishApplicationClose?.();
 await delayedShutdown;
 assert.equal(shutdownResolved, true);
@@ -84,6 +85,7 @@ await delayedHttpDrain;
 assert.equal(httpDrainResolved, true);
 
 const httpCloseError = new Error("http close failed");
+let applicationClosedAfterHttpError = false;
 await assert.rejects(
   shutdownHttpServer(
     {
@@ -91,7 +93,45 @@ await assert.rejects(
         callback(httpCloseError);
       },
     },
-    async () => {},
+    async () => {
+      applicationClosedAfterHttpError = true;
+    },
   ),
   httpCloseError,
 );
+assert.equal(applicationClosedAfterHttpError, true);
+
+const applicationCloseError = new Error("application close failed");
+await assert.rejects(
+  shutdownHttpServer(
+    {
+      close(callback: (error?: Error) => void) {
+        callback(httpCloseError);
+      },
+    },
+    async () => {
+      throw applicationCloseError;
+    },
+  ),
+  (error: unknown) =>
+    error instanceof AggregateError &&
+    error.errors.includes(httpCloseError) &&
+    error.errors.includes(applicationCloseError),
+);
+
+let forcedCloseCalls = 0;
+let pendingCloseCallback: ((error?: Error) => void) | undefined;
+await shutdownHttpServer(
+  {
+    close(callback: (error?: Error) => void) {
+      pendingCloseCallback = callback;
+    },
+    closeAllConnections() {
+      forcedCloseCalls += 1;
+      pendingCloseCallback?.();
+    },
+  },
+  async () => {},
+  10,
+);
+assert.equal(forcedCloseCalls, 1);

@@ -3,6 +3,10 @@
 DevSpace can be configured through `devspace init`, persisted config files, or
 environment variables.
 
+This fork is currently run from a source checkout. The examples use
+`node dist/cli.js`; after `npm link`, the equivalent `devspace` command also
+works.
+
 The default files are:
 
 ```text
@@ -13,18 +17,38 @@ The default files are:
 Use another config directory with:
 
 ```bash
-DEVSPACE_CONFIG_DIR=/path/to/config npx @waishnav/devspace serve
+DEVSPACE_CONFIG_DIR=/path/to/config node dist/cli.js serve
 ```
 
 ## Commands
 
 ```bash
-npx @waishnav/devspace init
-npx @waishnav/devspace serve
-npx @waishnav/devspace doctor
-npx @waishnav/devspace config get
-npx @waishnav/devspace config set publicBaseUrl https://devspace.example.com
+node dist/cli.js init
+node dist/cli.js serve
+node dist/cli.js admin
+node dist/cli.js admin --no-open
+node dist/cli.js doctor
+node dist/cli.js config get
+node dist/cli.js config set publicBaseUrl https://devspace.example.com
+node dist/cli.js config set toolMode codex
 ```
+
+## Local Admin Panel
+
+`devspace admin` starts a separate loopback-only management server on an
+available port and opens its one-time capability URL. It is not mounted on the
+public MCP listener and is not reachable through the configured tunnel.
+
+The first version manages:
+
+- allowed workspace roots
+- tool mode (`codex`, `full`, or `minimal`)
+- widget mode (`full`, `changes`, or `off`)
+- MCP, process, command-runtime, resident-workspace, and worktree limits
+
+Configuration writes are atomic and preserve unrelated settings. Saving reports
+whether a DevSpace restart is required but never interrupts the running MCP
+server automatically.
 
 ## Core Environment Variables
 
@@ -57,15 +81,59 @@ MCP clients discover metadata from:
 /.well-known/oauth-authorization-server
 ```
 
+Workspace and MCP resources are owned by the OAuth `clientId`. Reauthorizing the
+same registered client preserves access; a separately registered client cannot
+reuse another client's MCP session, workspace, or process identifiers.
+
+## Resource Lifecycle and Limits
+
+| Variable | Default | Purpose |
+| --- | ---: | --- |
+| `DEVSPACE_MCP_SESSION_IDLE_TIMEOUT_SECONDS` | `86400` | Close inactive MCP transports. |
+| `DEVSPACE_MCP_SESSION_CLOSE_TIMEOUT_SECONDS` | `5` | Maximum wait for one transport to close. |
+| `DEVSPACE_RESOURCE_CLEANUP_INTERVAL_SECONDS` | `300` | Sweep interval for idle resources. |
+| `DEVSPACE_MAX_MCP_SESSIONS` | `64` | Maximum live MCP transports. |
+| `DEVSPACE_MAX_PROCESS_SESSIONS` | `32` | Maximum retained process sessions. |
+| `DEVSPACE_MAX_PROCESS_SESSIONS_PER_WORKSPACE` | `8` | Per-workspace process limit. |
+| `DEVSPACE_MAX_COMMAND_RUNTIME_SECONDS` | `3600` | Hard upper runtime for every command. |
+| `DEVSPACE_PROCESS_SHUTDOWN_GRACE_SECONDS` | `5` | SIGTERM grace period before SIGKILL. |
+| `DEVSPACE_HTTP_DRAIN_TIMEOUT_SECONDS` | `30` | Drain deadline before remaining HTTP sockets are closed. |
+| `DEVSPACE_WORKSPACE_IDLE_TTL_SECONDS` | `604800` | Legacy compatibility setting; checkout workspaces are not closed automatically. |
+| `DEVSPACE_MAX_RESIDENT_WORKSPACES` | `256` | Maximum workspaces retained in memory. |
+| `DEVSPACE_MAX_MANAGED_WORKTREES` | `64` | Maximum managed worktrees retained on disk. |
+
+Clients must not call `close_workspace` as routine turn or conversation cleanup.
+Call it only after the user explicitly asks to close or release that workspace.
+It terminates running processes and closes the logical session. A clean managed
+worktree is removed; a dirty managed worktree is retained and the workspace
+stays open so its changes remain manageable.
+
+The `bash.timeout` parameter is a hard runtime limit. `exec_command` uses the
+global command runtime limit and `yieldTimeMs` only controls how long the tool
+waits before returning a process session.
+
+## Legacy Instruction Scan Settings
+
+| Variable | Default |
+| --- | ---: |
+| `DEVSPACE_INSTRUCTION_SCAN_MAX_DEPTH` | `32` |
+| `DEVSPACE_INSTRUCTION_SCAN_MAX_ENTRIES` | `100000` |
+| `DEVSPACE_INSTRUCTION_SCAN_DEADLINE_MS` | `5000` |
+
+These variables remain accepted for configuration compatibility but are no
+longer used for a recursive workspace scan. `open_workspace` now returns
+`instructionScan.lazy=true`, loads only global/root instructions, and discovers
+cached nested instructions when later tools enter their directory scope.
+
 ## Tool Modes
 
 `DEVSPACE_TOOL_MODE` controls the tool surface.
 
 | Value | Behavior |
 | --- | --- |
-| `minimal` | Default. Exposes `open_workspace`, `read`, `write`, `edit`, and `bash`. Clients use `bash` with tools such as `rg`, `find`, and `ls` for inspection. |
-| `full` | Exposes the minimal tools plus dedicated `grep`, `glob`, and `ls` tools. |
-| `codex` | Experimental. Exposes `open_workspace`, `read`, `apply_patch`, `exec_command`, and `write_stdin`. Existing mutation and shell tools are hidden. |
+| `codex` | Default. Codex-style unified exec surface: `open_workspace`, `read`, `batch_read`, `batch_inspect`, `apply_patch`, `exec_command`, and `write_stdin`. Best for browser MCP hosts (ChatGPT) that have no per-command approval surface. `exec_command` returns a `sessionId` for long-running processes; poll with `write_stdin`. A small command policy blocks `rm -f`, `sudo`, and pipe-to-shell. |
+| `full` | Dedicated file tools: `open_workspace`, `read`, `batch_read`, `batch_inspect`, `write`, `edit`, `grep`, `glob`, `ls`, `bash`, and `write_stdin`. |
+| `minimal` | `open_workspace`, `read`, `batch_read`, `batch_inspect`, `write`, `edit`, `bash`, and `write_stdin`. Clients can use bounded batch inspection or `bash` with `rg`, `find`, and `ls`. |
 
 `DEVSPACE_MINIMAL_TOOLS` remains a backward-compatible alias when
 `DEVSPACE_TOOL_MODE` is unset: `1` selects `minimal` and `0` selects `full`.
@@ -76,6 +144,17 @@ Codex-mode commands run without a PTY by default. Set `tty: true` on
 `exec_command` for interactive terminal programs. PTY support uses the optional
 `node-pty` dependency; `write_stdin` can send input, poll output, and resize PTY
 sessions.
+
+### Command policy (codex and bash modes)
+
+Shell commands are split at control operators (`&&`, `||`, `|`, `;`,
+subshells) and each segment is classified. `rm -f`, `sudo`, and piping into
+`bash`/`sh` are blocked and the model is told to use edit/write instead. This is
+a workflow guardrail, not a security boundary. OAuth and the roots allowlist
+constrain MCP identity and dedicated file tools, but shell commands run with
+the DevSpace OS user's permissions. If hard shell filesystem confinement is
+required, run DevSpace under a dedicated OS account or container with only the
+approved roots mounted.
 
 ## Widgets
 
@@ -131,7 +210,7 @@ Example:
 
 ```bash
 DEVSPACE_SKILL_PATHS="$HOME/.claude/skills,$HOME/company/skills" \
-npx @waishnav/devspace serve
+node dist/cli.js serve
 ```
 
 ## Logging
@@ -148,8 +227,17 @@ npx @waishnav/devspace serve
 
 Set `DEVSPACE_LOG_FORMAT=pretty` for local debugging.
 
+Boolean environment variables accept `1,true,yes,on` and
+`0,false,no,off` (case-insensitive). Other values fail startup instead of
+silently disabling a feature.
+
 Set `DEVSPACE_LOG_SHELL_COMMANDS=1` only when you intentionally want command
 previews in logs.
+
+`GET /healthz` is a liveness check. `GET /readyz` returns `503` while shutting
+down or when either SQLite store cannot answer a readiness probe. Structured
+request and tool logs include request IDs and short OAuth client identifier hashes, but
+never access tokens or full client identifiers.
 
 ## Env-Only Example
 
@@ -160,7 +248,7 @@ DEVSPACE_PUBLIC_BASE_URL="https://devspace.example.com" \
 DEVSPACE_WORKTREE_ROOT="$HOME/.devspace/worktrees" \
 DEVSPACE_TOOL_MODE="minimal" \
 DEVSPACE_WIDGETS="full" \
-npx @waishnav/devspace serve
+node dist/cli.js serve
 ```
 
 The environment assignments must be part of the same command invocation, or

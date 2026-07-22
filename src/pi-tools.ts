@@ -1,12 +1,10 @@
 import {
-  createBashTool,
   createEditTool,
   createFindTool,
   createGrepTool,
   createLsTool,
   createReadTool,
   createWriteTool,
-  type BashToolInput,
   type EditToolInput,
   type EditToolDetails,
   type FindToolInput,
@@ -116,14 +114,4 @@ export async function listDirectoryTool(input: LsToolInput, context: ToolContext
   const tool = createLsTool(context.cwd);
 
   return runTool((params) => tool.execute("list_directory", params), input, context);
-}
-
-export async function runShellTool(input: BashToolInput, context: ToolContext): Promise<ToolResponse> {
-  const tool = createBashTool(context.cwd);
-  const timeout = input.timeout === undefined ? 30 : Math.min(input.timeout, 300);
-
-  return runTool((params) => tool.execute("run_shell", params), {
-    command: input.command,
-    timeout,
-  }, context);
 }

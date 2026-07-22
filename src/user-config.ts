@@ -1,13 +1,51 @@
 import { randomBytes } from "node:crypto";
 import {
+  closeSync,
+  chmodSync,
   existsSync,
+  fsyncSync,
   mkdirSync,
+  openSync,
   readFileSync,
+  renameSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { expandHomePath } from "./roots.js";
+import {
+  MAX_TIMER_MS,
+  MIN_COMMAND_RUNTIME_MS,
+  RESOURCE_LIMIT_MAXIMUMS,
+} from "./resource-limits.js";
+import { z } from "zod";
+
+const devspaceUserConfigSchema = z.object({
+  host: z.string().min(1).optional(),
+  port: z.number().int().min(1).max(65_535).optional(),
+  allowedRoots: z.array(z.string()).optional(),
+  publicBaseUrl: z.string().nullable().optional(),
+  allowedHosts: z.array(z.string()).optional(),
+  stateDir: z.string().optional(),
+  worktreeRoot: z.string().optional(),
+  agentDir: z.string().optional(),
+  subagents: z.boolean().optional(),
+  toolMode: z.enum(["minimal", "full", "codex"]).optional(),
+  widgets: z.enum(["off", "changes", "full"]).optional(),
+  resources: z.object({
+    maxMcpSessions: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxMcpSessions).optional(),
+    maxProcessSessions: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxProcessSessions).optional(),
+    maxProcessSessionsPerWorkspace: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxProcessSessionsPerWorkspace).optional(),
+    maxCommandRuntimeMs: z.number().int().min(MIN_COMMAND_RUNTIME_MS).max(MAX_TIMER_MS).optional(),
+    maxResidentWorkspaces: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxResidentWorkspaces).optional(),
+    maxManagedWorktrees: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxManagedWorktrees).optional(),
+  }).passthrough().optional(),
+}).passthrough();
+
+const devspaceAuthConfigSchema = z.object({
+  ownerToken: z.string().optional(),
+}).passthrough();
 
 export interface DevspaceUserConfig {
   host?: string;
@@ -19,6 +57,18 @@ export interface DevspaceUserConfig {
   worktreeRoot?: string;
   agentDir?: string;
   subagents?: boolean;
+  toolMode?: "minimal" | "full" | "codex";
+  widgets?: "off" | "changes" | "full";
+  resources?: {
+    maxMcpSessions?: number;
+    maxProcessSessions?: number;
+    maxProcessSessionsPerWorkspace?: number;
+    maxCommandRuntimeMs?: number;
+    maxResidentWorkspaces?: number;
+    maxManagedWorktrees?: number;
+    [key: string]: unknown;
+  };
+  [key: string]: unknown;
 }
 
 export interface DevspaceAuthConfig {
@@ -68,8 +118,8 @@ export function loadDevspaceFiles(env: NodeJS.ProcessEnv = process.env): Devspac
     authPath,
     configExists,
     authExists,
-    config: configExists ? readJsonFile<DevspaceUserConfig>(configPath) : {},
-    auth: authExists ? readJsonFile<DevspaceAuthConfig>(authPath) : {},
+    config: configExists ? readJsonFile(configPath, devspaceUserConfigSchema) : {},
+    auth: authExists ? readJsonFile(authPath, devspaceAuthConfigSchema) : {},
   };
 }
 
@@ -112,12 +162,15 @@ export function resolveSubagentsFlag(
   env: NodeJS.ProcessEnv = process.env,
 ): boolean | undefined {
   if (env.DEVSPACE_SUBAGENTS === undefined) return config.subagents;
-  return ["1", "true", "yes", "on"].includes(env.DEVSPACE_SUBAGENTS.toLowerCase());
+  const value = env.DEVSPACE_SUBAGENTS.toLowerCase();
+  if (["1", "true", "yes", "on"].includes(value)) return true;
+  if (["0", "false", "no", "off"].includes(value)) return false;
+  throw new Error(`Invalid DEVSPACE_SUBAGENTS: ${env.DEVSPACE_SUBAGENTS} (expected boolean)`);
 }
 
-function readJsonFile<T>(filePath: string): T {
+function readJsonFile<T>(filePath: string, schema: z.ZodType<T>): T {
   try {
-    return JSON.parse(readFileSync(filePath, "utf8")) as T;
+    return schema.parse(JSON.parse(readFileSync(filePath, "utf8")));
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     throw new Error(`Unable to read ${filePath}: ${reason}`);
@@ -125,5 +178,27 @@ function readJsonFile<T>(filePath: string): T {
 }
 
 function writeJsonFile(filePath: string, value: unknown, mode: number): void {
-  writeFileSync(filePath, JSON.stringify(value, null, 2) + "\n", { mode });
+  const temporaryPath = join(
+    dirname(filePath),
+    `.${basename(filePath)}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`,
+  );
+  let descriptor: number | undefined;
+
+  try {
+    descriptor = openSync(temporaryPath, "wx", mode);
+    writeFileSync(descriptor, JSON.stringify(value, null, 2) + "\n", "utf8");
+    fsyncSync(descriptor);
+    closeSync(descriptor);
+    descriptor = undefined;
+    renameSync(temporaryPath, filePath);
+    chmodSync(filePath, mode);
+  } catch (error) {
+    if (descriptor !== undefined) closeSync(descriptor);
+    try {
+      unlinkSync(temporaryPath);
+    } catch {
+      // The temporary file may already have been renamed or never created.
+    }
+    throw error;
+  }
 }

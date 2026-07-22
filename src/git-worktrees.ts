@@ -33,6 +33,34 @@ export interface ManagedWorktree {
   managed: boolean;
 }
 
+export interface ManagedWorktreeRemovalResult {
+  removed: boolean;
+  reason?: "dirty" | "missing";
+}
+
+export async function removeManagedWorktree(input: {
+  sourceRoot: string;
+  worktreePath: string;
+  config: ServerConfig;
+}): Promise<ManagedWorktreeRemovalResult> {
+  const sourceRoot = assertAllowedPath(input.sourceRoot, input.config.allowedRoots);
+  const worktreePath = assertAllowedPath(input.worktreePath, [input.config.worktreeRoot]);
+  try {
+    const worktreeStats = await stat(worktreePath);
+    if (!worktreeStats.isDirectory()) return { removed: false, reason: "missing" };
+  } catch {
+    await git(["worktree", "prune"], sourceRoot).catch(() => undefined);
+    return { removed: false, reason: "missing" };
+  }
+
+  const dirty = (await git(["status", "--porcelain=v1"], worktreePath)).trim().length > 0;
+  if (dirty) return { removed: false, reason: "dirty" };
+
+  await git(["worktree", "remove", worktreePath], sourceRoot);
+  await git(["worktree", "prune"], sourceRoot);
+  return { removed: true };
+}
+
 export async function createManagedWorktree(input: {
   sourcePath: string;
   baseRef?: string;

@@ -2,13 +2,17 @@
 
 This page collects the setup issues users are most likely to hit.
 
+Commands below assume this fork was cloned, built with `npm run build`, and the
+current directory is the repository root. After `npm link`, `devspace` can be
+used instead of `node dist/cli.js`.
+
 ## `devspace` Command Not Found
 
 Use `npx`:
 
 ```bash
-npx @waishnav/devspace init
-npx @waishnav/devspace serve
+node dist/cli.js init
+node dist/cli.js serve
 ```
 
 If you installed globally, confirm npm's global bin directory is on `PATH`.
@@ -40,7 +44,7 @@ npm rebuild better-sqlite3
 Then run:
 
 ```bash
-npx @waishnav/devspace doctor
+node dist/cli.js doctor
 ```
 
 Release starts run a native dependency check before launching.
@@ -62,7 +66,7 @@ https://your-tunnel-host.example.com/mcp
 If you saved the wrong value:
 
 ```bash
-npx @waishnav/devspace config set publicBaseUrl https://your-tunnel-host.example.com
+node dist/cli.js config set publicBaseUrl https://your-tunnel-host.example.com
 ```
 
 ## Tunnel URL Changed
@@ -72,13 +76,13 @@ Temporary tunnels often change URLs between runs.
 For a one-off run:
 
 ```bash
-DEVSPACE_PUBLIC_BASE_URL="https://new-tunnel.example.com" npx @waishnav/devspace serve
+DEVSPACE_PUBLIC_BASE_URL="https://new-tunnel.example.com" node dist/cli.js serve
 ```
 
 For a stable URL:
 
 ```bash
-npx @waishnav/devspace config set publicBaseUrl https://devspace.example.com
+node dist/cli.js config set publicBaseUrl https://devspace.example.com
 ```
 
 ## Host Header Or 403 Problems
@@ -88,7 +92,7 @@ DevSpace derives allowed hosts from the configured public URL.
 Run:
 
 ```bash
-npx @waishnav/devspace doctor
+node dist/cli.js doctor
 ```
 
 Confirm the public URL hostname appears in allowed hosts. If you changed tunnel
@@ -97,7 +101,7 @@ URLs, update `publicBaseUrl`.
 Use this only for intentional local debugging:
 
 ```bash
-DEVSPACE_ALLOWED_HOSTS="*" npx @waishnav/devspace serve
+DEVSPACE_ALLOWED_HOSTS="*" node dist/cli.js serve
 ```
 
 ## OAuth Redirect Host Rejected
@@ -113,7 +117,7 @@ localhost
 If another MCP client uses a different redirect host, configure:
 
 ```bash
-DEVSPACE_OAUTH_ALLOWED_REDIRECT_HOSTS="chatgpt.com,example.com" npx @waishnav/devspace serve
+DEVSPACE_OAUTH_ALLOWED_REDIRECT_HOSTS="chatgpt.com,example.com" node dist/cli.js serve
 ```
 
 ## Owner Password Not Accepted
@@ -127,7 +131,7 @@ Make sure you are entering the Owner password from:
 To regenerate setup:
 
 ```bash
-npx @waishnav/devspace init --force
+node dist/cli.js init --force
 ```
 
 ## Unknown `workspaceId`
@@ -146,13 +150,13 @@ The path must be inside one of the allowed roots configured during setup.
 Run:
 
 ```bash
-npx @waishnav/devspace config get
+node dist/cli.js config get
 ```
 
 Then either open a project under an allowed root or rerun setup:
 
 ```bash
-npx @waishnav/devspace init --force
+node dist/cli.js init --force
 ```
 
 ## Worktree Mode Fails
@@ -180,7 +184,7 @@ Install Git for Windows and use Git Bash, or use WSL, MSYS2, or Cygwin Bash.
 Run:
 
 ```bash
-npx @waishnav/devspace doctor
+node dist/cli.js doctor
 ```
 
 Confirm Bash is detected.
@@ -190,7 +194,7 @@ Confirm Bash is detected.
 Skills are enabled by default. Check:
 
 ```bash
-DEVSPACE_SKILLS=1 npx @waishnav/devspace serve
+DEVSPACE_SKILLS=1 node dist/cli.js serve
 ```
 
 DevSpace looks in standard Agent Skills locations:

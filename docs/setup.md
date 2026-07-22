@@ -10,16 +10,29 @@ projects through DevSpace.
 - Git
 - Bash, including Git Bash or WSL on Windows
 - a public HTTPS URL that forwards to the local DevSpace server
+- a tunnel client such as [cloudflared](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/)
 
 DevSpace does not create the public tunnel for you. Use Cloudflare Tunnel,
 ngrok, Pinggy, Tailscale Funnel, or your own HTTPS reverse proxy.
 
-## Install And Configure
+## Install This Fork
+
+```bash
+git clone https://github.com/keepkeen/devspace.git
+cd devspace
+npm ci
+npm run build
+```
+
+All commands below run from this checkout. You may use `devspace` instead of
+`node dist/cli.js` after running `npm link`.
+
+## Configure
 
 Run:
 
 ```bash
-npx @waishnav/devspace init
+node dist/cli.js init
 ```
 
 The setup flow asks one question at a time.
@@ -79,20 +92,20 @@ https://your-tunnel-host.example.com/mcp
 Run:
 
 ```bash
-npx @waishnav/devspace serve
+node dist/cli.js serve
 ```
 
 If your tunnel URL changes for one run, override it without rewriting config:
 
 ```bash
-DEVSPACE_PUBLIC_BASE_URL="https://new-tunnel.example.com" npx @waishnav/devspace serve
+DEVSPACE_PUBLIC_BASE_URL="https://new-tunnel.example.com" node dist/cli.js serve
 ```
 
 For a stable public URL, persist it:
 
 ```bash
-npx @waishnav/devspace config set publicBaseUrl https://devspace.example.com
-npx @waishnav/devspace serve
+node dist/cli.js config set publicBaseUrl https://devspace.example.com
+node dist/cli.js serve
 ```
 
 ## Approve The Client
@@ -114,7 +127,7 @@ Keep `auth.json` private.
 Run:
 
 ```bash
-npx @waishnav/devspace doctor
+node dist/cli.js doctor
 ```
 
 The doctor command reports the resolved config, Node version, Node ABI, platform,

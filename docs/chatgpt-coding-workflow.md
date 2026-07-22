@@ -6,7 +6,8 @@ verification, and show the user what changed.
 
 ## Open One Workspace
 
-ChatGPT should call `open_workspace` once for a project folder:
+When a conversation needs a local project and does not already have its
+`workspaceId`, ChatGPT should call `open_workspace` with the exact path:
 
 ```json
 {
@@ -14,15 +15,22 @@ ChatGPT should call `open_workspace` once for a project folder:
 }
 ```
 
+For checkout mode, DevSpace reuses the active workspace belonging to the same
+authorized MCP client and canonical project path. Different authorized clients
+receive isolated workspace sessions while operating on the same local files.
+
 The result includes a `workspaceId`. All later file, search, edit, show-changes,
-and shell calls should reuse that same `workspaceId`.
+and shell calls in that conversation should reuse the same ID.
 
 Do not reopen the same folder unless:
 
 - the `workspaceId` is rejected as unknown
 - the user switches to another folder
 - the user switches between checkout and worktree mode
-- the user explicitly asks to reopen
+
+Do not call `close_workspace` as a normal end-of-turn or end-of-conversation
+step. Call it only after the user explicitly asks to close or release the
+workspace.
 
 ## Checkout Mode
 
@@ -69,11 +77,16 @@ When a workspace opens, DevSpace loads root-level instruction files:
 - `CLAUDE.md`
 - `CLAUDE.MD`
 
-Nested instruction files are returned as `availableAgentsFiles`. The model
-should read the relevant nested file before working under that directory.
+Nested instruction files are discovered lazily when a later tool enters their
+directory scope. DevSpace returns newly applicable instruction content with
+that tool result and caches directory listings and file versions. Mutating and
+shell tools stop before execution when they discover new instructions, so the
+model can follow them and retry safely with the returned one-time
+`instructionToken`. The token prevents parallel mutations from bypassing a
+newly discovered instruction scope.
 
-This keeps instructions explicit and inspectable instead of silently injecting
-new context during later tool calls.
+This avoids recursively scanning large repositories during `open_workspace`
+while keeping scoped instructions explicit and inspectable.
 
 ## Skills
 
@@ -120,33 +133,46 @@ existing subagent sessions for that workspace.
 
 ## Tool Names
 
-DevSpace exposes these tool names:
+By default DevSpace runs in `DEVSPACE_TOOL_MODE=codex`, the Codex-style unified
+exec surface best suited to browser MCP hosts like ChatGPT. It exposes:
 
 - `open_workspace`
 - `read`
-- `write`
-- `edit`
-- `bash`
-
-By default, DevSpace also runs in `DEVSPACE_TOOL_MODE=minimal`, so dedicated
-`grep`, `glob`, and `ls` tools are hidden. Use `bash` with command-line tools
-such as `rg`, `find`, and `ls` for search and directory inspection.
-
-Use `DEVSPACE_TOOL_MODE=full` to restore dedicated search and directory tools.
-
-The experimental Codex-style surface is enabled with
-`DEVSPACE_TOOL_MODE=codex`. It exposes:
-
-- `open_workspace`
-- `read`
+- `batch_read`
+- `batch_inspect`
 - `apply_patch`
 - `exec_command`
 - `write_stdin`
+
+Use `batch_read` when 2–8 file paths are already known, and `batch_inspect` when
+2–8 independent grep, glob, or directory-list operations are already known.
+Do not batch an iterative investigation when each next target depends on the
+previous result.
 
 In this mode, `write`, `edit`, `bash`, `grep`, `glob`, and `ls` are not
 registered. `exec_command` returns a process session ID when a command is still
 running after its yield window. Use `write_stdin` to poll it, send input, resize
 a PTY, or send Ctrl-C. Set `tty: true` only for commands that need a terminal.
+A small command policy blocks `rm -f`, `sudo`, and pipe-to-shell and tells the
+model to use `apply_patch` instead.
+
+Use `DEVSPACE_TOOL_MODE=full` to expose the dedicated file and shell tools:
+
+- `open_workspace`
+- `read`
+- `batch_read`
+- `batch_inspect`
+- `write`
+- `edit`
+- `grep`
+- `glob`
+- `ls`
+- `bash`
+- `write_stdin`
+
+Use `DEVSPACE_TOOL_MODE=minimal` for `open_workspace`, `read`, `batch_read`,
+`batch_inspect`, `write`, `edit`, `bash`, and `write_stdin` (clients can use
+the bounded batch inspection tool or `bash` with `rg`, `find`, and `ls`).
 
 ## Show Changes
 
@@ -173,5 +199,19 @@ The shell tool is for commands that belong in a terminal:
 - package scripts
 - environment checks
 
-File writes should go through the edit/write tools rather than shell
-redirection, heredocs, `tee`, `sed -i`, or generated scripts.
+Behavior is aligned with Codex's unified exec surface:
+
+- default tool mode is `codex` (`exec_command` + `write_stdin`)
+- working directory does **not** persist; pass `workingDirectory` when needed and do not rely on `cd`
+- shell env vars / aliases do **not** persist
+- long-running processes return a `sessionId`; poll with `write_stdin`
+- truncated output reports approximate original token count and omitted bytes
+- a small command policy blocks `rm -f`, `sudo`, and pipe-to-shell
+- independent commands should be issued as parallel tool calls; dependent ones use `&&`
+- HEREDOC is allowed for git commit / `gh pr` message bodies only
+- do not sleep-poll; use session + `write_stdin` instead
+
+In `full` / `minimal` modes, `bash` defaults to a 120s timeout (max 600) and
+supports `run_in_background`. File writes for project source should go through
+`apply_patch` (codex) or edit/write (full/minimal) rather than shell redirection,
+`tee`, `sed -i`, or generated scripts.

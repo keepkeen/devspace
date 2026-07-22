@@ -181,6 +181,15 @@ export class SqliteOAuthStore {
     this.database.close();
   }
 
+  isReady(): boolean {
+    try {
+      this.database.sqlite.prepare("select 1").get();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   private deleteExpiredTokens(nowSeconds: number): void {
     this.database.sqlite.prepare("delete from oauth_access_tokens where expires_at < ?").run(nowSeconds);
     this.database.sqlite.prepare("delete from oauth_refresh_tokens where expires_at < ?").run(nowSeconds);
