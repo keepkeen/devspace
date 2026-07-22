@@ -5,6 +5,8 @@ import {
   type WorkspaceSessionRow,
 } from "./db/schema.js";
 
+const MAX_CLEANUP_BATCH_SIZE = 10_000;
+
 export type WorkspaceMode = "checkout" | "worktree";
 
 export interface WorkspaceSession {
@@ -32,19 +34,23 @@ export interface WorkspaceStore {
     baseRef?: string;
     baseSha?: string;
     managed?: boolean;
+    maxActiveSessionsPerClient?: number;
   }): WorkspaceSession;
   createOrReuseCheckoutSession?(input: {
     id: string;
     ownerClientId: string;
     root: string;
     canonicalRoot: string;
+    maxActiveSessionsPerClient?: number;
   }): WorkspaceSession;
   getSession(id: string, ownerClientId: string): WorkspaceSession | undefined;
   touchSession(id: string, ownerClientId: string): void;
   closeSession(id: string, ownerClientId: string): boolean;
   deleteSession(id: string, ownerClientId: string): boolean;
   countManagedWorktrees(): number;
+  countActiveSessions?(ownerClientId?: string): number;
   listExpiredSessions(before: string, limit: number): WorkspaceSession[];
+  deleteClosedSessions?(before: string, limit: number): number;
   isReady(): boolean;
   close?(): void;
 }
@@ -65,6 +71,7 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
     baseRef?: string;
     baseSha?: string;
     managed?: boolean;
+    maxActiveSessionsPerClient?: number;
   }): WorkspaceSession {
     const now = new Date().toISOString();
     const session: WorkspaceSession = {
@@ -81,23 +88,27 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
       lastUsedAt: now,
     };
 
-    this.database.db
-      .insert(workspaceSessions)
-      .values({
-        id: session.id,
-        ownerClientId: session.ownerClientId,
-        root: session.root,
-        canonicalRoot: null,
-        status: session.status,
-        mode: session.mode,
-        sourceRoot: session.sourceRoot ?? null,
-        baseRef: session.baseRef ?? null,
-        baseSha: session.baseSha ?? null,
-        managed: String(session.managed),
-        createdAt: session.createdAt,
-        lastUsedAt: session.lastUsedAt,
-      })
-      .run();
+    const create = this.database.sqlite.transaction(() => {
+      this.assertActiveSessionQuota(session.ownerClientId, input.maxActiveSessionsPerClient);
+      this.database.db
+        .insert(workspaceSessions)
+        .values({
+          id: session.id,
+          ownerClientId: session.ownerClientId,
+          root: session.root,
+          canonicalRoot: null,
+          status: session.status,
+          mode: session.mode,
+          sourceRoot: session.sourceRoot ?? null,
+          baseRef: session.baseRef ?? null,
+          baseSha: session.baseSha ?? null,
+          managed: String(session.managed),
+          createdAt: session.createdAt,
+          lastUsedAt: session.lastUsedAt,
+        })
+        .run();
+    });
+    create.immediate();
 
     return session;
   }
@@ -107,6 +118,7 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
     ownerClientId: string;
     root: string;
     canonicalRoot: string;
+    maxActiveSessionsPerClient?: number;
   }): WorkspaceSession {
     const now = new Date().toISOString();
     const selectCanonical = this.database.sqlite.prepare(`
@@ -204,6 +216,8 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
           }) as WorkspaceSessionRow;
         }
 
+        this.assertActiveSessionQuota(values.ownerClientId, values.maxActiveSessionsPerClient);
+
         return insertCheckout.get(values) as WorkspaceSessionRow;
       },
     );
@@ -264,6 +278,17 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
     return row.count;
   }
 
+  countActiveSessions(ownerClientId?: string): number {
+    const row = ownerClientId === undefined
+      ? this.database.sqlite
+        .prepare("select count(*) as count from workspace_sessions where status = 'active'")
+        .get()
+      : this.database.sqlite
+        .prepare("select count(*) as count from workspace_sessions where status = 'active' and owner_client_id = ?")
+        .get(ownerClientId);
+    return (row as { count: number }).count;
+  }
+
   listExpiredSessions(before: string, limit: number): WorkspaceSession[] {
     return this.database.db
       .select()
@@ -274,9 +299,23 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
         lt(workspaceSessions.lastUsedAt, before),
       ))
       .orderBy(workspaceSessions.lastUsedAt)
-      .limit(limit)
+      .limit(cleanupBatchSize(limit))
       .all()
       .map(rowToWorkspaceSession);
+  }
+
+  deleteClosedSessions(before: string, limit: number): number {
+    const result = this.database.sqlite.prepare(`
+      delete from workspace_sessions
+      where id in (
+        select id
+        from workspace_sessions
+        where status = 'closed' and last_used_at < ?
+        order by last_used_at
+        limit ?
+      )
+    `).run(before, cleanupBatchSize(limit));
+    return result.changes;
   }
 
   isReady(): boolean {
@@ -290,6 +329,21 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
 
   close(): void {
     this.database.close();
+  }
+
+  private assertActiveSessionQuota(
+    ownerClientId: string,
+    maxActiveSessionsPerClient: number | undefined,
+  ): void {
+    if (maxActiveSessionsPerClient === undefined) return;
+    if (!Number.isInteger(maxActiveSessionsPerClient) || maxActiveSessionsPerClient < 1) {
+      throw new Error("Active workspace session quota must be a positive integer.");
+    }
+    if (this.countActiveSessions(ownerClientId) >= maxActiveSessionsPerClient) {
+      throw new Error(
+        `Active workspace session limit reached for this OAuth client (${maxActiveSessionsPerClient}).`,
+      );
+    }
   }
 
 }
@@ -313,4 +367,11 @@ function rowToWorkspaceSession(row: WorkspaceSessionRow): WorkspaceSession {
     createdAt: row.createdAt,
     lastUsedAt: row.lastUsedAt,
   };
+}
+
+function cleanupBatchSize(limit: number): number {
+  if (!Number.isInteger(limit) || limit < 1) {
+    throw new Error("Workspace cleanup limit must be a positive integer.");
+  }
+  return Math.min(limit, MAX_CLEANUP_BATCH_SIZE);
 }

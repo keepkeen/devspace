@@ -1,17 +1,35 @@
-import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { createRoot } from "react-dom/client";
 import type {
   AdminConfig,
   AdminConfigEnvelope,
   AdminConfigSavedResponse,
+  AdminDiagnosticsResponse,
   AdminErrorResponse,
   AdminResourceLimits,
+  AdminRestartResponse,
   AdminSessionResponse,
   AdminStatusResponse,
   AdminValidationIssue,
   ToolMode,
   WidgetMode,
 } from "./admin-types.js";
+import {
+  AddField,
+  CenteredState,
+  FieldMeta,
+  SectionHeading,
+  SelectField,
+  StatusCard,
+  UsageCard,
+  adminDetail,
+  backendDetail,
+  backendPresentation,
+  formatTimestamp,
+  mcpDetail,
+  tunnelDetail,
+  tunnelPresentation,
+} from "./admin-view.js";
 import "./admin-app.css";
 
 interface ApiFailureOptions {
@@ -40,8 +58,15 @@ type BootState =
       config: AdminConfig;
       overrides: string[];
       warnings: Record<string, string>;
+      revision: string;
     }
   | { phase: "error"; message: string };
+
+type SaveState =
+  | { phase: "idle" }
+  | { phase: "saving" | "restarting" }
+  | { phase: "success"; restartRequired: boolean; restarted: boolean }
+  | { phase: "error"; message: string; issues: AdminValidationIssue[]; configSaved: boolean; conflict?: boolean };
 
 const resourceFields: Array<{
   key: keyof AdminResourceLimits;
@@ -49,523 +74,524 @@ const resourceFields: Array<{
   description: string;
   displaySeconds?: boolean;
 }> = [
-  {
-    key: "maxMcpSessions",
-    label: "MCP 会话上限",
-    description: "允许同时保持的网页端 MCP 连接数。",
-  },
-  {
-    key: "maxProcessSessions",
-    label: "进程会话总上限",
-    description: "所有 workspace 合计可运行的终端进程数。",
-  },
-  {
-    key: "maxProcessSessionsPerWorkspace",
-    label: "单 workspace 进程上限",
-    description: "限制单个 workspace 同时占用的终端进程数。",
-  },
-  {
-    key: "maxCommandRuntimeMs",
-    label: "单条命令最长运行时间",
-    description: "命令达到此时间后会被终止。",
-    displaySeconds: true,
-  },
-  {
-    key: "maxResidentWorkspaces",
-    label: "驻留 workspace 上限",
-    description: "内存中保留的 workspace 会话数量。",
-  },
-  {
-    key: "maxManagedWorktrees",
-    label: "托管 worktree 上限",
-    description: "DevSpace 同时维护的 Git worktree 数量。",
-  },
+  { key: "maxMcpSessions", label: "MCP 会话上限", description: "同时保持的 MCP 客户端连接数。" },
+  { key: "maxMcpSessionsPerClient", label: "单客户端 MCP 上限", description: "单个 OAuth 客户端可占用的 MCP 会话数。" },
+  { key: "maxProcessSessions", label: "进程会话总上限", description: "所有 workspace 合计可运行的终端进程数。" },
+  { key: "maxProcessSessionsPerClient", label: "单客户端进程上限", description: "单个 OAuth 客户端跨 workspace 可占用的进程会话数。" },
+  { key: "maxProcessSessionsPerWorkspace", label: "单 workspace 进程上限", description: "单个 workspace 可同时占用的终端进程数。" },
+  { key: "maxCommandRuntimeMs", label: "命令最长运行时间", description: "命令达到此时间后会被终止。", displaySeconds: true },
+  { key: "maxResidentWorkspaces", label: "驻留 workspace 上限", description: "内存中保留的 workspace 会话数量。" },
+  { key: "maxActiveWorkspacesPerClient", label: "单客户端 workspace 上限", description: "单个 OAuth 客户端可保持的活跃 workspace 数。" },
+  { key: "maxManagedWorktrees", label: "托管 worktree 上限", description: "DevSpace 同时维护的 Git worktree 数量。" },
 ];
+
+const builtinInstructionFilenames = new Set([
+  "AGENTS.override.md", "AGENTS.override.MD", "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD",
+]);
 
 function AdminApp(): React.JSX.Element {
   const [boot, setBoot] = useState<BootState>({ phase: "loading" });
 
   useEffect(() => {
     let cancelled = false;
-
     void (async () => {
       const capability = readCapability();
       clearFragment();
-
       try {
         const session = await requestJson<AdminSessionResponse>("/api/session", {
           method: "POST",
-          headers: capability
-            ? { "X-DevSpace-Admin-Capability": capability }
-            : undefined,
+          headers: capability ? { "X-DevSpace-Admin-Capability": capability } : undefined,
         });
-
         const [status, configPayload] = await Promise.all([
           requestJson<AdminStatusResponse>("/api/status"),
           requestJson<AdminConfigEnvelope>("/api/config"),
         ]);
-
         if (!cancelled) {
           setBoot({
             phase: "ready",
             csrfToken: session.csrfToken,
             status,
-            config: configPayload.config,
+            config: normalizeConfig(configPayload.config),
             overrides: configPayload.overrides ?? [],
             warnings: configPayload.warnings ?? {},
+            revision: configPayload.revision,
           });
         }
       } catch (error) {
-        if (!cancelled) {
-          setBoot({ phase: "error", message: errorMessage(error) });
-        }
+        if (!cancelled) setBoot({ phase: "error", message: errorMessage(error) });
       }
     })();
-
-    return () => {
-      cancelled = true;
-    };
+    return () => { cancelled = true; };
   }, []);
 
   if (boot.phase === "loading") {
     return <CenteredState title="正在连接 DevSpace…" detail="正在建立本地管理会话。" busy />;
   }
-
   if (boot.phase === "error") {
     return <CenteredState title="无法打开管理面板" detail={boot.message} tone="error" />;
   }
-
-  return (
-    <AdminForm
-      initialConfig={boot.config}
-      status={boot.status}
-      csrfToken={boot.csrfToken}
-      initialOverrides={boot.overrides}
-      initialWarnings={boot.warnings}
-    />
-  );
+  return <AdminForm {...boot} initialConfig={boot.config} initialOverrides={boot.overrides} initialWarnings={boot.warnings} initialRevision={boot.revision} />;
 }
 
 function AdminForm({
   initialConfig,
-  status,
+  status: initialStatus,
   csrfToken,
   initialOverrides,
   initialWarnings,
+  initialRevision,
 }: {
   initialConfig: AdminConfig;
   status: AdminStatusResponse;
   csrfToken: string;
   initialOverrides: string[];
   initialWarnings: Record<string, string>;
+  initialRevision: string;
 }): React.JSX.Element {
-  const [config, setConfig] = useState<AdminConfig>(() => cloneConfig(initialConfig));
-  const [savedConfig, setSavedConfig] = useState<AdminConfig>(() => cloneConfig(initialConfig));
+  const [config, setConfig] = useState(() => cloneConfig(initialConfig));
+  const [savedConfig, setSavedConfig] = useState(() => cloneConfig(initialConfig));
   const [newRoot, setNewRoot] = useState("");
+  const [newFilename, setNewFilename] = useState("");
   const [rootError, setRootError] = useState<string | null>(null);
-  const [overrides, setOverrides] = useState<string[]>(initialOverrides);
-  const [warnings, setWarnings] = useState<Record<string, string>>(initialWarnings);
-  const [saveState, setSaveState] = useState<
-    | { phase: "idle" }
-    | { phase: "saving" }
-    | { phase: "success"; restartRequired: boolean }
-    | { phase: "error"; message: string; issues: AdminValidationIssue[] }
-  >({ phase: "idle" });
+  const [filenameError, setFilenameError] = useState<string | null>(null);
+  const [overrides, setOverrides] = useState(initialOverrides);
+  const [warnings, setWarnings] = useState(initialWarnings);
+  const [savedWarnings, setSavedWarnings] = useState(initialWarnings);
+  const [revision, setRevision] = useState(initialRevision);
+  const [saveState, setSaveState] = useState<SaveState>({ phase: "idle" });
+  const [status, setStatus] = useState(initialStatus);
+  const [statusRefresh, setStatusRefresh] = useState<"idle" | "loading" | "error">("idle");
+  const [copyState, setCopyState] = useState<"idle" | "copied" | "error">("idle");
+  const [restartConfirmationOpen, setRestartConfirmationOpen] = useState(false);
+  const [diagnostics, setDiagnostics] = useState<AdminDiagnosticsResponse | null>(null);
+  const [diagnosticsState, setDiagnosticsState] = useState<"loading" | "ready" | "error">("loading");
+  const [revokeArmed, setRevokeArmed] = useState(false);
+  const [revokeState, setRevokeState] = useState<"idle" | "working" | "success" | "error">("idle");
+  const restartTriggerRef = useRef<HTMLButtonElement>(null);
+  const restartDialogRef = useRef<HTMLElement>(null);
 
   const dirty = useMemo(
-    () => JSON.stringify(config) !== JSON.stringify(savedConfig),
-    [config, savedConfig],
+    () =>
+      JSON.stringify(config) !== JSON.stringify(savedConfig) ||
+      newRoot.trim().length > 0 ||
+      newFilename.trim().length > 0,
+    [config, savedConfig, newRoot, newFilename],
   );
+  const issuesByPath = useMemo(() => {
+    if (saveState.phase !== "error") return new Map<string, string[]>();
+    const result = new Map<string, string[]>();
+    for (const issue of saveState.issues) {
+      const path = issuePath(issue);
+      result.set(path, [...(result.get(path) ?? []), issue.message]);
+    }
+    return result;
+  }, [saveState]);
+  const backend = status.runtime?.backend;
+  const canRestart = Boolean(backend?.managed && backend.actions?.includes("restart"));
+
+  useEffect(() => {
+    if (!dirty) return;
+    const warnBeforeLeaving = (event: BeforeUnloadEvent): void => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warnBeforeLeaving);
+    return () => window.removeEventListener("beforeunload", warnBeforeLeaving);
+  }, [dirty]);
+
+  useEffect(() => {
+    if (!restartConfirmationOpen) return;
+    const dialog = restartDialogRef.current;
+    const background = document.querySelector<HTMLElement>(".settings-form");
+    if (!dialog) return;
+    background?.setAttribute("inert", "");
+    const focusable = [...dialog.querySelectorAll<HTMLElement>(
+      'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])',
+    )];
+    focusable[0]?.focus();
+    const handleDialogKeys = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") {
+        setRestartConfirmationOpen(false);
+        return;
+      }
+      if (event.key !== "Tab" || focusable.length === 0) return;
+      const first = focusable[0];
+      const last = focusable.at(-1)!;
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    window.addEventListener("keydown", handleDialogKeys);
+    return () => {
+      window.removeEventListener("keydown", handleDialogKeys);
+      background?.removeAttribute("inert");
+      restartTriggerRef.current?.focus();
+    };
+  }, [restartConfirmationOpen]);
+
+  function beginEdit(paths: string[] = []): void {
+    setSaveState({ phase: "idle" });
+    if (paths.length > 0) {
+      setWarnings((current) => Object.fromEntries(Object.entries(current).filter(([path]) => !paths.some((prefix) => path === prefix || path.startsWith(`${prefix}.`)))));
+    }
+  }
 
   function addRoot(): void {
     const path = newRoot.trim();
-    if (!path) {
-      setRootError("请输入目录路径。");
-      return;
-    }
-    if (config.allowedRoots.includes(path)) {
-      setRootError("这个目录已经在允许列表中。");
-      return;
-    }
-
-    setConfig((current) => ({
-      ...current,
-      allowedRoots: [...current.allowedRoots, path],
-    }));
+    if (!path) return setRootError("请输入目录路径。");
+    if (config.allowedRoots.includes(path)) return setRootError("这个目录已经在允许列表中。");
+    setConfig((current) => ({ ...current, allowedRoots: [...current.allowedRoots, path] }));
     setNewRoot("");
     setRootError(null);
-    setWarnings({});
-    setSaveState({ phase: "idle" });
+    beginEdit(["allowedRoots"]);
   }
 
   function removeRoot(index: number): void {
-    setConfig((current) => ({
-      ...current,
-      allowedRoots: current.allowedRoots.filter((_, rootIndex) => rootIndex !== index),
-    }));
-    setWarnings({});
-    setSaveState({ phase: "idle" });
+    if (config.allowedRoots.length <= 1) return setRootError("至少需要保留一个允许访问的目录。");
+    setConfig((current) => ({ ...current, allowedRoots: current.allowedRoots.filter((_, itemIndex) => itemIndex !== index) }));
+    setRootError(null);
+    beginEdit(["allowedRoots"]);
+  }
+
+  function addFilename(): void {
+    const filename = newFilename.trim();
+    if (!filename) return setFilenameError("请输入文件名。");
+    if (filename.length > 128) return setFilenameError("文件名不能超过 128 个字符。");
+    if (filename.includes("/") || filename.includes("\\")) return setFilenameError("请输入文件名，不要包含目录路径。");
+    if (builtinInstructionFilenames.has(filename)) return setFilenameError("这是内置说明文件名，不需要加入回退列表。");
+    if (config.projectDocFallbackFilenames.length >= 16) return setFilenameError("最多可配置 16 个回退文件名。");
+    if (config.projectDocFallbackFilenames.includes(filename)) return setFilenameError("这个文件名已经在回退列表中。");
+    setConfig((current) => ({ ...current, projectDocFallbackFilenames: [...current.projectDocFallbackFilenames, filename] }));
+    setNewFilename("");
+    setFilenameError(null);
+    beginEdit(["projectDocFallbackFilenames"]);
+  }
+
+  function removeFilename(index: number): void {
+    setConfig((current) => ({ ...current, projectDocFallbackFilenames: current.projectDocFallbackFilenames.filter((_, itemIndex) => itemIndex !== index) }));
+    beginEdit(["projectDocFallbackFilenames"]);
   }
 
   function updateResource(key: keyof AdminResourceLimits, displayedValue: string, seconds: boolean): void {
     const parsed = Number(displayedValue);
-    setConfig((current) => ({
-      ...current,
-      resources: {
-        ...current.resources,
-        [key]: seconds ? parsed * 1_000 : parsed,
-      },
-    }));
+    setConfig((current) => ({ ...current, resources: { ...current.resources, [key]: seconds ? parsed * 1_000 : parsed } }));
+    beginEdit([`resources.${key}`]);
+  }
+
+  function discardChanges(): void {
+    setConfig(cloneConfig(savedConfig));
+    setNewRoot("");
+    setNewFilename("");
+    setRootError(null);
+    setFilenameError(null);
+    setWarnings(savedWarnings);
     setSaveState({ phase: "idle" });
   }
 
-  async function save(event: FormEvent<HTMLFormElement>): Promise<void> {
-    event.preventDefault();
-    setSaveState({ phase: "saving" });
-
+  async function refreshStatus(): Promise<AdminStatusResponse | null> {
+    setStatusRefresh("loading");
     try {
-      const result = await requestJson<AdminConfigSavedResponse>("/api/config", {
-        method: "PUT",
-        headers: {
-          "Content-Type": "application/json",
-          "X-DevSpace-Admin-CSRF": csrfToken,
-        },
-        body: JSON.stringify({ config }),
+      const next = await requestJson<AdminStatusResponse>("/api/status");
+      setStatus(next);
+      setStatusRefresh("idle");
+      return next;
+    } catch {
+      setStatusRefresh("error");
+      return null;
+    }
+  }
+
+  async function refreshDiagnostics(): Promise<void> {
+    setDiagnosticsState("loading");
+    try {
+      setDiagnostics(await requestJson<AdminDiagnosticsResponse>("/api/diagnostics"));
+      setDiagnosticsState("ready");
+    } catch {
+      setDiagnosticsState("error");
+    }
+  }
+
+  async function reloadConfig(): Promise<void> {
+    try {
+      const payload = await requestJson<AdminConfigEnvelope>("/api/config");
+      const normalized = normalizeConfig(payload.config);
+      setConfig(cloneConfig(normalized));
+      setSavedConfig(cloneConfig(normalized));
+      setRevision(payload.revision);
+      setOverrides(payload.overrides ?? []);
+      setWarnings(payload.warnings ?? {});
+      setSavedWarnings(payload.warnings ?? {});
+      setSaveState({ phase: "idle" });
+    } catch (error) {
+      setSaveState({ phase: "error", message: errorMessage(error), issues: [], configSaved: false });
+    }
+  }
+
+  async function revokeAllClientsAndTokens(): Promise<void> {
+    const token = diagnostics?.security.confirmationToken;
+    if (!token) return;
+    setRevokeState("working");
+    try {
+      await requestJson("/api/security/revoke", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-DevSpace-Admin-CSRF": csrfToken },
+        body: JSON.stringify({
+          confirmation: "revoke_all_clients_and_tokens",
+          confirmationToken: token,
+        }),
       });
-      setConfig(cloneConfig(result.config));
-      setSavedConfig(cloneConfig(result.config));
-      setOverrides(result.overrides ?? overrides);
-      setWarnings(result.warnings ?? {});
-      setSaveState({ phase: "success", restartRequired: result.restartRequired });
+      setRevokeArmed(false);
+      setRevokeState("success");
+      await refreshDiagnostics();
+    } catch {
+      setRevokeState("error");
+    }
+  }
+
+  useEffect(() => {
+    void refreshDiagnostics();
+    const recover = (): void => {
+      void refreshStatus();
+      void refreshDiagnostics();
+    };
+    window.addEventListener("online", recover);
+    return () => window.removeEventListener("online", recover);
+  }, []);
+
+  async function copyPublicUrl(): Promise<void> {
+    if (!status.publicBaseUrl) return;
+    try {
+      await navigator.clipboard.writeText(status.publicBaseUrl);
+      setCopyState("copied");
+      window.setTimeout(() => setCopyState("idle"), 1_800);
+    } catch {
+      setCopyState("error");
+    }
+  }
+
+  async function save(restartAfterSave: boolean): Promise<void> {
+    if (newRoot.trim() || newFilename.trim()) {
+      if (newRoot.trim()) setRootError("请先点击“添加”，再保存设置。");
+      if (newFilename.trim()) setFilenameError("请先点击“添加”，再保存设置。");
+      return;
+    }
+    let configSaved = false;
+    let restartRequested = false;
+    let restartRequired = saveState.phase === "success" ? saveState.restartRequired : false;
+    setSaveState({ phase: "saving" });
+    try {
+      if (dirty) {
+        const result = await requestJson<AdminConfigSavedResponse>("/api/config", {
+          method: "PUT",
+          headers: {
+            "Content-Type": "application/json",
+            "If-Match": `"${revision}"`,
+            "X-DevSpace-Admin-CSRF": csrfToken,
+          },
+          body: JSON.stringify({ config }),
+        });
+        const normalized = normalizeConfig(result.config);
+        setConfig(cloneConfig(normalized));
+        setSavedConfig(cloneConfig(normalized));
+        setOverrides(result.overrides ?? overrides);
+        setWarnings(result.warnings ?? {});
+        setSavedWarnings(result.warnings ?? {});
+        setRevision(result.revision);
+        restartRequired = result.restartRequired;
+        configSaved = true;
+      }
+
+      if (restartAfterSave) {
+        const latestStatus = await refreshStatus();
+        const latestBackend = latestStatus?.runtime?.backend;
+        const token = latestBackend?.managed && latestBackend.actions.includes("restart")
+          ? latestBackend.confirmationToken
+          : undefined;
+        if (!token) throw new Error("重启确认已过期，请刷新状态后重试。");
+        setSaveState({ phase: "restarting" });
+        await requestJson<AdminRestartResponse>("/api/runtime/backend/restart", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-DevSpace-Admin-CSRF": csrfToken },
+          body: JSON.stringify({ confirmation: "restart", confirmationToken: token }),
+        });
+        restartRequested = true;
+        if (!(await waitForBackendRecovery())) {
+          throw new Error("重启请求已提交，但服务未在等待时间内恢复，请查看概览状态。");
+        }
+        setSaveState({ phase: "success", restartRequired: false, restarted: true });
+        return;
+      }
+      setSaveState({ phase: "success", restartRequired, restarted: false });
     } catch (error) {
       setSaveState({
         phase: "error",
         message: errorMessage(error),
         issues: error instanceof ApiFailure ? error.issues : [],
+        configSaved: configSaved || restartRequested,
+        conflict: error instanceof ApiFailure && error.status === 412,
       });
     }
+  }
+
+  function submit(event: FormEvent<HTMLFormElement>): void {
+    event.preventDefault();
+    void save(false);
+  }
+
+  async function waitForBackendRecovery(): Promise<boolean> {
+    for (const delayMs of [800, 1_200, 1_800, 2_500, 3_500, 5_000]) {
+      await delay(delayMs);
+      const next = await refreshStatus();
+      if (
+        next?.mcp.ready &&
+        next.runtime?.backend?.state === "running" &&
+        !next.runtime.backend.lastError
+      ) return true;
+    }
+    return false;
   }
 
   return (
     <div className="admin-shell">
       <header className="page-header">
-        <div className="brand-mark" aria-hidden="true">D</div>
-        <div>
-          <p className="eyebrow">LOCAL ADMIN</p>
-          <h1>DevSpace 管理面板</h1>
-          <p className="page-intro">管理网页端可访问的本地目录和服务运行限制。</p>
+        <div className="brand-mark" aria-hidden="true">DS</div>
+        <div className="header-copy">
+          <p className="eyebrow">DEVSPACE · LOCAL ADMIN</p>
+          <h1>管理控制面板</h1>
+          <p className="page-intro">查看连接状态，管理本机访问范围与运行限制。</p>
         </div>
+        <nav className="section-nav" aria-label="设置区段">
+          <a href="#overview">概览</a><a href="#runtime">运行情况</a><a href="#access">访问</a><a href="#tools">工具与说明</a><a href="#limits">限制</a>
+        </nav>
       </header>
 
-      <section className="status-grid" aria-label="服务信息">
-        <InfoItem
-          label="DevSpace 本地服务"
-          value={status.mcp.ready ? "已就绪" : "未就绪"}
-          tone={status.mcp.ready ? "success" : "danger"}
-        />
-        <InfoItem
-          label="公网地址（仅显示）"
-          value={status.publicBaseUrl || "未配置"}
-          mono
-        />
-        <InfoItem label="配置文件" value={status.configPath || "未提供"} mono />
-      </section>
-
-      <form className="settings-form" onSubmit={(event) => void save(event)}>
-        {overrides.length > 0 && (
-          <div className="notice warning" role="status">
-            <strong>部分设置由启动环境控制。</strong> 已锁定的项目不能在这里修改；请调整对应环境变量后再重启 DevSpace。
+      <form className="settings-form" onSubmit={submit}>
+        <section className="panel overview-panel" id="overview" aria-labelledby="overview-heading">
+          <SectionHeading kicker="OVERVIEW" title="概览" description="服务、隧道与公开连接状态。">
+            <button type="button" className="quiet-button" onClick={() => void refreshStatus()} disabled={statusRefresh === "loading"}>
+              {statusRefresh === "loading" ? "刷新中…" : "刷新状态"}
+            </button>
+          </SectionHeading>
+          {statusRefresh === "error" && <div className="inline-banner error" role="alert">状态刷新失败，当前仍显示上一次结果。</div>}
+          <div className="health-grid">
+            <StatusCard label="DevSpace 后端" {...backendPresentation(backend)} detail={backendDetail(backend)} />
+            <StatusCard label="公网隧道" {...tunnelPresentation(status)} detail={tunnelDetail(status)} />
+            <StatusCard label="MCP 服务" tone={status.mcp.ready ? "success" : "danger"} value={status.mcp.ready ? "已就绪" : "不可用"} detail={mcpDetail(status)} />
           </div>
-        )}
-
-        {Object.keys(warnings).length > 0 && (
-          <div className="notice warning" role="status">
-            <strong>当前配置中有需要修复的项目。</strong>
-            <ul>
-              {Object.entries(warnings).map(([path, message]) => (
-                <li key={path}>{path}：{message}</li>
-              ))}
-            </ul>
-          </div>
-        )}
-
-        {saveState.phase === "success" && (
-          <div className="notice success" role="status">
-            <strong>设置已保存。</strong>{" "}
-            {saveState.restartRequired
-              ? "需要重启 DevSpace 后生效；当前连接不会被自动中断。"
-              : "新设置已经生效。"}
-          </div>
-        )}
-
-        {saveState.phase === "error" && (
-          <div className="notice error" role="alert">
-            <strong>无法保存设置。</strong> {saveState.message}
-            {saveState.issues.length > 0 && (
-              <ul>
-                {saveState.issues.map((issue, index) => (
-                  <li key={`${issuePath(issue)}-${index}`}>
-                    {issuePath(issue) ? `${issuePath(issue)}：` : ""}{issue.message}
-                  </li>
-                ))}
-              </ul>
-            )}
-          </div>
-        )}
-
-        <section className="settings-card" aria-labelledby="roots-heading">
-          <div className="section-heading">
-            <div>
-              <h2 id="roots-heading">允许访问的目录</h2>
-              <p>只有列表中的目录及其子目录能被网页端读取和修改。</p>
+          <div className="overview-details">
+            <div className="detail-row public-url-row">
+              <div><span>公网地址</span><strong className="mono" title={status.publicBaseUrl}>{status.publicBaseUrl || "未配置"}</strong></div>
+              {status.publicBaseUrl && <div className="row-actions"><button type="button" className="text-button" onClick={() => void copyPublicUrl()}>{copyState === "copied" ? "已复制" : copyState === "error" ? "复制失败" : "复制"}</button><a className="text-button" href={status.publicBaseUrl} target="_blank" rel="noreferrer">打开</a></div>}
             </div>
-            <span className="count-badge">{config.allowedRoots.length}</span>
-          </div>
-
-          <div className="root-list">
-            {config.allowedRoots.length === 0 && (
-              <p className="empty-list">当前没有允许访问的目录。</p>
-            )}
-            {config.allowedRoots.map((root, index) => (
-              <div className="root-row" key={`${root}-${index}`}>
-                <div className="root-path">
-                  <code title={root}>{root}</code>
-                  {warnings[`allowedRoots.${index}`] && (
-                    <span className="field-error">目录不存在或已不可用</span>
-                  )}
-                </div>
-                <button
-                  type="button"
-                  className="remove-button"
-                  onClick={() => removeRoot(index)}
-                  aria-label={`移除目录 ${root}`}
-                  disabled={overrides.includes("allowedRoots")}
-                >
-                  移除
-                </button>
-              </div>
-            ))}
-          </div>
-
-          <div className="add-root-block">
-            <div className="add-root-form">
-              <label htmlFor="new-root">添加目录</label>
-              <div className="input-action-row">
-                <input
-                  id="new-root"
-                  type="text"
-                  value={newRoot}
-                  onChange={(event) => {
-                    setNewRoot(event.target.value);
-                    setRootError(null);
-                  }}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter") {
-                      event.preventDefault();
-                      addRoot();
-                    }
-                  }}
-                  placeholder="/Users/you/code/project"
-                  autoComplete="off"
-                  spellCheck={false}
-                  aria-describedby={rootError ? "new-root-error" : "new-root-help"}
-                  aria-invalid={Boolean(rootError)}
-                  disabled={overrides.includes("allowedRoots")}
-                />
-                <button
-                  type="button"
-                  className="secondary-button"
-                  onClick={addRoot}
-                  disabled={overrides.includes("allowedRoots")}
-                >添加</button>
-              </div>
-              <p id="new-root-help" className="field-help">请输入本机目录的绝对路径。</p>
-              {rootError && <p id="new-root-error" className="field-error">{rootError}</p>}
-            </div>
+            <div className="detail-row"><div><span>管理服务</span><strong>{adminDetail(status)}</strong></div></div>
+            <div className="detail-row"><div><span>配置文件</span><strong className="mono" title={status.configPath}>{status.configPath || "未提供"}</strong></div></div>
           </div>
         </section>
 
-        <section className="settings-card" aria-labelledby="modes-heading">
-          <div className="section-heading">
-            <div>
-              <h2 id="modes-heading">工具与界面</h2>
-              <p>控制模型可用的工具集合，以及 ChatGPT 中显示的结果卡片。</p>
+        <section className="panel" id="runtime" aria-labelledby="runtime-heading">
+          <SectionHeading kicker="RUNTIME" title="运行情况" description="当前会话、workspace、进程、授权记录与最近失败。">
+            <button type="button" className="quiet-button" onClick={() => void refreshDiagnostics()} disabled={diagnosticsState === "loading"}>
+              {diagnosticsState === "loading" ? "刷新中…" : "刷新数据"}
+            </button>
+          </SectionHeading>
+          {diagnosticsState === "error" && <div className="inline-banner error" role="alert">后端尚未提供内部诊断端点，或当前网络不可用。</div>}
+          {diagnostics && <>
+            <div className="usage-grid">
+              <UsageCard label="MCP 会话" metric={diagnostics.diagnostics.usage?.mcpSessions} />
+              <UsageCard label="进程会话" metric={diagnostics.diagnostics.usage?.processSessions} />
+              <UsageCard label="驻留 workspace" metric={diagnostics.diagnostics.usage?.workspaces} activeKey="resident" />
+              <UsageCard label="OAuth 客户端" metric={{ active: diagnostics.diagnostics.usage?.oauth?.clients ?? undefined }} />
             </div>
-          </div>
+            <div className="runtime-columns">
+              <div className="subsection">
+                <h3>最近失败</h3>
+                {(diagnostics.diagnostics.recentFailures?.length ?? 0) > 0
+                  ? <ul className="failure-list">{diagnostics.diagnostics.recentFailures?.map((failure, index) => <li key={`${failure.at ?? "failure"}-${index}`}><strong>{failure.event ?? "运行失败"}</strong><span>{[failure.category, failure.at ? formatTimestamp(failure.at) : undefined].filter(Boolean).join(" · ")}</span></li>)}</ul>
+                  : <p className="empty-copy">没有最近失败记录。</p>}
+              </div>
+              <div className="subsection security-actions">
+                <h3>诊断与安全</h3>
+                <p>诊断包仅包含汇总信息，不含路径、客户端 ID、令牌或错误详情。</p>
+                <div className="row-actions"><a className="secondary-button" href="/api/diagnostics/bundle" download>下载脱敏诊断包</a>{!revokeArmed && <button type="button" className="danger-button" onClick={() => { setRevokeArmed(true); setRevokeState("idle"); }}>撤销全部客户端与令牌</button>}</div>
+                {revokeArmed && <div className="danger-confirm" role="alert"><strong>所有远程客户端都会立即失效。</strong><div className="row-actions"><button type="button" className="quiet-button" onClick={() => setRevokeArmed(false)} disabled={revokeState === "working"}>取消</button><button type="button" className="danger-button" onClick={() => void revokeAllClientsAndTokens()} disabled={revokeState === "working"}>{revokeState === "working" ? "正在撤销…" : "确认全部撤销"}</button></div></div>}
+                {revokeState === "success" && <p className="field-help success" role="status">全部客户端和令牌已撤销。</p>}
+                {revokeState === "error" && <p className="field-error" role="alert">撤销失败；确认可能已过期，请刷新运行数据后重试。</p>}
+              </div>
+            </div>
+          </>}
+        </section>
 
+        {overrides.length > 0 && <div className="notice warning" role="status"><strong>部分设置由环境变量控制。</strong> 锁定项会在字段旁标出来源，需要修改启动环境后重启。</div>}
+
+        {saveState.phase === "success" && <div className="notice success" role="status"><strong>{saveState.restarted ? "重启请求已提交。" : "设置已保存。"}</strong> {!saveState.restarted && (saveState.restartRequired ? "需要重启后才能完全生效。" : "新设置已经生效。")}</div>}
+        {saveState.phase === "error" && <div className="notice error" role="alert"><strong>{saveState.configSaved ? "设置已保存，但后续操作失败。" : "无法保存设置。"}</strong> {saveState.message}{saveState.conflict && <button type="button" className="text-button" onClick={() => void reloadConfig()}>放弃本地修改并载入最新配置</button>}{saveState.issues.length > 0 && <ul>{saveState.issues.map((issue, index) => <li key={`${issuePath(issue)}-${index}`}>{issuePath(issue) ? `${issuePath(issue)}：` : ""}{issue.message}</li>)}</ul>}</div>}
+
+        <fieldset className="settings-fieldset" disabled={saveState.phase === "saving" || saveState.phase === "restarting"}>
+        <section className="panel" id="access" aria-labelledby="access-heading">
+          <SectionHeading kicker="ACCESS" title="访问" description="限制远程客户端可见的本机目录与项目说明文件。"><span className="count-badge">{config.allowedRoots.length}</span></SectionHeading>
+          <div className="subsection">
+            <div className="subsection-heading"><div><h3>允许访问的目录</h3><p>仅列表中的目录及其子目录可被读取和修改。</p></div><FieldMeta path="allowedRoots" overrides={overrides} warnings={warnings} issues={issuesByPath} /></div>
+            <div className="item-list">
+              {config.allowedRoots.map((root, index) => <div className="item-row" key={`${root}-${index}`}><div className="item-value"><code title={root}>{root}</code><FieldMeta path={`allowedRoots.${index}`} overrides={overrides} warnings={warnings} issues={issuesByPath} /></div><button type="button" className="remove-button" onClick={() => removeRoot(index)} aria-label={`移除目录 ${root}`} title={config.allowedRoots.length <= 1 ? "至少保留一个目录" : undefined} disabled={overrides.includes("allowedRoots") || config.allowedRoots.length <= 1}>移除</button></div>)}
+            </div>
+            <AddField id="new-root" label="添加目录" value={newRoot} onChange={(value) => { setNewRoot(value); setRootError(null); }} onAdd={addRoot} placeholder="/Users/you/code/project" help="请输入本机目录的绝对路径。" error={rootError} disabled={overrides.includes("allowedRoots")} />
+          </div>
+          <div className="subsection divided">
+            <div className="subsection-heading"><div><h3>项目说明回退文件</h3><p>找不到 AGENTS.md 时，按顺序查找这些文件名；留空可关闭回退。</p></div><FieldMeta path="projectDocFallbackFilenames" overrides={overrides} warnings={warnings} issues={issuesByPath} /></div>
+            {config.projectDocFallbackFilenames.length > 0 ? <div className="filename-list">{config.projectDocFallbackFilenames.map((filename, index) => <div className="filename-chip" key={`${filename}-${index}`}><span className="order-index">{index + 1}</span><code>{filename}</code><button type="button" aria-label={`移除回退文件 ${filename}`} onClick={() => removeFilename(index)} disabled={overrides.includes("projectDocFallbackFilenames")}>×</button><FieldMeta path={`projectDocFallbackFilenames.${index}`} overrides={overrides} warnings={warnings} issues={issuesByPath} /></div>)}</div> : <p className="empty-copy">未配置回退文件。</p>}
+            <AddField id="new-filename" label="添加回退文件名" value={newFilename} onChange={(value) => { setNewFilename(value); setFilenameError(null); }} onAdd={addFilename} placeholder="TEAM_GUIDE.md" help="仅输入文件名，不要包含路径分隔符。" error={filenameError} disabled={overrides.includes("projectDocFallbackFilenames")} />
+          </div>
+        </section>
+
+        <section className="panel" id="tools" aria-labelledby="tools-heading">
+          <SectionHeading kicker="TOOLS & INSTRUCTIONS" title="工具与说明" description="控制模型可用的工具集合及 ChatGPT 中的结果卡片。" />
           <div className="field-grid two-columns">
-            <SelectField<ToolMode>
-              id="tool-mode"
-              label="工具模式"
-              value={config.toolMode}
-              description="Codex 模式适合在 ChatGPT 网页端直接操作本地文件。"
-              options={[
-                ["codex", "Codex"],
-                ["full", "完整"],
-                ["minimal", "精简"],
-              ]}
-              onChange={(value) => {
-                setConfig((current) => ({ ...current, toolMode: value }));
-                setSaveState({ phase: "idle" });
-              }}
-              disabled={overrides.includes("toolMode")}
-            />
-            <SelectField<WidgetMode>
-              id="widget-mode"
-              label="结果卡片"
-              value={config.widgets}
-              description="控制聊天界面中工具调用详情和文件变更的展示。"
-              options={[
-                ["full", "完整显示"],
-                ["changes", "仅文件变更"],
-                ["off", "关闭"],
-              ]}
-              onChange={(value) => {
-                setConfig((current) => ({ ...current, widgets: value }));
-                setSaveState({ phase: "idle" });
-              }}
-              disabled={overrides.includes("widgets")}
-            />
+            <SelectField<ToolMode> id="tool-mode" label="工具模式" value={config.toolMode} description="Codex 模式适合直接操作本地文件。" options={[["codex", "Codex"], ["full", "完整"], ["minimal", "精简"]]} onChange={(value) => { setConfig((current) => ({ ...current, toolMode: value })); beginEdit(["toolMode"]); }} disabled={overrides.includes("toolMode")} meta={<FieldMeta path="toolMode" overrides={overrides} warnings={warnings} issues={issuesByPath} />} />
+            <SelectField<WidgetMode> id="widget-mode" label="结果卡片" value={config.widgets} description="控制工具调用详情和文件变更的展示。" options={[["full", "完整显示"], ["changes", "仅文件变更"], ["off", "关闭"]]} onChange={(value) => { setConfig((current) => ({ ...current, widgets: value })); beginEdit(["widgets"]); }} disabled={overrides.includes("widgets")} meta={<FieldMeta path="widgets" overrides={overrides} warnings={warnings} issues={issuesByPath} />} />
           </div>
         </section>
 
-        <section className="settings-card" aria-labelledby="limits-heading">
-          <div className="section-heading">
-            <div>
-              <h2 id="limits-heading">资源限制</h2>
-              <p>防止长时间连接或多个 workspace 占用过多本机资源。</p>
-            </div>
-          </div>
-
-          <div className="field-grid limits-grid">
-            {resourceFields.map((field) => {
-              const value = config.resources[field.key];
-              return (
-                <div className="field" key={field.key}>
-                  <label htmlFor={field.key}>{field.label}</label>
-                  <div className="number-input-wrap">
-                    <input
-                      id={field.key}
-                      type="number"
-                      min="1"
-                      step="1"
-                      required
-                      disabled={overrides.includes(`resources.${field.key}`)}
-                      value={field.displaySeconds ? value / 1_000 : value}
-                      onChange={(event) => updateResource(
-                        field.key,
-                        event.target.value,
-                        Boolean(field.displaySeconds),
-                      )}
-                      aria-describedby={`${field.key}-help`}
-                    />
-                    {field.displaySeconds && <span>秒</span>}
-                  </div>
-                  <p id={`${field.key}-help`} className="field-help">{field.description}</p>
-                </div>
-              );
-            })}
-          </div>
+        <section className="panel" id="limits" aria-labelledby="limits-heading">
+          <SectionHeading kicker="LIMITS" title="限制" description="为连接、进程和 workspace 设置本机资源边界。" />
+          <div className="field-grid limits-grid">{resourceFields.map((field) => { const path = `resources.${field.key}`; const value = config.resources[field.key]; return <div className="field" key={field.key}><label htmlFor={field.key}>{field.label}</label><div className="number-input-wrap"><input id={field.key} type="number" min="1" step="1" required disabled={overrides.includes(path)} value={field.displaySeconds ? value / 1_000 : value} onChange={(event) => updateResource(field.key, event.target.value, Boolean(field.displaySeconds))} aria-describedby={`${field.key}-help`} />{field.displaySeconds && <span>秒</span>}</div><p id={`${field.key}-help`} className="field-help">{field.description}</p><FieldMeta path={path} overrides={overrides} warnings={warnings} issues={issuesByPath} /></div>; })}</div>
         </section>
+        </fieldset>
 
         <div className="save-bar">
-          <p aria-live="polite">
-            {dirty ? "有尚未保存的修改" : "所有修改均已保存"}
-          </p>
-          <button
-            type="submit"
-            className="primary-button"
-            disabled={!dirty || saveState.phase === "saving"}
-          >
-            {saveState.phase === "saving" ? "正在保存…" : "保存设置"}
-          </button>
+          <div className="save-summary"><span className={dirty ? "dirty-dot" : "saved-dot"} aria-hidden="true" /><p aria-live="polite">{dirty ? "有尚未保存的修改" : "所有修改均已保存"}</p></div>
+          <div className="save-actions"><button type="button" className="quiet-button" onClick={discardChanges} disabled={!dirty || saveState.phase === "saving" || saveState.phase === "restarting"}>放弃修改</button><button type="submit" className="secondary-button strong" disabled={!dirty || saveState.phase === "saving" || saveState.phase === "restarting"}>{saveState.phase === "saving" ? "保存中…" : "保存"}</button>{canRestart && <button ref={restartTriggerRef} type="button" className="primary-button" onClick={() => setRestartConfirmationOpen(true)} disabled={saveState.phase === "saving" || saveState.phase === "restarting"}>{saveState.phase === "restarting" ? "正在重启…" : dirty ? "保存并重启" : "重启服务"}</button>}</div>
         </div>
       </form>
+      {restartConfirmationOpen && (
+        <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => {
+          if (event.target === event.currentTarget) setRestartConfirmationOpen(false);
+        }}>
+          <section ref={restartDialogRef} className="confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="restart-dialog-title" aria-describedby="restart-dialog-description">
+            <p className="section-kicker">RUNTIME ACTION</p>
+            <h2 id="restart-dialog-title">确认重启 DevSpace？</h2>
+            <p id="restart-dialog-description">重启会断开当前 MCP 会话并终止正在运行的命令。管理面板会保持打开，并在服务恢复后自动更新状态。</p>
+            {dirty && <div className="dialog-note">尚未保存的设置会先安全写入配置，再执行重启。</div>}
+            <div className="dialog-actions">
+              <button type="button" className="secondary-button" autoFocus onClick={() => setRestartConfirmationOpen(false)}>取消</button>
+              <button type="button" className="danger-button" onClick={() => {
+                setRestartConfirmationOpen(false);
+                void save(true);
+              }}>确认重启</button>
+            </div>
+          </section>
+        </div>
+      )}
     </div>
-  );
-}
-
-function InfoItem({
-  label,
-  value,
-  mono = false,
-  tone,
-}: {
-  label: string;
-  value: string;
-  mono?: boolean;
-  tone?: "success" | "danger";
-}): React.JSX.Element {
-  return (
-    <div className="info-item">
-      <span>{label}</span>
-      <strong className={`${mono ? "mono" : ""} ${tone ?? ""}`.trim()} title={value}>
-        {tone && <i className="status-dot" aria-hidden="true" />}
-        {value}
-      </strong>
-    </div>
-  );
-}
-
-function SelectField<T extends string>({
-  id,
-  label,
-  value,
-  description,
-  options,
-  onChange,
-  disabled = false,
-}: {
-  id: string;
-  label: string;
-  value: T;
-  description: string;
-  options: Array<readonly [T, string]>;
-  onChange(value: T): void;
-  disabled?: boolean;
-}): React.JSX.Element {
-  return (
-    <div className="field">
-      <label htmlFor={id}>{label}</label>
-      <select
-        id={id}
-        value={value}
-        disabled={disabled}
-        onChange={(event) => onChange(event.target.value as T)}
-      >
-        {options.map(([optionValue, optionLabel]) => (
-          <option key={optionValue} value={optionValue}>{optionLabel}</option>
-        ))}
-      </select>
-      <p className="field-help">{description}</p>
-    </div>
-  );
-}
-
-function CenteredState({
-  title,
-  detail,
-  busy = false,
-  tone = "neutral",
-}: {
-  title: string;
-  detail: string;
-  busy?: boolean;
-  tone?: "neutral" | "error";
-}): React.JSX.Element {
-  return (
-    <main className="centered-state" role={tone === "error" ? "alert" : "status"}>
-      <div className={`state-icon ${tone}`} aria-hidden="true">{busy ? "" : "!"}</div>
-      <h1>{title}</h1>
-      <p>{detail}</p>
-    </main>
   );
 }
 
 function readCapability(): string | null {
   const fragment = window.location.hash.slice(1);
-  if (!fragment) return null;
-  return new URLSearchParams(fragment).get("capability");
+  return fragment ? new URLSearchParams(fragment).get("capability") : null;
 }
 
 function clearFragment(): void {
@@ -573,60 +599,46 @@ function clearFragment(): void {
 }
 
 async function requestJson<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const response = await fetch(path, {
-    ...init,
-    credentials: "same-origin",
-    cache: "no-store",
-  });
+  const response = await fetch(path, { ...init, credentials: "same-origin", cache: "no-store" });
   const payload = await parseJson(response);
-
   if (!response.ok) {
     const error = payload as AdminErrorResponse | null;
-    throw new ApiFailure(
-      error?.error?.message ?? `请求失败（HTTP ${response.status}）。`,
-      { status: response.status, issues: collectIssues(error) },
-    );
+    throw new ApiFailure(error?.error?.message ?? `请求失败（HTTP ${response.status}）。`, { status: response.status, issues: collectIssues(error) });
   }
-
   return payload as T;
 }
 
 async function parseJson(response: Response): Promise<unknown> {
   const text = await response.text();
   if (!text) return {};
-  try {
-    return JSON.parse(text) as unknown;
-  } catch {
-    throw new ApiFailure("服务器返回了无法识别的响应。", { status: response.status });
-  }
+  try { return JSON.parse(text) as unknown; } catch { throw new ApiFailure("服务器返回了无法识别的响应。", { status: response.status }); }
 }
 
 function collectIssues(error: AdminErrorResponse | null): AdminValidationIssue[] {
   const fields = error?.error?.fields ?? {};
-  return Object.entries(fields).flatMap(([path, messages]) =>
-    (Array.isArray(messages) ? messages : [messages]).map((message) => ({ path, message })),
-  );
+  return Object.entries(fields).flatMap(([path, messages]) => (Array.isArray(messages) ? messages : [messages]).map((message) => ({ path, message })));
 }
 
 function issuePath(issue: AdminValidationIssue): string {
-  if (Array.isArray(issue.path)) return issue.path.join(".");
-  return issue.path ?? "";
+  return Array.isArray(issue.path) ? issue.path.join(".") : issue.path ?? "";
+}
+
+function normalizeConfig(config: AdminConfig): AdminConfig {
+  return { ...config, allowedRoots: [...(config.allowedRoots ?? [])], projectDocFallbackFilenames: [...(config.projectDocFallbackFilenames ?? [])], resources: { ...config.resources } };
 }
 
 function cloneConfig(config: AdminConfig): AdminConfig {
-  return {
-    ...config,
-    allowedRoots: [...config.allowedRoots],
-    resources: { ...config.resources },
-  };
+  return normalizeConfig(config);
 }
 
 function errorMessage(error: unknown): string {
-  if (error instanceof Error) return error.message;
-  return "发生了未知错误。";
+  return error instanceof Error ? error.message : "发生了未知错误。";
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolveDelay) => window.setTimeout(resolveDelay, ms));
 }
 
 const container = document.querySelector<HTMLElement>("#admin-app");
 if (!container) throw new Error("Missing #admin-app root element.");
-
 createRoot(container).render(<AdminApp />);

@@ -3,7 +3,32 @@ import { mkdirSync, mkdtempSync, readFileSync, renameSync, symlinkSync, writeFil
 import { createServer, request as httpRequest, type IncomingHttpHeaders } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { startAdminServer } from "./admin-server.js";
+import {
+  createPinnedLookup,
+  isPublicProbeAddress,
+  startAdminServer,
+} from "./admin-server.js";
+import { deriveInternalAdminToken, redactDiagnosticValue } from "./admin-backend.js";
+
+assert.equal(deriveInternalAdminToken("owner-test").length, 43);
+assert.deepEqual(redactDiagnosticValue({ pid: 42, accessToken: "secret", ok: true }), {
+  accessToken: "[redacted]",
+  ok: true,
+});
+
+assert.equal(isPublicProbeAddress("127.0.0.1"), false);
+assert.equal(isPublicProbeAddress("10.20.30.40"), false);
+assert.equal(isPublicProbeAddress("169.254.169.254"), false);
+assert.equal(isPublicProbeAddress("::1"), false);
+assert.equal(isPublicProbeAddress("fc00::1"), false);
+assert.equal(isPublicProbeAddress("::ffff:127.0.0.1"), false);
+assert.equal(isPublicProbeAddress("::ffff:7f00:1"), false);
+assert.equal(isPublicProbeAddress("0:0:0:0:0:ffff:7f00:1"), false);
+assert.equal(isPublicProbeAddress("0:0:0:0:0:FFFF:169.254.169.254"), false);
+assert.equal(isPublicProbeAddress("1.1.1.1"), true);
+assert.equal(isPublicProbeAddress("::ffff:1.1.1.1"), true);
+assert.equal(isPublicProbeAddress("0:0:0:0:0:ffff:101:101"), true);
+assert.equal(isPublicProbeAddress("2606:4700:4700::1111"), true);
 
 const testDir = mkdtempSync(join(tmpdir(), "devspace-admin-server-test-"));
 const configDir = join(testDir, "config");
@@ -23,6 +48,61 @@ const mcpServer = createServer((request, response) => {
 await listen(mcpServer);
 const mcpAddress = mcpServer.address();
 assert(mcpAddress && typeof mcpAddress !== "string");
+await new Promise<void>((resolvePinned, rejectPinned) => {
+  const pinnedRequest = httpRequest({
+    hostname: "public-probe.example",
+    port: mcpAddress.port,
+    path: "/readyz",
+    lookup: createPinnedLookup({ address: "127.0.0.1", family: 4 }),
+  }, (response) => {
+    response.resume();
+    response.on("end", () => {
+      try {
+        assert.equal(response.statusCode, 200);
+        resolvePinned();
+      } catch (error) {
+        rejectPinned(error);
+      }
+    });
+  });
+  pinnedRequest.on("error", rejectPinned);
+  pinnedRequest.end();
+});
+let runtimeRestartCount = 0;
+const runtimeManager = {
+  backendStatus: async () => ({
+    managed: true as const,
+    state: "running" as const,
+    supervisor: "launchd" as const,
+    label: "com.keepkeen.devspace.test",
+    actions: ["restart" as const],
+  }),
+  restartBackend: async () => {
+    runtimeRestartCount += 1;
+    return {
+      id: "operation-test",
+      target: "backend" as const,
+      action: "restart" as const,
+      state: "accepted" as const,
+      requestedAt: new Date().toISOString(),
+    };
+  },
+};
+let revokeCount = 0;
+const backendClient = {
+  diagnostics: async () => ({
+    generatedAt: "2026-07-22T00:00:00.000Z",
+    generation: "test-generation",
+    pid: 999,
+    usage: { mcpSessions: { active: 2, reserved: 1, limit: 10 } },
+    recentFailures: [{ at: "2026-07-22T00:00:00.000Z", event: "test_failure", category: "test" }],
+    ownerToken: "must-be-redacted",
+  }),
+  revokeAllClientsAndTokens: async () => {
+    revokeCount += 1;
+    return { revoked: true };
+  },
+};
 
 writeFileSync(join(configDir, "auth.json"), JSON.stringify({
   ownerToken: "secret-owner-token-that-must-not-leak",
@@ -40,6 +120,8 @@ const admin = await startAdminServer({
   port: 0,
   env: { DEVSPACE_CONFIG_DIR: configDir, DEVSPACE_WIDGETS: "off" },
   staticDir,
+  runtimeManager,
+  backendClient,
 });
 try {
   const url = new URL(admin.url);
@@ -100,6 +182,8 @@ try {
   assert.deepEqual(config.allowedRoots, [allowedRoot]);
   assert.equal(config.widgets, "off");
   assert.deepEqual(configEnvelope.overrides, ["widgets"]);
+  assert.equal(typeof configEnvelope.revision, "string");
+  assert.equal(configResponse.headers.etag, `"${configEnvelope.revision}"`);
 
   const missingCsrf = await request(url, {
     method: "PUT",
@@ -109,8 +193,7 @@ try {
   });
   assert.equal(missingCsrf.status, 403);
 
-  config.resources.maxMcpSessions = 10;
-  const update = await request(url, {
+  const missingRevision = await request(url, {
     method: "PUT",
     path: "/api/config",
     headers: {
@@ -121,8 +204,25 @@ try {
     },
     body: JSON.stringify({ config }),
   });
+  assert.equal(missingRevision.status, 428);
+
+  config.resources.maxMcpSessions = 10;
+  const update = await request(url, {
+    method: "PUT",
+    path: "/api/config",
+    headers: {
+      cookie,
+      origin,
+      "content-type": "application/json",
+      "if-match": `"${configEnvelope.revision}"`,
+      "x-devspace-admin-csrf": sessionBody.csrfToken,
+    },
+    body: JSON.stringify({ config }),
+  });
   assert.equal(update.status, 200);
-  assert.equal(JSON.parse(update.body).restartRequired, true);
+  const updateBody = JSON.parse(update.body);
+  assert.equal(updateBody.restartRequired, true);
+  assert.equal(typeof updateBody.revision, "string");
   assert.equal(JSON.parse(readFileSync(join(configDir, "config.json"), "utf8")).resources.maxMcpSessions, 10);
   assert.equal(JSON.parse(readFileSync(join(configDir, "config.json"), "utf8")).widgets, "full");
 
@@ -133,12 +233,27 @@ try {
       cookie,
       origin,
       "content-type": "application/json",
+      "if-match": `"${updateBody.revision}"`,
       "x-devspace-admin-csrf": sessionBody.csrfToken,
     },
     body: JSON.stringify({ config: { ...config, widgets: "full" } }),
   });
   assert.equal(attemptedOverride.status, 400);
   assert.match(attemptedOverride.body, /environment variable/);
+
+  const staleRevision = await request(url, {
+    method: "PUT",
+    path: "/api/config",
+    headers: {
+      cookie,
+      origin,
+      "content-type": "application/json",
+      "if-match": `"${configEnvelope.revision}"`,
+      "x-devspace-admin-csrf": sessionBody.csrfToken,
+    },
+    body: JSON.stringify({ config }),
+  });
+  assert.equal(staleRevision.status, 412);
 
   renameSync(allowedRoot, `${allowedRoot}-removed`);
   const staleConfig = await request(url, { path: "/api/config", headers: { cookie } });
@@ -148,12 +263,104 @@ try {
   const status = await request(url, { path: "/api/status", headers: { cookie } });
   assert.equal(status.status, 200);
   const statusBody = JSON.parse(status.body);
-  assert.deepEqual(statusBody.admin, { ready: true });
-  assert.deepEqual(statusBody.mcp, { ready: true, status: 200 });
+  assert.equal(statusBody.admin.ready, true);
+  assert.equal(statusBody.admin.version, "1.0.4");
+  assert.equal(typeof statusBody.admin.startedAt, "string");
+  assert.equal(statusBody.mcp.ready, true);
+  assert.equal(statusBody.mcp.status, 200);
+  assert.equal(typeof statusBody.mcp.latencyMs, "number");
+  assert.equal(typeof statusBody.mcp.checkedAt, "string");
+  assert.equal(statusBody.tunnel.configured, true);
+  assert.equal(statusBody.tunnel.hostname, "devspace.example.test");
+  assert.equal(statusBody.runtime.backend.managed, true);
+  assert.deepEqual(statusBody.runtime.backend.actions, ["restart"]);
+  assert.equal(typeof statusBody.runtime.backend.confirmationToken, "string");
   assert.equal(statusBody.configPath, join(configDir, "config.json"));
   assert.equal(statusBody.publicBaseUrl, "https://devspace.example.test");
   assert.doesNotMatch(status.body, /secret-owner-token/);
   assert.doesNotMatch(status.body, /display-password/);
+
+  const diagnostics = await request(url, { path: "/api/diagnostics", headers: { cookie } });
+  assert.equal(diagnostics.status, 200);
+  const diagnosticsBody = JSON.parse(diagnostics.body);
+  assert.equal(diagnosticsBody.diagnostics.generation, "test-generation");
+  assert.equal(typeof diagnosticsBody.security.confirmationToken, "string");
+  assert.doesNotMatch(diagnostics.body, /must-be-redacted|999/);
+  const bundle = await request(url, { path: "/api/diagnostics/bundle", headers: { cookie } });
+  assert.equal(bundle.status, 200);
+  assert.match(String(bundle.headers["content-disposition"]), /attachment/);
+  assert.doesNotMatch(bundle.body, /must-be-redacted|999/);
+
+  const revoke = await request(url, {
+    method: "POST",
+    path: "/api/security/revoke",
+    headers: {
+      cookie,
+      origin,
+      "content-type": "application/json",
+      "x-devspace-admin-csrf": sessionBody.csrfToken,
+    },
+    body: JSON.stringify({
+      confirmation: "revoke_all_clients_and_tokens",
+      confirmationToken: diagnosticsBody.security.confirmationToken,
+    }),
+  });
+  assert.equal(revoke.status, 200);
+  assert.equal(revokeCount, 1);
+
+  const privateProbeConfig = JSON.parse(readFileSync(join(configDir, "config.json"), "utf8"));
+  privateProbeConfig.publicBaseUrl = `http://127.0.0.1:${mcpAddress.port + 1}`;
+  writeFileSync(join(configDir, "config.json"), JSON.stringify(privateProbeConfig));
+  const privateProbeStatus = await request(url, { path: "/api/status", headers: { cookie } });
+  assert.equal(privateProbeStatus.status, 200);
+  assert.equal(JSON.parse(privateProbeStatus.body).tunnel.error, "unsafe_destination");
+  privateProbeConfig.publicBaseUrl = "https://display-user:display-password@devspace.example.test";
+  writeFileSync(join(configDir, "config.json"), JSON.stringify(privateProbeConfig));
+
+  const missingRestartCsrf = await request(url, {
+    method: "POST",
+    path: "/api/runtime/backend/restart",
+    headers: { cookie, origin, "content-type": "application/json" },
+    body: JSON.stringify({
+      confirmation: "restart",
+      confirmationToken: statusBody.runtime.backend.confirmationToken,
+    }),
+  });
+  assert.equal(missingRestartCsrf.status, 403);
+
+  const restart = await request(url, {
+    method: "POST",
+    path: "/api/runtime/backend/restart",
+    headers: {
+      cookie,
+      origin,
+      "content-type": "application/json",
+      "x-devspace-admin-csrf": sessionBody.csrfToken,
+    },
+    body: JSON.stringify({
+      confirmation: "restart",
+      confirmationToken: statusBody.runtime.backend.confirmationToken,
+    }),
+  });
+  assert.equal(restart.status, 202);
+  assert.equal(JSON.parse(restart.body).operation.id, "operation-test");
+  assert.equal(runtimeRestartCount, 1);
+  const replayedRestart = await request(url, {
+    method: "POST",
+    path: "/api/runtime/backend/restart",
+    headers: {
+      cookie,
+      origin,
+      "content-type": "application/json",
+      "x-devspace-admin-csrf": sessionBody.csrfToken,
+    },
+    body: JSON.stringify({
+      confirmation: "restart",
+      confirmationToken: statusBody.runtime.backend.confirmationToken,
+    }),
+  });
+  assert.equal(replayedRestart.status, 409);
+  assert.equal(runtimeRestartCount, 1);
 
   const repairableFile = JSON.parse(readFileSync(join(configDir, "config.json"), "utf8"));
   repairableFile.resources = {

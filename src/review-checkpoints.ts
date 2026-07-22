@@ -32,9 +32,13 @@ interface WorkspaceReviewState {
   openRef: string;
   baselineRef: string;
   diagnostic?: string;
+  initialization?: Promise<void>;
+  operationTail: Promise<void>;
+  closing: boolean;
 }
 
 export interface ReviewCheckpointManager {
+  activeWorkspaceIds(): string[];
   initializeWorkspace(input: { workspaceId: string; root: string }): Promise<void>;
   reviewChanges(input: {
     workspaceId: string;
@@ -42,19 +46,40 @@ export interface ReviewCheckpointManager {
     since?: ReviewSince;
     markReviewed?: boolean;
   }): Promise<ReviewChangesResult>;
+  cleanupWorkspace(input: { workspaceId: string }): Promise<void>;
+  cleanupStaleRefs(input: {
+    gitRoot: string;
+    activeWorkspaceIds?: Iterable<string>;
+    olderThanMs?: number;
+    maxWorkspaces?: number;
+    now?: number;
+  }): Promise<number>;
 }
 
 const REVIEW_REF_PREFIX = "refs/devspace/review";
+const DEFAULT_REVIEW_REF_RETENTION_MS = 30 * 24 * 60 * 60_000;
+const DEFAULT_MAX_REVIEW_WORKSPACES = 512;
 
 export function createReviewCheckpointManager(): ReviewCheckpointManager {
   const states = new Map<string, WorkspaceReviewState>();
 
-  return {
-    async initializeWorkspace({ workspaceId, root }) {
-      const refs = reviewRefs(workspaceId);
-      const state: WorkspaceReviewState = { root, ...refs };
+  async function initializeWorkspace(workspaceId: string, root: string): Promise<void> {
+    let state = states.get(workspaceId);
+    if (state) {
+      if (state.root !== root) throw new Error(`Workspace ${workspaceId} is already initialized for a different root.`);
+      if (state.closing) throw new Error(`Review checkpoints for workspace ${workspaceId} are being cleaned up.`);
+      if (state.initialization) return state.initialization;
+    } else {
+      state = {
+        root,
+        ...reviewRefs(workspaceId),
+        operationTail: Promise.resolve(),
+        closing: false,
+      };
       states.set(workspaceId, state);
+    }
 
+    const initializing = (async () => {
       try {
         const eligibility = await getGitEligibility(root);
         if (!eligibility.ok || !eligibility.gitRoot) {
@@ -69,46 +94,133 @@ export function createReviewCheckpointManager(): ReviewCheckpointManager {
       } catch (error) {
         state.diagnostic = error instanceof Error ? error.message : String(error);
       }
+    })();
+    state.initialization = initializing;
+    return initializing;
+  }
+
+  return {
+    activeWorkspaceIds() {
+      return Array.from(states.keys());
+    },
+    initializeWorkspace({ workspaceId, root }) {
+      return initializeWorkspace(workspaceId, root);
     },
 
     async reviewChanges({ workspaceId, root, since = "last_shown", markReviewed = true }) {
-      let state = states.get(workspaceId);
-      if (!state) {
-        await this.initializeWorkspace({ workspaceId, root });
-        state = states.get(workspaceId);
-      }
+      await initializeWorkspace(workspaceId, root);
+      const state = states.get(workspaceId);
 
       if (!state?.gitRoot) {
         throw new Error(state?.diagnostic ?? "show_changes requires a Git workspace in this version.");
       }
+      if (state.closing) throw new Error(`Review checkpoints for workspace ${workspaceId} are being cleaned up.`);
 
-      const baselineRef = since === "workspace_open" ? state.openRef : state.baselineRef;
-      const baseline = (await git(state.gitRoot, ["rev-parse", "--verify", `${baselineRef}^{commit}`])).stdout.trim();
-      const current = await createWorkingTreeSnapshot(state.gitRoot);
-      const patch = (await git(state.gitRoot, ["diff", "--binary", "--no-color", baseline, current], {
-        maxBuffer: 50 * 1024 * 1024,
-      })).stdout;
-      const numstat = (await git(state.gitRoot, ["diff", "--numstat", "-z", baseline, current], {
-        maxBuffer: 50 * 1024 * 1024,
-      })).stdout;
-      const files = parseNumstat(numstat);
-      const summary = summarizeFiles(files);
+      return serialize(state, async () => {
+        const gitRoot = state.gitRoot!;
+        const baselineRef = since === "workspace_open" ? state.openRef : state.baselineRef;
+        const baseline = (await git(gitRoot, ["rev-parse", "--verify", `${baselineRef}^{commit}`])).stdout.trim();
+        const current = await createWorkingTreeSnapshot(gitRoot);
+        const patch = (await git(gitRoot, ["diff", "--binary", "--no-color", baseline, current], {
+          maxBuffer: 50 * 1024 * 1024,
+        })).stdout;
+        const numstat = (await git(gitRoot, ["diff", "--numstat", "-z", baseline, current], {
+          maxBuffer: 50 * 1024 * 1024,
+        })).stdout;
+        const files = parseNumstat(numstat);
+        const summary = summarizeFiles(files);
 
-      if (markReviewed) {
-        await git(state.gitRoot, ["update-ref", state.baselineRef, current]);
+        if (markReviewed) {
+          await git(gitRoot, ["update-ref", state.baselineRef, current]);
+        }
+
+        return {
+          result:
+            summary.files === 0
+              ? `No changes since ${since === "workspace_open" ? "workspace open" : "last shown changes"}.`
+              : `Changed ${summary.files} ${summary.files === 1 ? "file" : "files"} (+${summary.additions} -${summary.removals}).`,
+          summary,
+          files,
+          patch,
+        };
+      });
+    },
+
+    async cleanupWorkspace({ workspaceId }) {
+      const state = states.get(workspaceId);
+      if (!state) return;
+      state.closing = true;
+      try {
+        await state.initialization;
+        await serialize(state, async () => {
+          if (state.gitRoot) {
+            await Promise.all([
+              git(state.gitRoot, ["update-ref", "-d", state.openRef]),
+              git(state.gitRoot, ["update-ref", "-d", state.baselineRef]),
+            ]);
+          }
+        });
+      } finally {
+        if (states.get(workspaceId) === state) states.delete(workspaceId);
       }
+    },
 
-      return {
-        result:
-          summary.files === 0
-            ? `No changes since ${since === "workspace_open" ? "workspace open" : "last shown changes"}.`
-            : `Changed ${summary.files} ${summary.files === 1 ? "file" : "files"} (+${summary.additions} -${summary.removals}).`,
-        summary,
-        files,
-        patch,
-      };
+    async cleanupStaleRefs({
+      gitRoot,
+      activeWorkspaceIds = [],
+      olderThanMs = DEFAULT_REVIEW_REF_RETENTION_MS,
+      maxWorkspaces = DEFAULT_MAX_REVIEW_WORKSPACES,
+      now = Date.now(),
+    }) {
+      const activeSegments = new Set(Array.from(activeWorkspaceIds, safeWorkspaceRefSegment));
+      const output = (await git(gitRoot, [
+        "for-each-ref",
+        "--format=%(refname)%00%(creatordate:unix)",
+        REVIEW_REF_PREFIX,
+      ])).stdout;
+      const refs = parseReviewRefs(output).filter((entry) => !activeSegments.has(entry.segment));
+      const newestBySegment = new Map<string, number>();
+      for (const entry of refs) {
+        newestBySegment.set(entry.segment, Math.max(newestBySegment.get(entry.segment) ?? 0, entry.createdAt));
+      }
+      const inactive = Array.from(newestBySegment, ([segment, createdAt]) => ({ segment, createdAt }))
+        .sort((left, right) => right.createdAt - left.createdAt);
+      const expired = new Set(inactive
+        .filter((entry, index) => now - entry.createdAt > olderThanMs || index >= maxWorkspaces)
+        .map((entry) => entry.segment));
+      const deleting = refs.filter((entry) => expired.has(entry.segment));
+      await Promise.all(deleting.map((entry) => git(gitRoot, ["update-ref", "-d", entry.ref])));
+      return deleting.length;
     },
   };
+}
+
+async function serialize<T>(state: WorkspaceReviewState, operation: () => Promise<T>): Promise<T> {
+  const previous = state.operationTail;
+  let release!: () => void;
+  state.operationTail = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+  }
+}
+
+function parseReviewRefs(output: string): Array<{ ref: string; segment: string; createdAt: number }> {
+  const entries: Array<{ ref: string; segment: string; createdAt: number }> = [];
+  for (const line of output.split("\n")) {
+    if (!line) continue;
+    const [ref, timestamp] = line.split("\0");
+    const suffix = ref?.slice(`${REVIEW_REF_PREFIX}/`.length);
+    const segment = suffix?.split("/")[0];
+    const createdAt = Number(timestamp) * 1_000;
+    if (!ref?.startsWith(`${REVIEW_REF_PREFIX}/`) || !segment || !Number.isFinite(createdAt)) continue;
+    entries.push({ ref, segment, createdAt });
+  }
+  return entries;
 }
 
 function reviewRefs(workspaceId: string): Pick<WorkspaceReviewState, "openRef" | "baselineRef"> {

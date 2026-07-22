@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import * as prompts from "@clack/prompts";
 import { getShellConfig } from "@earendil-works/pi-coding-agent";
 import { satisfies } from "semver";
+import { DEVSPACE_VERSION } from "./version.js";
 import { loadConfig } from "./config.js";
 import { runLocalAgentProvider } from "./local-agent-adapters.js";
 import {
@@ -29,12 +30,17 @@ import {
 import { createLocalAgentStore, type LocalAgentRecord } from "./local-agent-store.js";
 import type { LocalAgentRunResult } from "./local-agent-runtime.js";
 import {
+  cleanupDetachedAgentPromptArtifacts,
+  removeDetachedAgentPrompt,
+} from "./detached-agent-cleanup.js";
+import {
   ensureDevspaceDefaultSkills,
   generateOwnerToken,
   loadDevspaceFiles,
   resolveSubagentsFlag,
   writeDevspaceAuth,
   writeDevspaceConfig,
+  updateDevspaceConfig,
   type DevspaceUserConfig,
 } from "./user-config.js";
 import { expandHomePath } from "./roots.js";
@@ -346,10 +352,10 @@ function runConfigCommand(args: string[]): void {
   const value = rest.join(" ").trim();
   if (key === "publicBaseUrl") {
     if (!value) throw new Error("Missing publicBaseUrl value.");
-    writeDevspaceConfig({
-      ...files.config,
+    updateDevspaceConfig((config) => ({
+      ...config,
       publicBaseUrl: normalizeOptionalPublicBaseUrl(value),
-    });
+    }));
     console.log(`Updated ${files.configPath}`);
     return;
   }
@@ -358,7 +364,7 @@ function runConfigCommand(args: string[]): void {
     if (value !== "minimal" && value !== "full" && value !== "codex") {
       throw new Error("toolMode must be one of: codex, full, minimal.");
     }
-    writeDevspaceConfig({ ...files.config, toolMode: value });
+    updateDevspaceConfig((config) => ({ ...config, toolMode: value }));
     console.log(`Updated ${files.configPath}`);
     return;
   }
@@ -393,6 +399,7 @@ function printHelp(): void {
 }
 
 async function runAgentsCommand(args: string[]): Promise<void> {
+  await cleanupDetachedAgentPromptArtifacts();
   const [subcommand, ...rest] = args;
   switch (subcommand) {
     case "ls":
@@ -422,6 +429,7 @@ async function runAgentsCommand(args: string[]): Promise<void> {
 async function runAgentsList(): Promise<void> {
   const config = loadConfig();
   const store = createLocalAgentStore(config);
+  store.cleanup();
   const agents = store.list(resolveCurrentWorkspaceScope());
 
   if (agents.length === 0) {
@@ -440,6 +448,7 @@ async function runAgentsRun(args: string[]): Promise<void> {
   const config = loadConfig();
   const workspaceRoot = resolveCurrentWorkspaceRoot();
   const store = createLocalAgentStore(config);
+  store.cleanup();
   const existing = store.get(parsed.target);
 
   if (existing) {
@@ -448,14 +457,19 @@ async function runAgentsRun(args: string[]): Promise<void> {
     }
     assertLocalAgentProviderAvailable(existing.provider);
     const promptFile = writeAgentPromptFile(parsed.prompt);
-    store.update(existing.id, {
-      status: "starting",
-      model: parsed.model ?? existing.model,
-      thinking: parsed.thinking ?? existing.thinking,
-      latestResponse: undefined,
-      error: undefined,
-    });
-    spawnAgentWorker(existing.id, promptFile);
+    try {
+      store.update(existing.id, {
+        status: "starting",
+        model: parsed.model ?? existing.model,
+        thinking: parsed.thinking ?? existing.thinking,
+        latestResponse: undefined,
+        error: undefined,
+      });
+      spawnAgentWorker(existing.id, promptFile);
+    } catch (error) {
+      await removeDetachedAgentPrompt(promptFile);
+      throw error;
+    }
     console.log(formatAgentLine({
       ...existing,
       status: "running",
@@ -475,16 +489,21 @@ async function runAgentsRun(args: string[]): Promise<void> {
   assertLocalAgentProviderAvailable(target.provider);
 
   const promptFile = writeAgentPromptFile(parsed.prompt);
-  const record = store.create({
-    workspaceId: process.env.DEVSPACE_WORKSPACE_ID,
-    workspaceRoot,
-    profileName: target.name,
-    provider: target.provider,
-    model: target.model,
-    thinking: target.thinking,
-  });
-
-  spawnAgentWorker(record.id, promptFile);
+  let record: LocalAgentRecord;
+  try {
+    record = store.create({
+      workspaceId: process.env.DEVSPACE_WORKSPACE_ID,
+      workspaceRoot,
+      profileName: target.name,
+      provider: target.provider,
+      model: target.model,
+      thinking: target.thinking,
+    });
+    spawnAgentWorker(record.id, promptFile);
+  } catch (error) {
+    await removeDetachedAgentPrompt(promptFile);
+    throw error;
+  }
   console.log(formatAgentLine({ ...record, status: "running" }));
 }
 
@@ -494,6 +513,7 @@ async function runAgentsShow(args: string[]): Promise<void> {
 
   const config = loadConfig();
   const store = createLocalAgentStore(config);
+  store.cleanup();
   let record = store.get(id);
   if (!record) throw new Error(`Unknown subagent id: ${id}`);
 
@@ -525,28 +545,33 @@ async function runAgentsWorker(args: string[]): Promise<void> {
 
   const config = loadConfig();
   const store = createLocalAgentStore(config);
-  const record = store.get(id);
-  if (!record) throw new Error(`Unknown subagent id: ${id}`);
-
-  store.update(record.id, { status: "running", error: undefined });
   try {
-    const profiles = await loadLocalAgentProfiles(config, record.workspaceRoot);
-    const profile = profiles.find((candidate) => candidate.name === record.profileName);
-    const prompt = await readFile(promptFile, "utf8");
-    const result = profile
-      ? await runLocalAgentProfile(profile, record, prompt)
-      : await runRawLocalAgentProvider(record, prompt);
-    store.update(record.id, {
-      providerSessionId: result.providerSessionId ?? undefined,
-      status: "idle",
-      latestResponse: result.finalResponse,
-      error: undefined,
-    });
-  } catch (error) {
-    store.update(record.id, {
-      status: "error",
-      error: error instanceof Error ? error.message : String(error),
-    });
+    store.cleanup();
+    const record = store.get(id);
+    if (!record) throw new Error(`Unknown subagent id: ${id}`);
+
+    store.update(record.id, { status: "running", error: undefined });
+    try {
+      const profiles = await loadLocalAgentProfiles(config, record.workspaceRoot);
+      const profile = profiles.find((candidate) => candidate.name === record.profileName);
+      const prompt = await readFile(promptFile, "utf8");
+      const result = profile
+        ? await runLocalAgentProfile(profile, record, prompt)
+        : await runRawLocalAgentProvider(record, prompt);
+      store.update(record.id, {
+        providerSessionId: result.providerSessionId ?? undefined,
+        status: "idle",
+        latestResponse: result.finalResponse,
+        error: undefined,
+      });
+    } catch (error) {
+      store.update(record.id, {
+        status: "error",
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  } finally {
+    await removeDetachedAgentPrompt(promptFile);
   }
 }
 
@@ -599,6 +624,9 @@ function spawnAgentWorker(agentId: string, promptFile: string): void {
     stdio: "ignore",
     env: process.env,
   });
+  child.once("error", () => {
+    void removeDetachedAgentPrompt(promptFile);
+  });
   child.unref();
 }
 
@@ -647,12 +675,7 @@ function printAgentsHelp(): void {
 }
 
 function printVersion(): void {
-  const packageJson = require("../package.json") as { version?: unknown };
-  if (typeof packageJson.version !== "string") {
-    throw new Error("Unable to read DevSpace package version.");
-  }
-
-  console.log(packageJson.version);
+  console.log(DEVSPACE_VERSION);
 }
 
 function normalizeOptionalPublicBaseUrl(value: string): string | null {

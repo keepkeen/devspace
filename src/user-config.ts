@@ -8,6 +8,7 @@ import {
   openSync,
   readFileSync,
   renameSync,
+  statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -25,6 +26,10 @@ import {
   MAX_PROJECT_DOC_FALLBACK_FILENAME_LENGTH,
 } from "./project-instructions.js";
 import { z } from "zod";
+import {
+  CURRENT_CONFIG_SCHEMA_VERSION,
+  migrateConfigDocument,
+} from "./config-migrations.js";
 
 const projectDocFallbackFilenameSchema = z
   .string()
@@ -38,6 +43,7 @@ const projectDocFallbackFilenamesSchema = z
   .max(MAX_PROJECT_DOC_FALLBACK_FILENAMES);
 
 const devspaceUserConfigSchema = z.object({
+  schemaVersion: z.literal(CURRENT_CONFIG_SCHEMA_VERSION),
   host: z.string().min(1).optional(),
   port: z.number().int().min(1).max(65_535).optional(),
   allowedRoots: z.array(z.string()).optional(),
@@ -53,10 +59,13 @@ const devspaceUserConfigSchema = z.object({
   widgets: z.enum(["off", "changes", "full"]).optional(),
   resources: z.object({
     maxMcpSessions: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxMcpSessions).optional(),
+    maxMcpSessionsPerClient: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxMcpSessionsPerClient).optional(),
     maxProcessSessions: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxProcessSessions).optional(),
+    maxProcessSessionsPerClient: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxProcessSessionsPerClient).optional(),
     maxProcessSessionsPerWorkspace: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxProcessSessionsPerWorkspace).optional(),
     maxCommandRuntimeMs: z.number().int().min(MIN_COMMAND_RUNTIME_MS).max(MAX_TIMER_MS).optional(),
     maxResidentWorkspaces: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxResidentWorkspaces).optional(),
+    maxActiveWorkspacesPerClient: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxActiveWorkspacesPerClient).optional(),
     maxManagedWorktrees: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxManagedWorktrees).optional(),
   }).passthrough().optional(),
 }).passthrough();
@@ -66,6 +75,7 @@ const devspaceAuthConfigSchema = z.object({
 }).passthrough();
 
 export interface DevspaceUserConfig {
+  schemaVersion?: typeof CURRENT_CONFIG_SCHEMA_VERSION;
   host?: string;
   port?: number;
   allowedRoots?: string[];
@@ -81,10 +91,13 @@ export interface DevspaceUserConfig {
   widgets?: "off" | "changes" | "full";
   resources?: {
     maxMcpSessions?: number;
+    maxMcpSessionsPerClient?: number;
     maxProcessSessions?: number;
+    maxProcessSessionsPerClient?: number;
     maxProcessSessionsPerWorkspace?: number;
     maxCommandRuntimeMs?: number;
     maxResidentWorkspaces?: number;
+    maxActiveWorkspacesPerClient?: number;
     maxManagedWorktrees?: number;
     [key: string]: unknown;
   };
@@ -138,7 +151,7 @@ export function loadDevspaceFiles(env: NodeJS.ProcessEnv = process.env): Devspac
     authPath,
     configExists,
     authExists,
-    config: configExists ? readJsonFile(configPath, devspaceUserConfigSchema) : {},
+    config: configExists ? readAndMigrateConfigFile(configPath) : {},
     auth: authExists ? readJsonFile(authPath, devspaceAuthConfigSchema) : {},
   };
 }
@@ -146,11 +159,67 @@ export function loadDevspaceFiles(env: NodeJS.ProcessEnv = process.env): Devspac
 export function writeDevspaceConfig(
   config: DevspaceUserConfig,
   env: NodeJS.ProcessEnv = process.env,
+  options: { lockHeld?: boolean } = {},
 ): string {
-  const filePath = devspaceConfigPath(env);
+  const write = () => {
+    const filePath = devspaceConfigPath(env);
+    mkdirSync(devspaceConfigDir(env), { recursive: true });
+    writeJsonFile(filePath, {
+      ...config,
+      schemaVersion: CURRENT_CONFIG_SCHEMA_VERSION,
+    }, 0o600);
+    return filePath;
+  };
+  return options.lockHeld ? write() : withDevspaceConfigLockSync(env, write);
+}
+
+export function updateDevspaceConfig(
+  update: (config: DevspaceUserConfig) => DevspaceUserConfig,
+  env: NodeJS.ProcessEnv = process.env,
+): { config: DevspaceUserConfig; path: string } {
+  return withDevspaceConfigLockSync(env, () => {
+    const config = update(loadDevspaceFiles(env).config);
+    return { config, path: writeDevspaceConfig(config, env, { lockHeld: true }) };
+  });
+}
+
+export function withDevspaceConfigLockSync<T>(
+  env: NodeJS.ProcessEnv,
+  action: () => T,
+): T {
+  const lockPath = `${devspaceConfigPath(env)}.lock`;
+  const token = `${process.pid}:${randomBytes(16).toString("hex")}`;
+  const deadline = Date.now() + 5_000;
   mkdirSync(devspaceConfigDir(env), { recursive: true });
-  writeJsonFile(filePath, config, 0o600);
-  return filePath;
+
+  while (true) {
+    try {
+      const descriptor = openSync(lockPath, "wx", 0o600);
+      writeFileSync(descriptor, token, "utf8");
+      fsyncSync(descriptor);
+      closeSync(descriptor);
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      try {
+        if (Date.now() - statSync(lockPath).mtimeMs > 30_000) unlinkSync(lockPath);
+      } catch (staleError) {
+        if ((staleError as NodeJS.ErrnoException).code !== "ENOENT") throw staleError;
+      }
+      if (Date.now() >= deadline) throw new Error("The configuration is currently being changed by another process.");
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+    }
+  }
+
+  try {
+    return action();
+  } finally {
+    try {
+      if (readFileSync(lockPath, "utf8") === token) unlinkSync(lockPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
 }
 
 export function writeDevspaceAuth(
@@ -194,6 +263,64 @@ function readJsonFile<T>(filePath: string, schema: z.ZodType<T>): T {
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     throw new Error(`Unable to read ${filePath}: ${reason}`);
+  }
+}
+
+function readAndMigrateConfigFile(filePath: string): DevspaceUserConfig {
+  let source: string;
+  try {
+    source = readFileSync(filePath, "utf8");
+    const migration = migrateConfigDocument(JSON.parse(source));
+    const config = devspaceUserConfigSchema.parse(migration.config);
+    if (migration.changed) persistConfigMigration(filePath, source, config, migration.fromVersion);
+    return config;
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(`Unable to read ${filePath}: ${reason}`);
+  }
+}
+
+function persistConfigMigration(
+  filePath: string,
+  source: string,
+  config: DevspaceUserConfig,
+  fromVersion: number,
+): void {
+  const backupPath = `${filePath}.backup-v${fromVersion}`;
+  if (!existsSync(backupPath)) writeJsonBackup(backupPath, source);
+  try {
+    writeJsonFile(filePath, config, 0o600);
+  } catch (error) {
+    try {
+      writeJsonFile(filePath, JSON.parse(source), 0o600);
+    } catch {
+      // Preserve the original migration error; the backup remains available.
+    }
+    throw error;
+  }
+}
+
+function writeJsonBackup(filePath: string, source: string): void {
+  let descriptor: number | undefined;
+  let created = false;
+  try {
+    descriptor = openSync(filePath, "wx", 0o600);
+    created = true;
+    writeFileSync(descriptor, source, "utf8");
+    fsyncSync(descriptor);
+    closeSync(descriptor);
+    descriptor = undefined;
+    chmodSync(filePath, 0o600);
+  } catch (error) {
+    if (descriptor !== undefined) closeSync(descriptor);
+    if (created) {
+      try {
+        unlinkSync(filePath);
+      } catch {
+        // Preserve the original error.
+      }
+    }
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
   }
 }
 

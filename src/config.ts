@@ -22,13 +22,16 @@ export interface ResourceLimitsConfig {
   mcpSessionCloseTimeoutMs: number;
   cleanupIntervalMs: number;
   maxMcpSessions: number;
+  maxMcpSessionsPerClient: number;
   maxProcessSessions: number;
+  maxProcessSessionsPerClient: number;
   maxProcessSessionsPerWorkspace: number;
   maxCommandRuntimeMs: number;
   processShutdownGraceMs: number;
   httpDrainTimeoutMs: number;
   workspaceIdleTtlMs: number;
   maxResidentWorkspaces: number;
+  maxActiveWorkspacesPerClient: number;
   maxManagedWorktrees: number;
 }
 
@@ -211,21 +214,35 @@ function parseResourceLimits(
   env: NodeJS.ProcessEnv,
   configured: DevspaceUserConfig["resources"],
 ): ResourceLimitsConfig {
+  const maxMcpSessions = parsePositiveInteger(
+    env.DEVSPACE_MAX_MCP_SESSIONS,
+    configured?.maxMcpSessions ?? 64,
+    "DEVSPACE_MAX_MCP_SESSIONS",
+    RESOURCE_LIMIT_MAXIMUMS.maxMcpSessions,
+  );
+  const maxProcessSessions = parsePositiveInteger(
+    env.DEVSPACE_MAX_PROCESS_SESSIONS,
+    configured?.maxProcessSessions ?? 32,
+    "DEVSPACE_MAX_PROCESS_SESSIONS",
+    RESOURCE_LIMIT_MAXIMUMS.maxProcessSessions,
+  );
   const limits = {
     mcpSessionIdleTimeoutMs: seconds(env.DEVSPACE_MCP_SESSION_IDLE_TIMEOUT_SECONDS, 30 * 60, "DEVSPACE_MCP_SESSION_IDLE_TIMEOUT_SECONDS"),
     mcpSessionCloseTimeoutMs: seconds(env.DEVSPACE_MCP_SESSION_CLOSE_TIMEOUT_SECONDS, 5, "DEVSPACE_MCP_SESSION_CLOSE_TIMEOUT_SECONDS"),
     cleanupIntervalMs: seconds(env.DEVSPACE_RESOURCE_CLEANUP_INTERVAL_SECONDS, 5 * 60, "DEVSPACE_RESOURCE_CLEANUP_INTERVAL_SECONDS"),
-    maxMcpSessions: parsePositiveInteger(
-      env.DEVSPACE_MAX_MCP_SESSIONS,
-      configured?.maxMcpSessions ?? 64,
-      "DEVSPACE_MAX_MCP_SESSIONS",
-      RESOURCE_LIMIT_MAXIMUMS.maxMcpSessions,
+    maxMcpSessions,
+    maxMcpSessionsPerClient: parsePositiveInteger(
+      env.DEVSPACE_MAX_MCP_SESSIONS_PER_CLIENT,
+      configured?.maxMcpSessionsPerClient ?? Math.min(8, maxMcpSessions),
+      "DEVSPACE_MAX_MCP_SESSIONS_PER_CLIENT",
+      RESOURCE_LIMIT_MAXIMUMS.maxMcpSessionsPerClient,
     ),
-    maxProcessSessions: parsePositiveInteger(
-      env.DEVSPACE_MAX_PROCESS_SESSIONS,
-      configured?.maxProcessSessions ?? 32,
-      "DEVSPACE_MAX_PROCESS_SESSIONS",
-      RESOURCE_LIMIT_MAXIMUMS.maxProcessSessions,
+    maxProcessSessions,
+    maxProcessSessionsPerClient: parsePositiveInteger(
+      env.DEVSPACE_MAX_PROCESS_SESSIONS_PER_CLIENT,
+      configured?.maxProcessSessionsPerClient ?? Math.min(16, maxProcessSessions),
+      "DEVSPACE_MAX_PROCESS_SESSIONS_PER_CLIENT",
+      RESOURCE_LIMIT_MAXIMUMS.maxProcessSessionsPerClient,
     ),
     maxProcessSessionsPerWorkspace: parsePositiveInteger(
       env.DEVSPACE_MAX_PROCESS_SESSIONS_PER_WORKSPACE,
@@ -245,6 +262,12 @@ function parseResourceLimits(
       "DEVSPACE_MAX_RESIDENT_WORKSPACES",
       RESOURCE_LIMIT_MAXIMUMS.maxResidentWorkspaces,
     ),
+    maxActiveWorkspacesPerClient: parsePositiveInteger(
+      env.DEVSPACE_MAX_ACTIVE_WORKSPACES_PER_CLIENT,
+      configured?.maxActiveWorkspacesPerClient ?? 32,
+      "DEVSPACE_MAX_ACTIVE_WORKSPACES_PER_CLIENT",
+      RESOURCE_LIMIT_MAXIMUMS.maxActiveWorkspacesPerClient,
+    ),
     maxManagedWorktrees: parsePositiveInteger(
       env.DEVSPACE_MAX_MANAGED_WORKTREES,
       configured?.maxManagedWorktrees ?? 64,
@@ -256,9 +279,20 @@ function parseResourceLimits(
 }
 
 function assertResourceLimits(resources: ResourceLimitsConfig): void {
+  if (resources.maxMcpSessionsPerClient > resources.maxMcpSessions) {
+    throw new Error("DEVSPACE_MAX_MCP_SESSIONS_PER_CLIENT cannot exceed DEVSPACE_MAX_MCP_SESSIONS");
+  }
+  if (resources.maxProcessSessionsPerClient > resources.maxProcessSessions) {
+    throw new Error("DEVSPACE_MAX_PROCESS_SESSIONS_PER_CLIENT cannot exceed DEVSPACE_MAX_PROCESS_SESSIONS");
+  }
   if (resources.maxProcessSessionsPerWorkspace > resources.maxProcessSessions) {
     throw new Error(
       "DEVSPACE_MAX_PROCESS_SESSIONS_PER_WORKSPACE cannot exceed DEVSPACE_MAX_PROCESS_SESSIONS",
+    );
+  }
+  if (resources.maxProcessSessionsPerWorkspace > resources.maxProcessSessionsPerClient) {
+    throw new Error(
+      "DEVSPACE_MAX_PROCESS_SESSIONS_PER_WORKSPACE cannot exceed DEVSPACE_MAX_PROCESS_SESSIONS_PER_CLIENT",
     );
   }
 }
@@ -380,6 +414,9 @@ export function loadConfigForAdmin(env: NodeJS.ProcessEnv = process.env): Server
 
 function parsePublicBaseUrl(value: string): string {
   const parsed = new URL(value);
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error("DEVSPACE_PUBLIC_BASE_URL must use http or https.");
+  }
   parsed.hash = "";
   parsed.search = "";
   parsed.pathname = parsed.pathname.replace(/\/+$/, "");

@@ -340,6 +340,49 @@ const detachedHungResults = await detachedHungRegistry.closeIdle(0);
 assert.equal(detachedHungDisposition, "intentional");
 assert.match(String(detachedHungResults[0]?.error), /Timed out closing MCP session/);
 assert.equal(detachedHungRegistry.size, 1);
+
+const perClient = new McpSessionRegistry<FakeTransport>({
+  maxSessions: 3,
+  maxSessionsPerClient: 1,
+});
+const clientAReservation = perClient.tryReserve("client-a");
+assert(clientAReservation);
+assert.equal(perClient.tryReserve("client-a"), undefined);
+const clientBReservation = perClient.tryReserve("client-b");
+assert(clientBReservation);
+assert.throws(
+  () => perClient.register("wrong-owner", "client-b", createTransport(), clientAReservation),
+  /different OAuth client/,
+);
+perClient.register("client-a-session", "client-a", createTransport(), clientAReservation);
+perClient.register("client-b-session", "client-b", createTransport(), clientBReservation);
+assert.deepEqual(perClient.usageSnapshot("client-a"), {
+  sessions: 2,
+  reservations: 0,
+  limit: 3,
+  owner: { sessions: 1, reservations: 0, limit: 1 },
+});
+const clientAReplacement = await perClient.reserveWithIdleReclaim("client-a");
+assert.equal(clientAReplacement.reclaimed?.sessionId, "client-a-session");
+assert(clientAReplacement.reservation);
+perClient.register(
+  "client-a-replacement",
+  "client-a",
+  createTransport(),
+  clientAReplacement.reservation,
+);
+assert.equal(perClient.get("client-b-session", "client-b") !== undefined, true);
+assert.equal(perClient.usageSnapshot("client-a").owner?.sessions, 1);
+await perClient.closeAll();
+
+const perClientActive = new McpSessionRegistry<FakeTransport>({
+  maxSessions: 3,
+  maxSessionsPerClient: 1,
+});
+perClientActive.register("active-client-a", "client-a", createTransport());
+assert(perClientActive.acquire("active-client-a", "client-a"));
+assert.deepEqual(await perClientActive.reserveWithIdleReclaim("client-a"), {});
+await perClientActive.closeAll();
 assert.equal(detachedHungRegistry.tryReserve(), undefined);
 assert.deepEqual(await detachedHungRegistry.closeAll(), []);
 assert.equal(detachedHungRegistry.size, 1);

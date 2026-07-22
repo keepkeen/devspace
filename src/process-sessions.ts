@@ -85,9 +85,21 @@ export interface ProcessSessionManagerOptions {
   maxBufferCharacters?: number;
   completedSessionTtlMs?: number;
   maxSessions?: number;
+  maxSessionsPerClient?: number;
   maxSessionsPerWorkspace?: number;
   maxRuntimeMs?: number;
   terminationGraceMs?: number;
+}
+
+export interface ProcessSessionUsageSnapshot {
+  sessions: number;
+  running: number;
+  limit: number;
+  owner?: {
+    sessions: number;
+    running: number;
+    limit: number;
+  };
 }
 
 function boundedInteger(value: number | undefined, fallback: number, maximum: number): number {
@@ -250,6 +262,7 @@ export class ProcessSessionManager {
   private readonly maxBufferCharacters: number;
   private readonly completedSessionTtlMs: number;
   private readonly maxSessions: number;
+  private readonly maxSessionsPerClient: number;
   private readonly maxSessionsPerWorkspace: number;
   private readonly maxRuntimeMs: number;
   private readonly terminationGraceMs: number;
@@ -262,6 +275,7 @@ export class ProcessSessionManager {
     this.maxBufferCharacters = options.maxBufferCharacters ?? DEFAULT_BUFFER_CHARACTERS;
     this.completedSessionTtlMs = options.completedSessionTtlMs ?? COMPLETED_SESSION_TTL_MS;
     this.maxSessions = options.maxSessions ?? Number.POSITIVE_INFINITY;
+    this.maxSessionsPerClient = options.maxSessionsPerClient ?? Number.POSITIVE_INFINITY;
     this.maxSessionsPerWorkspace = options.maxSessionsPerWorkspace ?? Number.POSITIVE_INFINITY;
     this.maxRuntimeMs = options.maxRuntimeMs ?? 60 * 60 * 1_000;
     this.terminationGraceMs = options.terminationGraceMs ?? 5_000;
@@ -275,6 +289,12 @@ export class ProcessSessionManager {
     this.reapCompletedSessions();
     if (this.sessions.size >= this.maxSessions) {
       throw new Error(`Process session limit reached (${this.maxSessions}).`);
+    }
+    const clientSessions = Array.from(this.sessions.values()).filter(
+      (session) => session.ownerClientId === input.ownerClientId,
+    ).length;
+    if (clientSessions >= this.maxSessionsPerClient) {
+      throw new Error(`Process session limit reached for this OAuth client (${this.maxSessionsPerClient}).`);
     }
     const workspaceSessions = Array.from(this.sessions.values()).filter(
       (session) => session.ownerClientId === input.ownerClientId && session.workspaceId === input.workspaceId,
@@ -375,6 +395,24 @@ export class ProcessSessionManager {
     return Array.from(this.sessions.values()).some(
       (session) => session.running && session.ownerClientId === ownerClientId && session.workspaceId === workspaceId,
     );
+  }
+
+  usageSnapshot(ownerClientId?: string): ProcessSessionUsageSnapshot {
+    const sessions = Array.from(this.sessions.values());
+    return {
+      sessions: sessions.length,
+      running: sessions.filter((session) => session.running).length,
+      limit: this.maxSessions,
+      ...(ownerClientId === undefined ? {} : {
+        owner: {
+          sessions: sessions.filter((session) => session.ownerClientId === ownerClientId).length,
+          running: sessions.filter(
+            (session) => session.ownerClientId === ownerClientId && session.running,
+          ).length,
+          limit: this.maxSessionsPerClient,
+        },
+      }),
+    };
   }
 
   reopenWorkspace(ownerClientId: string, workspaceId: string): void {

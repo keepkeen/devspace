@@ -80,6 +80,16 @@ export const oauthRefreshTokens = sqliteTable(
   },
 );
 
+export const oauthOwnerCredential = sqliteTable(
+  "oauth_owner_credential",
+  {
+    id: integer("id").primaryKey(),
+    salt: text("salt").notNull(),
+    verifier: text("verifier").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+);
+
 export const localAgentSessions = sqliteTable(
   "local_agent_sessions",
   {

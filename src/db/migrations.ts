@@ -32,6 +32,11 @@ const migrations: Migration[] = [
     name: "workspace-checkout-reuse",
     up: migrateWorkspaceCheckoutReuse,
   },
+  {
+    version: 6,
+    name: "oauth-owner-credential",
+    up: migrateOAuthOwnerCredential,
+  },
 ];
 
 export function migrateDatabase(sqlite: Database.Database): void {
@@ -205,6 +210,17 @@ function migrateWorkspaceCheckoutReuse(sqlite: Database.Database): void {
     create unique index if not exists workspace_sessions_active_checkout_owner_canonical_root_uq
       on workspace_sessions(owner_client_id, canonical_root)
       where canonical_root is not null and mode = 'checkout' and status = 'active';
+  `);
+}
+
+function migrateOAuthOwnerCredential(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists oauth_owner_credential (
+      id integer primary key check (id = 1),
+      salt text not null,
+      verifier text not null,
+      updated_at text not null
+    );
   `);
 }
 

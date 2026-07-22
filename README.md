@@ -1,32 +1,35 @@
 <p align="center">
+  <strong>简体中文</strong> · <a href="./README_EN.md">English</a>
+</p>
+
+<p align="center">
   <img src="./docs/assets/devspace-logo-light.png" alt="DevSpace" width="136">
 </p>
 
 <h1 align="center">DevSpace</h1>
 
 <p align="center">
-  <strong>Let ChatGPT safely inspect, edit, and run your approved local projects through MCP.</strong>
+  <strong>让 ChatGPT 直接读取、修改和测试你电脑上的项目。</strong>
 </p>
 
 <p align="center">
-  A production-hardened community fork focused on persistent browser workflows,<br>
-  bounded resources, identity isolation, lower latency, and local administration.
+  DevSpace 把你授权的本地目录转换成安全、可检查的 MCP 工具。<br>
+  ChatGPT 操作的是真实本地文件，不需要把整个仓库上传到云端沙箱。
 </p>
 
 <p align="center">
-  <a href="https://github.com/keepkeen/devspace/blob/main/LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-2ea44f?style=flat-square"></a>
-  <img alt="Node.js 22.19–26" src="https://img.shields.io/badge/node-%3E%3D22.19%20%3C27-43853d?style=flat-square&logo=node.js&logoColor=white">
-  <img alt="MCP Streamable HTTP" src="https://img.shields.io/badge/MCP-Streamable_HTTP-6f42c1?style=flat-square">
-  <img alt="ChatGPT App" src="https://img.shields.io/badge/ChatGPT-Custom_App-111?style=flat-square&logo=openai&logoColor=white">
-  <a href="https://github.com/Waishnav/devspace"><img alt="Upstream" src="https://img.shields.io/badge/upstream-Waishnav%2Fdevspace-blue?style=flat-square&logo=github"></a>
+  <a href="https://github.com/keepkeen/devspace/blob/main/LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-2f6f44?style=flat-square"></a>
+  <img alt="Node.js 22.19–26" src="https://img.shields.io/badge/node-%3E%3D22.19%20%3C27-3f6b45?style=flat-square&logo=node.js&logoColor=white">
+  <img alt="MCP Streamable HTTP" src="https://img.shields.io/badge/MCP-Streamable_HTTP-343a40?style=flat-square">
+  <img alt="ChatGPT App" src="https://img.shields.io/badge/ChatGPT-App-111?style=flat-square&logo=openai&logoColor=white">
 </p>
 
 <p align="center">
-  <a href="#quick-start">Quick Start</a> ·
-  <a href="#connect-chatgpt">Connect ChatGPT</a> ·
-  <a href="#what-this-fork-improves">Fork Improvements</a> ·
-  <a href="#security-model">Security</a> ·
-  <a href="./docs/configuration.md">Configuration</a>
+  <a href="#快速开始">快速开始</a> ·
+  <a href="#连接-chatgpt">连接 ChatGPT</a> ·
+  <a href="#怎么使用">怎么使用</a> ·
+  <a href="#这个分支改进了什么">分支亮点</a> ·
+  <a href="#安全边界">安全边界</a>
 </p>
 
 <p align="center">
@@ -36,79 +39,64 @@
 </p>
 
 > [!IMPORTANT]
-> This repository is a community fork of
-> [Waishnav/devspace](https://github.com/Waishnav/devspace), based on upstream
-> commit [`80423b5`](https://github.com/Waishnav/devspace/commit/80423b5).
-> It is not an official upstream release. Upstream may have evolved since that
-> baseline; see [What this fork improves](#what-this-fork-improves) for the
-> exact scope maintained here.
+> 这是 [Waishnav/devspace](https://github.com/Waishnav/devspace) 的社区增强分支，
+> 基于上游提交
+> [`80423b5`](https://github.com/Waishnav/devspace/commit/80423b5)。
+> 本仓库不是上游官方版本。
 
-## Why DevSpace?
+## DevSpace 是什么？
 
-ChatGPT cannot directly see `/Users/you/code/my-project`. Its hosted Python or
-Code Interpreter environment is a different machine. DevSpace bridges that gap
-with an explicit MCP tool surface:
+ChatGPT 运行在云端，正常情况下无法打开你电脑上的
+`/Users/alice/code/my-app`。Code Interpreter 和网页版 Python 也运行在另一台
+机器上，所以把本地路径发给它们是没有用的。
 
-- open only directories you allow;
-- read, search, patch, and test the real local checkout;
-- keep one workspace alive across long gaps between browser conversations;
-- expose interactive tool cards in ChatGPT;
-- retain OAuth, path, process, and resource boundaries around remote access.
+DevSpace 在你的电脑上启动一个轻量 MCP 服务。授权目录之后，ChatGPT 可以：
 
-DevSpace does **not** synchronize your entire repository to a hosted workspace.
-Only content returned by invoked MCP tools is sent to the connected MCP host.
+- 读取文件和搜索代码；
+- 修改文件和应用补丁；
+- 运行测试、Lint、构建和其他命令；
+- 查看 Git 变更；
+- 遵守 `AGENTS.md`、`CLAUDE.md` 和本地 Skill；
+- 在对话结束或网络重新连接后继续使用同一个 workspace。
 
-## Architecture
+在普通工作流中，DevSpace 只是工具服务，不是另一个隐藏的编码模型。由
+ChatGPT 自己决定调用哪些工具，每次调用都会显示在对话中。项目也提供可选的
+本地子代理功能，但默认关闭。
+
+专用文件工具只能打开允许列表中的目录。DevSpace 不会提前上传整个仓库；只有
+工具调用实际返回的内容会发送给 MCP 客户端。
+
+## 工作原理
 
 ```mermaid
 flowchart LR
-    U["Browser"] --> C["ChatGPT"]
-    C --> E["Public HTTPS edge"]
-    E --> T["Persistent Cloudflare Tunnel"]
-    T --> D["DevSpace · 127.0.0.1:7676"]
-    D --> A["OAuth + client identity"]
-    A --> W["Workspace registry"]
-    W --> R["Approved local roots"]
-    W --> P["Bounded file, search, patch, and process tools"]
-    M["Local-only admin panel"] -. loopback only .-> D
+    U["你"] --> C["ChatGPT 网页端"]
+    C --> H["公网 HTTPS 地址"]
+    H --> T["Cloudflare Tunnel"]
+    T --> D["本地 DevSpace · 127.0.0.1:7676"]
+    D --> W["已授权的本地目录"]
+    D --> P["文件、Git 和命令工具"]
+    A["本地管理面板"] -. "仅 localhost" .-> D
 ```
 
-The public listener carries MCP, OAuth discovery/approval, ChatGPT app assets,
-and health endpoints. The separate management panel binds to loopback, uses a
-one-time capability URL, and is never mounted on the tunnel.
+公网地址用于传输 MCP 和 OAuth 请求。管理面板只监听本机地址，不会暴露到
+Tunnel 上。
 
-## Highlights
+## 快速开始
 
-| Capability | What it gives you |
-| --- | --- |
-| Persistent workspaces | Reuse a checkout after minutes, hours, or later conversations; workspaces are closed only when explicitly requested. |
-| Browser-first MCP tools | GPT-facing descriptions explain when to call DevSpace instead of probing a hosted sandbox. |
-| Lower round-trip cost | `batch_read` and `batch_inspect` combine 2–8 independent reads/searches in one MCP call. |
-| Lazy project instructions | Root instructions load immediately; nested overrides, `AGENTS.md`/`CLAUDE.md`, and configured fallback files load only when their scope is entered. |
-| Identity isolation | MCP sessions, workspaces, processes, and OAuth ownership are scoped to the authorized client. |
-| Hard resource bounds | MCP/process quotas, command runtime limits, output caps, idle cleanup, graceful termination, and capacity reclamation. |
-| Local admin panel | Add allowed roots and configure tools, widgets, and limits without editing JSON by hand. |
-| Inspectable operations | Structured JSON logs, request IDs, hashed identities, health checks, tool timing, and explicit error states. |
-
-## Quick Start
-
-### 1. Requirements
+### 环境要求
 
 - Node.js `>=22.19 <27`
-- npm and Git
-- Bash on Linux/macOS, or Git Bash/WSL on Windows
-- a tunnel client such as [cloudflared](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/)
-- a public HTTPS endpoint that forwards to `127.0.0.1:7676`
-- ChatGPT access to custom MCP apps; availability currently depends on your
-  ChatGPT plan and workspace settings
+- npm 和 Git
+- macOS/Linux 上的 Bash，或者 Windows 上的 Git Bash/WSL
+- 一个公网 HTTPS Tunnel，例如
+  [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/)
+- 允许开启开发者模式的 ChatGPT 账号或工作区
 
-Use the **same Node runtime** for installation and execution because
-`better-sqlite3` is a native module.
+安装依赖、构建项目和启动服务时应使用同一套 Node.js。DevSpace 使用原生模块
+`better-sqlite3`，不同 Node ABI 之间不能直接混用。
 
-### 2. Install this fork
-
-This fork is not published under the upstream npm package name. Build it from
-source:
+### 1. 安装这个分支
 
 ```bash
 git clone https://github.com/keepkeen/devspace.git
@@ -117,92 +105,94 @@ npm ci
 npm run build
 ```
 
-Run the CLI directly from the checkout:
+下面的教程直接从当前仓库运行 CLI：
 
 ```bash
 node dist/cli.js --help
 ```
 
-Optionally expose `devspace` globally as a symlink to this checkout:
+如果你更喜欢简短的 `devspace` 命令：
 
 ```bash
 npm link
 devspace --help
 ```
 
-### 3. Initialize
+### 2. 初始化配置
 
 ```bash
 node dist/cli.js init
 ```
 
-The setup wizard asks for:
+初始化向导主要询问三项内容：
 
-1. **Allowed roots** — the narrow local directories ChatGPT may open.
-2. **Local port** — `7676` by default.
-3. **Public base URL** — the HTTPS origin without `/mcp`.
+1. **允许访问的根目录**：例如 `/Users/alice/code`。ChatGPT 只能通过专用
+   文件工具打开这些目录。
+2. **本地端口**：默认是 `7676`。
+3. **公网地址**：你的 HTTPS Tunnel 地址，不包含 `/mcp`。
 
-Example:
-
-```text
-Allowed roots: /Users/alice/code,/Users/alice/work
-Port: 7676
-Public base URL: https://devspace.example.com
-```
-
-Configuration and the Owner password are stored separately:
+普通配置和 Owner 密码分开保存：
 
 ```text
 ~/.devspace/config.json
 ~/.devspace/auth.json
 ```
 
-Never commit or share `auth.json`.
+不要分享或提交 `auth.json`。任何拿到 Owner 密码的人都可以批准新的 MCP 客户端。
 
-### 4. Start DevSpace
+### 3. 启动 DevSpace
 
 ```bash
 node dist/cli.js serve
 ```
 
-Verify the local service:
+保持服务运行，在另一个终端检查本地状态：
 
 ```bash
 curl http://127.0.0.1:7676/readyz
 ```
 
-Check for HTTP `200` and `"ok": true`. The response also reports lifecycle and
-database checks, for example:
+健康状态会返回 HTTP `200`，JSON 中包含：
 
 ```json
-{"ok":true,"name":"devspace","status":"ready","checks":{"lifecycle":true,"workspaceDatabase":true,"oauthDatabase":true}}
+{"ok":true,"name":"devspace","status":"ready"}
 ```
 
-### 5. Expose it through HTTPS
+也可以运行安装诊断：
 
-DevSpace binds to loopback by default. A tunnel connects the public HTTPS
-endpoint to the local server.
+```bash
+node dist/cli.js doctor
+```
 
-#### Fast test with Cloudflare Quick Tunnel
+### 4. 启动 HTTPS Tunnel
 
-Keep DevSpace running in terminal 1. Start the tunnel in terminal 2:
+临时测试可以直接运行：
 
 ```bash
 cloudflared tunnel --url http://127.0.0.1:7676
 ```
 
-Save the printed HTTPS origin. In terminal 1, stop DevSpace with `Ctrl-C`, then
-update the saved URL and restart it:
+Cloudflare 会打印一个临时地址，例如：
+
+```text
+https://random-name.trycloudflare.com
+```
+
+保存该地址，然后重新启动 DevSpace：
 
 ```bash
 node dist/cli.js config set publicBaseUrl https://random-name.trycloudflare.com
 node dist/cli.js serve
 ```
 
-Quick Tunnel URLs change when restarted. For an always-on ChatGPT connection,
-use a named tunnel and a stable hostname.
+检查完整公网链路：
 
-#### Stable named Cloudflare Tunnel
+```bash
+curl https://random-name.trycloudflare.com/readyz
+```
+
+Quick Tunnel 每次重启都可能更换地址。日常使用建议创建带固定域名的 Named
+Tunnel：
 
 ```bash
 cloudflared tunnel login
@@ -210,7 +200,7 @@ cloudflared tunnel create devspace
 cloudflared tunnel route dns devspace devspace.example.com
 ```
 
-Create `~/.cloudflared/config.yml`:
+`~/.cloudflared/config.yml` 示例：
 
 ```yaml
 tunnel: YOUR_TUNNEL_UUID
@@ -222,26 +212,116 @@ ingress:
   - service: http_status:404
 ```
 
-Start it:
+启动 Named Tunnel：
 
 ```bash
 cloudflared tunnel --config ~/.cloudflared/config.yml run devspace
 ```
 
-Verify the complete route:
+最后保存固定公网地址：
 
 ```bash
-curl https://devspace.example.com/readyz
+node dist/cli.js config set publicBaseUrl https://devspace.example.com
 ```
 
-For long-term use, run both `devspace serve` and `cloudflared` through your OS
-service manager (`launchd`, `systemd`, or an equivalent supervisor) with
-automatic restart enabled.
+## 连接 ChatGPT
+
+OpenAI 目前把自定义 MCP 集成称为 **developer-mode app（开发者模式应用）**。
+产品界面可能继续变化，最新入口请参考 OpenAI 官方的
+[Connect from ChatGPT](https://developers.openai.com/apps-sdk/deploy/connect-chatgpt)。
+
+1. 打开 ChatGPT 的 **Settings → Security and login**，开启
+   **Developer mode**。组织账号可能需要管理员先允许该功能。
+2. 打开 **Settings → Plugins**，或者直接访问
+   [chatgpt.com/plugins](https://chatgpt.com/plugins)。
+3. 新建一个 developer-mode app。
+4. 填写容易理解的名称和说明，例如 `Local DevSpace`。
+5. MCP 地址填写完整的 `/mcp` URL：
+
+   ```text
+   https://devspace.example.com/mcp
+   ```
+
+6. 创建应用并检查 ChatGPT 扫描到的工具列表。
+7. 在 DevSpace OAuth 页面输入 `~/.devspace/auth.json` 中的 Owner 密码。
+8. 新建 ChatGPT 对话，点击输入框附近的 **+**，选择 **More**，然后把
+   DevSpace 应用添加到当前对话。
+
+如果 DevSpace 新增或修改了工具，请在 ChatGPT 的 **Settings → Plugins** 中
+打开该应用并选择 **Refresh**。只重启本地服务不会自动更新 ChatGPT 缓存的工具
+定义。
+
+## 怎么使用
+
+在提示词里明确要求使用 DevSpace，并给出准确的本地路径：
+
+```text
+使用 DevSpace 打开 /Users/alice/code/my-app。
+先阅读项目指令，找出失败的测试并修复，运行最小范围的验证，
+最后总结修改了哪些文件。
+```
+
+正常的调用流程是：
+
+1. ChatGPT 用本地项目路径调用 `open_workspace`。
+2. DevSpace 返回 `workspaceId` 和当前目录适用的项目指令。
+3. 后续读取、搜索、编辑和命令调用都复用这个 `workspaceId`。
+4. ChatGPT 的 MCP 连接重新建立后，workspace 仍然存在；同一个已授权客户端也
+   可以在之后的对话中重新使用它。
+5. 只有你明确要求释放 workspace 时，模型才应调用 `close_workspace`。长时间
+   未使用的 workspace 也可能在达到配置的空闲期限后自动过期。
+
+不要让 ChatGPT 使用云端 Python 或 Code Interpreter 去检查本地路径。它们仍可
+用于与本地项目无关的计算和数据处理；本地项目操作应通过 DevSpace 完成。
+
+### 两个 ChatGPT 账号
+
+不同 OAuth 客户端会得到各自独立的 workspace ID 和进程会话。如果两个账号都
+打开同一个本地 checkout，它们修改的仍然是磁盘上的同一份文件。本分支实现了
+身份和资源隔离，但不会自动合并或锁定同一文件的并发修改。除非使用独立 Git
+worktree，否则不建议两个账号同时写入同一个项目。
+
+### `AGENTS.md` 和 Skill
+
+打开 workspace 时，DevSpace 会返回根目录适用的 `AGENTS.md`、`CLAUDE.md`
+等指令。嵌套目录中的指令只在 ChatGPT 第一次进入该目录时加载，避免首次打开
+大型仓库就递归扫描所有文件夹。
+
+DevSpace 也会告诉 ChatGPT 当前可用的本地 Skill。模型必须先读取对应的
+`SKILL.md`，之后才允许读取该 Skill 的支持文件并执行其中的工作流。详细规则见
+[ChatGPT 编码工作流](./docs/chatgpt-coding-workflow.md)。
+
+### 工具模式
+
+| 模式 | ChatGPT 可以使用的工具 | 建议用途 |
+| --- | --- | --- |
+| `codex` | `read`、`apply_patch`、`exec_command`、批量工具和进程轮询 | ChatGPT 和编码模型的推荐默认模式。 |
+| `full` | 独立的读取、写入、编辑、搜索、目录和 Bash 工具 | 适合偏好细粒度工具的 MCP 客户端。 |
+| `minimal` | 精简后的必要文件与命令工具 | 需要最小工具表面时使用。 |
+
+如果已经明确知道多个相互独立的文件或搜索目标，`batch_read` 和
+`batch_inspect` 可以减少 MCP 往返。如果下一个目标依赖上一次搜索结果，模型
+仍应按顺序检查，而不是强行批量处理。
+
+## 保持长期在线
+
+要让 ChatGPT 随时连接到本地，需要同时保持两个进程运行：
+
+```text
+DevSpace 服务  +  HTTPS Tunnel
+```
+
+建议用 `launchd`、`systemd` 等系统服务管理器运行它们，开启自动重启，并使用
+固定 Tunnel 域名。ChatGPT 对话结束不会自动关闭本地 workspace；workspace
+状态保存在 SQLite 中，不依赖某一条 HTTP 连接。
+
+服务重启后，ChatGPT 可能创建新的 MCP 传输会话，但已持久化的 checkout
+workspace 仍然可以复用。
 
 <details>
-<summary><strong>Using Shadowrocket or another TUN proxy?</strong></summary>
+<summary><strong>小火箭或其他 TUN 代理</strong></summary>
 
-Route Cloudflare Tunnel endpoints directly, before generic proxy/final rules:
+把以下 Cloudflare Tunnel 直连规则放在通用代理和 FINAL 规则之前：
 
 ```text
 DOMAIN,region1.v2.argotunnel.com,DIRECT
@@ -253,176 +333,97 @@ IP-CIDR6,2606:4700:a0::/48,DIRECT,no-resolve
 IP-CIDR6,2606:4700:a8::/48,DIRECT,no-resolve
 ```
 
-Do not route the entire `198.18.0.0/15` Fake-IP range directly.
+不要把整个 `198.18.0.0/15` Fake-IP 网段设为直连。
 
 </details>
 
-## Connect ChatGPT
-
-> [!NOTE]
-> OpenAI currently documents full custom MCP apps, including write actions, for
-> ChatGPT Business and Enterprise/Edu on the web. The feature is beta and the
-> UI may change. Check the current
-> [OpenAI developer-mode documentation](https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt)
-> for plan and administrator requirements.
-
-1. Enable **Developer mode** for your ChatGPT account/workspace.
-2. Open **Settings → Apps → Create**. Workspace administrators can also use
-   **Workspace settings → Apps → Create**.
-3. Enter a name such as `Local DevSpace`.
-4. Set the MCP endpoint to:
-
-   ```text
-   https://devspace.example.com/mcp
-   ```
-
-5. Select OAuth authentication when prompted.
-6. Click **Scan Tools**.
-7. Complete the DevSpace authorization page using the Owner password from
-   `~/.devspace/auth.json`.
-8. Wait for the tool scan to finish, create the app, and enable it for the
-   conversation.
-
-Try this prompt:
-
-```text
-Use DevSpace to open /Users/alice/code/my-app.
-Read the applicable AGENTS.md files, inspect the project, fix the failing tests,
-run the smallest relevant verification, and summarize the changed files.
-```
-
-The model should call `open_workspace` with the exact local path and reuse the
-returned `workspaceId`. It should not use Code Interpreter or hosted Python to
-probe that path because those tools run on a different filesystem. They remain
-appropriate for work unrelated to the local workspace.
-
-> [!TIP]
-> ChatGPT may keep a frozen snapshot of an app's tool definitions. After adding
-> or changing MCP tools, use the app's **Refresh/Scan Tools** action or recreate
-> the draft app if your plan does not support refreshing it.
-
-## Local Management Panel
+## 本地管理面板
 
 ```bash
 node dist/cli.js admin
 ```
 
-The panel opens a loopback-only, one-time URL. It can manage:
+DevSpace 会打开一个仅限 localhost、带一次性令牌的管理地址。面板可以：
 
-- allowed workspace roots;
-- tool mode: `codex`, `full`, or `minimal`;
-- widget mode: `full`, `changes`, or `off`;
-- MCP and process-session quotas;
-- command, workspace, and worktree limits;
-- readiness and restart-required status.
+- 添加和删除允许访问的目录；
+- 选择工具模式和组件模式；
+- 设置 MCP、进程、workspace、命令和 worktree 配额；
+- 查看后端、Tunnel、配额和最近失败状态；
+- 下载经过脱敏的诊断报告；
+- 一键撤销所有 OAuth 客户端和 Token；
+- 重启明确授权的 macOS `launchd` 后端，并验证新 PID 和 readiness generation。
 
-Saving configuration does not restart the backend automatically.
-
-## How the Model Uses DevSpace
-
-### Workspace lifecycle
-
-1. Call `open_workspace` once for a local project or worktree.
-2. Reuse the returned `workspaceId` for later calls and later turns.
-3. Reopen only if the ID is unknown or the user switches folders/modes.
-4. Call `close_workspace` only when the user explicitly asks to release it.
-
-Checkout workspaces persist across idle periods. This supports the common
-browser workflow where the next conversation begins hours later.
-
-### Tool modes
-
-| Mode | Tools | Best for |
-| --- | --- | --- |
-| `codex` | `open_workspace`, `read`, `batch_read`, `batch_inspect`, `apply_patch`, `exec_command`, `write_stdin` | Compact ChatGPT/Codex-style workflow. |
-| `full` | Dedicated read/write/edit/grep/glob/ls/bash tools plus batch tools | Hosts that benefit from explicit file operations. |
-| `minimal` | Essential file tools, batch inspection, and bash | Smaller generic MCP surfaces. |
-
-When 2–8 targets are already known, the server description tells the model to
-prefer `batch_read` or `batch_inspect`. Iterative “inspect one result, then
-choose the next target” work remains intentionally sequential.
-
-### Project instructions
-
-- Global and root project instructions load during `open_workspace`. Global instructions use the built-in names; each project directory prefers `AGENTS.override.md`, then `AGENTS.md`, `CLAUDE.md`, and configured fallbacks.
-- Nested instruction files are discovered lazily along the canonical target
-  path and cached by directory/file version.
-- Literal `cd`/`pushd` targets inside shell commands participate in the same
-  instruction gate; dynamic directory expressions must use `workingDirectory`
-  or a literal path before execution is allowed.
-- Cwd-changing shell destinations must already exist. `CDPATH`, opaque nested
-  shells, and syntax that cannot be scoped safely fail closed; split directory
-  creation and execution into separate calls when needed.
-- New or changed scoped instructions are returned before mutations run.
-- Mutating tools require the returned one-time `instructionToken` on retry,
-  preventing parallel calls from racing past unseen instructions.
-
-## What This Fork Improves
-
-The comparison below is against upstream commit
-[`80423b5`](https://github.com/Waishnav/devspace/commit/80423b5), the parent of
-this fork's change set.
-
-| Area | Upstream baseline | This fork |
-| --- | --- | --- |
-| Workspace lifecycle | Session lifecycle could be coupled too closely to MCP/client turnover. | Persistent checkout workspaces, explicit-only close semantics, durable ownership, clean/dirty worktree-aware closure. |
-| MCP capacity | Bounded stale cleanup, but bursts of abandoned transports could still exhaust all slots. | Reservation-aware capacity reclamation, paired reclaim slots, close timeout, quarantine on failed close, and regression coverage for saturation. |
-| Resource limits | Several resources relied on soft or indirect limits. | Explicit MCP/process/per-workspace quotas, resident-workspace/worktree caps, output budgets, hard command runtime, and cleanup intervals. |
-| Command execution | Basic shell execution. | Foreground/background sessions, PTY support, real hard timeouts, process-tree termination, bounded retained output, and graceful shutdown. |
-| `open_workspace` protocol | Workspace opening was represented too much like a read-only operation. | Correct mutating/open lifecycle annotations, stable reuse semantics, better GPT-facing instructions, and durable session restoration. |
-| Identity isolation | Single-user OAuth without full ownership checks on every resource. | OAuth-client ownership for MCP sessions, workspaces, processes, refresh flows, and persisted database state. |
-| Project instruction discovery | Recursive descendant scan during open, bounded only by depth/entry/deadline caps. | Immediate root load plus canonical-path lazy discovery, versioned caches, symlink checks, and instruction acknowledgement tokens. |
-| ChatGPT latency | Mostly one target per file/search tool call. | Concurrent, ordered, bounded `batch_read` and `batch_inspect` tools for known independent targets. |
-| GPT tool guidance | Generic MCP descriptions could lead the model to probe a hosted sandbox or close workspaces automatically. | Explicit local-filesystem workflow, correct workspace reuse/close rules, field-name guidance, batch heuristics, and Code Interpreter boundary. |
-| Command safety | Shell exposed with limited workflow guidance. | Command classifier blocks high-risk patterns such as `rm -f`, `sudo`, and pipe-to-shell; canonical path confinement is applied to dedicated file operations. |
-| Local administration | JSON/environment configuration only. | Loopback-only React admin panel with one-time capability, CSRF/Origin/Host checks, atomic config writes, and no automatic backend restart. |
-| Observability | Basic logs. | Structured request/tool logs, request IDs, hashed client identifiers, safe command previews, readiness checks, duration/error fields, and controlled asset logging. |
-| Shutdown behavior | Process exit could leave work in ambiguous states. | HTTP draining, MCP sealing/closure, process termination grace periods, timeout escalation, and readiness transitions. |
-| Cross-platform process handling | Platform behavior was less explicit. | macOS/Linux/Windows-aware signaling and process-tree tests, plus native dependency/runtime diagnostics. |
-
-The implementation is intentionally direct: ChatGPT invokes inspectable MCP
-tools against approved local roots. It does not launch a second autonomous
-coding agent behind the user's back.
-
-## Security Model
-
-DevSpace is remote access to your machine. Treat an authorized ChatGPT app as a
-trusted coding collaborator.
-
-### Enforced boundaries
-
-- server binds to `127.0.0.1` by default;
-- narrow root allowlist with canonical/symlink checks for dedicated file tools;
-- Host and OAuth redirect allowlists;
-- Owner-password OAuth approval;
-- per-client ownership of workspaces, MCP sessions, and processes;
-- bounded sessions, command runtime, output, and retained resources;
-- local admin panel is not exposed through the MCP listener;
-- secrets and raw OAuth tokens are excluded from normal logs.
-
-### Important shell boundary
-
-`exec_command`/`bash` run with the DevSpace OS user's permissions. The file-tool
-allowlist is **not an OS sandbox for arbitrary shell commands**. If you require
-hard filesystem confinement, run DevSpace under a dedicated OS account or in a
-container/VM with only approved roots mounted.
-
-Recommended practices:
-
-1. Allow the narrowest possible roots.
-2. Keep `~/.devspace/auth.json` and tunnel credentials private.
-3. Do not expose the local admin port publicly.
-4. Use a dedicated hostname and TLS tunnel.
-5. Run under a dedicated OS account for higher-risk or multi-user deployments.
-6. Review ChatGPT write confirmations and the returned diffs.
-
-Read the complete [security model](./docs/security.md).
-
-## Configuration
-
-Common commands:
+保存配置不会偷偷重启后端。影响运行服务的配置需要在后端重启后生效。在
+macOS 上，只有明确授权的 `launchd` 服务才能由管理面板重启，例如：
 
 ```bash
+DEVSPACE_LAUNCHD_SERVICE_LABEL=com.waishnav.devspace node dist/cli.js admin
+```
+
+管理面板不会启动、接管或结束任意 `cloudflared` 进程。Tunnel 控制目前只显示
+状态，不执行启停操作。
+
+## 这个分支改进了什么？
+
+上游项目验证了“通过 MCP 访问本地 workspace”这条路线。本分支重点解决日常
+使用 ChatGPT 网页端时的持久性、安全性、速度和管理问题。
+
+以下对比基于上游提交
+[`80423b5`](https://github.com/Waishnav/devspace/commit/80423b5)。
+
+| 方面 | 这个分支的改进 |
+| --- | --- |
+| 持久 workspace | workspace 生命周期不再绑定短暂的 ChatGPT MCP 连接，并能跨服务重启恢复。再次打开相同 checkout 会复用记录，不会不断创建重复 workspace。 |
+| 更清楚的模型提示 | 工具说明会告诉 GPT 本地路径应交给 DevSpace、什么时候复用或关闭 workspace，以及什么时候使用批量工具。 |
+| 更快的项目检查 | `batch_read`、`batch_inspect`、懒加载项目指令和缓存减少了不必要的 MCP 往返及大目录扫描。 |
+| 完整生命周期 | workspace 操作租约、独占关闭、请求排空、进程终止和统一清理，避免资源仍在使用时被提前关闭。 |
+| 真正的资源限制 | 全局和单客户端配额覆盖 MCP 会话、workspace、进程、worktree、输出和命令时间。超时命令先接收 `SIGTERM`，宽限期后仍未退出则使用 `SIGKILL`。 |
+| 客户端身份隔离 | MCP 会话、workspace、进程和持久化状态都校验 OAuth 所有权，一个客户端不能复用另一个客户端的 ID。 |
+| 项目指令 | 根目录指令立即加载；嵌套 `AGENTS.md`/`CLAUDE.md` 按路径懒加载，模型确认新指令前不会执行写入。 |
+| 本地 Skill | 安全展示标准 Skill 目录；模型读取对应 `SKILL.md` 后，支持文件才会开放。 |
+| 更安全的命令流程 | 阻止高风险命令模式，限制输出大小，并支持轮询或中断后台/PTY 进程。 |
+| 管理面板 | localhost React 面板可管理目录和配额，通过 revision/ETag 防止覆盖并发配置，验证重启结果并提供脱敏诊断。 |
+| OAuth 加固 | 授权页面禁止 iframe 嵌套，自动清理过期记录，Owner 可一键撤销全部客户端和 Token，Token 以哈希形式存储。 |
+| 可观测性 | 结构化请求/工具日志、客户端哈希、进程代次、资源使用率、近期脱敏失败和可下载诊断报告。 |
+| 完整发布测试 | Node 24/26 CI、macOS/Linux/Windows 进程测试、真实浏览器测试、`npm pack`、安装后 CLI 启动和 SQLite 原生模块检查。 |
+
+## 安全边界
+
+DevSpace 允许远程模型在受控范围内访问你的电脑。请把已授权的 ChatGPT 应用
+当成一个拥有当前 DevSpace 系统用户权限的编码协作者。
+
+DevSpace 会强制执行：
+
+- 专用文件工具的目录允许列表；
+- 真实路径和符号链接检查；
+- OAuth 授权和单客户端资源所有权；
+- Host 与 OAuth 重定向地址允许列表；
+- MCP 会话、进程、输出和命令时间限制；
+- 只监听 localhost 的管理面板；
+- 明确的写操作标注和 ChatGPT 确认流程。
+
+> [!WARNING]
+> `exec_command` 和 `bash` 使用运行 DevSpace 的系统用户权限。文件工具的目录
+> 允许列表并不是任意 shell 命令的操作系统级沙箱。如果需要强隔离，请使用
+> 专用系统账号，或者把 DevSpace 放进只挂载授权目录的容器/虚拟机中运行。
+
+推荐做法：
+
+1. 只授权真正需要的最小目录。
+2. 保护好 `~/.devspace/auth.json` 和 Tunnel 凭据。
+3. 不要把本地管理面板暴露到公网 Tunnel。
+4. 使用 TLS 和固定域名。
+5. 检查 ChatGPT 的写操作确认和 Git Diff。
+6. 高风险或多用户环境使用专用系统账号。
+
+完整说明见[安全模型](./docs/security.md)。
+
+## 配置
+
+常用命令：
+
+```bash
+node dist/cli.js init
 node dist/cli.js doctor
 node dist/cli.js config get
 node dist/cli.js config set publicBaseUrl https://devspace.example.com
@@ -430,40 +431,53 @@ node dist/cli.js config set toolMode codex
 node dist/cli.js admin
 ```
 
-Common environment variables:
+常用环境变量：
 
-| Variable | Default | Purpose |
+| 变量 | 默认值 | 用途 |
 | --- | --- | --- |
-| `HOST` | `127.0.0.1` | Local bind address. |
-| `PORT` | `7676` | Local MCP/admin-independent server port. |
-| `DEVSPACE_ALLOWED_ROOTS` | — | Comma-separated approved workspace roots. |
-| `DEVSPACE_PUBLIC_BASE_URL` | — | Public HTTPS origin without `/mcp`. |
-| `DEVSPACE_TOOL_MODE` | `codex` | `codex`, `full`, or `minimal`. |
-| `DEVSPACE_WIDGETS` | `full` | `full`, `changes`, or `off`. |
-| `DEVSPACE_MAX_MCP_SESSIONS` | `64` | Maximum live MCP transports. |
-| `DEVSPACE_MAX_PROCESS_SESSIONS` | `32` | Maximum retained process sessions. |
-| `DEVSPACE_MAX_COMMAND_RUNTIME_SECONDS` | `3600` | Hard upper runtime for a command. |
+| `HOST` | `127.0.0.1` | 本地监听地址。 |
+| `PORT` | `7676` | 本地 MCP 服务端口。 |
+| `DEVSPACE_ALLOWED_ROOTS` | — | 逗号分隔的授权目录。 |
+| `DEVSPACE_PUBLIC_BASE_URL` | — | 不带 `/mcp` 的公网 HTTPS 地址。 |
+| `DEVSPACE_TOOL_MODE` | `codex` | `codex`、`full` 或 `minimal`。 |
+| `DEVSPACE_WIDGETS` | `full` | `full`、`changes` 或 `off`。 |
+| `DEVSPACE_MAX_MCP_SESSIONS` | `64` | MCP 会话全局上限。 |
+| `DEVSPACE_MAX_PROCESS_SESSIONS` | `32` | 保留进程会话的全局上限。 |
+| `DEVSPACE_MAX_COMMAND_RUNTIME_SECONDS` | `3600` | 命令硬超时时间。 |
 
-See the full [configuration reference](./docs/configuration.md).
+完整选项见[配置参考](./docs/configuration.md)。
 
-## Troubleshooting
+## 常见问题
 
 <details>
-<summary><strong>ChatGPT says the local tool is disabled</strong></summary>
+<summary><strong>ChatGPT 提示本地工具已被禁用</strong></summary>
 
-- Confirm the custom app is enabled in the current chat.
-- Verify `https://your-host/mcp` is the configured endpoint.
-- Run `curl https://your-host/readyz`.
-- Refresh/rescan the app tools after server changes.
-- Complete OAuth approval again if authorization expired.
+- 确认当前对话已经添加 DevSpace 应用。
+- 确认配置的 URL 以 `/mcp` 结尾。
+- 运行 `curl https://your-host/readyz`。
+- 修改工具后，在 ChatGPT Plugin 设置里刷新应用。
+- 如果客户端或 Token 已被撤销，重新完成 OAuth 授权。
 
 </details>
 
 <details>
-<summary><strong><code>better-sqlite3</code> cannot load</strong></summary>
+<summary><strong>公网地址返回 502</strong></summary>
 
-The install and service are using different Node ABIs. Rebuild with the same
-Node executable used to run DevSpace:
+先检查本地服务：
+
+```bash
+curl http://127.0.0.1:7676/readyz
+```
+
+如果本地正常，再检查 `cloudflared` 日志，并确认 ingress 指向
+`http://127.0.0.1:7676`。
+
+</details>
+
+<details>
+<summary><strong><code>better-sqlite3</code> 无法加载</strong></summary>
+
+安装依赖和运行服务使用的 Node.js ABI 可能不同：
 
 ```bash
 npm rebuild better-sqlite3
@@ -473,75 +487,46 @@ node dist/cli.js doctor
 </details>
 
 <details>
-<summary><strong>Public endpoint returns 502</strong></summary>
+<summary><strong>工具调用很慢</strong></summary>
 
-Check the local origin first:
-
-```bash
-curl http://127.0.0.1:7676/readyz
-```
-
-If local readiness fails, inspect DevSpace logs. If local readiness succeeds,
-inspect `cloudflared` logs and confirm the ingress points to
-`http://127.0.0.1:7676`.
+- 已知多个独立目标后，使用 `batch_read` 或 `batch_inspect`。
+- 分别测试本地和公网 `/readyz` 延迟。
+- 如果使用 VPN/TUN 代理，让 Cloudflare Tunnel 相关地址按需直连。
+- 长时间测试或构建属于命令执行时间，并不一定是 MCP 传输慢。
 
 </details>
 
-<details>
-<summary><strong>Tool calls are slow</strong></summary>
+更多内容见[故障排查](./docs/gotchas.md)。
 
-- Prefer `batch_read`/`batch_inspect` once multiple targets are known.
-- Keep `cloudflared` on its default `auto` transport unless measurements show
-  HTTP/2 is more stable than QUIC on your network.
-- Ensure VPN/TUN software routes `argotunnel.com` directly when appropriate.
-- Compare local `/readyz` latency with the public `/readyz` route.
-
-</details>
-
-More cases are documented in [Troubleshooting Gotchas](./docs/gotchas.md).
-
-## Development
+## 开发
 
 ```bash
 npm ci
 npm run dev
 npm run typecheck
 npm test
+npm run test:browser
 npm run build
 ```
 
-Before publishing a change:
+## 文档
 
-```bash
-npm run typecheck
-npm test
-npm run build
-git diff --check
-```
+- [安装指南](./docs/setup.md)
+- [ChatGPT 编码工作流](./docs/chatgpt-coding-workflow.md)
+- [配置参考](./docs/configuration.md)
+- [安全模型](./docs/security.md)
+- [故障排查](./docs/gotchas.md)
 
-## Documentation
+## 上游与署名
 
-- [Setup Guide](./docs/setup.md)
-- [ChatGPT Coding Workflow](./docs/chatgpt-coding-workflow.md)
-- [Configuration Reference](./docs/configuration.md)
-- [Security Model](./docs/security.md)
-- [Troubleshooting](./docs/gotchas.md)
+DevSpace 由 [Waishnav](https://github.com/Waishnav) 创建。本分支保留原项目的
+提交历史、资源和 MIT 许可证，并单独维护针对 ChatGPT 持久工作流、安全、速度
+和本地管理的增强功能。
 
-## Upstream and Attribution
+- 上游项目：[Waishnav/devspace](https://github.com/Waishnav/devspace)
+- 当前分支：[keepkeen/devspace](https://github.com/keepkeen/devspace)
+- 对比基线：[`80423b5`](https://github.com/Waishnav/devspace/commit/80423b5)
 
-DevSpace was created by [Waishnav](https://github.com/Waishnav). This fork keeps
-the original project history, assets, and MIT license while maintaining a
-separate browser-persistence, security-hardening, latency, and administration
-change set.
+## 许可证
 
-- Upstream: [Waishnav/devspace](https://github.com/Waishnav/devspace)
-- Enhanced fork: [keepkeen/devspace](https://github.com/keepkeen/devspace)
-- Baseline commit: [`80423b5`](https://github.com/Waishnav/devspace/commit/80423b5)
-
-If a change is broadly useful and compatible with upstream direction, consider
-proposing it upstream separately after review.
-
-## License
-
-[MIT](./LICENSE) © Waishnav and contributors. Fork modifications remain under
-the same license.
+[MIT](./LICENSE) © Waishnav and contributors。本分支改动使用相同许可证。

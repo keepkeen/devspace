@@ -83,8 +83,19 @@ The management panel runs as a separate `devspace admin` process bound to
 `127.0.0.1` on its own port. Never proxy that port through Cloudflare or another
 tunnel. Each launch uses a one-time URL-fragment capability, an HttpOnly local
 session cookie, strict Host/Origin checks, and CSRF protection. The panel does
-not expose OAuth owner tokens or tunnel credentials and does not restart the MCP
-service automatically.
+not expose OAuth owner tokens or tunnel credentials. Both the Admin UI and OAuth
+approval page deny iframe embedding with CSP `frame-ancestors 'none'` and
+`X-Frame-Options: DENY`.
+
+Runtime restart is available only for an explicitly enrolled user-level
+launchd service. It requires the authenticated local session, CSRF, a short-lived
+one-time confirmation token, and a fixed service label. DevSpace calls
+`/bin/launchctl` directly with fixed arguments; it does not invoke a shell,
+accept executable paths, or control root/system services. Restart completion is
+verified using the enrolled launchd process PID plus a fresh backend readiness
+generation before the UI reports success.
+Tunnel management remains status-only, and public diagnostics issue only a
+credential-free `/readyz` request without following redirects.
 
 ## Shell Access
 

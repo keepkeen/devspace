@@ -39,16 +39,37 @@ node dist/cli.js config set toolMode codex
 available port and opens its one-time capability URL. It is not mounted on the
 public MCP listener and is not reachable through the configured tunnel.
 
-The first version manages:
+The control panel provides:
 
+- a refreshable overview of the local MCP service and public `/readyz` route
 - allowed workspace roots
+- project-instruction fallback filenames
 - tool mode (`codex`, `full`, or `minimal`)
 - widget mode (`full`, `changes`, or `off`)
 - MCP, process, command-runtime, resident-workspace, and worktree limits
+- per-OAuth-client MCP, process, and active-workspace quotas
+- active resource counts, quota usage, recent sanitized failures, and a redacted diagnostic bundle
+- one-click revocation of every registered OAuth client and access/refresh token
+- inline validation, environment-override sources, discard/reset, and unsaved-change protection
 
-Configuration writes are atomic and preserve unrelated settings. Saving reports
-whether a DevSpace restart is required but never interrupts the running MCP
-server automatically.
+Configuration documents use `schemaVersion: 1`. Legacy documents are migrated
+with a versioned backup, and failed writes roll back. Admin reads return a
+revision/ETag and saves use compare-and-swap, so a CLI or second panel cannot
+silently overwrite newer changes. Saving reports whether a DevSpace restart is
+required. When the enrolled user launchd service
+is loaded, the panel also offers an explicitly confirmed **Save and restart**
+action. The operation uses a one-time confirmation token and fixed `launchctl`
+arguments. Success requires a new launchd PID, a changed `/readyz` generation,
+and restored readiness; a successful `kickstart` exit alone is insufficient.
+
+Set `DEVSPACE_LAUNCHD_SERVICE_LABEL` to explicitly enroll a user service, for
+example `com.waishnav.devspace`. When it is unset or empty, runtime control is
+disabled. Manual, system-owned, non-macOS, and unloaded services remain
+status-only.
+
+Tunnel checks are deliberately read-only. The panel probes the configured
+public `/readyz` URL without credentials, redirects, or tunnel secrets, but it
+does not start, stop, or adopt `cloudflared` processes.
 
 ## Core Environment Variables
 
@@ -62,6 +83,7 @@ server automatically.
 | `DEVSPACE_OAUTH_OWNER_TOKEN` | Owner password for OAuth approval. Must be at least 16 characters. |
 | `DEVSPACE_WORKTREE_ROOT` | Directory for managed Git worktrees. Defaults to `~/.devspace/worktrees`. |
 | `DEVSPACE_STATE_DIR` | Directory for SQLite state. Defaults to `~/.local/share/devspace`. |
+| `DEVSPACE_LAUNCHD_SERVICE_LABEL` | Explicitly enrolled user launchd service that the local panel may restart; unset/empty disables control. |
 
 ## OAuth
 
@@ -84,6 +106,9 @@ MCP clients discover metadata from:
 Workspace and MCP resources are owned by the OAuth `clientId`. Reauthorizing the
 same registered client preserves access; a separately registered client cannot
 reuse another client's MCP session, workspace, or process identifiers.
+Changing the Owner password and restarting DevSpace invalidates all previously
+registered clients and tokens. The local Admin panel can revoke them immediately
+without changing the password.
 
 ## Resource Lifecycle and Limits
 
@@ -93,13 +118,16 @@ reuse another client's MCP session, workspace, or process identifiers.
 | `DEVSPACE_MCP_SESSION_CLOSE_TIMEOUT_SECONDS` | `5` | Maximum wait for one transport to close. |
 | `DEVSPACE_RESOURCE_CLEANUP_INTERVAL_SECONDS` | `300` | Sweep interval for idle resources. |
 | `DEVSPACE_MAX_MCP_SESSIONS` | `64` | Maximum live MCP transports. |
+| `DEVSPACE_MAX_MCP_SESSIONS_PER_CLIENT` | `8` | Maximum MCP transports owned by one OAuth client. |
 | `DEVSPACE_MAX_PROCESS_SESSIONS` | `32` | Maximum retained process sessions. |
+| `DEVSPACE_MAX_PROCESS_SESSIONS_PER_CLIENT` | `16` | Maximum retained process sessions owned by one OAuth client. |
 | `DEVSPACE_MAX_PROCESS_SESSIONS_PER_WORKSPACE` | `8` | Per-workspace process limit. |
 | `DEVSPACE_MAX_COMMAND_RUNTIME_SECONDS` | `3600` | Hard upper runtime for every command. |
 | `DEVSPACE_PROCESS_SHUTDOWN_GRACE_SECONDS` | `5` | SIGTERM grace period before SIGKILL. |
 | `DEVSPACE_HTTP_DRAIN_TIMEOUT_SECONDS` | `30` | Drain deadline before remaining HTTP sockets are closed. |
-| `DEVSPACE_WORKSPACE_IDLE_TTL_SECONDS` | `604800` | Legacy compatibility setting; checkout workspaces are not closed automatically. |
+| `DEVSPACE_WORKSPACE_IDLE_TTL_SECONDS` | `604800` | Close inactive non-worktree workspace sessions during lifecycle cleanup. |
 | `DEVSPACE_MAX_RESIDENT_WORKSPACES` | `256` | Maximum workspaces retained in memory. |
+| `DEVSPACE_MAX_ACTIVE_WORKSPACES_PER_CLIENT` | `32` | Maximum active persisted workspaces owned by one OAuth client. |
 | `DEVSPACE_MAX_MANAGED_WORKTREES` | `64` | Maximum managed worktrees retained on disk. |
 
 Clients must not call `close_workspace` as routine turn or conversation cleanup.
@@ -123,9 +151,9 @@ Configure fallbacks in `~/.devspace/config.json`:
 ```
 
 Or set `DEVSPACE_PROJECT_DOC_FALLBACK_FILENAMES` to a comma-separated list.
-Fallback entries must be plain filenames without path separators. The local
-admin panel preserves this setting when saving other fields but does not edit
-it directly.
+Fallback entries must be plain filenames without path separators. They can also
+be added and removed from the local Admin panel unless the environment
+variable overrides the setting.
 
 Before a shell command runs, literal `cd` and `pushd` destinations are checked
 for nested instructions. Destinations must already exist, inherited `CDPATH`

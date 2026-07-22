@@ -6,9 +6,11 @@ import {
   OPEN_WORKSPACE_ANNOTATIONS,
   SHOW_CHANGES_ANNOTATIONS,
   combineBatchResultWithInstructions,
+  containsBatchedToolCall,
   commandInstructionScopePaths,
   isCompleteReadResult,
   readinessSnapshot,
+  workspaceOperationId,
   workspaceAppAssetPaths,
 } from "./server.js";
 
@@ -107,6 +109,32 @@ assert.deepEqual(notReady.body.checks, {
   workspaceDatabase: false,
   oauthDatabase: true,
 });
+
+const generated = readinessSnapshot({
+  closing: false,
+  workspaceDatabaseReady: true,
+  oauthDatabaseReady: true,
+  generation: "generation-test",
+});
+assert.equal(generated.body.generation, "generation-test");
+
+assert.equal(workspaceOperationId({
+  method: "tools/call",
+  params: { name: "read_file", arguments: { workspaceId: "ws_test" } },
+}), "ws_test");
+assert.equal(workspaceOperationId({
+  method: "tools/call",
+  params: { name: "close_workspace", arguments: { workspaceId: "ws_test" } },
+}), undefined);
+assert.equal(workspaceOperationId([{ method: "tools/call" }]), undefined);
+assert.equal(containsBatchedToolCall([
+  { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "close_workspace", arguments: { workspaceId: "ws_test" } } },
+  { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "exec_command", arguments: { workspaceId: "ws_test", command: "pwd" } } },
+]), true);
+assert.equal(containsBatchedToolCall([
+  { jsonrpc: "2.0", id: 1, method: "ping" },
+  { jsonrpc: "2.0", method: "notifications/initialized" },
+]), false);
 
 const publicAssets = workspaceAppAssetPaths();
 assert.equal(publicAssets.has("admin.html"), false);

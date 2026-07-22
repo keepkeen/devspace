@@ -1,13 +1,16 @@
 import assert from "node:assert/strict";
-import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   AdminConfigValidationError,
+  AdminConfigConflictError,
   adminConfigOverridePaths,
   adminConfigWarnings,
   loadAdminConfig,
+  loadAdminConfigSnapshot,
   saveAdminConfig,
+  saveAdminConfigIfMatch,
   validateAdminConfig,
 } from "./admin-config.js";
 
@@ -34,19 +37,25 @@ chmodSync(join(configDir, "config.json"), 0o644);
 
 const env = { DEVSPACE_CONFIG_DIR: configDir };
 const initial = loadAdminConfig(env);
+assert.equal(JSON.parse(readFileSync(join(configDir, "config.json"), "utf8")).schemaVersion, 1);
+assert.equal(existsSync(join(configDir, "config.json.backup-v0")), true);
+assert.equal(JSON.parse(readFileSync(join(configDir, "config.json.backup-v0"), "utf8")).schemaVersion, undefined);
 assert.equal(initial.toolMode, "minimal");
 assert.equal(initial.widgets, "changes");
+assert.deepEqual(initial.projectDocFallbackFilenames, []);
 assert.equal(initial.resources.maxMcpSessions, 12);
 
 const next = validateAdminConfig({
   ...initial,
   allowedRoots: [rootB, join(testDir, "root-a-link"), rootA],
+  projectDocFallbackFilenames: ["TEAM_GUIDE.md", "TEAM_GUIDE.md"],
   toolMode: "codex",
   widgets: "full",
   resources: {
     ...initial.resources,
     maxMcpSessions: 20,
     maxProcessSessions: 10,
+    maxProcessSessionsPerClient: 10,
     maxProcessSessionsPerWorkspace: 5,
   },
 });
@@ -55,12 +64,14 @@ assert.deepEqual(next.allowedRoots, [realpathSync(rootB), realpathSync(rootA)]);
 const saved = saveAdminConfig(next, env);
 assert.equal(saved.restartRequired, true);
 assert.deepEqual(saved.config.allowedRoots, [realpathSync(rootB), realpathSync(rootA)]);
+assert.deepEqual(saved.config.projectDocFallbackFilenames, ["TEAM_GUIDE.md"]);
 assert.equal(lstatSync(join(configDir, "config.json")).mode & 0o777, 0o600);
 const persisted = JSON.parse(readFileSync(join(configDir, "config.json"), "utf8"));
 assert.deepEqual(persisted.futureSetting, { preserve: true });
 assert.equal(persisted.publicBaseUrl, "https://example.test");
 assert.equal(persisted.resources.cleanupIntervalMs, 1234);
 assert.equal(persisted.resources.maxMcpSessions, 20);
+assert.deepEqual(persisted.projectDocFallbackFilenames, ["TEAM_GUIDE.md"]);
 assert.equal(saveAdminConfig(next, env).restartRequired, false);
 
 assert.equal(
@@ -81,8 +92,9 @@ assert.deepEqual(
     DEVSPACE_TOOL_MODE: "full",
     DEVSPACE_WIDGETS: "off",
     DEVSPACE_MAX_MCP_SESSIONS: "7",
+    DEVSPACE_PROJECT_DOC_FALLBACK_FILENAMES: "LOCAL_RULES.md",
   }),
-  ["toolMode", "widgets", "resources.maxMcpSessions"],
+  ["projectDocFallbackFilenames", "toolMode", "widgets", "resources.maxMcpSessions"],
 );
 
 const overriddenEnv = { ...env, DEVSPACE_TOOL_MODE: "full" };
@@ -98,6 +110,22 @@ const savedWithOverride = saveAdminConfig({
 assert.equal(savedWithOverride.config.toolMode, "full");
 assert.equal(JSON.parse(readFileSync(join(configDir, "config.json"), "utf8")).toolMode, "codex");
 
+const concurrentSnapshot = await loadAdminConfigSnapshot(env);
+const concurrentResults = await Promise.allSettled([
+  saveAdminConfigIfMatch({
+    ...concurrentSnapshot.config,
+    resources: { ...concurrentSnapshot.config.resources, maxMcpSessions: 21 },
+  }, concurrentSnapshot.revision, env),
+  saveAdminConfigIfMatch({
+    ...concurrentSnapshot.config,
+    resources: { ...concurrentSnapshot.config.resources, maxMcpSessions: 22 },
+  }, concurrentSnapshot.revision, env),
+]);
+assert.equal(concurrentResults.filter((result) => result.status === "fulfilled").length, 1);
+const rejectedConcurrent = concurrentResults.find((result) => result.status === "rejected");
+assert(rejectedConcurrent?.status === "rejected");
+assert(rejectedConcurrent.reason instanceof AdminConfigConflictError);
+
 const conflictConfigDir = join(testDir, "conflict-config");
 mkdirSync(conflictConfigDir);
 writeFileSync(join(conflictConfigDir, "auth.json"), JSON.stringify({
@@ -105,7 +133,7 @@ writeFileSync(join(conflictConfigDir, "auth.json"), JSON.stringify({
 }));
 writeFileSync(join(conflictConfigDir, "config.json"), JSON.stringify({
   allowedRoots: [rootA],
-  resources: { maxProcessSessions: 4, maxProcessSessionsPerWorkspace: 4 },
+  resources: { maxProcessSessions: 4, maxProcessSessionsPerClient: 4, maxProcessSessionsPerWorkspace: 4 },
 }));
 const conflictEnv = {
   DEVSPACE_CONFIG_DIR: conflictConfigDir,
@@ -145,6 +173,10 @@ assert.match(adminConfigWarnings(configWithMissingRoot)["allowedRoots.0"], /no l
 assertValidationError({ ...next, allowedRoots: [] }, "allowedRoots");
 assertValidationError({ ...next, allowedRoots: [join(testDir, "missing")] }, "allowedRoots.0");
 assertValidationError({ ...next, allowedRoots: ["/"] }, "allowedRoots.0");
+assertValidationError({
+  ...next,
+  projectDocFallbackFilenames: ["../AGENTS.md"],
+}, "projectDocFallbackFilenames.0");
 assertValidationError({
   ...next,
   resources: { ...next.resources, maxProcessSessions: 2, maxProcessSessionsPerWorkspace: 3 },

@@ -92,13 +92,16 @@ assert.deepEqual(loadConfig(baseEnv).resources, {
   mcpSessionCloseTimeoutMs: 5_000,
   cleanupIntervalMs: 300_000,
   maxMcpSessions: 64,
+  maxMcpSessionsPerClient: 8,
   maxProcessSessions: 32,
+  maxProcessSessionsPerClient: 16,
   maxProcessSessionsPerWorkspace: 8,
   maxCommandRuntimeMs: 3_600_000,
   processShutdownGraceMs: 5_000,
   httpDrainTimeoutMs: 30_000,
   workspaceIdleTtlMs: 604_800_000,
   maxResidentWorkspaces: 256,
+  maxActiveWorkspacesPerClient: 32,
   maxManagedWorktrees: 64,
 });
 assert.deepEqual(loadConfig(baseEnv).instructionScan, {
@@ -109,21 +112,27 @@ assert.deepEqual(loadConfig(baseEnv).instructionScan, {
 const limitedConfig = loadConfig({
   ...baseEnv,
   DEVSPACE_MAX_MCP_SESSIONS: "4",
+  DEVSPACE_MAX_MCP_SESSIONS_PER_CLIENT: "3",
   DEVSPACE_MAX_PROCESS_SESSIONS: "5",
+  DEVSPACE_MAX_PROCESS_SESSIONS_PER_CLIENT: "4",
   DEVSPACE_MAX_PROCESS_SESSIONS_PER_WORKSPACE: "2",
   DEVSPACE_MAX_COMMAND_RUNTIME_SECONDS: "30",
   DEVSPACE_WORKSPACE_IDLE_TTL_SECONDS: "60",
   DEVSPACE_MAX_MANAGED_WORKTREES: "3",
+  DEVSPACE_MAX_ACTIVE_WORKSPACES_PER_CLIENT: "2",
   DEVSPACE_INSTRUCTION_SCAN_MAX_DEPTH: "3",
   DEVSPACE_INSTRUCTION_SCAN_MAX_ENTRIES: "50",
   DEVSPACE_INSTRUCTION_SCAN_DEADLINE_MS: "25",
 });
 assert.equal(limitedConfig.resources.maxMcpSessions, 4);
+assert.equal(limitedConfig.resources.maxMcpSessionsPerClient, 3);
 assert.equal(limitedConfig.resources.maxProcessSessions, 5);
+assert.equal(limitedConfig.resources.maxProcessSessionsPerClient, 4);
 assert.equal(limitedConfig.resources.maxProcessSessionsPerWorkspace, 2);
 assert.equal(limitedConfig.resources.maxCommandRuntimeMs, 30_000);
 assert.equal(limitedConfig.resources.workspaceIdleTtlMs, 60_000);
 assert.equal(limitedConfig.resources.maxManagedWorktrees, 3);
+assert.equal(limitedConfig.resources.maxActiveWorkspacesPerClient, 2);
 assert.deepEqual(limitedConfig.instructionScan, { maxDepth: 3, maxEntries: 50, deadlineMs: 25 });
 
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_LOG_LEVEL: "silent" }).logging.level, "silent");
@@ -144,6 +153,23 @@ assert.equal(loadConfig({ ...baseEnv, DEVSPACE_LOG_ASSETS: "OFF" }).logging.asse
 assert.throws(
   () => loadConfig({ ...baseEnv, DEVSPACE_LOG_ASSETS: "treu" }),
   /Invalid DEVSPACE_LOG_ASSETS: treu \(expected boolean\)/,
+);
+assert.throws(
+  () => loadConfig({
+    ...baseEnv,
+    DEVSPACE_MAX_MCP_SESSIONS: "2",
+    DEVSPACE_MAX_MCP_SESSIONS_PER_CLIENT: "3",
+  }),
+  /DEVSPACE_MAX_MCP_SESSIONS_PER_CLIENT cannot exceed DEVSPACE_MAX_MCP_SESSIONS/,
+);
+assert.throws(
+  () => loadConfig({
+    ...baseEnv,
+    DEVSPACE_MAX_PROCESS_SESSIONS: "4",
+    DEVSPACE_MAX_PROCESS_SESSIONS_PER_CLIENT: "3",
+    DEVSPACE_MAX_PROCESS_SESSIONS_PER_WORKSPACE: "4",
+  }),
+  /DEVSPACE_MAX_PROCESS_SESSIONS_PER_WORKSPACE cannot exceed DEVSPACE_MAX_PROCESS_SESSIONS_PER_CLIENT/,
 );
 assert.throws(
   () => loadConfig({ ...baseEnv, DEVSPACE_SKILLS: "" }),
@@ -233,6 +259,10 @@ assert.equal(
 assert.deepEqual(
   loadConfig({ ...baseEnv, DEVSPACE_PUBLIC_BASE_URL: "https://abc.trycloudflare.com/" }).allowedHosts,
   ["localhost", "127.0.0.1", "::1", "abc.trycloudflare.com"],
+);
+assert.throws(
+  () => loadConfig({ ...baseEnv, DEVSPACE_PUBLIC_BASE_URL: "javascript:alert(1)" }),
+  /must use http or https/,
 );
 assert.deepEqual(
   loadConfig({ ...baseEnv, DEVSPACE_ALLOWED_HOSTS: "*" }).allowedHosts,

@@ -95,6 +95,33 @@ export interface OpenWorkspaceInput {
   baseRef?: string;
 }
 
+export interface WorkspaceCloseLease {
+  workspace: Workspace;
+  commit(options?: { delete?: boolean }): boolean;
+  abort(): void;
+}
+
+export interface WorkspaceUsageSnapshot {
+  activePersisted: number;
+  resident: number;
+  closing: number;
+  leased: number;
+  maxResident: number;
+}
+
+interface WorkspaceLifecycleState {
+  ownerClientId: string;
+  phase: "open" | "closing";
+  activeOperations: number;
+  drained?: Promise<void>;
+  resolveDrained?: () => void;
+}
+
+const MAX_INSTRUCTION_VERSIONS_PER_WORKSPACE = 1_024;
+const MAX_PENDING_INSTRUCTION_ACKNOWLEDGEMENTS = 32;
+const INSTRUCTION_ACKNOWLEDGEMENT_TTL_MS = 10 * 60_000;
+const CLOSED_WORKSPACE_HISTORY_RETENTION_MS = 30 * 24 * 60 * 60_000;
+
 type PathStats = Stats;
 type DirectoryOps = {
   stat: (path: string) => Promise<PathStats>;
@@ -105,6 +132,7 @@ export class WorkspaceRegistry {
   private readonly workspaces = new Map<string, Workspace>();
   private readonly checkoutWorkspaceIds = new Map<string, string>();
   private readonly pendingCheckoutWorkspaces = new Map<string, Promise<WorkspaceContext>>();
+  private readonly lifecycleStates = new Map<string, WorkspaceLifecycleState>();
   private readonly instructionDirectoryCache = new Map<string, {
     fingerprint: string;
     files: string[];
@@ -173,6 +201,7 @@ export class WorkspaceRegistry {
     };
     this.store?.touchSession(workspaceId, ownerClientId);
     this.workspaces.set(restoredWorkspace.id, restoredWorkspace);
+    this.ensureLifecycleState(restoredWorkspace);
     this.evictResidentWorkspaces();
 
     return restoredWorkspace;
@@ -287,7 +316,7 @@ export class WorkspaceRegistry {
     files: ApplicableAgentsFile[],
   ): Promise<void> {
     for (const file of files) {
-      workspace.deliveredInstructionVersions.set(file.path, file.fingerprint);
+      setBoundedMap(workspace.deliveredInstructionVersions, file.path, file.fingerprint, MAX_INSTRUCTION_VERSIONS_PER_WORKSPACE);
     }
   }
 
@@ -312,7 +341,7 @@ export class WorkspaceRegistry {
       createdAt: Date.now(),
       files: versionedFiles,
     });
-    while (workspace.pendingInstructionAcknowledgements.size > 32) {
+    while (workspace.pendingInstructionAcknowledgements.size > MAX_PENDING_INSTRUCTION_ACKNOWLEDGEMENTS) {
       const oldest = workspace.pendingInstructionAcknowledgements.keys().next().value;
       if (!oldest) break;
       workspace.pendingInstructionAcknowledgements.delete(oldest);
@@ -323,7 +352,7 @@ export class WorkspaceRegistry {
   async acknowledgeInstructions(workspace: Workspace, token: string): Promise<void> {
     const pending = workspace.pendingInstructionAcknowledgements.get(token);
     if (!pending) throw new Error("Unknown or expired instructionToken. Retry the tool without it to load current instructions.");
-    if (Date.now() - pending.createdAt > 10 * 60_000) {
+    if (Date.now() - pending.createdAt > INSTRUCTION_ACKNOWLEDGEMENT_TTL_MS) {
       workspace.pendingInstructionAcknowledgements.delete(token);
       throw new Error("Expired instructionToken. Retry the tool without it to load current instructions.");
     }
@@ -335,8 +364,8 @@ export class WorkspaceRegistry {
       }
     }
     for (const file of pending.files) {
-      workspace.deliveredInstructionVersions.set(file.path, file.fingerprint);
-      workspace.acknowledgedInstructionVersions.set(file.path, file.fingerprint);
+      setBoundedMap(workspace.deliveredInstructionVersions, file.path, file.fingerprint, MAX_INSTRUCTION_VERSIONS_PER_WORKSPACE);
+      setBoundedMap(workspace.acknowledgedInstructionVersions, file.path, file.fingerprint, MAX_INSTRUCTION_VERSIONS_PER_WORKSPACE);
     }
     workspace.pendingInstructionAcknowledgements.delete(token);
     workspace.instructionAcknowledgementGeneration += 1;
@@ -359,13 +388,128 @@ export class WorkspaceRegistry {
     return workspace.root;
   }
 
+  async withWorkspaceOperation<T>(
+    ownerClientId: string,
+    workspaceId: string,
+    callback: (workspace: Workspace) => T | Promise<T>,
+  ): Promise<T> {
+    const existingLifecycle = this.lifecycleStates.get(workspaceId);
+    if (existingLifecycle?.ownerClientId === ownerClientId && existingLifecycle.phase === "closing") {
+      throw new Error(`Workspace ${workspaceId} is closing and cannot accept new operations.`);
+    }
+    const workspace = this.getWorkspace(ownerClientId, workspaceId);
+    const lifecycle = this.ensureLifecycleState(workspace);
+    if (lifecycle.phase === "closing") {
+      throw new Error(`Workspace ${workspaceId} is closing and cannot accept new operations.`);
+    }
+    lifecycle.activeOperations += 1;
+    try {
+      return await callback(workspace);
+    } finally {
+      lifecycle.activeOperations -= 1;
+      if (lifecycle.activeOperations === 0) lifecycle.resolveDrained?.();
+      this.evictResidentWorkspaces();
+    }
+  }
+
+  async acquireExclusiveClose(ownerClientId: string, workspaceId: string): Promise<WorkspaceCloseLease> {
+    const existingLifecycle = this.lifecycleStates.get(workspaceId);
+    if (existingLifecycle?.ownerClientId === ownerClientId && existingLifecycle.phase === "closing") {
+      throw new Error(`Workspace ${workspaceId} is already closing.`);
+    }
+    const workspace = this.getWorkspace(ownerClientId, workspaceId);
+    const lifecycle = this.ensureLifecycleState(workspace);
+    lifecycle.phase = "closing";
+    if (lifecycle.activeOperations > 0) {
+      lifecycle.drained = new Promise<void>((resolve) => {
+        lifecycle.resolveDrained = resolve;
+      });
+      await lifecycle.drained;
+    }
+
+    let finished = false;
+    const abort = () => {
+      if (finished) return;
+      finished = true;
+      lifecycle.phase = "open";
+      lifecycle.drained = undefined;
+      lifecycle.resolveDrained = undefined;
+      this.evictResidentWorkspaces();
+    };
+    return {
+      workspace,
+      commit: (options = {}) => {
+        if (finished) return false;
+        const closed = this.store
+          ? options.delete
+            ? this.store.deleteSession(workspaceId, ownerClientId)
+            : this.store.closeSession(workspaceId, ownerClientId)
+          : this.workspaces.has(workspaceId);
+        if (!closed) {
+          abort();
+          return false;
+        }
+        finished = true;
+        this.workspaces.delete(workspaceId);
+        this.lifecycleStates.delete(workspaceId);
+        this.removeCheckoutWorkspaceId(workspaceId);
+        this.purgeInstructionCachesForUnusedRoot(workspace.root);
+        return true;
+      },
+      abort,
+    };
+  }
+
+  usageSnapshot(ownerClientId?: string): WorkspaceUsageSnapshot {
+    const resident = Array.from(this.workspaces.values())
+      .filter((workspace) => !ownerClientId || workspace.ownerClientId === ownerClientId)
+      .length;
+    const lifecycle = Array.from(this.lifecycleStates.values())
+      .filter((state) => !ownerClientId || state.ownerClientId === ownerClientId);
+    return {
+      activePersisted: this.store?.countActiveSessions?.(ownerClientId) ?? resident,
+      resident,
+      closing: lifecycle.filter((state) => state.phase === "closing").length,
+      leased: lifecycle.reduce((count, state) => count + state.activeOperations, 0),
+      maxResident: this.config.resources.maxResidentWorkspaces,
+    };
+  }
+
+  cleanupLifecycleState(now = Date.now()): {
+    expiredInstructionTokens: number;
+    deletedClosedWorkspaceSessions: number;
+  } {
+    let expiredInstructionTokens = 0;
+    for (const workspace of this.workspaces.values()) {
+      for (const [token, pending] of workspace.pendingInstructionAcknowledgements) {
+        if (now - pending.createdAt <= INSTRUCTION_ACKNOWLEDGEMENT_TTL_MS) continue;
+        workspace.pendingInstructionAcknowledgements.delete(token);
+        expiredInstructionTokens += 1;
+      }
+      trimMap(workspace.deliveredInstructionVersions, MAX_INSTRUCTION_VERSIONS_PER_WORKSPACE);
+      trimMap(workspace.acknowledgedInstructionVersions, MAX_INSTRUCTION_VERSIONS_PER_WORKSPACE);
+    }
+    this.trimInstructionCaches();
+    this.evictResidentWorkspaces();
+    const historyBefore = new Date(now - CLOSED_WORKSPACE_HISTORY_RETENTION_MS).toISOString();
+    const deletedClosedWorkspaceSessions = this.store?.deleteClosedSessions?.(
+      historyBefore,
+      this.config.resources.maxResidentWorkspaces,
+    ) ?? 0;
+    return { expiredInstructionTokens, deletedClosedWorkspaceSessions };
+  }
+
   closeWorkspace(ownerClientId: string, workspaceId: string): boolean {
     const workspace = this.workspaces.get(workspaceId);
     if (workspace && workspace.ownerClientId !== ownerClientId) return false;
+    const lifecycle = this.lifecycleStates.get(workspaceId);
+    if (lifecycle && (lifecycle.phase === "closing" || lifecycle.activeOperations > 0)) return false;
     const closed = this.store?.closeSession(workspaceId, ownerClientId) ?? Boolean(workspace);
     if (closed) {
       this.workspaces.delete(workspaceId);
+      this.lifecycleStates.delete(workspaceId);
       this.removeCheckoutWorkspaceId(workspaceId);
+      if (workspace) this.purgeInstructionCachesForUnusedRoot(workspace.root);
     }
     return closed;
   }
@@ -373,10 +517,14 @@ export class WorkspaceRegistry {
   deleteWorkspace(ownerClientId: string, workspaceId: string): boolean {
     const workspace = this.workspaces.get(workspaceId);
     if (workspace && workspace.ownerClientId !== ownerClientId) return false;
+    const lifecycle = this.lifecycleStates.get(workspaceId);
+    if (lifecycle && (lifecycle.phase === "closing" || lifecycle.activeOperations > 0)) return false;
     const deleted = this.store?.deleteSession(workspaceId, ownerClientId) ?? Boolean(workspace);
     if (deleted) {
       this.workspaces.delete(workspaceId);
+      this.lifecycleStates.delete(workspaceId);
       this.removeCheckoutWorkspaceId(workspaceId);
+      if (workspace) this.purgeInstructionCachesForUnusedRoot(workspace.root);
     }
     return deleted;
   }
@@ -391,9 +539,13 @@ export class WorkspaceRegistry {
     for (const session of this.store.listExpiredSessions(before, this.config.resources.maxResidentWorkspaces)) {
       if (session.managed) continue;
       if (hasActiveProcess(session.ownerClientId, session.id)) continue;
+      const lifecycle = this.lifecycleStates.get(session.id);
+      if (lifecycle && (lifecycle.phase === "closing" || lifecycle.activeOperations > 0)) continue;
       if (!this.store.closeSession(session.id, session.ownerClientId)) continue;
       this.workspaces.delete(session.id);
+      this.lifecycleStates.delete(session.id);
       this.removeCheckoutWorkspaceId(session.id);
+      this.purgeInstructionCachesForUnusedRoot(session.root);
       closed.push(session.id);
     }
     return closed;
@@ -497,6 +649,9 @@ export class WorkspaceRegistry {
     const residentCheckoutId = indexedCheckoutId && this.workspaces.has(indexedCheckoutId)
       ? indexedCheckoutId
       : undefined;
+    if (residentCheckoutId && this.lifecycleStates.get(residentCheckoutId)?.phase === "closing") {
+      throw new Error(`Workspace ${residentCheckoutId} is closing and cannot be reopened yet.`);
+    }
     const workspace: Workspace = {
       id: residentCheckoutId ?? `ws_${randomUUID()}`,
       ownerClientId: input.ownerClientId,
@@ -525,7 +680,11 @@ export class WorkspaceRegistry {
         ownerClientId: workspace.ownerClientId,
         root: workspace.root,
         canonicalRoot: input.canonicalRoot,
+        maxActiveSessionsPerClient: this.config.resources.maxActiveWorkspacesPerClient,
       });
+      if (this.lifecycleStates.get(session.id)?.phase === "closing") {
+        throw new Error(`Workspace ${session.id} is closing and cannot be reopened yet.`);
+      }
       reused = session.id !== workspace.id;
       workspace.id = session.id;
       workspace.root = session.root;
@@ -541,10 +700,12 @@ export class WorkspaceRegistry {
         baseRef: workspace.worktree?.baseRef,
         baseSha: workspace.worktree?.baseSha,
         managed: workspace.worktree?.managed,
+        maxActiveSessionsPerClient: this.config.resources.maxActiveWorkspacesPerClient,
       });
     }
     if (checkoutKey) this.checkoutWorkspaceIds.set(checkoutKey, workspace.id);
     this.workspaces.set(workspace.id, workspace);
+    this.ensureLifecycleState(workspace);
     this.evictResidentWorkspaces();
 
     return { workspace, agentsFiles, availableAgentsFiles, instructionScan, reused };
@@ -614,8 +775,8 @@ export class WorkspaceRegistry {
         if (!isPathInsideRoot(resolvedPath, canonicalRoot)) continue;
         const metadata = await stat(resolvedPath);
         const fingerprint = statsFingerprint(metadata);
-        workspace.deliveredInstructionVersions.set(resolvedPath, fingerprint);
-        workspace.acknowledgedInstructionVersions.set(resolvedPath, fingerprint);
+        setBoundedMap(workspace.deliveredInstructionVersions, resolvedPath, fingerprint, MAX_INSTRUCTION_VERSIONS_PER_WORKSPACE);
+        setBoundedMap(workspace.acknowledgedInstructionVersions, resolvedPath, fingerprint, MAX_INSTRUCTION_VERSIONS_PER_WORKSPACE);
       } catch {
         // The initial loader already returned safe fallback content. A later
         // path-based check will retry if this file becomes readable.
@@ -630,7 +791,10 @@ export class WorkspaceRegistry {
     const directoryStats = await stat(resolvedDirectory);
     const fingerprint = statsFingerprint(directoryStats);
     const cached = this.instructionDirectoryCache.get(resolvedDirectory);
-    if (cached?.fingerprint === fingerprint) return cached.files;
+    if (cached?.fingerprint === fingerprint) {
+      refreshMapEntry(this.instructionDirectoryCache, resolvedDirectory, cached);
+      return cached.files;
+    }
 
     const discoveredFiles: string[] = [];
     for (const name of projectInstructionFilenames(this.config.projectDocFallbackFilenames)) {
@@ -648,6 +812,7 @@ export class WorkspaceRegistry {
     }
     const files = discoveredFiles;
     this.instructionDirectoryCache.set(resolvedDirectory, { fingerprint, files });
+    this.trimInstructionCaches();
     return files;
   }
 
@@ -658,9 +823,13 @@ export class WorkspaceRegistry {
     const metadata = await stat(path);
     const fingerprint = statsFingerprint(metadata);
     const cached = this.instructionFileCache.get(path);
-    if (cached?.fingerprint === fingerprint) return cached;
+    if (cached?.fingerprint === fingerprint) {
+      refreshMapEntry(this.instructionFileCache, path, cached);
+      return cached;
+    }
     const entry = { fingerprint, content: await readFile(path, "utf8") };
     this.instructionFileCache.set(path, entry);
+    this.trimInstructionCaches();
     return entry;
   }
 
@@ -668,16 +837,47 @@ export class WorkspaceRegistry {
     while (this.workspaces.size > this.config.resources.maxResidentWorkspaces) {
       let oldest: Workspace | undefined;
       for (const workspace of this.workspaces.values()) {
+        const lifecycle = this.lifecycleStates.get(workspace.id);
+        if (lifecycle && (lifecycle.phase === "closing" || lifecycle.activeOperations > 0)) continue;
         if (!oldest || workspace.lastUsedAt < oldest.lastUsedAt) oldest = workspace;
       }
       if (!oldest) return;
       this.workspaces.delete(oldest.id);
+      this.lifecycleStates.delete(oldest.id);
     }
   }
 
   private removeCheckoutWorkspaceId(workspaceId: string): void {
     for (const [key, indexedWorkspaceId] of this.checkoutWorkspaceIds) {
       if (indexedWorkspaceId === workspaceId) this.checkoutWorkspaceIds.delete(key);
+    }
+  }
+
+  private ensureLifecycleState(workspace: Workspace): WorkspaceLifecycleState {
+    const existing = this.lifecycleStates.get(workspace.id);
+    if (existing) return existing;
+    const state: WorkspaceLifecycleState = {
+      ownerClientId: workspace.ownerClientId,
+      phase: "open",
+      activeOperations: 0,
+    };
+    this.lifecycleStates.set(workspace.id, state);
+    return state;
+  }
+
+  private trimInstructionCaches(): void {
+    const residentLimit = Math.max(64, this.config.resources.maxResidentWorkspaces * 8);
+    trimMap(this.instructionDirectoryCache, residentLimit);
+    trimMap(this.instructionFileCache, residentLimit);
+  }
+
+  private purgeInstructionCachesForUnusedRoot(root: string): void {
+    if (Array.from(this.workspaces.values()).some((workspace) => workspace.root === root)) return;
+    for (const path of this.instructionDirectoryCache.keys()) {
+      if (isPathInsideRoot(path, root)) this.instructionDirectoryCache.delete(path);
+    }
+    for (const path of this.instructionFileCache.keys()) {
+      if (isPathInsideRoot(path, root)) this.instructionFileCache.delete(path);
     }
   }
 }
@@ -780,6 +980,25 @@ function ancestorDirectories(root: string, target: string): string[] {
 
 function statsFingerprint(metadata: Stats): string {
   return `${metadata.dev}:${metadata.ino}:${metadata.size}:${metadata.mtimeMs}:${metadata.ctimeMs}`;
+}
+
+function setBoundedMap<K, V>(map: Map<K, V>, key: K, value: V, limit: number): void {
+  map.delete(key);
+  map.set(key, value);
+  trimMap(map, limit);
+}
+
+function refreshMapEntry<K, V>(map: Map<K, V>, key: K, value: V): void {
+  map.delete(key);
+  map.set(key, value);
+}
+
+function trimMap<K, V>(map: Map<K, V>, limit: number): void {
+  while (map.size > limit) {
+    const oldest = map.keys().next().value as K | undefined;
+    if (oldest === undefined) return;
+    map.delete(oldest);
+  }
 }
 
 function isMissingPathError(error: unknown): boolean {

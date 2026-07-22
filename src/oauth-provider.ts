@@ -10,7 +10,13 @@ import type {
   OAuthTokens,
 } from "@modelcontextprotocol/sdk/shared/auth.js";
 import { checkResourceAllowed, resourceUrlFromServerUrl } from "@modelcontextprotocol/sdk/shared/auth-utils.js";
-import { SqliteOAuthClientsStore, SqliteOAuthStore } from "./oauth-store.js";
+import {
+  SqliteOAuthClientsStore,
+  SqliteOAuthStore,
+  type OAuthDiagnosticSnapshot,
+  type OAuthCleanupCounts,
+  type OAuthRevocationCounts,
+} from "./oauth-store.js";
 
 export interface OAuthConfig {
   ownerToken: string;
@@ -111,6 +117,21 @@ function requestedScopesAllowed(requested: string[], supported: string[]): boole
   return requested.every((scope) => supported.includes(scope));
 }
 
+function setAuthorizationResponseHeaders(res: Response): void {
+  res.setHeader("Cache-Control", "no-store");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader(
+    "Content-Security-Policy",
+    "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+  );
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
+  res.setHeader("Cross-Origin-Resource-Policy", "same-origin");
+  res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+}
+
 export class SingleUserOAuthProvider implements OAuthServerProvider {
   readonly clientsStore: OAuthRegisteredClientsStore;
   private readonly codes = new Map<string, AuthorizationCodeRecord>();
@@ -124,6 +145,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
   ) {
     this.resourceServerUrl = resourceUrlFromServerUrl(resourceServerUrl);
     this.oauthStore = new SqliteOAuthStore(stateDir);
+    this.oauthStore.reconcileOwnerCredential(config.ownerToken);
     this.clientsStore = new SqliteOAuthClientsStore(this.oauthStore, config.allowedRedirectHosts);
   }
 
@@ -132,6 +154,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     params: AuthorizationParams,
     res: Response,
   ): Promise<void> {
+    setAuthorizationResponseHeaders(res);
     if (!params.resource || !checkResourceAllowed({ requestedResource: params.resource, configuredResource: this.resourceServerUrl })) {
       throw new InvalidRequestError("Invalid or missing OAuth resource");
     }
@@ -254,6 +277,28 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     const hashed = hashToken(request.token);
     this.oauthStore.deleteAccessToken(hashed);
     this.oauthStore.deleteRefreshToken(hashed);
+  }
+
+  revokeAll(): OAuthRevocationCounts {
+    this.codes.clear();
+    return this.oauthStore.revokeAll();
+  }
+
+  diagnosticSnapshot(): OAuthDiagnosticSnapshot {
+    return this.oauthStore.diagnosticSnapshot();
+  }
+
+  cleanupExpired(nowSeconds = Math.floor(Date.now() / 1_000)): OAuthCleanupCounts & {
+    authorizationCodes: number;
+  } {
+    let authorizationCodes = 0;
+    const nowMs = nowSeconds * 1_000;
+    for (const [code, record] of this.codes) {
+      if (record.expiresAtMs >= nowMs) continue;
+      this.codes.delete(code);
+      authorizationCodes += 1;
+    }
+    return { ...this.oauthStore.cleanupExpired(nowSeconds), authorizationCodes };
   }
 
   close(): void {

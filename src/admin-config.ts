@@ -1,3 +1,5 @@
+import { createHash, randomBytes } from "node:crypto";
+import { open, readFile, stat, unlink } from "node:fs/promises";
 import { realpathSync, statSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { z } from "zod";
@@ -8,19 +10,32 @@ import {
   MIN_COMMAND_RUNTIME_MS,
   RESOURCE_LIMIT_MAXIMUMS,
 } from "./resource-limits.js";
-import { loadDevspaceFiles, writeDevspaceConfig } from "./user-config.js";
+import {
+  isValidProjectDocFallbackFilename,
+  MAX_PROJECT_DOC_FALLBACK_FILENAMES,
+  MAX_PROJECT_DOC_FALLBACK_FILENAME_LENGTH,
+  normalizeProjectDocFallbackFilenames,
+} from "./project-instructions.js";
+import { devspaceConfigPath, loadDevspaceFiles, withDevspaceConfigLockSync, writeDevspaceConfig } from "./user-config.js";
+
+const CONFIG_LOCK_WAIT_MS = 5_000;
+const CONFIG_LOCK_STALE_MS = 30_000;
 
 export interface AdminResourceLimits {
   maxMcpSessions: number;
+  maxMcpSessionsPerClient: number;
   maxProcessSessions: number;
+  maxProcessSessionsPerClient: number;
   maxProcessSessionsPerWorkspace: number;
   maxCommandRuntimeMs: number;
   maxResidentWorkspaces: number;
+  maxActiveWorkspacesPerClient: number;
   maxManagedWorktrees: number;
 }
 
 export interface AdminConfig {
   allowedRoots: string[];
+  projectDocFallbackFilenames: string[];
   toolMode: ToolMode;
   widgets: WidgetMode;
   resources: AdminResourceLimits;
@@ -38,16 +53,45 @@ export class AdminConfigValidationError extends Error {
   }
 }
 
+export class AdminConfigConflictError extends Error {
+  constructor(readonly currentRevision: string) {
+    super("The configuration changed after it was loaded.");
+    this.name = "AdminConfigConflictError";
+  }
+}
+
+export class AdminConfigLockError extends Error {
+  constructor() {
+    super("The configuration is currently being changed by another process.");
+    this.name = "AdminConfigLockError";
+  }
+}
+
+export interface AdminConfigSnapshot {
+  config: AdminConfig;
+  revision: string;
+}
+
 const adminConfigSchema = z.object({
   allowedRoots: z.array(z.string().trim().min(1)).min(1).max(128),
+  projectDocFallbackFilenames: z.array(
+    z.string()
+      .trim()
+      .min(1)
+      .max(MAX_PROJECT_DOC_FALLBACK_FILENAME_LENGTH)
+      .refine(isValidProjectDocFallbackFilename, "Must be a filename without path separators."),
+  ).max(MAX_PROJECT_DOC_FALLBACK_FILENAMES),
   toolMode: z.enum(["minimal", "full", "codex"]),
   widgets: z.enum(["off", "changes", "full"]),
   resources: z.object({
     maxMcpSessions: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxMcpSessions),
+    maxMcpSessionsPerClient: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxMcpSessionsPerClient),
     maxProcessSessions: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxProcessSessions),
+    maxProcessSessionsPerClient: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxProcessSessionsPerClient),
     maxProcessSessionsPerWorkspace: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxProcessSessionsPerWorkspace),
     maxCommandRuntimeMs: z.number().int().min(MIN_COMMAND_RUNTIME_MS).max(MAX_TIMER_MS),
     maxResidentWorkspaces: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxResidentWorkspaces),
+    maxActiveWorkspacesPerClient: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxActiveWorkspacesPerClient),
     maxManagedWorktrees: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxManagedWorktrees),
   }).strict(),
 }).strict();
@@ -56,9 +100,36 @@ export function loadAdminConfig(env: NodeJS.ProcessEnv = process.env): AdminConf
   const config = loadConfigForAdmin(env);
   return parseAdminConfigShape({
     allowedRoots: config.allowedRoots,
+    projectDocFallbackFilenames: config.projectDocFallbackFilenames,
     toolMode: config.toolMode,
     widgets: config.widgets,
     resources: pickAdminResourceLimits(config.resources),
+  });
+}
+
+export async function loadAdminConfigSnapshot(
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<AdminConfigSnapshot> {
+  const config = loadAdminConfig(env);
+  return { config, revision: await adminConfigRevision(env) };
+}
+
+export async function saveAdminConfigIfMatch(
+  input: unknown,
+  expectedRevision: string,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<{
+  config: AdminConfig;
+  restartRequired: boolean;
+  revision: string;
+}> {
+  return withConfigLock(env, async () => {
+    const currentRevision = await adminConfigRevision(env);
+    if (currentRevision !== expectedRevision) {
+      throw new AdminConfigConflictError(currentRevision);
+    }
+    const saved = saveAdminConfig(input, env, { lockHeld: true });
+    return { ...saved, revision: await adminConfigRevision(env) };
   });
 }
 
@@ -99,9 +170,27 @@ export function validateAdminConfig(input: unknown): AdminConfig {
     fields["resources.maxProcessSessionsPerWorkspace"] =
       "Per-workspace process sessions cannot exceed global process sessions.";
   }
+  if (parsed.resources.maxMcpSessionsPerClient > parsed.resources.maxMcpSessions) {
+    fields["resources.maxMcpSessionsPerClient"] =
+      "Per-client MCP sessions cannot exceed global MCP sessions.";
+  }
+  if (parsed.resources.maxProcessSessionsPerClient > parsed.resources.maxProcessSessions) {
+    fields["resources.maxProcessSessionsPerClient"] =
+      "Per-client process sessions cannot exceed global process sessions.";
+  }
+  if (parsed.resources.maxProcessSessionsPerWorkspace > parsed.resources.maxProcessSessionsPerClient) {
+    fields["resources.maxProcessSessionsPerWorkspace"] =
+      "Per-workspace process sessions cannot exceed per-client process sessions.";
+  }
   if (Object.keys(fields).length > 0) throw new AdminConfigValidationError(fields);
 
-  return { ...parsed, allowedRoots };
+  return {
+    ...parsed,
+    allowedRoots,
+    projectDocFallbackFilenames: normalizeProjectDocFallbackFilenames(
+      parsed.projectDocFallbackFilenames,
+    ),
+  };
 }
 
 export function adminConfigWarnings(config: AdminConfig): AdminConfigWarnings {
@@ -122,12 +211,27 @@ export function adminConfigWarnings(config: AdminConfig): AdminConfigWarnings {
     warnings["resources.maxProcessSessionsPerWorkspace"] =
       "Per-workspace process sessions exceed the global process-session limit.";
   }
+  if (config.resources.maxMcpSessionsPerClient > config.resources.maxMcpSessions) {
+    warnings["resources.maxMcpSessionsPerClient"] =
+      "Per-client MCP sessions exceed the global MCP-session limit.";
+  }
+  if (config.resources.maxProcessSessionsPerClient > config.resources.maxProcessSessions) {
+    warnings["resources.maxProcessSessionsPerClient"] =
+      "Per-client process sessions exceed the global process-session limit.";
+  }
+  if (config.resources.maxProcessSessionsPerWorkspace > config.resources.maxProcessSessionsPerClient) {
+    warnings["resources.maxProcessSessionsPerWorkspace"] =
+      "Per-workspace process sessions exceed the per-client process-session limit.";
+  }
   return warnings;
 }
 
 export function adminConfigOverridePaths(env: NodeJS.ProcessEnv = process.env): string[] {
   const paths: string[] = [];
   if (env.DEVSPACE_ALLOWED_ROOTS !== undefined) paths.push("allowedRoots");
+  if (env.DEVSPACE_PROJECT_DOC_FALLBACK_FILENAMES !== undefined) {
+    paths.push("projectDocFallbackFilenames");
+  }
   if (env.DEVSPACE_TOOL_MODE !== undefined || env.DEVSPACE_MINIMAL_TOOLS !== undefined) {
     paths.push("toolMode");
   }
@@ -135,10 +239,13 @@ export function adminConfigOverridePaths(env: NodeJS.ProcessEnv = process.env): 
 
   const resourceOverrides: Array<[keyof AdminResourceLimits, string]> = [
     ["maxMcpSessions", "DEVSPACE_MAX_MCP_SESSIONS"],
+    ["maxMcpSessionsPerClient", "DEVSPACE_MAX_MCP_SESSIONS_PER_CLIENT"],
     ["maxProcessSessions", "DEVSPACE_MAX_PROCESS_SESSIONS"],
+    ["maxProcessSessionsPerClient", "DEVSPACE_MAX_PROCESS_SESSIONS_PER_CLIENT"],
     ["maxProcessSessionsPerWorkspace", "DEVSPACE_MAX_PROCESS_SESSIONS_PER_WORKSPACE"],
     ["maxCommandRuntimeMs", "DEVSPACE_MAX_COMMAND_RUNTIME_SECONDS"],
     ["maxResidentWorkspaces", "DEVSPACE_MAX_RESIDENT_WORKSPACES"],
+    ["maxActiveWorkspacesPerClient", "DEVSPACE_MAX_ACTIVE_WORKSPACES_PER_CLIENT"],
     ["maxManagedWorktrees", "DEVSPACE_MAX_MANAGED_WORKTREES"],
   ];
   for (const [field, variable] of resourceOverrides) {
@@ -150,7 +257,11 @@ export function adminConfigOverridePaths(env: NodeJS.ProcessEnv = process.env): 
 export function saveAdminConfig(
   input: unknown,
   env: NodeJS.ProcessEnv = process.env,
+  options: { lockHeld?: boolean } = {},
 ): { config: AdminConfig; restartRequired: boolean } {
+  if (!options.lockHeld) {
+    return withDevspaceConfigLockSync(env, () => saveAdminConfig(input, env, { lockHeld: true }));
+  }
   const config = validateAdminConfig(input);
   const previous = loadAdminConfig(env);
   const overridePaths = adminConfigOverridePaths(env);
@@ -171,19 +282,44 @@ export function saveAdminConfig(
   }
   const nextConfig = { ...files.config, resources };
   if (!overridePaths.includes("allowedRoots")) nextConfig.allowedRoots = config.allowedRoots;
+  if (!overridePaths.includes("projectDocFallbackFilenames")) {
+    nextConfig.projectDocFallbackFilenames = config.projectDocFallbackFilenames;
+  }
   if (!overridePaths.includes("toolMode")) nextConfig.toolMode = config.toolMode;
   if (!overridePaths.includes("widgets")) nextConfig.widgets = config.widgets;
+  const persistedMaxMcpSessions = resources.maxMcpSessions ?? 64;
+  const persistedPerClientMcp = resources.maxMcpSessionsPerClient ?? 8;
   const persistedMaxProcessSessions = resources.maxProcessSessions ?? 32;
+  const persistedPerClientProcess = resources.maxProcessSessionsPerClient ?? 16;
   const persistedPerWorkspace = resources.maxProcessSessionsPerWorkspace ?? 8;
+  if (persistedPerClientMcp > persistedMaxMcpSessions) {
+    throw new AdminConfigValidationError({
+      "resources.maxMcpSessionsPerClient":
+        "The saved per-client limit cannot exceed the saved global MCP-session limit after environment overrides are removed.",
+    });
+  }
+  if (persistedPerClientProcess > persistedMaxProcessSessions) {
+    throw new AdminConfigValidationError({
+      "resources.maxProcessSessionsPerClient":
+        "The saved per-client limit cannot exceed the saved global process-session limit after environment overrides are removed.",
+    });
+  }
   if (persistedPerWorkspace > persistedMaxProcessSessions) {
     throw new AdminConfigValidationError({
       "resources.maxProcessSessionsPerWorkspace":
         "The saved per-workspace limit cannot exceed the saved global process-session limit after environment overrides are removed.",
     });
   }
+  if (persistedPerWorkspace > persistedPerClientProcess) {
+    throw new AdminConfigValidationError({
+      "resources.maxProcessSessionsPerWorkspace":
+        "The saved per-workspace limit cannot exceed the saved per-client process-session limit after environment overrides are removed.",
+    });
+  }
   writeDevspaceConfig(
     nextConfig,
     env,
+    { lockHeld: true },
   );
 
   const saved = loadAdminConfig(env);
@@ -207,7 +343,12 @@ function parseAdminConfigShape(input: unknown): AdminConfig {
 }
 
 function valueAtPath(config: AdminConfig, path: string): unknown {
-  if (path === "allowedRoots" || path === "toolMode" || path === "widgets") return config[path];
+  if (
+    path === "allowedRoots" ||
+    path === "projectDocFallbackFilenames" ||
+    path === "toolMode" ||
+    path === "widgets"
+  ) return config[path];
   const resourceKey = path.slice("resources.".length) as keyof AdminResourceLimits;
   return config.resources[resourceKey];
 }
@@ -219,10 +360,66 @@ function configValuesEqual(left: unknown, right: unknown): boolean {
 function pickAdminResourceLimits(resources: AdminResourceLimits): AdminResourceLimits {
   return {
     maxMcpSessions: resources.maxMcpSessions,
+    maxMcpSessionsPerClient: resources.maxMcpSessionsPerClient,
     maxProcessSessions: resources.maxProcessSessions,
+    maxProcessSessionsPerClient: resources.maxProcessSessionsPerClient,
     maxProcessSessionsPerWorkspace: resources.maxProcessSessionsPerWorkspace,
     maxCommandRuntimeMs: resources.maxCommandRuntimeMs,
     maxResidentWorkspaces: resources.maxResidentWorkspaces,
+    maxActiveWorkspacesPerClient: resources.maxActiveWorkspacesPerClient,
     maxManagedWorktrees: resources.maxManagedWorktrees,
   };
+}
+
+async function adminConfigRevision(env: NodeJS.ProcessEnv): Promise<string> {
+  let contents: Buffer;
+  try {
+    contents = await readFile(devspaceConfigPath(env));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    contents = Buffer.alloc(0);
+  }
+  return createHash("sha256").update(contents).digest("base64url");
+}
+
+async function withConfigLock<T>(
+  env: NodeJS.ProcessEnv,
+  action: () => Promise<T>,
+): Promise<T> {
+  const lockPath = `${devspaceConfigPath(env)}.lock`;
+  const token = `${process.pid}:${randomBytes(16).toString("hex")}`;
+  const deadline = Date.now() + CONFIG_LOCK_WAIT_MS;
+
+  while (true) {
+    try {
+      const handle = await open(lockPath, "wx", 0o600);
+      try {
+        await handle.writeFile(token, "utf8");
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      try {
+        const lockStat = await stat(lockPath);
+        if (Date.now() - lockStat.mtimeMs > CONFIG_LOCK_STALE_MS) await unlink(lockPath);
+      } catch (staleError) {
+        if ((staleError as NodeJS.ErrnoException).code !== "ENOENT") throw staleError;
+      }
+      if (Date.now() >= deadline) throw new AdminConfigLockError();
+      await new Promise((resolveWait) => setTimeout(resolveWait, 25));
+    }
+  }
+
+  try {
+    return await action();
+  } finally {
+    try {
+      if ((await readFile(lockPath, "utf8")) === token) await unlink(lockPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
 }

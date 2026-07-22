@@ -12,7 +12,7 @@ import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { checkResourceAllowed, resourceUrlFromServerUrl } from "@modelcontextprotocol/sdk/shared/auth-utils.js";
 import {
   registerAppResource,
-  registerAppTool,
+  registerAppTool as registerSdkAppTool,
   RESOURCE_MIME_TYPE,
 } from "@modelcontextprotocol/ext-apps/server";
 import express from "express";
@@ -71,7 +71,13 @@ import { formatPathForPrompt } from "./skills.js";
 import { createWorkspaceStore } from "./workspace-store.js";
 import { formatAgentsPath, WorkspaceRegistry, type Workspace } from "./workspaces.js";
 import { removeManagedWorktree } from "./git-worktrees.js";
+import { RuntimeDiagnostics } from "./runtime-diagnostics.js";
+import { ActiveRequestBarrier } from "./request-barrier.js";
+import { createRuntimeControlPlane } from "./runtime-control-plane.js";
+import { DEVSPACE_SERVER_INFO } from "./version.js";
 import { summarizeLocalAgentProfile } from "./local-agent-profiles.js";
+import { createLocalAgentStore } from "./local-agent-store.js";
+import { cleanupDetachedAgentPromptArtifacts } from "./detached-agent-cleanup.js";
 import {
   formatLocalAgentProviderAvailabilitySummary,
   getLocalAgentProviderAvailabilitySnapshot,
@@ -82,6 +88,17 @@ const SHELL_COMMAND_MAX_CHARACTERS = 100_000;
 
 type Transport = StreamableHTTPServerTransport;
 const requestContext = new AsyncLocalStorage<{ clientId: string; requestId?: string }>();
+const toolHandlerBarriers = new WeakMap<McpServer, ActiveRequestBarrier>();
+const registerAppTool: typeof registerSdkAppTool = ((...args: unknown[]) => {
+  const server = args[0] as McpServer;
+  const handlerIndex = args.length - 1;
+  const handler = args[handlerIndex];
+  const barrier = toolHandlerBarriers.get(server);
+  if (barrier && typeof handler === "function") {
+    args[handlerIndex] = (...handlerArgs: unknown[]) => barrier.track(() => handler(...handlerArgs));
+  }
+  return (registerSdkAppTool as (...parameters: unknown[]) => unknown)(...args);
+}) as typeof registerSdkAppTool;
 // MCP clients can reconnect without closing the previous transport. Bound stale
 // session retention so abandoned MCP servers do not accumulate for the life of the process.
 const WORKSPACE_APP_URI = "ui://devspace/workspace-app.html";
@@ -373,6 +390,26 @@ function sendJsonRpcError(
     jsonrpc: "2.0",
     error: { code, message },
     id: null,
+  });
+}
+
+export function workspaceOperationId(body: unknown): string | undefined {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return undefined;
+  const request = body as { method?: unknown; params?: unknown };
+  if (request.method !== "tools/call" || !request.params || typeof request.params !== "object") {
+    return undefined;
+  }
+  const params = request.params as { name?: unknown; arguments?: unknown };
+  if (params.name === "open_workspace" || params.name === "close_workspace") return undefined;
+  if (!params.arguments || typeof params.arguments !== "object") return undefined;
+  const workspaceId = (params.arguments as { workspaceId?: unknown }).workspaceId;
+  return typeof workspaceId === "string" && workspaceId.length > 0 ? workspaceId : undefined;
+}
+
+export function containsBatchedToolCall(body: unknown): boolean {
+  return Array.isArray(body) && body.some((entry) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return false;
+    return (entry as { method?: unknown }).method === "tools/call";
   });
 }
 
@@ -1029,19 +1066,16 @@ function createMcpServer(
   reviewCheckpoints: ReturnType<typeof createReviewCheckpointManager>,
   processSessions: ProcessSessionManager,
   localAgentProviders: LocalAgentProviderAvailability[],
+  runtimeDiagnostics: RuntimeDiagnostics,
+  activeToolHandlers: ActiveRequestBarrier,
 ): McpServer {
   const server = new McpServer(
-    {
-      name: "devspace",
-      title: "DevSpace",
-      version: "0.1.0",
-      description:
-        "Secure local coding workspace for MCP clients. Provides workspace-scoped file, search, edit, write, and shell tools.",
-    },
+    DEVSPACE_SERVER_INFO,
     {
       instructions: serverInstructions(config),
     },
   );
+  toolHandlerBarriers.set(server, activeToolHandlers);
 
   registerAppResource(
     server,
@@ -1147,9 +1181,19 @@ function createMcpServer(
         { path, mode, baseRef },
       );
       if (config.widgets === "changes") {
-        void reviewCheckpoints.initializeWorkspace({
+        await reviewCheckpoints.initializeWorkspace({
           workspaceId: workspace.id,
           root: workspace.root,
+        });
+        void reviewCheckpoints.cleanupStaleRefs({
+          gitRoot: workspace.root,
+          activeWorkspaceIds: reviewCheckpoints.activeWorkspaceIds(),
+        }).catch((error) => {
+          runtimeDiagnostics.recordFailure("review_ref_cleanup_failed", error);
+          logEvent(config.logging, "warn", "review_ref_cleanup_failed", {
+            workspaceId: workspace.id,
+            ...errorFields(error),
+          });
         });
       }
       const visibleSkills = workspace.skills
@@ -1299,13 +1343,15 @@ function createMcpServer(
     },
     async ({ workspaceId }) => {
       const startedAt = performance.now();
-      const workspace = workspaces.getWorkspace(ownerClientId, workspaceId);
-      const processesTerminated = await processSessions.terminateWorkspace(ownerClientId, workspaceId);
+      const closeLease = await workspaces.acquireExclusiveClose(ownerClientId, workspaceId);
+      const workspace = closeLease.workspace;
+      let processesTerminated = 0;
       let worktreeRemoved = false;
       let worktreeRetainedReason: "dirty" | undefined;
-      let closed: boolean;
-      if (workspace.mode === "worktree" && workspace.sourceRoot && workspace.worktree?.managed) {
-        try {
+      let closed = false;
+      try {
+        processesTerminated = await processSessions.terminateWorkspace(ownerClientId, workspaceId);
+        if (workspace.mode === "worktree" && workspace.sourceRoot && workspace.worktree?.managed) {
           const removal = await removeManagedWorktree({
             sourceRoot: workspace.sourceRoot,
             worktreePath: workspace.root,
@@ -1313,20 +1359,32 @@ function createMcpServer(
           });
           worktreeRemoved = removal.removed;
           if (removal.removed || removal.reason === "missing") {
-            closed = workspaces.deleteWorkspace(ownerClientId, workspaceId);
+            try {
+              await reviewCheckpoints.cleanupWorkspace({ workspaceId });
+            } catch (error) {
+              runtimeDiagnostics.recordFailure("review_cleanup_failed", error);
+              logEvent(config.logging, "warn", "review_cleanup_failed", { workspaceId, ...errorFields(error) });
+            }
+            closed = closeLease.commit({ delete: true });
           } else {
             worktreeRetainedReason = "dirty";
-            processSessions.reopenWorkspace(ownerClientId, workspaceId);
-            closed = false;
+            closeLease.abort();
           }
-        } catch (error) {
-          processSessions.reopenWorkspace(ownerClientId, workspaceId);
-          throw error;
+        } else {
+          try {
+            await reviewCheckpoints.cleanupWorkspace({ workspaceId });
+          } catch (error) {
+            runtimeDiagnostics.recordFailure("review_cleanup_failed", error);
+            logEvent(config.logging, "warn", "review_cleanup_failed", { workspaceId, ...errorFields(error) });
+          }
+          closed = closeLease.commit();
         }
-      } else {
-        closed = workspaces.closeWorkspace(ownerClientId, workspaceId);
+      } catch (error) {
+        closeLease.abort();
+        throw error;
+      } finally {
+        processSessions.reopenWorkspace(ownerClientId, workspaceId);
       }
-      if (closed) processSessions.reopenWorkspace(ownerClientId, workspaceId);
       logToolCall(config, {
         tool: "close_workspace",
         workspaceId,
@@ -2398,29 +2456,13 @@ function createMcpServer(
   return server;
 }
 
-export function readinessSnapshot(input: {
-  closing: boolean;
-  workspaceDatabaseReady: boolean;
-  oauthDatabaseReady: boolean;
-}) {
-  const checks = {
-    lifecycle: !input.closing,
-    workspaceDatabase: input.workspaceDatabaseReady,
-    oauthDatabase: input.oauthDatabaseReady,
-  };
-  const ready = Object.values(checks).every(Boolean);
-  return {
-    statusCode: ready ? 200 : 503,
-    body: {
-      ok: ready,
-      name: "devspace",
-      status: ready ? "ready" : "not_ready",
-      checks,
-    },
-  };
-}
+export { readinessSnapshot } from "./runtime-control-plane.js";
 
 export function createServer(config = loadConfig()): RunningServer {
+  const processGeneration = randomUUID();
+  const runtimeDiagnostics = new RuntimeDiagnostics();
+  const activeMcpRequests = new ActiveRequestBarrier();
+  const activeToolHandlers = new ActiveRequestBarrier();
   const allowedHosts = config.allowedHosts.includes("*")
     ? undefined
     : Array.from(new Set([config.host, ...config.allowedHosts]));
@@ -2430,6 +2472,7 @@ export function createServer(config = loadConfig()): RunningServer {
   });
   const transports = new McpSessionRegistry<Transport>({
     maxSessions: config.resources.maxMcpSessions,
+    maxSessionsPerClient: config.resources.maxMcpSessionsPerClient,
     closeTimeoutMs: config.resources.mcpSessionCloseTimeoutMs,
   });
   const mcpUrl = new URL("/mcp", config.publicBaseUrl);
@@ -2441,10 +2484,12 @@ export function createServer(config = loadConfig()): RunningServer {
     resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(resourceServerUrl),
   });
   const workspaceStore = createWorkspaceStore(config.stateDir);
+  const localAgentStore = createLocalAgentStore(config);
   const workspaces = new WorkspaceRegistry(config, workspaceStore);
   const reviewCheckpoints = createReviewCheckpointManager();
   const processSessions = new ProcessSessionManager({
     maxSessions: config.resources.maxProcessSessions,
+    maxSessionsPerClient: config.resources.maxProcessSessionsPerClient,
     maxSessionsPerWorkspace: config.resources.maxProcessSessionsPerWorkspace,
     maxRuntimeMs: config.resources.maxCommandRuntimeMs,
     terminationGraceMs: config.resources.processShutdownGraceMs,
@@ -2478,12 +2523,36 @@ export function createServer(config = loadConfig()): RunningServer {
     }
   };
 
+  let cleanupRunning = false;
+  let cleanupPromise: Promise<void> | undefined;
   const sessionCleanupTimer = setInterval(() => {
-    void (async () => {
+    if (cleanupRunning) return;
+    cleanupRunning = true;
+    cleanupPromise = (async () => {
       const results = await transports.closeIdle(config.resources.mcpSessionIdleTimeoutMs);
       logSessionCloseResults("idle_timeout", results);
+      const closedWorkspaceIds = workspaces.closeExpiredSessions(
+        config.resources.workspaceIdleTtlMs,
+        (ownerClientId, workspaceId) => processSessions.hasActive(ownerClientId, workspaceId),
+      );
+      const reviewCleanupResults = await Promise.allSettled(
+        closedWorkspaceIds.map((workspaceId) => reviewCheckpoints.cleanupWorkspace({ workspaceId })),
+      );
+      for (const result of reviewCleanupResults) {
+        if (result.status === "rejected") {
+          runtimeDiagnostics.recordFailure("review_cleanup_failed", result.reason);
+        }
+      }
+      workspaces.cleanupLifecycleState();
+      oauthProvider.cleanupExpired();
+      localAgentStore.cleanup();
+      await cleanupDetachedAgentPromptArtifacts();
     })().catch((error) => {
+      runtimeDiagnostics.recordFailure("resource_cleanup_failed", error);
       logEvent(config.logging, "error", "resource_cleanup_failed", errorFields(error));
+    }).finally(() => {
+      cleanupRunning = false;
+      cleanupPromise = undefined;
     });
   }, config.resources.cleanupIntervalMs);
   sessionCleanupTimer.unref();
@@ -2551,18 +2620,22 @@ export function createServer(config = loadConfig()): RunningServer {
     }),
   );
 
-  app.get("/healthz", (_req, res) => {
-    res.json({ ok: true, name: "devspace", status: "alive" });
-  });
-
-  app.get("/readyz", (_req, res) => {
-    const snapshot = readinessSnapshot({
-      closing,
-      workspaceDatabaseReady: workspaces.isReady(),
-      oauthDatabaseReady: oauthProvider.isReady(),
-    });
-    res.status(snapshot.statusCode).json(snapshot.body);
-  });
+  app.use(createRuntimeControlPlane({
+    ownerToken: config.oauth.ownerToken,
+    generation: processGeneration,
+    isClosing: () => closing,
+    workspaceDatabaseReady: () => workspaces.isReady(),
+    oauthDatabaseReady: () => oauthProvider.isReady(),
+    mcpUsage: () => transports.usageSnapshot(),
+    processUsage: () => processSessions.usageSnapshot(),
+    workspaceUsage: () => workspaces.usageSnapshot(),
+    oauthUsage: () => oauthProvider.diagnosticSnapshot(),
+    revokeAll: () => oauthProvider.revokeAll(),
+    runtimeDiagnostics,
+    onGlobalRevocation: (revoked) => {
+      logEvent(config.logging, "warn", "oauth_global_revocation", { ...revoked });
+    },
+  }));
 
   app.all("/mcp", async (req, res) => {
     const requestId = res.locals.requestId as string | undefined;
@@ -2574,6 +2647,8 @@ export function createServer(config = loadConfig()): RunningServer {
       return;
     }
 
+    const releaseActiveRequest = activeMcpRequests.enter();
+    try {
     await new Promise<void>((resolve, reject) => {
       bearerAuth(req, res, (error?: unknown) => {
         if (error) reject(error);
@@ -2603,6 +2678,16 @@ export function createServer(config = loadConfig()): RunningServer {
       isInitialize: initializeRequest,
       clientIdHash: identifierHash(ownerClientId),
     });
+
+    if (containsBatchedToolCall(req.body)) {
+      sendJsonRpcError(
+        res,
+        400,
+        -32600,
+        "Tool calls must be sent individually; use batch_read or batch_inspect for bounded multi-file work",
+      );
+      return;
+    }
 
     let reservation: McpSessionReservation | undefined;
     let acquiredSessionId: string | undefined;
@@ -2676,6 +2761,8 @@ export function createServer(config = loadConfig()): RunningServer {
           reviewCheckpoints,
           processSessions,
           localAgentProviders,
+          runtimeDiagnostics,
+          activeToolHandlers,
         );
         await server.connect(transport);
       } else {
@@ -2683,11 +2770,18 @@ export function createServer(config = loadConfig()): RunningServer {
         return;
       }
 
-      await requestContext.run(
+      const workspaceId = workspaceOperationId(req.body);
+      const handleRequest = () => requestContext.run(
         { clientId: ownerClientId, requestId },
         () => transport.handleRequest(req, res, req.body),
       );
+      if (workspaceId) {
+        await workspaces.withWorkspaceOperation(ownerClientId, workspaceId, handleRequest);
+      } else {
+        await handleRequest();
+      }
     } catch (error) {
+      runtimeDiagnostics.recordFailure("mcp_request_error", error);
       logEvent(config.logging, "error", "mcp_request_error", {
         requestId,
         clientIdHash: identifierHash(ownerClientId),
@@ -2710,18 +2804,16 @@ export function createServer(config = loadConfig()): RunningServer {
       }
       if (acquiredSessionId) transports.release(acquiredSessionId, ownerClientId);
     }
+    } finally {
+      releaseActiveRequest();
+    }
   });
 
-  let transportClosePromise: Promise<void> | undefined;
   const beginClose = (): Promise<void> => {
     closing = true;
     transports.seal();
     clearInterval(sessionCleanupTimer);
-    transportClosePromise ??= (async () => {
-      const results = await transports.closeAll();
-      logSessionCloseResults("server_shutdown", results);
-    })();
-    return transportClosePromise;
+    return Promise.resolve();
   };
   let closePromise: Promise<void> | undefined;
   return {
@@ -2732,6 +2824,19 @@ export function createServer(config = loadConfig()): RunningServer {
     close: () => {
       closePromise ??= (async () => {
         await beginClose();
+        await cleanupPromise;
+        const [requestsDrained, toolsDrained] = await Promise.all([
+          activeMcpRequests.waitForIdle(config.resources.httpDrainTimeoutMs),
+          activeToolHandlers.waitForIdle(config.resources.httpDrainTimeoutMs),
+        ]);
+        if (!requestsDrained || !toolsDrained) {
+          runtimeDiagnostics.recordFailure("mcp_request_drain_timeout");
+          throw new Error(
+            `Active MCP requests or tool handlers did not drain within ${config.resources.httpDrainTimeoutMs}ms; resources remain open to avoid inconsistent state.`,
+          );
+        }
+        const closeResults = await transports.closeAll();
+        logSessionCloseResults("server_shutdown", closeResults);
         if (transports.size > 0) {
           const retryResults = await transports.closeAll();
           logSessionCloseResults("server_shutdown", retryResults);
@@ -2744,6 +2849,11 @@ export function createServer(config = loadConfig()): RunningServer {
         }
         try {
           oauthProvider.close();
+        } catch (error) {
+          closeErrors.push(error);
+        }
+        try {
+          localAgentStore.close();
         } catch (error) {
           closeErrors.push(error);
         }

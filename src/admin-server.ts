@@ -1,29 +1,54 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { createReadStream, realpathSync, statSync } from "node:fs";
+import { lookup as dnsLookup } from "node:dns/promises";
 import { createServer, get as httpGet, type IncomingMessage, type ServerResponse } from "node:http";
+import { get as httpsGet } from "node:https";
+import { BlockList, isIP, type LookupFunction } from "node:net";
 import { extname, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  AdminConfigConflictError,
+  AdminConfigLockError,
   adminConfigOverridePaths,
   adminConfigWarnings,
   AdminConfigValidationError,
-  loadAdminConfig,
-  saveAdminConfig,
+  loadAdminConfigSnapshot,
+  saveAdminConfigIfMatch,
 } from "./admin-config.js";
+import {
+  AdminBackendProxyError,
+  HttpAdminBackendClient,
+  redactDiagnosticValue,
+  type AdminBackendClient,
+} from "./admin-backend.js";
 import { loadConfigForAdmin } from "./config.js";
 import { devspaceConfigPath } from "./user-config.js";
+import {
+  AdminRuntimeError,
+  AdminRuntimeManager,
+  probeBackendReadiness,
+  type BackendRuntimeOperation,
+  type BackendRuntimeStatus,
+} from "./admin-runtime.js";
+import { logEvent } from "./logger.js";
+import { DEVSPACE_VERSION } from "./version.js";
 
 const CAPABILITY_HEADER = "x-devspace-admin-capability";
 const CSRF_HEADER = "x-devspace-admin-csrf";
 const SESSION_COOKIE = "devspace_admin_session";
 const MAX_BODY_BYTES = 64 * 1_024;
 const SESSION_TTL_MS = 60 * 60 * 1_000;
+const RUNTIME_CONFIRMATION_TTL_MS = 60 * 1_000;
+const SECURITY_CONFIRMATION_TTL_MS = 60 * 1_000;
+const unsafeProbeAddresses = createUnsafeProbeBlockList();
 
 export interface StartAdminServerOptions {
   host?: "127.0.0.1";
   port?: number;
   env?: NodeJS.ProcessEnv;
   staticDir?: string;
+  runtimeManager?: AdminRuntimeController;
+  backendClient?: AdminBackendClient;
 }
 
 export interface RunningAdminServer {
@@ -34,6 +59,19 @@ export interface RunningAdminServer {
 interface AdminSession {
   csrfToken: string;
   expiresAt: number;
+  runtimeConfirmation?: {
+    token: string;
+    expiresAt: number;
+  };
+  securityConfirmation?: {
+    token: string;
+    expiresAt: number;
+  };
+}
+
+export interface AdminRuntimeController {
+  backendStatus(): Promise<BackendRuntimeStatus>;
+  restartBackend(): Promise<BackendRuntimeOperation>;
 }
 
 class HttpError extends Error {
@@ -60,6 +98,20 @@ export async function startAdminServer(
   const staticDir = resolve(
     options.staticDir ?? fileURLToPath(new URL("../dist/admin-ui", import.meta.url)),
   );
+  const startedAt = new Date().toISOString();
+  const version = DEVSPACE_VERSION;
+  const initialConfig = loadConfigForAdmin(env);
+  const logging = initialConfig.logging;
+  const runtimeManager = options.runtimeManager ?? new AdminRuntimeManager({
+    env,
+    probeReady: () => probeBackendReadiness(initialConfig.host, initialConfig.port),
+    onEvent: (event, fields) => logEvent(logging, "info", event, fields),
+  });
+  const backendClient = options.backendClient ?? new HttpAdminBackendClient({
+    host: initialConfig.host,
+    port: initialConfig.port,
+    ownerToken: initialConfig.oauth.ownerToken,
+  });
   const capability = randomBytes(32).toString("base64url");
   const capabilityState = { available: true };
   const sessions = new Map<string, AdminSession>();
@@ -82,6 +134,10 @@ export async function startAdminServer(
           capabilityState,
           env,
           sessions,
+          runtimeManager,
+          backendClient,
+          startedAt,
+          version,
         });
         return;
       }
@@ -140,6 +196,10 @@ async function handleApiRequest(
     capabilityState: { available: boolean };
     env: NodeJS.ProcessEnv;
     sessions: Map<string, AdminSession>;
+    runtimeManager: AdminRuntimeController;
+    backendClient: AdminBackendClient;
+    startedAt: string;
+    version: string;
   },
 ): Promise<void> {
   if (pathname === "/api/session" && request.method === "POST") {
@@ -170,22 +230,99 @@ async function handleApiRequest(
   const session = authenticate(request, context.sessions);
   if (pathname === "/api/status" && request.method === "GET") {
     const config = loadConfigForAdmin(context.env);
-    const mcp = await probeMcpReady(config.host, config.port);
+    const [mcp, tunnel, backend] = await Promise.all([
+      probeMcpReady(config.host, config.port),
+      probePublicTunnel(config.publicBaseUrl, config.host, config.port),
+      context.runtimeManager.backendStatus(),
+    ]);
+    const backendWithConfirmation = backend.managed && backend.actions.includes("restart")
+      ? { ...backend, ...runtimeConfirmation(session) }
+      : backend;
     sendJson(response, 200, {
       configPath: devspaceConfigPath(context.env),
       publicBaseUrl: redactUrlCredentials(config.publicBaseUrl),
-      admin: { ready: true },
+      admin: { ready: true, version: context.version, startedAt: context.startedAt },
       mcp,
+      tunnel,
+      runtime: { backend: backendWithConfirmation },
     });
     return;
   }
   if (pathname === "/api/config" && request.method === "GET") {
-    const config = loadAdminConfig(context.env);
+    const snapshot = await loadAdminConfigSnapshot(context.env);
+    response.setHeader("ETag", quoteEtag(snapshot.revision));
     sendJson(response, 200, {
-      config,
+      config: snapshot.config,
+      revision: snapshot.revision,
       overrides: adminConfigOverridePaths(context.env),
-      warnings: adminConfigWarnings(config),
+      warnings: adminConfigWarnings(snapshot.config),
     });
+    return;
+  }
+  if (pathname === "/api/diagnostics" && request.method === "GET") {
+    try {
+      sendJson(response, 200, {
+        diagnostics: redactDiagnosticValue(await context.backendClient.diagnostics()),
+        security: securityConfirmation(session),
+      });
+    } catch (error) {
+      throwBackendProxyError(error);
+    }
+    return;
+  }
+  if (pathname === "/api/diagnostics/bundle" && request.method === "GET") {
+    try {
+      const config = (await loadAdminConfigSnapshot(context.env)).config;
+      response.setHeader(
+        "Content-Disposition",
+        `attachment; filename="devspace-diagnostics-${new Date().toISOString().slice(0, 10)}.json"`,
+      );
+      sendJson(response, 200, {
+        generatedAt: new Date().toISOString(),
+        admin: { version: context.version, startedAt: context.startedAt },
+        config: {
+          toolMode: config.toolMode,
+          widgets: config.widgets,
+          allowedRootCount: config.allowedRoots.length,
+          projectDocFallbackFilenameCount: config.projectDocFallbackFilenames.length,
+          resources: config.resources,
+        },
+        backend: redactDiagnosticValue(await context.backendClient.diagnostics()),
+      });
+    } catch (error) {
+      throwBackendProxyError(error);
+    }
+    return;
+  }
+  if (pathname === "/api/runtime/backend/restart" && request.method === "POST") {
+    const csrfToken = singleHeader(request, CSRF_HEADER);
+    if (!csrfToken || !secretsEqual(csrfToken, session.csrfToken)) {
+      throw new HttpError(403, "invalid_csrf", "The CSRF token is invalid.");
+    }
+    const body = await readJsonBody(request);
+    const confirmation = session.runtimeConfirmation;
+    session.runtimeConfirmation = undefined;
+    if (
+      !isRecord(body) ||
+      body.confirmation !== "restart" ||
+      typeof body.confirmationToken !== "string" ||
+      !confirmation ||
+      confirmation.expiresAt <= Date.now() ||
+      !secretsEqual(body.confirmationToken, confirmation.token)
+    ) {
+      throw new HttpError(
+        409,
+        "invalid_runtime_confirmation",
+        "The backend restart confirmation is invalid or expired. Refresh status and try again.",
+      );
+    }
+    try {
+      const operation = await context.runtimeManager.restartBackend();
+      sendJson(response, 202, { operation });
+    } catch (error) {
+      if (!(error instanceof AdminRuntimeError)) throw error;
+      throw new HttpError(error.status, error.code, error.message);
+    }
     return;
   }
   if (pathname === "/api/config" && request.method === "PUT") {
@@ -193,18 +330,30 @@ async function handleApiRequest(
     if (!csrfToken || !secretsEqual(csrfToken, session.csrfToken)) {
       throw new HttpError(403, "invalid_csrf", "The CSRF token is invalid.");
     }
+    const ifMatch = parseIfMatch(singleHeader(request, "if-match"));
+    if (!ifMatch) {
+      throw new HttpError(428, "revision_required", "If-Match is required to update configuration.");
+    }
     const body = await readJsonBody(request);
     if (!isRecord(body) || !("config" in body)) {
       throw new HttpError(400, "invalid_config", "The request must contain a config object.");
     }
     try {
-      const saved = saveAdminConfig(body.config, context.env);
+      const saved = await saveAdminConfigIfMatch(body.config, ifMatch, context.env);
+      response.setHeader("ETag", quoteEtag(saved.revision));
       sendJson(response, 200, {
         ...saved,
         overrides: adminConfigOverridePaths(context.env),
         warnings: adminConfigWarnings(saved.config),
       });
     } catch (error) {
+      if (error instanceof AdminConfigConflictError) {
+        response.setHeader("ETag", quoteEtag(error.currentRevision));
+        throw new HttpError(412, "revision_conflict", "The configuration changed. Reload it before saving again.");
+      }
+      if (error instanceof AdminConfigLockError) {
+        throw new HttpError(503, "config_locked", error.message);
+      }
       if (!(error instanceof AdminConfigValidationError)) throw error;
       sendJson(response, 400, {
         error: {
@@ -213,6 +362,31 @@ async function handleApiRequest(
           fields: error.fields,
         },
       });
+    }
+    return;
+  }
+  if (pathname === "/api/security/revoke" && request.method === "POST") {
+    const csrfToken = singleHeader(request, CSRF_HEADER);
+    if (!csrfToken || !secretsEqual(csrfToken, session.csrfToken)) {
+      throw new HttpError(403, "invalid_csrf", "The CSRF token is invalid.");
+    }
+    const body = await readJsonBody(request);
+    const confirmation = session.securityConfirmation;
+    session.securityConfirmation = undefined;
+    if (
+      !isRecord(body) ||
+      body.confirmation !== "revoke_all_clients_and_tokens" ||
+      typeof body.confirmationToken !== "string" ||
+      !confirmation ||
+      confirmation.expiresAt <= Date.now() ||
+      !secretsEqual(body.confirmationToken, confirmation.token)
+    ) {
+      throw new HttpError(409, "invalid_security_confirmation", "The revoke confirmation is invalid or expired.");
+    }
+    try {
+      sendJson(response, 200, { result: await context.backendClient.revokeAllClientsAndTokens() });
+    } catch (error) {
+      throwBackendProxyError(error);
     }
     return;
   }
@@ -279,13 +453,21 @@ async function probeMcpReady(host: string, port: number): Promise<{
   ready: boolean;
   status: number | null;
   error?: "unreachable";
+  latencyMs: number;
+  checkedAt: string;
 }> {
+  const startedAt = performance.now();
+  const checkedAt = new Date().toISOString();
   return new Promise((resolveProbe) => {
     let settled = false;
     const finish = (result: { ready: boolean; status: number | null; error?: "unreachable" }): void => {
       if (settled) return;
       settled = true;
-      resolveProbe(result);
+      resolveProbe({
+        ...result,
+        latencyMs: Math.round(performance.now() - startedAt),
+        checkedAt,
+      });
     };
     const request = httpGet(
       { hostname: probeHost(host), port, path: "/readyz", timeout: 1_500 },
@@ -299,10 +481,208 @@ async function probeMcpReady(host: string, port: number): Promise<{
   });
 }
 
+async function probePublicTunnel(
+  publicBaseUrl: string,
+  localHost: string,
+  localPort: number,
+): Promise<{
+  configured: boolean;
+  reachable: boolean;
+  ready: boolean;
+  status: number | null;
+  hostname?: string;
+  error?: "unreachable" | "unsafe_destination";
+  latencyMs?: number;
+}> {
+  const url = new URL(publicBaseUrl);
+  const configured = !isLocalPublicUrl(url, localHost, localPort);
+  if (!configured) {
+    return {
+      configured: false,
+      reachable: false,
+      ready: false,
+      status: null,
+      hostname: url.hostname,
+    };
+  }
+  url.username = "";
+  url.password = "";
+  url.search = "";
+  url.hash = "";
+  url.pathname = `${url.pathname.replace(/\/+$/, "")}/readyz`;
+  const startedAt = performance.now();
+  let endpoint: { address: string; family: 4 | 6 };
+  try {
+    const addresses = await dnsLookup(url.hostname, { all: true, verbatim: true });
+    if (
+      addresses.length === 0 ||
+      addresses.some((address) => !isPublicProbeAddress(address.address))
+    ) {
+      return {
+        configured: true,
+        reachable: false,
+        ready: false,
+        status: null,
+        hostname: url.hostname,
+        latencyMs: Math.round(performance.now() - startedAt),
+        error: "unsafe_destination",
+      };
+    }
+    endpoint = {
+      address: addresses[0].address,
+      family: addresses[0].family === 6 ? 6 : 4,
+    };
+  } catch {
+    return {
+      configured: true,
+      reachable: false,
+      ready: false,
+      status: null,
+      hostname: url.hostname,
+      latencyMs: Math.round(performance.now() - startedAt),
+      error: "unreachable",
+    };
+  }
+  const pinnedLookup = createPinnedLookup(endpoint);
+
+  return new Promise((resolveProbe) => {
+    let settled = false;
+    const finish = (result: {
+      reachable: boolean;
+      ready: boolean;
+      status: number | null;
+      error?: "unreachable" | "unsafe_destination";
+    }): void => {
+      if (settled) return;
+      settled = true;
+      resolveProbe({
+        configured: true,
+        hostname: url.hostname,
+        latencyMs: Math.round(performance.now() - startedAt),
+        ...result,
+      });
+    };
+    const get = url.protocol === "https:" ? httpsGet : httpGet;
+    const probe = get(url, {
+      timeout: 3_000,
+      lookup: pinnedLookup,
+    }, (probeResponse) => {
+      probeResponse.resume();
+      const status = probeResponse.statusCode ?? null;
+      finish({ reachable: true, ready: status === 200, status });
+    });
+    probe.on("timeout", () => probe.destroy());
+    probe.on("error", () => finish({
+      reachable: false,
+      ready: false,
+      status: null,
+      error: "unreachable",
+    }));
+  });
+}
+
+export function isPublicProbeAddress(address: string): boolean {
+  const mappedIpv4 = ipv4MappedAddress(address);
+  if (mappedIpv4) return isPublicProbeAddress(mappedIpv4);
+  const family = isIP(address);
+  if (family === 0) return false;
+  return !unsafeProbeAddresses.check(address, family === 4 ? "ipv4" : "ipv6");
+}
+
+function ipv4MappedAddress(address: string): string | undefined {
+  if (isIP(address) !== 6 || address.includes("%")) return undefined;
+  const hextets = expandIpv6Hextets(address);
+  if (
+    !hextets ||
+    hextets.slice(0, 5).some((part) => part !== 0) ||
+    hextets[5] !== 0xffff
+  ) return undefined;
+  const high = hextets[6];
+  const low = hextets[7];
+  return `${high >>> 8}.${high & 0xff}.${low >>> 8}.${low & 0xff}`;
+}
+
+function expandIpv6Hextets(address: string): number[] | undefined {
+  let source = address.toLowerCase();
+  if (source.includes(".")) {
+    const separator = source.lastIndexOf(":");
+    const octets = source.slice(separator + 1).split(".").map(Number);
+    if (
+      separator < 0 ||
+      octets.length !== 4 ||
+      octets.some((octet) => !Number.isInteger(octet) || octet < 0 || octet > 255)
+    ) return undefined;
+    source = `${source.slice(0, separator)}:${((octets[0] << 8) | octets[1]).toString(16)}:${((octets[2] << 8) | octets[3]).toString(16)}`;
+  }
+
+  const halves = source.split("::");
+  if (halves.length > 2) return undefined;
+  const left = halves[0] ? halves[0].split(":") : [];
+  const right = halves.length === 2 && halves[1] ? halves[1].split(":") : [];
+  const missing = 8 - left.length - right.length;
+  if ((halves.length === 1 && missing !== 0) || (halves.length === 2 && missing < 1)) return undefined;
+  const groups = [...left, ...Array(Math.max(0, missing)).fill("0"), ...right];
+  if (groups.length !== 8 || groups.some((group) => !/^[0-9a-f]{1,4}$/.test(group))) return undefined;
+  return groups.map((group) => Number.parseInt(group, 16));
+}
+
+export function createPinnedLookup(endpoint: {
+  address: string;
+  family: 4 | 6;
+}): LookupFunction {
+  return (_hostname, options, callback) => {
+    if (options.all) callback(null, [{ ...endpoint }]);
+    else callback(null, endpoint.address, endpoint.family);
+  };
+}
+
+function createUnsafeProbeBlockList(): BlockList {
+  const blockList = new BlockList();
+  for (const [network, prefix] of [
+    ["0.0.0.0", 8], ["10.0.0.0", 8], ["100.64.0.0", 10],
+    ["127.0.0.0", 8], ["169.254.0.0", 16], ["172.16.0.0", 12],
+    ["192.0.0.0", 24], ["192.0.2.0", 24], ["192.168.0.0", 16],
+    ["198.18.0.0", 15], ["198.51.100.0", 24], ["203.0.113.0", 24],
+    ["224.0.0.0", 4], ["240.0.0.0", 4],
+  ] as const) {
+    blockList.addSubnet(network, prefix, "ipv4");
+  }
+  for (const [network, prefix] of [
+    ["::", 128], ["::1", 128], ["64:ff9b:1::", 48],
+    ["100::", 64], ["2001:2::", 48], ["2001:db8::", 32],
+    ["fc00::", 7], ["fe80::", 10], ["ff00::", 8],
+  ] as const) {
+    blockList.addSubnet(network, prefix, "ipv6");
+  }
+  return blockList;
+}
+
 function probeHost(host: string): string {
   if (host === "0.0.0.0") return "127.0.0.1";
   if (host === "::") return "::1";
   return host;
+}
+
+function isLocalPublicUrl(url: URL, host: string, port: number): boolean {
+  const localHosts = new Set(["localhost", "127.0.0.1", "::1", probeHost(host)]);
+  const effectivePort = url.port || (url.protocol === "https:" ? "443" : "80");
+  return localHosts.has(url.hostname) && effectivePort === String(port);
+}
+
+function runtimeConfirmation(session: AdminSession): {
+  confirmationToken: string;
+  confirmationExpiresAt: string;
+} {
+  if (!session.runtimeConfirmation || session.runtimeConfirmation.expiresAt <= Date.now()) {
+    session.runtimeConfirmation = {
+      token: randomBytes(32).toString("base64url"),
+      expiresAt: Date.now() + RUNTIME_CONFIRMATION_TTL_MS,
+    };
+  }
+  return {
+    confirmationToken: session.runtimeConfirmation.token,
+    confirmationExpiresAt: new Date(session.runtimeConfirmation.expiresAt).toISOString(),
+  };
 }
 
 async function serveStaticFile(
@@ -367,6 +747,38 @@ function sendJson(response: ServerResponse, status: number, body: unknown): void
   response.statusCode = status;
   response.setHeader("Content-Type", "application/json; charset=utf-8");
   response.end(JSON.stringify(body));
+}
+
+function quoteEtag(revision: string): string {
+  return `"${revision}"`;
+}
+
+function parseIfMatch(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  return /^"([A-Za-z0-9_-]{43})"$/.exec(value.trim())?.[1];
+}
+
+function securityConfirmation(session: AdminSession): {
+  confirmationToken: string;
+  confirmationExpiresAt: string;
+} {
+  if (!session.securityConfirmation || session.securityConfirmation.expiresAt <= Date.now()) {
+    session.securityConfirmation = {
+      token: randomBytes(32).toString("base64url"),
+      expiresAt: Date.now() + SECURITY_CONFIRMATION_TTL_MS,
+    };
+  }
+  return {
+    confirmationToken: session.securityConfirmation.token,
+    confirmationExpiresAt: new Date(session.securityConfirmation.expiresAt).toISOString(),
+  };
+}
+
+function throwBackendProxyError(error: unknown): never {
+  if (error instanceof AdminBackendProxyError) {
+    throw new HttpError(error.status, error.code, error.message);
+  }
+  throw error;
 }
 
 function singleHeader(request: IncomingMessage, name: string): string | undefined {

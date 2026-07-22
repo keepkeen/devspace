@@ -297,6 +297,49 @@ try {
   await quotaManager.shutdown();
 }
 
+const clientQuotaManager = new ProcessSessionManager({
+  maxSessions: 3,
+  maxSessionsPerClient: 1,
+  maxSessionsPerWorkspace: 2,
+  maxRuntimeMs: 10_000,
+});
+try {
+  const clientASession = await clientQuotaManager.start({
+    ownerClientId: "client-a",
+    workspaceId: "client-quota-a",
+    cwd: process.cwd(),
+    command: `${node} -e "setInterval(() => {}, 1000)"`,
+    yieldTimeMs: 5,
+  });
+  assert.ok(clientASession.sessionId);
+  await assert.rejects(
+    clientQuotaManager.start({
+      ownerClientId: "client-a",
+      workspaceId: "client-quota-b",
+      cwd: process.cwd(),
+      command: `${node} -e "setInterval(() => {}, 1000)"`,
+      yieldTimeMs: 5,
+    }),
+    /limit reached for this OAuth client/,
+  );
+  const clientBSession = await clientQuotaManager.start({
+    ownerClientId: "client-b",
+    workspaceId: "client-quota-a",
+    cwd: process.cwd(),
+    command: `${node} -e "setInterval(() => {}, 1000)"`,
+    yieldTimeMs: 5,
+  });
+  assert.ok(clientBSession.sessionId);
+  assert.deepEqual(clientQuotaManager.usageSnapshot("client-a"), {
+    sessions: 2,
+    running: 2,
+    limit: 3,
+    owner: { sessions: 1, running: 1, limit: 1 },
+  });
+} finally {
+  await clientQuotaManager.shutdown();
+}
+
 const timeoutManager = new ProcessSessionManager({
   maxRuntimeMs: 1_000,
   terminationGraceMs: 100,

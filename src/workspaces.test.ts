@@ -91,6 +91,68 @@ try {
   const otherOwnerCheckout = await registry.openWorkspace("client-b", root);
   assert.notEqual(otherOwnerCheckout.workspace.id, workspace.id);
 
+  const lifecycleRegistry = new WorkspaceRegistry(config);
+  const lifecycleWorkspace = (await lifecycleRegistry.openWorkspace(ownerClientId, root)).workspace;
+  let releaseOperation!: () => void;
+  let operationStarted!: () => void;
+  const operationStartedPromise = new Promise<void>((resolve) => {
+    operationStarted = resolve;
+  });
+  const operationBarrier = new Promise<void>((resolve) => {
+    releaseOperation = resolve;
+  });
+  const activeOperation = lifecycleRegistry.withWorkspaceOperation(
+    ownerClientId,
+    lifecycleWorkspace.id,
+    async (leasedWorkspace) => {
+      operationStarted();
+      await operationBarrier;
+      return leasedWorkspace.id;
+    },
+  );
+  await operationStartedPromise;
+  const exclusiveClosePromise = lifecycleRegistry.acquireExclusiveClose(ownerClientId, lifecycleWorkspace.id);
+  await assert.rejects(
+    lifecycleRegistry.withWorkspaceOperation(ownerClientId, lifecycleWorkspace.id, () => undefined),
+    /is closing/,
+  );
+  await assert.rejects(
+    lifecycleRegistry.openWorkspace(ownerClientId, root),
+    /is closing/,
+  );
+  assert.deepEqual(lifecycleRegistry.usageSnapshot(ownerClientId), {
+    activePersisted: 1,
+    resident: 1,
+    closing: 1,
+    leased: 1,
+    maxResident: config.resources.maxResidentWorkspaces,
+  });
+  releaseOperation();
+  assert.equal(await activeOperation, lifecycleWorkspace.id);
+  const exclusiveClose = await exclusiveClosePromise;
+  exclusiveClose.abort();
+  assert.equal(
+    await lifecycleRegistry.withWorkspaceOperation(ownerClientId, lifecycleWorkspace.id, (current) => current.id),
+    lifecycleWorkspace.id,
+  );
+  const committedClose = await lifecycleRegistry.acquireExclusiveClose(ownerClientId, lifecycleWorkspace.id);
+  assert.equal(committedClose.commit(), true);
+  assert.throws(
+    () => lifecycleRegistry.getWorkspace(ownerClientId, lifecycleWorkspace.id),
+    /Unknown workspaceId/,
+  );
+  const leaseDeleteStore = new SqliteWorkspaceStore(join(root, ".lease-delete-state"));
+  const leaseDeleteRegistry = new WorkspaceRegistry(config, leaseDeleteStore);
+  const leaseDeleteWorkspace = (await leaseDeleteRegistry.openWorkspace(ownerClientId, root)).workspace;
+  const deleteLease = await leaseDeleteRegistry.acquireExclusiveClose(ownerClientId, leaseDeleteWorkspace.id);
+  await assert.rejects(
+    leaseDeleteRegistry.openWorkspace(ownerClientId, root),
+    /is closing/,
+  );
+  assert.equal(deleteLease.commit({ delete: true }), true);
+  assert.equal(leaseDeleteStore.deleteSession(leaseDeleteWorkspace.id, ownerClientId), false);
+  leaseDeleteStore.close();
+
   assert.equal(workspace.mode, "checkout");
   assert.deepEqual(
     agentsFiles.map((file) => file.content),
@@ -225,6 +287,17 @@ try {
   );
   await assert.rejects(
     registry.acknowledgeInstructions(workspace, instructionToken),
+    /Unknown or expired instructionToken/,
+  );
+  const currentWorkspace = registry.getWorkspace(ownerClientId, workspace.id);
+  const expiringToken = await registry.createInstructionAcknowledgement(currentWorkspace, []);
+  currentWorkspace.pendingInstructionAcknowledgements.get(expiringToken)!.createdAt = 0;
+  assert.deepEqual(registry.cleanupLifecycleState(), {
+    expiredInstructionTokens: 1,
+    deletedClosedWorkspaceSessions: 0,
+  });
+  await assert.rejects(
+    registry.acknowledgeInstructions(currentWorkspace, expiringToken),
     /Unknown or expired instructionToken/,
   );
 
@@ -455,6 +528,10 @@ try {
   assert.equal(restoredWorktree.worktree?.managed, true);
   assert.equal(restoredRegistry.closeWorkspace("client-b", persistentWorkspace.workspace.id), false);
   assert.equal(restoredRegistry.closeWorkspace(ownerClientId, persistentWorkspace.workspace.id), true);
+  assert.deepEqual(restoredRegistry.cleanupLifecycleState(Date.now() + 31 * 24 * 60 * 60_000), {
+    expiredInstructionTokens: 0,
+    deletedClosedWorkspaceSessions: 2,
+  });
   assert.throws(
     () => restoredRegistry.getWorkspace(ownerClientId, persistentWorkspace.workspace.id),
     /Unknown workspaceId/,

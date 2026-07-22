@@ -58,6 +58,41 @@ try {
     store.list({ workspaceId: "ws_1" }).map((agent) => agent.id).sort(),
     [created.id, createdFromOtherStore.id].sort(),
   );
+
+  otherStore.update(createdFromOtherStore.id, { status: "running" });
+  const completed = store.update(store.create({
+    workspaceId: "ws_1",
+    workspaceRoot: join(root, "project"),
+    profileName: "reviewer",
+    provider: "codex",
+  }).id, { status: "idle" });
+  const pruned = store.cleanup({
+    retentionMs: 365 * 24 * 60 * 60_000,
+    maxCompletedRecords: 1,
+  });
+  assert.equal(pruned.pruned, 1);
+  assert.equal(store.get(createdFromOtherStore.id)?.status, "running");
+  assert.equal([store.get(created.id), store.get(completed.id)].filter(Boolean).length, 1);
+
+  const staleStarting = store.create({
+    workspaceId: "ws_1",
+    workspaceRoot: join(root, "project"),
+    profileName: "reviewer",
+    provider: "codex",
+  });
+  const cleanupNow = Date.now() + 11 * 60_000;
+  const reconciled = store.cleanup({
+    now: cleanupNow,
+    staleStartingMs: 10 * 60_000,
+    staleRunningMs: 48 * 60 * 60_000,
+    retentionMs: 365 * 24 * 60 * 60_000,
+    maxCompletedRecords: 10,
+  });
+  assert.equal(reconciled.reconciledStarting, 1);
+  assert.equal(reconciled.reconciledRunning, 0);
+  assert.equal(store.get(staleStarting.id)?.status, "error");
+  assert.match(store.get(staleStarting.id)?.error ?? "", /did not start/);
+  assert.equal(store.get(createdFromOtherStore.id)?.status, "running");
 } finally {
   for (const store of stores) {
     store.close();
