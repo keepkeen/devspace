@@ -84,7 +84,7 @@ one-time capability URL, and is never mounted on the tunnel.
 | Persistent workspaces | Reuse a checkout after minutes, hours, or later conversations; workspaces are closed only when explicitly requested. |
 | Browser-first MCP tools | GPT-facing descriptions explain when to call DevSpace instead of probing a hosted sandbox. |
 | Lower round-trip cost | `batch_read` and `batch_inspect` combine 2–8 independent reads/searches in one MCP call. |
-| Lazy project instructions | Root instructions load immediately; nested `AGENTS.md`/`CLAUDE.md` files load and cache only when their scope is entered. |
+| Lazy project instructions | Root instructions load immediately; nested overrides, `AGENTS.md`/`CLAUDE.md`, and configured fallback files load only when their scope is entered. |
 | Identity isolation | MCP sessions, workspaces, processes, and OAuth ownership are scoped to the authorized client. |
 | Hard resource bounds | MCP/process quotas, command runtime limits, output caps, idle cleanup, graceful termination, and capacity reclamation. |
 | Local admin panel | Add allowed roots and configure tools, widgets, and limits without editing JSON by hand. |
@@ -344,9 +344,15 @@ choose the next target” work remains intentionally sequential.
 
 ### Project instructions
 
-- Root/global `AGENTS.md` and `CLAUDE.md` files load during `open_workspace`.
+- Global and root project instructions load during `open_workspace`. Global instructions use the built-in names; each project directory prefers `AGENTS.override.md`, then `AGENTS.md`, `CLAUDE.md`, and configured fallbacks.
 - Nested instruction files are discovered lazily along the canonical target
   path and cached by directory/file version.
+- Literal `cd`/`pushd` targets inside shell commands participate in the same
+  instruction gate; dynamic directory expressions must use `workingDirectory`
+  or a literal path before execution is allowed.
+- Cwd-changing shell destinations must already exist. `CDPATH`, opaque nested
+  shells, and syntax that cannot be scoped safely fail closed; split directory
+  creation and execution into separate calls when needed.
 - New or changed scoped instructions are returned before mutations run.
 - Mutating tools require the returned one-time `instructionToken` on retry,
   preventing parallel calls from racing past unseen instructions.

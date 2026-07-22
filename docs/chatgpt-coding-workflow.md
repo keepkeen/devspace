@@ -70,12 +70,16 @@ to proceed with the user.
 
 ## Project Instructions
 
-When a workspace opens, DevSpace loads root-level instruction files:
+When a workspace opens, DevSpace loads the first matching global instruction
+from the built-in names and the first matching project-root instruction in this
+priority order:
 
+- `AGENTS.override.md`
 - `AGENTS.md`
 - `AGENTS.MD`
 - `CLAUDE.md`
 - `CLAUDE.MD`
+- configured project document fallback filenames
 
 Nested instruction files are discovered lazily when a later tool enters their
 directory scope. DevSpace returns newly applicable instruction content with
@@ -84,6 +88,13 @@ shell tools stop before execution when they discover new instructions, so the
 model can follow them and retry safely with the returned one-time
 `instructionToken`. The token prevents parallel mutations from bypassing a
 newly discovered instruction scope.
+
+Shell calls also inspect literal `cd` and `pushd` targets before execution.
+Dynamic targets such as `cd "$TARGET"`, `cd $(command)`, or `cd ~/path` are
+rejected because their instruction scope cannot be established safely; pass a
+literal `workingDirectory` or literal shell path instead. Cwd destinations must
+already exist, inherited `CDPATH` is removed, and opaque nested-shell forms
+fail closed. Create a directory in one call and enter it in a later call.
 
 This avoids recursively scanning large repositories during `open_workspace`
 while keeping scoped instructions explicit and inspectable.
@@ -117,7 +128,10 @@ before use.
 Legacy project paths such as `.pi/skills` can be added through `DEVSPACE_SKILL_PATHS` when needed.
 
 When `open_workspace` returns matching skills, the model should read the
-advertised `SKILL.md` before following that skill.
+advertised `SKILL.md` before following that skill. `~/...` advertised paths are
+accepted. A skill activates only after a successful, complete, unbounded, and
+untruncated `SKILL.md` read; partial and batch reads do not activate its
+supporting files.
 
 Skill paths may be outside the workspace. DevSpace only permits reading:
 

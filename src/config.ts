@@ -4,6 +4,7 @@ import { expandHomePath } from "./roots.js";
 import type { LoggingConfig, LogFormat, LogLevel } from "./logger.js";
 import type { OAuthConfig } from "./oauth-provider.js";
 import { MAX_TIMER_MS, RESOURCE_LIMIT_MAXIMUMS } from "./resource-limits.js";
+import { normalizeProjectDocFallbackFilenames } from "./project-instructions.js";
 import {
   devspaceAgentsDir,
   devspaceSkillsDir,
@@ -54,6 +55,7 @@ export interface ServerConfig {
   devspaceAgentsDir: string;
   subagents: boolean;
   agentDir: string;
+  projectDocFallbackFilenames: string[];
   logging: LoggingConfig;
   resources: ResourceLimitsConfig;
   instructionScan: InstructionScanConfig;
@@ -98,6 +100,13 @@ function parseAllowedHosts(value: string | string[] | undefined, derivedHosts: s
       .filter(Boolean) ?? [];
 
   return normalizeAllowedHosts(rawHosts, derivedHosts);
+}
+
+function parseProjectDocFallbackFilenames(value: string | string[] | undefined): string[] {
+  const entries = Array.isArray(value)
+    ? value
+    : value?.split(",").map((entry) => entry.trim()).filter(Boolean);
+  return normalizeProjectDocFallbackFilenames(entries);
 }
 
 function normalizeAllowedHosts(rawHosts: string[], derivedHosts: string[]): string[] {
@@ -358,6 +367,11 @@ export function loadConfigForAdmin(env: NodeJS.ProcessEnv = process.env): Server
         ? files.config.subagents === true
         : parseBoolean(env.DEVSPACE_SUBAGENTS, "DEVSPACE_SUBAGENTS"),
     agentDir: resolve(expandHomePath(env.DEVSPACE_AGENT_DIR ?? files.config.agentDir ?? defaultAgentDir())),
+    projectDocFallbackFilenames: parseProjectDocFallbackFilenames(
+      env.DEVSPACE_PROJECT_DOC_FALLBACK_FILENAMES ??
+        files.config.projectDocFallbackFilenames ??
+        files.config.project_doc_fallback_filenames,
+    ),
     logging: parseLoggingConfig(env),
     resources: parseResourceLimits(env, files.config.resources),
     instructionScan: parseInstructionScan(env),

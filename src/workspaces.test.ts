@@ -10,6 +10,7 @@ import { databasePath } from "./db/client.js";
 import { GitWorktreeError, removeManagedWorktree } from "./git-worktrees.js";
 import { SqliteWorkspaceStore, type WorkspaceStore } from "./workspace-store.js";
 import { ensureCheckoutWorkspaceRoot, WorkspaceRegistry } from "./workspaces.js";
+import { formatPathForPrompt } from "./skills.js";
 
 const execFileAsync = promisify(execFile);
 const root = await mkdtemp(join(tmpdir(), "devspace-workspace-test-"));
@@ -27,7 +28,14 @@ try {
     await writeFile(join(agentDir, "skills", "AGENTS.md"), "global instructions\n");
     await symlink("skills/AGENTS.md", join(agentDir, "AGENTS.md"));
   }
+  await writeFile(join(agentDir, "AGENTS.override.md"), "global override instructions\n");
   await writeFile(join(root, "AGENTS.md"), "root instructions\n");
+  await mkdir(join(agentDir, "skills", "workspace-skill"), { recursive: true });
+  await writeFile(
+    join(agentDir, "skills", "workspace-skill", "SKILL.md"),
+    "---\nname: workspace-skill\ndescription: Workspace test skill.\n---\n\n# Skill\n",
+  );
+  await writeFile(join(agentDir, "skills", "workspace-skill", "reference.md"), "reference\n");
   await mkdir(join(root, ".devspace", "agents"), { recursive: true });
   await writeFile(
     join(root, ".devspace", "agents", "reviewer.md"),
@@ -86,7 +94,7 @@ try {
   assert.equal(workspace.mode, "checkout");
   assert.deepEqual(
     agentsFiles.map((file) => file.content),
-    ["global instructions\n", "root instructions\n"],
+    ["global override instructions\n", "root instructions\n"],
   );
   assert.deepEqual(
     availableAgentsFiles.map((file) => file.path),
@@ -95,6 +103,98 @@ try {
   assert.equal(instructionScan.complete, true);
   assert.equal(instructionScan.lazy, true);
   assert.equal(instructionScan.directoriesScanned, 0);
+  const workspaceSkill = workspace.skills.find((skill) => skill.name === "workspace-skill");
+  assert(workspaceSkill);
+  const promptedSkillPath = formatPathForPrompt(workspaceSkill.filePath);
+  const workspaceSkillRead = registry.resolveReadPath(workspace, promptedSkillPath);
+  assert.equal(workspaceSkillRead.skillRead?.isSkillFile, true);
+  assert.equal(workspaceSkillRead.absolutePath, workspaceSkill.filePath);
+  const workspaceSkillReference = join(workspaceSkill.baseDir, "reference.md");
+  assert.throws(
+    () => registry.resolveReadPath(workspace, workspaceSkillReference),
+    /outside (workspace root|allowed roots)/i,
+  );
+  registry.markReadPathLoaded(workspace, workspaceSkillRead, false);
+  assert.throws(
+    () => registry.resolveReadPath(workspace, workspaceSkillReference),
+    /outside (workspace root|allowed roots)/i,
+  );
+  registry.markReadPathLoaded(workspace, workspaceSkillRead, true);
+  assert.equal(
+    registry.resolveReadPath(workspace, workspaceSkillReference).absolutePath,
+    workspaceSkillReference,
+  );
+
+  const priorityDirectory = join(root, "instruction-priority");
+  await mkdir(priorityDirectory);
+  await writeFile(join(priorityDirectory, "AGENTS.md"), "ordinary instructions\n");
+  await writeFile(join(priorityDirectory, "CLAUDE.md"), "claude instructions\n");
+  await writeFile(join(priorityDirectory, "AGENTS.override.md"), "override instructions\n");
+  const priorityInstructions = await registry.loadApplicableAgentsFiles(
+    workspace,
+    ["instruction-priority/file.txt"],
+  );
+  assert.deepEqual(
+    priorityInstructions.map((file) => ({ path: file.path, content: file.content })),
+    [{
+      path: join(canonicalRoot, "instruction-priority", "AGENTS.override.md"),
+      content: "override instructions\n",
+    }],
+  );
+
+  const fallbackProject = join(root, "fallback-project");
+  await mkdir(join(fallbackProject, "nested"), { recursive: true });
+  await writeFile(join(fallbackProject, "TEAM_GUIDE.md"), "root fallback instructions\n");
+  await writeFile(join(fallbackProject, "AGENTS.md"), "root ordinary instructions\n");
+  await writeFile(join(fallbackProject, "AGENTS.override.md"), "root override instructions\n");
+  await writeFile(join(fallbackProject, "nested", "TEAM_GUIDE.md"), "nested fallback instructions\n");
+  const canonicalFallbackProject = await realpath(fallbackProject);
+  const fallbackConfig = loadConfig({
+    DEVSPACE_CONFIG_DIR: join(root, ".fallback-config"),
+    DEVSPACE_ALLOWED_ROOTS: root,
+    DEVSPACE_AGENT_DIR: agentDir,
+    DEVSPACE_PROJECT_DOC_FALLBACK_FILENAMES: "TEAM_GUIDE.md",
+    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+    PORT: "1",
+  });
+  const fallbackRegistry = new WorkspaceRegistry(fallbackConfig);
+  const fallbackOpen = await fallbackRegistry.openWorkspace(ownerClientId, fallbackProject);
+  assert.deepEqual(
+    fallbackOpen.agentsFiles
+      .filter((file) => file.path.startsWith(canonicalFallbackProject))
+      .map((file) => ({ path: file.path, content: file.content })),
+    [{
+      path: join(canonicalFallbackProject, "AGENTS.override.md"),
+      content: "root override instructions\n",
+    }],
+  );
+  const nestedFallback = await fallbackRegistry.loadApplicableAgentsFiles(
+    fallbackOpen.workspace,
+    ["nested/file.txt"],
+  );
+  assert.deepEqual(
+    nestedFallback.map((file) => ({ path: file.path, content: file.content })),
+    [{
+      path: join(canonicalFallbackProject, "nested", "TEAM_GUIDE.md"),
+      content: "nested fallback instructions\n",
+    }],
+  );
+  await rm(join(fallbackProject, "AGENTS.override.md"));
+  const fallbackWithoutOverride = await fallbackRegistry.openWorkspace(ownerClientId, fallbackProject);
+  assert.deepEqual(
+    fallbackWithoutOverride.agentsFiles
+      .filter((file) => file.path.startsWith(canonicalFallbackProject))
+      .map((file) => file.content),
+    ["root ordinary instructions\n"],
+  );
+  await rm(join(fallbackProject, "AGENTS.md"));
+  const fallbackOnly = await fallbackRegistry.openWorkspace(ownerClientId, fallbackProject);
+  assert.deepEqual(
+    fallbackOnly.agentsFiles
+      .filter((file) => file.path.startsWith(canonicalFallbackProject))
+      .map((file) => file.content),
+    ["root fallback instructions\n"],
+  );
   const nestedInstructions = await registry.loadApplicableAgentsFiles(workspace, ["nested/file.txt"]);
   assert.deepEqual(nestedInstructions.map(({ path, content }) => ({ path, content })), [{
     path: join(canonicalRoot, "nested", "AGENTS.md"),
@@ -257,7 +357,7 @@ try {
   assert.equal(worktreeWorkspace.workspace.worktree?.dirtySource, true);
   assert.equal(worktreeWorkspace.workspace.worktree?.managed, true);
   assert.equal((await stat(worktreeWorkspace.workspace.root)).isDirectory(), true);
-  assert.match(worktreeWorkspace.agentsFiles.map((file) => file.content).join("\n"), /global instructions/);
+  assert.match(worktreeWorkspace.agentsFiles.map((file) => file.content).join("\n"), /global override instructions/);
   assert.match(worktreeWorkspace.agentsFiles.map((file) => file.content).join("\n"), /git root instructions/);
 
   const cappedConfig = loadConfig({
@@ -487,7 +587,7 @@ try {
     const aliasCheckout = await new WorkspaceRegistry(aliasConfig).openWorkspace(ownerClientId, aliasRoot);
     assert.deepEqual(
       aliasCheckout.agentsFiles.map((file) => file.content),
-      ["global instructions\n", "root instructions\n"],
+      ["global override instructions\n", "root instructions\n"],
     );
 
     const aliasReuseStore = new SqliteWorkspaceStore(join(root, ".alias-reuse-state"));

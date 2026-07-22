@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { access, realpath } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -41,6 +41,7 @@ import {
 } from "./bash-prompt.js";
 import { runWorkspaceBash } from "./bash-tool.js";
 import { classifyCommand } from "./command-policy.js";
+import { analyzeShellCommandScopes } from "./shell-command-scopes.js";
 import {
   BATCH_MAX_ITEMS,
   BATCH_READ_DEFAULT_LINES,
@@ -76,6 +77,8 @@ import {
   getLocalAgentProviderAvailabilitySnapshot,
   type LocalAgentProviderAvailability,
 } from "./local-agent-availability.js";
+
+const SHELL_COMMAND_MAX_CHARACTERS = 100_000;
 
 type Transport = StreamableHTTPServerTransport;
 const requestContext = new AsyncLocalStorage<{ clientId: string; requestId?: string }>();
@@ -405,6 +408,17 @@ function contentText(content: ToolContent[]): string {
     .join("\n");
 }
 
+export function isCompleteReadResult(
+  input: { offset?: number; limit?: number },
+  details: { truncation?: { truncated: boolean } } | undefined,
+): boolean {
+  return (
+    input.offset === undefined &&
+    input.limit === undefined &&
+    details?.truncation?.truncated !== true
+  );
+}
+
 function toolErrorPreview(content: ToolContent[]): string | undefined {
   const text = contentText(content).replace(/\s+/g, " ").trim();
   if (!text) return undefined;
@@ -501,6 +515,56 @@ async function applicableMutationGate(
       `No mutation or command was executed because new scoped instructions must be reviewed first. Follow them, then retry the same tool call with instructionToken=${token}.\n\n${notice}`,
     )],
     isError: true,
+  };
+}
+
+export function commandInstructionScopePaths(
+  workspaceRoot: string,
+  command: string,
+  cwd: string,
+  workingDirectory: string | undefined,
+): { paths: string[] } | { error: { content: ToolContent[]; isError: true } } {
+  const analysis = analyzeShellCommandScopes(command, cwd, workspaceRoot);
+  if (analysis.unresolvedCwds.length > 0) {
+    const unresolved = analysis.unresolvedCwds
+      .map((entry) => `${entry.fragment} (${entry.reason})`)
+      .join(", ");
+    return {
+      error: {
+        content: [textBlock(
+          "No command was executed because a shell directory change could not be checked against scoped project instructions. " +
+          "Use the workingDirectory field or a literal cd/pushd path, then retry. " +
+          `Unresolved directory change: ${unresolved}`,
+        )],
+        isError: true,
+      },
+    };
+  }
+
+  const unavailable = analysis.staticCwdAlternatives.find((alternatives) =>
+    alternatives.some((path) => {
+      try {
+        return !statSync(path).isDirectory();
+      } catch {
+        return true;
+      }
+    })
+  );
+  if (unavailable) {
+    return {
+      error: {
+        content: [textBlock(
+          "No command was executed because a literal cd/pushd destination does not yet exist as a directory. " +
+          "Create or populate the directory in one call, then run the scoped command in a second call. " +
+          `Unavailable directory candidates: ${unavailable.join(", ")}`,
+        )],
+        isError: true,
+      },
+    };
+  }
+
+  return {
+    paths: [workingDirectory ?? ".", ...analysis.staticCwds],
   };
 }
 
@@ -834,7 +898,7 @@ function registerCodexProcessTools(
           .string()
           .describe("Workspace identifier from open_workspace (required on every call; DevSpace-specific)."),
         instructionToken: z.string().optional().describe("One-time token returned when scoped project instructions must be reviewed before retrying this command."),
-        cmd: z.string().min(1).describe("Shell command to execute."),
+        cmd: z.string().min(1).max(SHELL_COMMAND_MAX_CHARACTERS).describe("Shell command to execute."),
         tty: z
           .boolean()
           .optional()
@@ -874,10 +938,17 @@ function registerCodexProcessTools(
       const startedAt = performance.now();
       const workspace = workspaces.getWorkspace(ownerClientId, workspaceId);
       const cwd = workspaces.resolveWorkingDirectory(workspace, workingDirectory);
+      const commandScopes = commandInstructionScopePaths(
+        workspace.root,
+        cmd,
+        cwd,
+        workingDirectory,
+      );
+      if ("error" in commandScopes) return commandScopes.error;
       const instructionGate = await applicableMutationGate(
         workspaces,
         workspace,
-        [workingDirectory ?? "."],
+        commandScopes.paths,
         instructionToken,
       );
       if (instructionGate) return instructionGate;
@@ -1348,7 +1419,10 @@ function createMcpServer(
           path: input.path,
         }, response.content, startedAt);
       } else {
-        workspaces.markReadPathLoaded(workspace, readPath);
+        const completeSkillRead =
+          readPath.skillRead?.isSkillFile === true &&
+          isCompleteReadResult(input, response.details);
+        workspaces.markReadPathLoaded(workspace, readPath, completeSkillRead);
       }
       const agentsNotice = applicableAgentsNotice(newlyLoadedAgentsFiles, workspace.root);
       const content = agentsNotice
@@ -1446,7 +1520,7 @@ function createMcpServer(
               readRoots: readPath.readRoots,
             },
           );
-          if (!response.isError) workspaces.markReadPathLoaded(workspace, readPath);
+          if (!response.isError) workspaces.markReadPathLoaded(workspace, readPath, false);
           return { ok: !response.isError, result: contentText(response.content) };
         },
       );
@@ -2148,6 +2222,7 @@ function createMcpServer(
           command: z
             .string()
             .min(1)
+            .max(SHELL_COMMAND_MAX_CHARACTERS)
             .describe(
               `The command to execute. Prefer ${toolNames.edit}/${toolNames.write} for project file changes. HEREDOC is allowed for git commit / gh pr message bodies.`,
             ),
@@ -2197,10 +2272,18 @@ function createMcpServer(
       }) => {
         const startedAt = performance.now();
         const workspace = workspaces.getWorkspace(ownerClientId, workspaceId);
+        const cwd = workspaces.resolveWorkingDirectory(workspace, workingDirectory);
+        const commandScopes = commandInstructionScopePaths(
+          workspace.root,
+          command,
+          cwd,
+          workingDirectory,
+        );
+        if ("error" in commandScopes) return commandScopes.error;
         const instructionGate = await applicableMutationGate(
           workspaces,
           workspace,
-          [workingDirectory ?? "."],
+          commandScopes.paths,
           instructionToken,
         );
         if (instructionGate) return instructionGate;

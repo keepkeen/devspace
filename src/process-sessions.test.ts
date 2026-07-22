@@ -50,16 +50,20 @@ assert.equal(foreground.exitCode, 0);
 assert.match(foreground.output, /foreground/);
 assert.equal(foreground.sessionId, undefined);
 
+const previousCdPath = process.env.CDPATH;
+process.env.CDPATH = "/tmp/should-not-leak";
 const environment = await manager.start({
   ownerClientId,
   workspaceId: "workspace-a",
   workspaceRoot: "/tmp/devspace-workspace-a",
   cwd: process.cwd(),
-  command: `${node} -e "console.log([process.env.NO_COLOR, process.env.TERM, process.env.PAGER, process.env.GIT_PAGER, process.env.GH_PAGER, process.env.CODEX_CI, process.env.DEVSPACE_WORKSPACE_ID, process.env.DEVSPACE_WORKSPACE_ROOT].join(','))"`,
+  command: `${node} -e "console.log([process.env.NO_COLOR, process.env.TERM, process.env.PAGER, process.env.GIT_PAGER, process.env.GH_PAGER, process.env.CODEX_CI, process.env.DEVSPACE_WORKSPACE_ID, process.env.DEVSPACE_WORKSPACE_ROOT, process.env.CDPATH ?? 'unset'].join(','))"`,
   yieldTimeMs: 2_000,
 });
+if (previousCdPath === undefined) delete process.env.CDPATH;
+else process.env.CDPATH = previousCdPath;
 assert.equal(environment.running, false);
-assert.match(environment.output, /1,dumb,cat,cat,cat,1,workspace-a,\/tmp\/devspace-workspace-a/);
+assert.match(environment.output, /1,dumb,cat,cat,cat,1,workspace-a,\/tmp\/devspace-workspace-a,unset/);
 
 const background = await manager.start({
   ownerClientId,

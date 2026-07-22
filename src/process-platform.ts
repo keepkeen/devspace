@@ -83,9 +83,13 @@ function bashCommand(shell: string, command: string): ShellCommand {
   // Legacy WSL bash.exe needs stdin transport; DevSpace always passes the
   // command as an argument, so prefer -c for standard bash and Git Bash.
   if (isLegacyWslBashPath(shell)) {
-    return { executable: shell, args: ["-c", command] };
+    return { executable: shell, args: ["-c", protectShellCdPath(command)] };
   }
-  return { executable: shell, args: ["-c", command] };
+  return { executable: shell, args: ["-c", protectShellCdPath(command)] };
+}
+
+function protectShellCdPath(command: string): string {
+  return `CDPATH=''; readonly CDPATH\n${command}`;
 }
 
 /**
@@ -107,10 +111,10 @@ export function resolveShellCommand(
     if (LOGIN_SHELLS.has(shellName)) {
       // Non-login -c keeps startup fast and matches Claude/pi; profile is still
       // partially inherited via process env.
-      return { executable: configuredShell, args: ["-c", command] };
+      return { executable: configuredShell, args: ["-c", protectShellCdPath(command)] };
     }
     if (POSIX_SHELLS.has(shellName)) {
-      return { executable: configuredShell, args: ["-c", command] };
+      return { executable: configuredShell, args: ["-c", protectShellCdPath(command)] };
     }
     if (shellName === "bash" || configuredShell.toLowerCase().endsWith("bash.exe")) {
       return bashCommand(configuredShell, command);
@@ -136,7 +140,7 @@ export function resolveShellCommand(
   const bashOnPath = findBashOnPath(platform);
   if (bashOnPath) return bashCommand(bashOnPath, command);
 
-  return { executable: "/bin/sh", args: ["-c", command] };
+  return { executable: "/bin/sh", args: ["-c", protectShellCdPath(command)] };
 }
 
 export function terminateProcessTree(

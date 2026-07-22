@@ -11,6 +11,7 @@ import {
   type GrepToolInput,
   type LsToolInput,
   type ReadToolInput,
+  type ReadToolDetails,
   type WriteToolInput,
   type AgentToolResult,
 } from "@earendil-works/pi-coding-agent";
@@ -64,7 +65,10 @@ async function runTool<TInput, TDetails = unknown>(
   }
 }
 
-export async function readFileTool(input: ReadToolInput, context: ToolContext): Promise<ToolResponse> {
+export async function readFileTool(
+  input: ReadToolInput,
+  context: ToolContext,
+): Promise<ToolResponse<ReadToolDetails | undefined>> {
   const path = resolveAllowedPath(input.path, context.cwd, context.readRoots ?? [context.root]);
   const tool = createReadTool(context.cwd);
 

@@ -108,6 +108,31 @@ It terminates running processes and closes the logical session. A clean managed
 worktree is removed; a dirty managed worktree is retained and the workspace
 stays open so its changes remain manageable.
 
+## Project Instructions
+
+Within each project directory, DevSpace loads at most one instruction file in
+this order: `AGENTS.override.md`, `AGENTS.md`, `CLAUDE.md`, then configured
+fallback filenames. Uppercase `.MD` compatibility names are also recognized.
+
+Configure fallbacks in `~/.devspace/config.json`:
+
+```json
+{
+  "projectDocFallbackFilenames": ["TEAM_GUIDE.md", ".agents.md"]
+}
+```
+
+Or set `DEVSPACE_PROJECT_DOC_FALLBACK_FILENAMES` to a comma-separated list.
+Fallback entries must be plain filenames without path separators. The local
+admin panel preserves this setting when saving other fields but does not edit
+it directly.
+
+Before a shell command runs, literal `cd` and `pushd` destinations are checked
+for nested instructions. Destinations must already exist, inherited `CDPATH`
+is removed, and dynamic or opaque cwd-changing syntax is rejected. Prefer the
+tool's `workingDirectory` field; split directory creation and execution across
+two calls when necessary.
+
 The `bash.timeout` parameter is a hard runtime limit. `exec_command` uses the
 global command runtime limit and `yieldTimeMs` only controls how long the tool
 waits before returning a process session.

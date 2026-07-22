@@ -26,6 +26,18 @@ assert.equal(loadConfig(baseEnv).skillsEnabled, true);
 assert.equal(loadConfig(baseEnv).devspaceSkillsDir, join(emptyConfigDir, "skills"));
 assert.equal(loadConfig(baseEnv).devspaceAgentsDir, join(emptyConfigDir, "agents"));
 assert.equal(loadConfig(baseEnv).subagents, false);
+assert.deepEqual(loadConfig(baseEnv).projectDocFallbackFilenames, []);
+assert.deepEqual(
+  loadConfig({
+    ...baseEnv,
+    DEVSPACE_PROJECT_DOC_FALLBACK_FILENAMES: "TEAM_GUIDE.md,.agents.md,TEAM_GUIDE.md",
+  }).projectDocFallbackFilenames,
+  ["TEAM_GUIDE.md", ".agents.md"],
+);
+assert.throws(
+  () => loadConfig({ ...baseEnv, DEVSPACE_PROJECT_DOC_FALLBACK_FILENAMES: "../AGENTS.md" }),
+  /Invalid project document fallback filename/,
+);
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_SKILLS: "0" }).skillsEnabled, false);
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_SKILLS: "1" }).skillsEnabled, true);
 assert.equal(
@@ -237,6 +249,7 @@ writeFileSync(
     subagents: true,
     toolMode: "full",
     widgets: "changes",
+    projectDocFallbackFilenames: ["TEAM_GUIDE.md", ".agents.md"],
     resources: {
       maxMcpSessions: 11,
       maxProcessSessions: 9,
@@ -258,6 +271,7 @@ const fileConfig = loadConfig({ DEVSPACE_CONFIG_DIR: configDir });
 assert.equal(fileConfig.port, 8787);
 assert.equal(fileConfig.oauth.ownerToken, "persisted-owner-token-long-enough");
 assert.equal(fileConfig.publicBaseUrl, "https://devspace.example.com");
+assert.deepEqual(fileConfig.projectDocFallbackFilenames, ["TEAM_GUIDE.md", ".agents.md"]);
 assert.equal(fileConfig.subagents, true);
 assert.equal(fileConfig.toolMode, "full");
 assert.equal(fileConfig.widgets, "changes");

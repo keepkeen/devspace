@@ -3,9 +3,9 @@ import { realpathSync, type Stats } from "node:fs";
 import type { WorkspaceMode, WorkspaceStore } from "./workspace-store.js";
 import { lstat, mkdir, readFile, realpath, stat } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
-import { loadProjectContextFiles } from "@earendil-works/pi-coding-agent";
 import type { ServerConfig } from "./config.js";
 import { createManagedWorktree, removeManagedWorktree } from "./git-worktrees.js";
+import { projectInstructionFilenames } from "./project-instructions.js";
 import { assertAllowedPath, isPathInsideRoot, resolveAllowedPath } from "./roots.js";
 import {
   loadWorkspaceSkills,
@@ -188,24 +188,26 @@ export class WorkspaceRegistry {
   }
 
   resolveReadPath(workspace: Workspace, inputPath: string): WorkspaceReadPath {
+    const skillRead = resolveSkillReadPath(
+      workspace.skills,
+      workspace.activatedSkillDirs,
+      inputPath,
+    );
+    if (skillRead) {
+      return {
+        absolutePath: skillRead.absolutePath,
+        readRoots: [workspace.root, skillRead.skill.baseDir],
+        skillRead,
+      };
+    }
+
     try {
       return {
         absolutePath: this.resolvePath(workspace, inputPath),
         readRoots: [workspace.root],
       };
     } catch (workspaceError) {
-      const skillRead = resolveSkillReadPath(
-        workspace.skills,
-        workspace.activatedSkillDirs,
-        inputPath,
-      );
-      if (!skillRead) throw workspaceError;
-
-      return {
-        absolutePath: skillRead.absolutePath,
-        readRoots: [workspace.root, skillRead.skill.baseDir],
-        skillRead,
-      };
+      throw workspaceError;
     }
   }
 
@@ -241,8 +243,12 @@ export class WorkspaceRegistry {
     throw new Error(`Path cannot be confined to workspace root: ${inputPath}`);
   }
 
-  markReadPathLoaded(workspace: Workspace, readPath: WorkspaceReadPath): void {
-    if (readPath.skillRead?.isSkillFile) {
+  markReadPathLoaded(
+    workspace: Workspace,
+    readPath: WorkspaceReadPath,
+    complete: boolean,
+  ): void {
+    if (complete && readPath.skillRead?.isSkillFile) {
       markSkillActivated(workspace.activatedSkillDirs, readPath.skillRead.skill);
     }
   }
@@ -570,25 +576,27 @@ export class WorkspaceRegistry {
 
   private async loadInitialAgentsFiles(root: string): Promise<LoadedAgentsFile[]> {
     const agentDir = resolve(this.config.agentDir);
-    const resolvedRoot = (await tryRealpath(root)) ?? root;
     const resolvedAgentDir = (await tryRealpath(agentDir)) ?? agentDir;
     const loadedFiles: LoadedAgentsFile[] = [];
 
-    for (const file of loadProjectContextFiles({ cwd: root, agentDir })) {
-      const path = resolve(file.path);
-      if (!isInitialAgentsFilePath(path, root, agentDir)) continue;
-      const content = await readResolvedContextFile(
-        path,
-        file.content,
-        resolvedRoot,
-        resolvedAgentDir,
-      );
-      if (content === undefined) continue;
+    for (const name of projectInstructionFilenames([])) {
+      const candidate = join(agentDir, name);
+      try {
+        const candidateStats = await lstat(candidate);
+        if (!candidateStats.isFile() && !candidateStats.isSymbolicLink()) continue;
+        const path = await realpath(candidate);
+        if (!isPathInsideRoot(path, resolvedAgentDir)) continue;
+        if (!(await stat(path)).isFile()) continue;
+        loadedFiles.push({ path, content: await readFile(path, "utf8") });
+        break;
+      } catch (error) {
+        if (!isMissingPathError(error)) throw error;
+      }
+    }
 
-      loadedFiles.push({
-        path,
-        content,
-      });
+    for (const path of await this.instructionPathsForDirectory(root, root)) {
+      const file = await this.readCachedInstruction(path);
+      loadedFiles.push({ path, content: file.content });
     }
 
     return loadedFiles;
@@ -598,11 +606,12 @@ export class WorkspaceRegistry {
     workspace: Workspace,
     files: LoadedAgentsFile[],
   ): Promise<void> {
+    const canonicalRoot = await realpath(workspace.root);
     for (const file of files) {
-      if (!isPathInsideRoot(file.path, workspace.root)) continue;
+      if (!isPathInsideRoot(file.path, canonicalRoot)) continue;
       try {
         const resolvedPath = await realpath(file.path);
-        if (!isPathInsideRoot(resolvedPath, workspace.root)) continue;
+        if (!isPathInsideRoot(resolvedPath, canonicalRoot)) continue;
         const metadata = await stat(resolvedPath);
         const fingerprint = statsFingerprint(metadata);
         workspace.deliveredInstructionVersions.set(resolvedPath, fingerprint);
@@ -615,27 +624,29 @@ export class WorkspaceRegistry {
   }
 
   private async instructionPathsForDirectory(root: string, directory: string): Promise<string[]> {
+    const resolvedRoot = await realpath(root);
     const resolvedDirectory = await realpath(directory);
-    if (!isPathInsideRoot(resolvedDirectory, root)) return [];
+    if (!isPathInsideRoot(resolvedDirectory, resolvedRoot)) return [];
     const directoryStats = await stat(resolvedDirectory);
     const fingerprint = statsFingerprint(directoryStats);
     const cached = this.instructionDirectoryCache.get(resolvedDirectory);
     if (cached?.fingerprint === fingerprint) return cached.files;
 
-    const discoveredFiles = new Set<string>();
-    for (const name of CONTEXT_FILE_NAMES) {
+    const discoveredFiles: string[] = [];
+    for (const name of projectInstructionFilenames(this.config.projectDocFallbackFilenames)) {
       const candidate = join(resolvedDirectory, name);
       try {
         const candidateStats = await lstat(candidate);
         if (!candidateStats.isFile()) continue;
         const resolvedPath = await realpath(candidate);
-        if (!isPathInsideRoot(resolvedPath, root)) continue;
-        discoveredFiles.add(resolvedPath);
+        if (!isPathInsideRoot(resolvedPath, resolvedRoot)) continue;
+        discoveredFiles.push(resolvedPath);
+        break;
       } catch (error) {
         if (!isMissingPathError(error)) throw error;
       }
     }
-    const files = [...discoveredFiles].sort((a, b) => a.localeCompare(b));
+    const files = discoveredFiles;
     this.instructionDirectoryCache.set(resolvedDirectory, { fingerprint, files });
     return files;
   }
@@ -691,8 +702,6 @@ export async function ensureCheckoutWorkspaceRoot(
   return await ops.stat(path);
 }
 
-const CONTEXT_FILE_NAMES = new Set(["AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"]);
-
 export function formatAgentsPath(path: string, workspaceRoot: string | undefined): string {
   if (!workspaceRoot) return path.split(sep).join("/");
 
@@ -707,26 +716,6 @@ export function formatAgentsPath(path: string, workspaceRoot: string | undefined
   }
 
   return relationship.split(sep).join("/");
-}
-
-function isInitialAgentsFilePath(path: string, root: string, agentDir: string): boolean {
-  if (isPathInsideRoot(path, agentDir)) return true;
-  return isPathInsideRoot(path, root) && dirname(path) === root;
-}
-
-async function readResolvedContextFile(
-  path: string,
-  fallbackContent: string,
-  root: string,
-  agentDir: string,
-): Promise<string | undefined> {
-  try {
-    const resolvedPath = await realpath(path);
-    if (!isInitialAgentsFilePath(resolvedPath, root, agentDir)) return undefined;
-    return await readFile(resolvedPath, "utf8");
-  } catch {
-    return fallbackContent;
-  }
 }
 
 async function tryRealpath(path: string): Promise<string | undefined> {

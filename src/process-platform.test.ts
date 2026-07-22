@@ -18,26 +18,26 @@ assert.deepEqual(
 // Prefer non-login -c for configured login shells (faster, Claude/pi style).
 assert.deepEqual(resolveShellCommand("echo ok", "darwin", { SHELL: "/bin/zsh" }), {
   executable: "/bin/zsh",
-  args: ["-c", "echo ok"],
+  args: ["-c", "CDPATH=''; readonly CDPATH\necho ok"],
 });
 
 assert.deepEqual(resolveShellCommand("echo ok", "linux", { SHELL: "/bin/dash" }), {
   executable: "/bin/dash",
-  args: ["-c", "echo ok"],
+  args: ["-c", "CDPATH=''; readonly CDPATH\necho ok"],
 });
 
 // Unknown shells fall back to bash/sh rather than blindly using fish.
 const fish = resolveShellCommand("echo ok", "linux", { SHELL: "/usr/bin/fish" });
 assert.ok(fish.executable === "/bin/bash" || fish.executable === "/bin/sh" || fish.executable.endsWith("bash"));
 assert.deepEqual(fish.args.slice(0, 1), ["-c"]);
-assert.equal(fish.args[1], "echo ok");
+assert.equal(fish.args[1], "CDPATH=''; readonly CDPATH\necho ok");
 
 // Explicit DEVSPACE_SHELL / SHELL bash path is honored.
 assert.deepEqual(
   resolveShellCommand("echo ok", "linux", { DEVSPACE_SHELL: "/usr/local/bin/bash" }),
   {
     executable: "/usr/local/bin/bash",
-    args: ["-c", "echo ok"],
+    args: ["-c", "CDPATH=''; readonly CDPATH\necho ok"],
   },
 );
 

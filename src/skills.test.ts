@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import assert from "node:assert/strict";
@@ -9,8 +9,9 @@ import {
   loadWorkspaceSkills,
   resolveSkillReadPath,
 } from "./skills.js";
+import { WorkspaceRegistry } from "./workspaces.js";
 
-const root = await mkdtemp(join(tmpdir(), "devspace-skills-test-"));
+const root = await realpath(await mkdtemp(join(tmpdir(), "devspace-skills-test-")));
 const originalHome = process.env.HOME;
 const originalUserProfile = process.env.USERPROFILE;
 
@@ -236,6 +237,24 @@ try {
   const projectSkill = loaded.skills.find((skill) => skill.name === "agent-project-skill");
   assert.ok(projectSkill);
   assert.match(formatPathForPrompt(projectSkill.filePath), /SKILL\.md$/);
+
+  const workspaceRegistry = new WorkspaceRegistry(config);
+  const { workspace: skillWorkspace } = await workspaceRegistry.openWorkspace(
+    "skill-client",
+    projectRoot,
+  );
+  const advertisedWorkspaceSkill = skillWorkspace.skills.find(
+    (skill) => skill.name === "agent-project-skill",
+  );
+  assert(advertisedWorkspaceSkill);
+  const advertisedSkillPath = formatPathForPrompt(advertisedWorkspaceSkill.filePath);
+  assert.match(advertisedSkillPath, /^~\//);
+  const advertisedSkillRead = workspaceRegistry.resolveReadPath(
+    skillWorkspace,
+    advertisedSkillPath,
+  );
+  assert.equal(advertisedSkillRead.skillRead?.isSkillFile, true);
+  assert.equal(advertisedSkillRead.absolutePath, advertisedWorkspaceSkill.filePath);
 
   const skillFileRead = resolveSkillReadPath(loaded.skills, new Set(), projectSkill.filePath);
   assert.equal(skillFileRead?.isSkillFile, true);

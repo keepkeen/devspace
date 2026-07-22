@@ -19,7 +19,23 @@ import {
   MIN_COMMAND_RUNTIME_MS,
   RESOURCE_LIMIT_MAXIMUMS,
 } from "./resource-limits.js";
+import {
+  isValidProjectDocFallbackFilename,
+  MAX_PROJECT_DOC_FALLBACK_FILENAMES,
+  MAX_PROJECT_DOC_FALLBACK_FILENAME_LENGTH,
+} from "./project-instructions.js";
 import { z } from "zod";
+
+const projectDocFallbackFilenameSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(MAX_PROJECT_DOC_FALLBACK_FILENAME_LENGTH)
+  .refine(isValidProjectDocFallbackFilename, "Must be a filename without path separators.");
+
+const projectDocFallbackFilenamesSchema = z
+  .array(projectDocFallbackFilenameSchema)
+  .max(MAX_PROJECT_DOC_FALLBACK_FILENAMES);
 
 const devspaceUserConfigSchema = z.object({
   host: z.string().min(1).optional(),
@@ -30,6 +46,8 @@ const devspaceUserConfigSchema = z.object({
   stateDir: z.string().optional(),
   worktreeRoot: z.string().optional(),
   agentDir: z.string().optional(),
+  projectDocFallbackFilenames: projectDocFallbackFilenamesSchema.optional(),
+  project_doc_fallback_filenames: projectDocFallbackFilenamesSchema.optional(),
   subagents: z.boolean().optional(),
   toolMode: z.enum(["minimal", "full", "codex"]).optional(),
   widgets: z.enum(["off", "changes", "full"]).optional(),
@@ -56,6 +74,8 @@ export interface DevspaceUserConfig {
   stateDir?: string;
   worktreeRoot?: string;
   agentDir?: string;
+  projectDocFallbackFilenames?: string[];
+  project_doc_fallback_filenames?: string[];
   subagents?: boolean;
   toolMode?: "minimal" | "full" | "codex";
   widgets?: "off" | "changes" | "full";

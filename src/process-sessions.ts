@@ -114,7 +114,7 @@ function processEnvironment(input?: {
   workspaceId?: string;
   workspaceRoot?: string;
 }): Record<string, string> {
-  return {
+  const environment: Record<string, string> = {
     ...Object.fromEntries(
       Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined),
     ),
@@ -129,6 +129,10 @@ function processEnvironment(input?: {
     ...(input?.workspaceId ? { DEVSPACE_WORKSPACE_ID: input.workspaceId } : {}),
     ...(input?.workspaceRoot ? { DEVSPACE_WORKSPACE_ROOT: input.workspaceRoot } : {}),
   };
+  // CDPATH changes the destination of an otherwise literal relative `cd`,
+  // which would invalidate the instruction-scope check performed before spawn.
+  delete environment.CDPATH;
+  return environment;
 }
 
 function codePointLength(value: string): number {
