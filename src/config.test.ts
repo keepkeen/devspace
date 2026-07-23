@@ -23,6 +23,9 @@ assert.equal(loadConfig({ ...baseEnv, DEVSPACE_TOOL_MODE: "codex" }).toolMode, "
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_MINIMAL_TOOLS: "0" }).toolMode, "full");
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_MINIMAL_TOOLS: "1" }).toolMode, "minimal");
 assert.equal(loadConfig(baseEnv).skillsEnabled, true);
+assert.deepEqual(loadConfig(baseEnv).skillPaths, []);
+assert.deepEqual(loadConfig(baseEnv).disabledSkillPaths, []);
+assert.equal(loadConfig(baseEnv).adminSkillsDir, "/etc/codex/skills");
 assert.equal(loadConfig(baseEnv).devspaceSkillsDir, join(emptyConfigDir, "skills"));
 assert.equal(loadConfig(baseEnv).devspaceAgentsDir, join(emptyConfigDir, "agents"));
 assert.equal(loadConfig(baseEnv).subagents, false);
@@ -40,6 +43,19 @@ assert.throws(
 );
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_SKILLS: "0" }).skillsEnabled, false);
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_SKILLS: "1" }).skillsEnabled, true);
+assert.deepEqual(
+  loadConfig({ ...baseEnv, DEVSPACE_SKILL_PATHS: "repo-skills,../shared-skills" }).skillPaths,
+  ["repo-skills", "../shared-skills"],
+);
+assert.deepEqual(
+  loadConfig({ ...baseEnv, DEVSPACE_DISABLED_SKILL_PATHS: "one/SKILL.md,two/SKILL.md" })
+    .disabledSkillPaths,
+  ["one/SKILL.md", "two/SKILL.md"],
+);
+assert.equal(
+  loadConfig({ ...baseEnv, DEVSPACE_ADMIN_SKILLS_DIR: "admin-skills" }).adminSkillsDir,
+  "admin-skills",
+);
 assert.equal(
   loadConfig({ ...baseEnv, DEVSPACE_SUBAGENTS: "1" }).subagents,
   true,
@@ -96,6 +112,9 @@ assert.deepEqual(loadConfig(baseEnv).resources, {
   maxProcessSessions: 32,
   maxProcessSessionsPerClient: 16,
   maxProcessSessionsPerWorkspace: 8,
+  maxProcessOutputFileBytes: 64 * 1024 * 1024,
+  maxProcessOutputStorageBytes: 1024 * 1024 * 1024,
+  completedProcessOutputTtlMs: 24 * 60 * 60 * 1_000,
   maxCommandRuntimeMs: 3_600_000,
   processShutdownGraceMs: 5_000,
   httpDrainTimeoutMs: 30_000,
@@ -116,6 +135,9 @@ const limitedConfig = loadConfig({
   DEVSPACE_MAX_PROCESS_SESSIONS: "5",
   DEVSPACE_MAX_PROCESS_SESSIONS_PER_CLIENT: "4",
   DEVSPACE_MAX_PROCESS_SESSIONS_PER_WORKSPACE: "2",
+  DEVSPACE_MAX_PROCESS_OUTPUT_FILE_BYTES: "1048576",
+  DEVSPACE_MAX_PROCESS_OUTPUT_STORAGE_BYTES: "2097152",
+  DEVSPACE_COMPLETED_PROCESS_OUTPUT_TTL_SECONDS: "90",
   DEVSPACE_MAX_COMMAND_RUNTIME_SECONDS: "30",
   DEVSPACE_WORKSPACE_IDLE_TTL_SECONDS: "60",
   DEVSPACE_MAX_MANAGED_WORKTREES: "3",
@@ -129,6 +151,9 @@ assert.equal(limitedConfig.resources.maxMcpSessionsPerClient, 3);
 assert.equal(limitedConfig.resources.maxProcessSessions, 5);
 assert.equal(limitedConfig.resources.maxProcessSessionsPerClient, 4);
 assert.equal(limitedConfig.resources.maxProcessSessionsPerWorkspace, 2);
+assert.equal(limitedConfig.resources.maxProcessOutputFileBytes, 1_048_576);
+assert.equal(limitedConfig.resources.maxProcessOutputStorageBytes, 2_097_152);
+assert.equal(limitedConfig.resources.completedProcessOutputTtlMs, 90_000);
 assert.equal(limitedConfig.resources.maxCommandRuntimeMs, 30_000);
 assert.equal(limitedConfig.resources.workspaceIdleTtlMs, 60_000);
 assert.equal(limitedConfig.resources.maxManagedWorktrees, 3);
@@ -182,6 +207,26 @@ assert.throws(
 assert.throws(
   () => loadConfig({ ...baseEnv, DEVSPACE_MAX_COMMAND_RUNTIME_SECONDS: "2147484" }),
   /Invalid DEVSPACE_MAX_COMMAND_RUNTIME_SECONDS: 2147484/,
+);
+assert.throws(
+  () => loadConfig({ ...baseEnv, DEVSPACE_MAX_PROCESS_OUTPUT_FILE_BYTES: "1073741825" }),
+  /Invalid DEVSPACE_MAX_PROCESS_OUTPUT_FILE_BYTES: 1073741825/,
+);
+assert.throws(
+  () => loadConfig({ ...baseEnv, DEVSPACE_MAX_PROCESS_OUTPUT_STORAGE_BYTES: "10737418241" }),
+  /Invalid DEVSPACE_MAX_PROCESS_OUTPUT_STORAGE_BYTES: 10737418241/,
+);
+assert.throws(
+  () => loadConfig({ ...baseEnv, DEVSPACE_COMPLETED_PROCESS_OUTPUT_TTL_SECONDS: "2147484" }),
+  /Invalid DEVSPACE_COMPLETED_PROCESS_OUTPUT_TTL_SECONDS: 2147484/,
+);
+assert.throws(
+  () => loadConfig({
+    ...baseEnv,
+    DEVSPACE_MAX_PROCESS_OUTPUT_FILE_BYTES: "2048",
+    DEVSPACE_MAX_PROCESS_OUTPUT_STORAGE_BYTES: "1024",
+  }),
+  /DEVSPACE_MAX_PROCESS_OUTPUT_FILE_BYTES cannot exceed DEVSPACE_MAX_PROCESS_OUTPUT_STORAGE_BYTES/,
 );
 assert.throws(
   () => loadConfig({ ...baseEnv, DEVSPACE_INSTRUCTION_SCAN_MAX_DEPTH: "257" }),
@@ -280,10 +325,16 @@ writeFileSync(
     toolMode: "full",
     widgets: "changes",
     projectDocFallbackFilenames: ["TEAM_GUIDE.md", ".agents.md"],
+    skillPaths: ["workspace-skills"],
+    disabledSkillPaths: ["workspace-skills/disabled/SKILL.md"],
+    adminSkillsDir: "/opt/devspace/admin-skills",
     resources: {
       maxMcpSessions: 11,
       maxProcessSessions: 9,
       maxProcessSessionsPerWorkspace: 3,
+      maxProcessOutputFileBytes: 2_097_152,
+      maxProcessOutputStorageBytes: 4_194_304,
+      completedProcessOutputTtlMs: 120_000,
       maxCommandRuntimeMs: 45_000,
       maxResidentWorkspaces: 22,
       maxManagedWorktrees: 7,
@@ -302,12 +353,18 @@ assert.equal(fileConfig.port, 8787);
 assert.equal(fileConfig.oauth.ownerToken, "persisted-owner-token-long-enough");
 assert.equal(fileConfig.publicBaseUrl, "https://devspace.example.com");
 assert.deepEqual(fileConfig.projectDocFallbackFilenames, ["TEAM_GUIDE.md", ".agents.md"]);
+assert.deepEqual(fileConfig.skillPaths, ["workspace-skills"]);
+assert.deepEqual(fileConfig.disabledSkillPaths, ["workspace-skills/disabled/SKILL.md"]);
+assert.equal(fileConfig.adminSkillsDir, "/opt/devspace/admin-skills");
 assert.equal(fileConfig.subagents, true);
 assert.equal(fileConfig.toolMode, "full");
 assert.equal(fileConfig.widgets, "changes");
 assert.equal(fileConfig.resources.maxMcpSessions, 11);
 assert.equal(fileConfig.resources.maxProcessSessions, 9);
 assert.equal(fileConfig.resources.maxProcessSessionsPerWorkspace, 3);
+assert.equal(fileConfig.resources.maxProcessOutputFileBytes, 2_097_152);
+assert.equal(fileConfig.resources.maxProcessOutputStorageBytes, 4_194_304);
+assert.equal(fileConfig.resources.completedProcessOutputTtlMs, 120_000);
 assert.equal(fileConfig.resources.maxCommandRuntimeMs, 45_000);
 assert.equal(fileConfig.resources.maxResidentWorkspaces, 22);
 assert.equal(fileConfig.resources.maxManagedWorktrees, 7);

@@ -268,6 +268,8 @@ OpenAI 目前把自定义 MCP 集成称为 **developer-mode app（开发者模�
 3. 后续读取、搜索、编辑和命令调用都复用这个 `workspaceId`。
 4. ChatGPT 的 MCP 连接重新建立后，workspace 仍然存在；同一个已授权客户端也
    可以在之后的对话中重新使用它。
+   如果你删除、刷新或重新授权了 ChatGPT 应用，新的 OAuth 客户端不能复用旧
+   `workspaceId`；模型应丢弃被拒绝的 ID，并立即再次调用 `open_workspace`。
 5. 只有你明确要求释放 workspace 时，模型才应调用 `close_workspace`。长时间
    未使用的 workspace 也可能在达到配置的空闲期限后自动过期。
 
@@ -285,10 +287,14 @@ worktree，否则不建议两个账号同时写入同一个项目。
 
 打开 workspace 时，DevSpace 会返回根目录适用的 `AGENTS.md`、`CLAUDE.md`
 等指令。嵌套目录中的指令只在 ChatGPT 第一次进入该目录时加载，避免首次打开
-大型仓库就递归扫描所有文件夹。
+大型仓库就递归扫描所有文件夹。纯空白指令文件会跳过，全局、根目录和嵌套
+指令链合计最多 32 KiB；后台进程后续通过 `write_stdin` 进入新目录时也会先经过
+同一套指令确认。
 
-DevSpace 也会告诉 ChatGPT 当前可用的本地 Skill。模型必须先读取对应的
-`SKILL.md`，之后才允许读取该 Skill 的支持文件并执行其中的工作流。详细规则见
+DevSpace 也会告诉 ChatGPT 当前可用的本地 Skill。ChatGPT 网页端没有 Codex 的
+`$skill`/`/skills` 界面，因此模型通过 `load_skill` 完整加载对应 `SKILL.md`；
+加载成功后才允许读取支持文件并执行工作流。同名 Skill 不会被覆盖，模型使用
+`skillId`、路径和作用域区分。详细规则见
 [ChatGPT 编码工作流](./docs/chatgpt-coding-workflow.md)。
 
 ### 工具模式
@@ -299,9 +305,23 @@ DevSpace 也会告诉 ChatGPT 当前可用的本地 Skill。模型必须先读�
 | `full` | 独立的读取、写入、编辑、搜索、目录和 Bash 工具 | 适合偏好细粒度工具的 MCP 客户端。 |
 | `minimal` | 精简后的必要文件与命令工具 | 需要最小工具表面时使用。 |
 
+需要发送多行 Python、SQL 或 SSH 脚本时，模型可使用 `exec_command`/`bash`
+的结构化 `stdin` 字段，避免多层引号在远端解析失败。提供 `stdin` 后默认自动
+关闭输入流；需要继续交互时可设 `closeStdin: false`，之后通过 `write_stdin`
+追加内容或关闭输入流。PTY 不模拟 Ctrl-D 作为 EOF。
+
 如果已经明确知道多个相互独立的文件或搜索目标，`batch_read` 和
 `batch_inspect` 可以减少 MCP 往返。如果下一个目标依赖上一次搜索结果，模型
 仍应按顺序检查，而不是强行批量处理。
+
+DevSpace 对较大的工具结果只保留一份模型可见正文，避免同一文件或命令输出在
+`content` 和 `structuredContent` 中重复占用上下文。单项读取、Skill 加载和
+进程输出把正文放在文本 `content` 中，结构化结果只保留后续调用所需的状态与
+句柄；批量工具则把各项正文保留在 `structuredContent.items[]`，文本 `content`
+只返回完成摘要，不再提供拼接后的聚合 `result`。`_meta` 只承载可选的
+ChatGPT 组件信息，普通 MCP 客户端可以忽略。依赖旧重复字段的客户端需要按上述
+归属读取结果；详细契约见[ChatGPT 编码工作流](./docs/chatgpt-coding-workflow.md)。
+单个 `SKILL.md` 的加载上限为 64 KiB。
 
 ## 保持长期在线
 
@@ -345,7 +365,7 @@ node dist/cli.js admin
 
 DevSpace 会打开一个仅限 localhost、带一次性令牌的管理地址。面板可以：
 
-- 添加和删除允许访问的目录；
+- 添加和删除允许访问的目录；保存后热更新，无需重启；
 - 选择工具模式和组件模式；
 - 设置 MCP、进程、workspace、命令和 worktree 配额；
 - 查看后端、Tunnel、配额和最近失败状态；
@@ -353,7 +373,8 @@ DevSpace 会打开一个仅限 localhost、带一次性令牌的管理地址。�
 - 一键撤销所有 OAuth 客户端和 Token；
 - 重启明确授权的 macOS `launchd` 后端，并验证新 PID 和 readiness generation。
 
-保存配置不会偷偷重启后端。影响运行服务的配置需要在后端重启后生效。在
+保存配置不会偷偷重启后端。允许访问的目录会立即热更新：新增目录马上可用，
+移除目录会使相关 workspace 失效并终止其运行命令。其他影响运行服务的配置仍需重启。在
 macOS 上，只有明确授权的 `launchd` 服务才能由管理面板重启，例如：
 
 ```bash
@@ -379,9 +400,9 @@ DEVSPACE_LAUNCHD_SERVICE_LABEL=com.waishnav.devspace node dist/cli.js admin
 | 完整生命周期 | workspace 操作租约、独占关闭、请求排空、进程终止和统一清理，避免资源仍在使用时被提前关闭。 |
 | 真正的资源限制 | 全局和单客户端配额覆盖 MCP 会话、workspace、进程、worktree、输出和命令时间。超时命令先接收 `SIGTERM`，宽限期后仍未退出则使用 `SIGKILL`。 |
 | 客户端身份隔离 | MCP 会话、workspace、进程和持久化状态都校验 OAuth 所有权，一个客户端不能复用另一个客户端的 ID。 |
-| 项目指令 | 根目录指令立即加载；嵌套 `AGENTS.md`/`CLAUDE.md` 按路径懒加载，模型确认新指令前不会执行写入。 |
-| 本地 Skill | 安全展示标准 Skill 目录；模型读取对应 `SKILL.md` 后，支持文件才会开放。 |
-| 更安全的命令流程 | 阻止高风险命令模式，限制输出大小，并支持轮询或中断后台/PTY 进程。 |
+| 项目指令 | 根目录指令立即加载；空文件跳过；全链限制为 32 KiB；嵌套 `AGENTS.md`/`CLAUDE.md` 按路径懒加载，写入、命令及交互式 `write_stdin` 跨目录前都要确认新指令。 |
+| 本地 Skill | 在已批准根目录内从项目祖先发现 Skill，并支持用户、Admin 和 DevSpace bundled 来源；保留同名项并显示来源；8,000 字符目录预算避免挤占上下文；`load_skill` 为 ChatGPT 网页端提供可审计的显式加载。 |
+| 更安全的命令流程 | 阻止高风险命令模式，限制内联输出大小，并支持轮询或中断后台/PTY 进程；完整输出以受限 `outputId` 持久化，可用 `read_process_output` 分页恢复。 |
 | 管理面板 | localhost React 面板可管理目录和配额，通过 revision/ETag 防止覆盖并发配置，验证重启结果并提供脱敏诊断。 |
 | OAuth 加固 | 授权页面禁止 iframe 嵌套，自动清理过期记录，Owner 可一键撤销全部客户端和 Token，Token 以哈希形式存储。 |
 | 可观测性 | 结构化请求/工具日志、客户端哈希、进程代次、资源使用率、近期脱敏失败和可下载诊断报告。 |
@@ -443,6 +464,9 @@ node dist/cli.js admin
 | `DEVSPACE_WIDGETS` | `full` | `full`、`changes` 或 `off`。 |
 | `DEVSPACE_MAX_MCP_SESSIONS` | `64` | MCP 会话全局上限。 |
 | `DEVSPACE_MAX_PROCESS_SESSIONS` | `32` | 保留进程会话的全局上限。 |
+| `DEVSPACE_MAX_PROCESS_OUTPUT_FILE_BYTES` | `67108864` | 单个进程完整输出的持久化上限（64 MiB）。 |
+| `DEVSPACE_MAX_PROCESS_OUTPUT_STORAGE_BYTES` | `1073741824` | 所有持久化进程输出的总上限（1 GiB）。 |
+| `DEVSPACE_COMPLETED_PROCESS_OUTPUT_TTL_SECONDS` | `86400` | 已完成进程输出的保留时间（24 小时）。 |
 | `DEVSPACE_MAX_COMMAND_RUNTIME_SECONDS` | `3600` | 命令硬超时时间。 |
 
 完整选项见[配置参考](./docs/configuration.md)。

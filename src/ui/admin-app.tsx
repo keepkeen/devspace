@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { createRoot } from "react-dom/client";
 import type {
   AdminConfig,
@@ -59,6 +59,7 @@ type BootState =
       overrides: string[];
       warnings: Record<string, string>;
       revision: string;
+      rootsRevision: string;
     }
   | { phase: "error"; message: string };
 
@@ -73,13 +74,17 @@ const resourceFields: Array<{
   label: string;
   description: string;
   displaySeconds?: boolean;
+  unit?: string;
 }> = [
   { key: "maxMcpSessions", label: "MCP 会话上限", description: "同时保持的 MCP 客户端连接数。" },
   { key: "maxMcpSessionsPerClient", label: "单客户端 MCP 上限", description: "单个 OAuth 客户端可占用的 MCP 会话数。" },
   { key: "maxProcessSessions", label: "进程会话总上限", description: "所有 workspace 合计可运行的终端进程数。" },
   { key: "maxProcessSessionsPerClient", label: "单客户端进程上限", description: "单个 OAuth 客户端跨 workspace 可占用的进程会话数。" },
   { key: "maxProcessSessionsPerWorkspace", label: "单 workspace 进程上限", description: "单个 workspace 可同时占用的终端进程数。" },
-  { key: "maxCommandRuntimeMs", label: "命令最长运行时间", description: "命令达到此时间后会被终止。", displaySeconds: true },
+  { key: "maxProcessOutputFileBytes", label: "单份进程输出上限", description: "单个进程可持久化的完整输出字节数。", unit: "字节" },
+  { key: "maxProcessOutputStorageBytes", label: "进程输出存储总上限", description: "所有持久化进程输出合计可占用的字节数。", unit: "字节" },
+  { key: "completedProcessOutputTtlMs", label: "已完成输出保留时间", description: "进程结束后完整输出继续保留的时间。", displaySeconds: true, unit: "秒" },
+  { key: "maxCommandRuntimeMs", label: "命令最长运行时间", description: "命令达到此时间后会被终止。", displaySeconds: true, unit: "秒" },
   { key: "maxResidentWorkspaces", label: "驻留 workspace 上限", description: "内存中保留的 workspace 会话数量。" },
   { key: "maxActiveWorkspacesPerClient", label: "单客户端 workspace 上限", description: "单个 OAuth 客户端可保持的活跃 workspace 数。" },
   { key: "maxManagedWorktrees", label: "托管 worktree 上限", description: "DevSpace 同时维护的 Git worktree 数量。" },
@@ -89,46 +94,67 @@ const builtinInstructionFilenames = new Set([
   "AGENTS.override.md", "AGENTS.override.MD", "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD",
 ]);
 
+const toolModeLabels: Record<ToolMode, string> = { codex: "Codex", full: "完整", minimal: "精简" };
+const widgetModeLabels: Record<WidgetMode, string> = { full: "完整显示", changes: "仅文件变更", off: "关闭" };
+
 function AdminApp(): React.JSX.Element {
   const [boot, setBoot] = useState<BootState>({ phase: "loading" });
+  const capabilityRef = useRef(readCapability());
+  const bootingRef = useRef(false);
+  const bootReadyRef = useRef(false);
 
-  useEffect(() => {
-    let cancelled = false;
-    void (async () => {
-      const capability = readCapability();
-      clearFragment();
+  const bootstrap = useCallback(async (): Promise<void> => {
+    if (bootingRef.current || bootReadyRef.current) return;
+    bootingRef.current = true;
+    setBoot({ phase: "loading" });
+    try {
+      let session: AdminSessionResponse;
       try {
-        const session = await requestJson<AdminSessionResponse>("/api/session", {
+        const capability = capabilityRef.current;
+        session = await requestJson<AdminSessionResponse>("/api/session", {
           method: "POST",
           headers: capability ? { "X-DevSpace-Admin-Capability": capability } : undefined,
         });
-        const [status, configPayload] = await Promise.all([
-          requestJson<AdminStatusResponse>("/api/status"),
-          requestJson<AdminConfigEnvelope>("/api/config"),
-        ]);
-        if (!cancelled) {
-          setBoot({
-            phase: "ready",
-            csrfToken: session.csrfToken,
-            status,
-            config: normalizeConfig(configPayload.config),
-            overrides: configPayload.overrides ?? [],
-            warnings: configPayload.warnings ?? {},
-            revision: configPayload.revision,
-          });
-        }
+        capabilityRef.current = null;
       } catch (error) {
-        if (!cancelled) setBoot({ phase: "error", message: errorMessage(error) });
+        if (error instanceof ApiFailure) capabilityRef.current = null;
+        throw error;
       }
-    })();
-    return () => { cancelled = true; };
+      const [status, configPayload] = await Promise.all([
+        requestJson<AdminStatusResponse>("/api/status"),
+        requestJson<AdminConfigEnvelope>("/api/config"),
+      ]);
+      bootReadyRef.current = true;
+      setBoot({
+        phase: "ready",
+        csrfToken: session.csrfToken,
+        status,
+        config: normalizeConfig(configPayload.config),
+        overrides: configPayload.overrides ?? [],
+        warnings: configPayload.warnings ?? {},
+        revision: configPayload.revision,
+        rootsRevision: configPayload.rootsRevision,
+      });
+    } catch (error) {
+      setBoot({ phase: "error", message: errorMessage(error) });
+    } finally {
+      bootingRef.current = false;
+    }
   }, []);
+
+  useEffect(() => {
+    clearFragment();
+    void bootstrap();
+    const recover = (): void => { void bootstrap(); };
+    window.addEventListener("online", recover);
+    return () => window.removeEventListener("online", recover);
+  }, [bootstrap]);
 
   if (boot.phase === "loading") {
     return <CenteredState title="正在连接 DevSpace…" detail="正在建立本地管理会话。" busy />;
   }
   if (boot.phase === "error") {
-    return <CenteredState title="无法打开管理面板" detail={boot.message} tone="error" />;
+    return <CenteredState title="无法打开管理面板" detail={boot.message} tone="error"><button type="button" className="secondary-button" onClick={() => void bootstrap()}>重试连接</button></CenteredState>;
   }
   return <AdminForm {...boot} initialConfig={boot.config} initialOverrides={boot.overrides} initialWarnings={boot.warnings} initialRevision={boot.revision} />;
 }
@@ -140,6 +166,7 @@ function AdminForm({
   initialOverrides,
   initialWarnings,
   initialRevision,
+  rootsRevision: initialRootsRevision,
 }: {
   initialConfig: AdminConfig;
   status: AdminStatusResponse;
@@ -147,6 +174,7 @@ function AdminForm({
   initialOverrides: string[];
   initialWarnings: Record<string, string>;
   initialRevision: string;
+  rootsRevision: string;
 }): React.JSX.Element {
   const [config, setConfig] = useState(() => cloneConfig(initialConfig));
   const [savedConfig, setSavedConfig] = useState(() => cloneConfig(initialConfig));
@@ -158,6 +186,7 @@ function AdminForm({
   const [warnings, setWarnings] = useState(initialWarnings);
   const [savedWarnings, setSavedWarnings] = useState(initialWarnings);
   const [revision, setRevision] = useState(initialRevision);
+  const [savedRootsRevision, setSavedRootsRevision] = useState(initialRootsRevision);
   const [saveState, setSaveState] = useState<SaveState>({ phase: "idle" });
   const [status, setStatus] = useState(initialStatus);
   const [statusRefresh, setStatusRefresh] = useState<"idle" | "loading" | "error">("idle");
@@ -177,6 +206,10 @@ function AdminForm({
       newFilename.trim().length > 0,
     [config, savedConfig, newRoot, newFilename],
   );
+  const rootsOnlyDirty = useMemo(() => {
+    if (!dirty || newRoot.trim() || newFilename.trim()) return false;
+    return JSON.stringify({ ...config, allowedRoots: savedConfig.allowedRoots }) === JSON.stringify(savedConfig);
+  }, [config, dirty, newFilename, newRoot, savedConfig]);
   const issuesByPath = useMemo(() => {
     if (saveState.phase !== "error") return new Map<string, string[]>();
     const result = new Map<string, string[]>();
@@ -186,6 +219,16 @@ function AdminForm({
     }
     return result;
   }, [saveState]);
+  const activeRuntimeConfig = diagnostics?.diagnostics.runtimeConfig;
+  const runtimeConfigMismatch = Boolean(
+    activeRuntimeConfig &&
+    (activeRuntimeConfig.toolMode !== savedConfig.toolMode || activeRuntimeConfig.widgets !== savedConfig.widgets),
+  );
+  const rootsPolicyMismatch = Boolean(
+    activeRuntimeConfig?.allowedRootsRevision &&
+    activeRuntimeConfig.allowedRootsRevision !== savedRootsRevision,
+  );
+  const rootsCleanupPending = (activeRuntimeConfig?.allowedRootsCleanupPending ?? 0) > 0;
   const backend = status.runtime?.backend;
   const canRestart = Boolean(backend?.managed && backend.actions?.includes("restart"));
 
@@ -322,6 +365,7 @@ function AdminForm({
       setConfig(cloneConfig(normalized));
       setSavedConfig(cloneConfig(normalized));
       setRevision(payload.revision);
+      setSavedRootsRevision(payload.rootsRevision);
       setOverrides(payload.overrides ?? []);
       setWarnings(payload.warnings ?? {});
       setSavedWarnings(payload.warnings ?? {});
@@ -401,8 +445,10 @@ function AdminForm({
         setWarnings(result.warnings ?? {});
         setSavedWarnings(result.warnings ?? {});
         setRevision(result.revision);
+        setSavedRootsRevision(result.rootsRevision);
         restartRequired = result.restartRequired;
         configSaved = true;
+        void refreshDiagnostics();
       }
 
       if (restartAfterSave) {
@@ -450,7 +496,10 @@ function AdminForm({
         next?.mcp.ready &&
         next.runtime?.backend?.state === "running" &&
         !next.runtime.backend.lastError
-      ) return true;
+      ) {
+        await refreshDiagnostics();
+        return true;
+      }
     }
     return false;
   }
@@ -503,6 +552,7 @@ function AdminForm({
             <div className="usage-grid">
               <UsageCard label="MCP 会话" metric={diagnostics.diagnostics.usage?.mcpSessions} />
               <UsageCard label="进程会话" metric={diagnostics.diagnostics.usage?.processSessions} />
+              <UsageCard label="进程输出字节" metric={diagnostics.diagnostics.usage?.processOutput} />
               <UsageCard label="驻留 workspace" metric={diagnostics.diagnostics.usage?.workspaces} activeKey="resident" />
               <UsageCard label="OAuth 客户端" metric={{ active: diagnostics.diagnostics.usage?.oauth?.clients ?? undefined }} />
             </div>
@@ -534,7 +584,8 @@ function AdminForm({
         <section className="panel" id="access" aria-labelledby="access-heading">
           <SectionHeading kicker="ACCESS" title="访问" description="限制远程客户端可见的本机目录与项目说明文件。"><span className="count-badge">{config.allowedRoots.length}</span></SectionHeading>
           <div className="subsection">
-            <div className="subsection-heading"><div><h3>允许访问的目录</h3><p>仅列表中的目录及其子目录可被读取和修改。</p></div><FieldMeta path="allowedRoots" overrides={overrides} warnings={warnings} issues={issuesByPath} /></div>
+            <div className="subsection-heading"><div><h3>允许访问的目录</h3><p>仅列表中的目录及其子目录可被读取和修改；保存后立即生效，无需重启。移除目录会终止其运行命令并使已有 workspace 失效。</p></div><FieldMeta path="allowedRoots" overrides={overrides} warnings={warnings} issues={issuesByPath} /></div>
+            {(rootsPolicyMismatch || rootsCleanupPending) && <div className="inline-banner warning" role="status"><strong>{rootsCleanupPending ? "目录权限已收紧，但后台清理尚未完成。" : "保存的目录权限尚未与运行中的后端一致。"}</strong> 后台会持续重试；在提示消失前，请勿依赖刚新增的目录，必要时可重启后端。</div>}
             <div className="item-list">
               {config.allowedRoots.map((root, index) => <div className="item-row" key={`${root}-${index}`}><div className="item-value"><code title={root}>{root}</code><FieldMeta path={`allowedRoots.${index}`} overrides={overrides} warnings={warnings} issues={issuesByPath} /></div><button type="button" className="remove-button" onClick={() => removeRoot(index)} aria-label={`移除目录 ${root}`} title={config.allowedRoots.length <= 1 ? "至少保留一个目录" : undefined} disabled={overrides.includes("allowedRoots") || config.allowedRoots.length <= 1}>移除</button></div>)}
             </div>
@@ -549,21 +600,22 @@ function AdminForm({
 
         <section className="panel" id="tools" aria-labelledby="tools-heading">
           <SectionHeading kicker="TOOLS & INSTRUCTIONS" title="工具与说明" description="控制模型可用的工具集合及 ChatGPT 中的结果卡片。" />
+          {activeRuntimeConfig && <div className={`inline-banner ${runtimeConfigMismatch ? "warning" : "neutral"}`} role="status">{runtimeConfigMismatch ? <><strong>后端仍运行：工具模式 {toolModeLabels[activeRuntimeConfig.toolMode]}，结果卡片 {widgetModeLabels[activeRuntimeConfig.widgets]}；需重启。</strong> 重启后在 ChatGPT 应用中刷新工具。</> : <>后端已运行当前保存的工具配置。ChatGPT 应用仍可能缓存工具定义；如显示未更新，请刷新工具。</>}</div>}
           <div className="field-grid two-columns">
-            <SelectField<ToolMode> id="tool-mode" label="工具模式" value={config.toolMode} description="Codex 模式适合直接操作本地文件。" options={[["codex", "Codex"], ["full", "完整"], ["minimal", "精简"]]} onChange={(value) => { setConfig((current) => ({ ...current, toolMode: value })); beginEdit(["toolMode"]); }} disabled={overrides.includes("toolMode")} meta={<FieldMeta path="toolMode" overrides={overrides} warnings={warnings} issues={issuesByPath} />} />
+            <SelectField<ToolMode> id="tool-mode" label="工具模式" value={config.toolMode} description="Codex 用 apply_patch / exec_command 替代 write / edit / bash 等分散工具；保存后需重启后端，并在 ChatGPT 中刷新应用工具。" options={[["codex", "Codex"], ["full", "完整"], ["minimal", "精简"]]} onChange={(value) => { setConfig((current) => ({ ...current, toolMode: value })); beginEdit(["toolMode"]); }} disabled={overrides.includes("toolMode")} meta={<FieldMeta path="toolMode" overrides={overrides} warnings={warnings} issues={issuesByPath} />} />
             <SelectField<WidgetMode> id="widget-mode" label="结果卡片" value={config.widgets} description="控制工具调用详情和文件变更的展示。" options={[["full", "完整显示"], ["changes", "仅文件变更"], ["off", "关闭"]]} onChange={(value) => { setConfig((current) => ({ ...current, widgets: value })); beginEdit(["widgets"]); }} disabled={overrides.includes("widgets")} meta={<FieldMeta path="widgets" overrides={overrides} warnings={warnings} issues={issuesByPath} />} />
           </div>
         </section>
 
         <section className="panel" id="limits" aria-labelledby="limits-heading">
           <SectionHeading kicker="LIMITS" title="限制" description="为连接、进程和 workspace 设置本机资源边界。" />
-          <div className="field-grid limits-grid">{resourceFields.map((field) => { const path = `resources.${field.key}`; const value = config.resources[field.key]; return <div className="field" key={field.key}><label htmlFor={field.key}>{field.label}</label><div className="number-input-wrap"><input id={field.key} type="number" min="1" step="1" required disabled={overrides.includes(path)} value={field.displaySeconds ? value / 1_000 : value} onChange={(event) => updateResource(field.key, event.target.value, Boolean(field.displaySeconds))} aria-describedby={`${field.key}-help`} />{field.displaySeconds && <span>秒</span>}</div><p id={`${field.key}-help`} className="field-help">{field.description}</p><FieldMeta path={path} overrides={overrides} warnings={warnings} issues={issuesByPath} /></div>; })}</div>
+          <div className="field-grid limits-grid">{resourceFields.map((field) => { const path = `resources.${field.key}`; const value = config.resources[field.key]; const invalid = (issuesByPath.get(path)?.length ?? 0) > 0; const errorId = `${field.key}-errors`; return <div className="field" key={field.key}><label htmlFor={field.key}>{field.label}</label><div className="number-input-wrap"><input id={field.key} type="number" min="1" step="1" required disabled={overrides.includes(path)} value={field.displaySeconds ? value / 1_000 : value} onChange={(event) => updateResource(field.key, event.target.value, Boolean(field.displaySeconds))} aria-invalid={invalid} aria-describedby={`${field.key}-help${invalid ? ` ${errorId}` : ""}`} />{field.unit && <span>{field.unit}</span>}</div><p id={`${field.key}-help`} className="field-help">{field.description}</p><FieldMeta id={invalid ? errorId : undefined} path={path} overrides={overrides} warnings={warnings} issues={issuesByPath} /></div>; })}</div>
         </section>
         </fieldset>
 
         <div className="save-bar">
           <div className="save-summary"><span className={dirty ? "dirty-dot" : "saved-dot"} aria-hidden="true" /><p aria-live="polite">{dirty ? "有尚未保存的修改" : "所有修改均已保存"}</p></div>
-          <div className="save-actions"><button type="button" className="quiet-button" onClick={discardChanges} disabled={!dirty || saveState.phase === "saving" || saveState.phase === "restarting"}>放弃修改</button><button type="submit" className="secondary-button strong" disabled={!dirty || saveState.phase === "saving" || saveState.phase === "restarting"}>{saveState.phase === "saving" ? "保存中…" : "保存"}</button>{canRestart && <button ref={restartTriggerRef} type="button" className="primary-button" onClick={() => setRestartConfirmationOpen(true)} disabled={saveState.phase === "saving" || saveState.phase === "restarting"}>{saveState.phase === "restarting" ? "正在重启…" : dirty ? "保存并重启" : "重启服务"}</button>}</div>
+          <div className="save-actions"><button type="button" className="quiet-button" onClick={discardChanges} disabled={!dirty || saveState.phase === "saving" || saveState.phase === "restarting"}>放弃修改</button><button type="submit" className="secondary-button strong" disabled={!dirty || saveState.phase === "saving" || saveState.phase === "restarting"}>{saveState.phase === "saving" ? "保存中…" : "保存"}</button>{canRestart && !rootsOnlyDirty && <button ref={restartTriggerRef} type="button" className="primary-button" onClick={() => setRestartConfirmationOpen(true)} disabled={saveState.phase === "saving" || saveState.phase === "restarting"}>{saveState.phase === "restarting" ? "正在重启…" : dirty ? "保存并重启" : "重启服务"}</button>}</div>
         </div>
       </form>
       {restartConfirmationOpen && (

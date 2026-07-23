@@ -13,6 +13,7 @@ export interface BashPromptToolNames {
   ls: string;
   shell: string;
   writeStdin: string;
+  readProcessOutput: string;
 }
 
 export interface BashPromptOptions {
@@ -25,10 +26,10 @@ export interface BashPromptOptions {
 export function buildBashToolDescription(options: BashPromptOptions): string {
   const { toolNames, hasInspectionTools } = options;
   const inspection = hasInspectionTools
-    ? `Prefer ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} for file inspection.`
-    : `Dedicated search tools are unavailable, so use ${toolNames.shell} with rg, find, ls, or tree for discovery and ${toolNames.read} for direct reads.`;
+    ? `Prefer ${toolNames.read}/${toolNames.grep}/${toolNames.glob}/${toolNames.ls} for inspection.`
+    : `Use ${toolNames.shell} with rg/find/ls for discovery and ${toolNames.read} for reads.`;
 
-  return `Use this when a task requires a terminal command, such as a test, build, git operation, package script, or environment check. Each call starts at the workspace root or workingDirectory; ${inspection} Use run_in_background with ${toolNames.writeStdin} for long-running commands.`;
+  return `Run terminal commands at workspace root or workingDirectory. ${inspection} Long jobs: run_in_background + ${toolNames.writeStdin}.`;
 }
 
 /**
@@ -37,18 +38,16 @@ export function buildBashToolDescription(options: BashPromptOptions): string {
 export function buildBashServerInstructions(options: BashPromptOptions): string {
   const { toolNames, hasInspectionTools } = options;
   const inspection = hasInspectionTools
-    ? `Prefer ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} for file inspection. `
-    : `In minimal tool mode, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} are disabled; use ${toolNames.shell} with rg, find, ls, and tree for search and directory inspection. Prefer ${toolNames.read} for direct file reads. `;
+    ? `Inspect with ${toolNames.read}/${toolNames.grep}/${toolNames.glob}/${toolNames.ls}. `
+    : `Inspect with ${toolNames.read}, or ${toolNames.shell} plus rg/find/ls. `;
 
   return (
     `${inspection}` +
-    `Prefer ${toolNames.edit} for targeted modifications and ${toolNames.write} only for new files or complete rewrites. ` +
-    `Use ${toolNames.shell} for tests, builds, git, package scripts, and other commands that belong in a terminal. ` +
-    `Each ${toolNames.shell} call starts at the workspace root unless workingDirectory is set; cwd and shell state do not persist. ` +
-    `Default ${toolNames.shell} timeout is ${BASH_DEFAULT_TIMEOUT_SECONDS}s (max ${BASH_MAX_TIMEOUT_SECONDS}s). ` +
-    `For long-running processes set run_in_background and poll with ${toolNames.writeStdin}. ` +
-    `Do not create or modify project source files via shell redirection, sed -i, or generated scripts; HEREDOC is allowed for git/gh message bodies only. ` +
-    `A small set of dangerous commands (rm -f, sudo, pipe-to-shell) is blocked.`
+    `Use ${toolNames.edit} for targeted edits, ${toolNames.write} for new/full files, and ${toolNames.shell} for terminal work. ` +
+    `${toolNames.shell} starts at workspace root unless workingDirectory is set; cwd/shell state do not persist. Timeout ${BASH_DEFAULT_TIMEOUT_SECONDS}s, max ${BASH_MAX_TIMEOUT_SECONDS}s. ` +
+    `Send multiline Python, SQL, or SSH payloads with stdin; it closes by default. ` +
+    `For long jobs use run_in_background + ${toolNames.writeStdin}; page outputId with ${toolNames.readProcessOutput}. ` +
+    `If a process session is unknown, stop polling it and rerun the command; inspect any outputId first. Normal workspace shell writes are allowed; privilege escalation, forced/recursive deletion, and pipe-to-shell are blocked.`
   );
 }
 
@@ -63,7 +62,7 @@ export function buildWorkspaceLifecycleInstruction(options: {
   closeWorkspace: string;
 }): string {
   const { openWorkspace, closeWorkspace } = options;
-  return `Use DevSpace tools whenever a request requires reading or changing files, searching code, or running commands in a project on the user's local machine. If the current conversation does not already have a workspaceId for the requested local project, call ${openWorkspace} with the exact project path; do not probe the path through a host sandbox or code interpreter because it is a different filesystem. The server reuses an active checkout workspace for the same authorized client and canonical path when available. Reuse the returned workspaceId on every later DevSpace call in the conversation. Call ${openWorkspace} again only when switching folders/worktrees or checkout/worktree mode, or when the current ID is unknown. Call ${closeWorkspace} only after the user explicitly asks to close or release that workspace; never call it automatically at the end of a turn, task, or conversation. Host tools, including code interpreters, remain appropriate for work unrelated to the local workspace.`;
+  return `For local-project work use DevSpace, not hosted Python. Call ${openWorkspace} with the exact path once and reuse its workspaceId. If the MCP session is rejected, reconnect and retry once. If workspaceId is unknown, discard it, reopen the original exact path, replace the ID, and retry once. Never call ${closeWorkspace} unless the user asks to release the workspace.`;
 }
 
 /**
@@ -77,17 +76,16 @@ export function buildCodexServerInstructions(options: {
   read: string;
   batchRead: string;
   batchInspect: string;
+  loadSkill?: string;
+  readProcessOutput: string;
   writeStdin: string;
 }): string {
-  const { read, batchRead, batchInspect, writeStdin } = options;
+  const { read, batchRead, batchInspect, loadSkill, readProcessOutput, writeStdin } = options;
   return [
-    `Tools: ${read} for one known file, ${batchRead} for 2–8 known files, ${batchInspect} for 2–8 known searches/listings, apply_patch for file changes, exec_command for shell, ${writeStdin} to poll/interact with running processes.`,
-    `When multiple targets are already known, prefer ${batchRead} or ${batchInspect} over repeated single calls. Keep iterative discovery when the next target depends on the previous result; do not pad a batch with speculative work.`,
-    "Field names differ from stock Codex: workingDirectory (not workdir), yieldTimeMs (not yield_time_ms), maxOutputTokens (not max_output_tokens), sessionId (not session_id). Always pass workspaceId.",
-    "cwd does not persist across exec_command calls; each call starts at the workspace root unless workingDirectory is set. Do not rely on cd across calls.",
-    "Do not pass sandbox_permissions, additional_permissions, prefix_rule, justification, shell, or login — they are not supported.",
-    "Command policy blocks rm -f, sudo, and pipe-to-shell. Prefer apply_patch for file edits; ask the user before destructive actions.",
-    "Follow instructions returned by open_workspace and later tools; nested project instructions are loaded lazily when a tool enters their scope. Read applicable skill files before working in their scope.",
-    "If a mutation or command is blocked with an instructionToken, review the returned scoped instructions and pass that exact token when retrying the same tool call.",
+    `Follow open_workspace agentsFiles; nested instructions arrive on first access. If instructionToken is returned, review and retry with it.${loadSkill ? ` Load matching skills with ${loadSkill}; explicit-only skills require the user's request.` : ""}`,
+    `Use ${read} for one file, ${batchRead}/${batchInspect} for 2–8 independent targets, apply_patch for edits, and exec_command for shell work; keep dependent discovery iterative.`,
+    "Fields: workingDirectory, stdin, closeStdin, yieldTimeMs, maxOutputTokens, sessionId. Use stdin for multiline Python, SQL, or SSH payloads; it closes by default. PTY input requires closeStdin=false. Omit Codex sandbox, approval, shell, and login fields. Commands start at workspace root; cwd does not persist.",
+    `Poll with ${writeStdin}; page outputId with ${readProcessOutput}. Unknown process session: stop polling, inspect outputId, then rerun. Workspace shell writes are allowed; dangerous commands stay blocked.`,
+    ...(loadSkill ? [`After backend restart or workspace recovery, reload ${loadSkill} before support files.`] : []),
   ].join(" ");
 }

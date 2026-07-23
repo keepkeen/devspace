@@ -101,10 +101,7 @@ for (const command of [
   'echo "$(c\\d nested; touch x)"',
   "shopt -s expand_aliases; alias c='cd nested'; c",
 ]) {
-  assert.ok(
-    analyze(command).unresolvedCwds.some((entry) => entry.reason === "unsupported-syntax"),
-    `${command} did not fail closed`,
-  );
+  assert.deepEqual(analyze(command).unresolvedCwds, [], `${command} was rejected as opaque syntax`);
 }
 
 for (const command of [

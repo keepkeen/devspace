@@ -33,6 +33,8 @@ interface AuthorizationCodeRecord {
 }
 
 const CODE_TTL_MS = 5 * 60 * 1000;
+const AUTH_FAILURE_WINDOW_MS = 5 * 60 * 1000;
+const MAX_AUTH_FAILURES_PER_WINDOW = 5;
 
 function randomToken(): string {
   return randomBytes(32).toString("base64url");
@@ -117,12 +119,13 @@ function requestedScopesAllowed(requested: string[], supported: string[]): boole
   return requested.every((scope) => supported.includes(scope));
 }
 
-function setAuthorizationResponseHeaders(res: Response): void {
+function setAuthorizationResponseHeaders(res: Response, redirectUri: string): void {
+  const redirectOrigin = new URL(redirectUri).origin;
   res.setHeader("Cache-Control", "no-store");
   res.setHeader("Pragma", "no-cache");
   res.setHeader(
     "Content-Security-Policy",
-    "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+    `default-src 'none'; style-src 'unsafe-inline'; form-action 'self' ${redirectOrigin}; frame-ancestors 'none'; base-uri 'none'`,
   );
   res.setHeader("X-Frame-Options", "DENY");
   res.setHeader("X-Content-Type-Options", "nosniff");
@@ -134,9 +137,11 @@ function setAuthorizationResponseHeaders(res: Response): void {
 
 export class SingleUserOAuthProvider implements OAuthServerProvider {
   readonly clientsStore: OAuthRegisteredClientsStore;
+  readonly ownerCredentialChanged: boolean;
   private readonly codes = new Map<string, AuthorizationCodeRecord>();
   private readonly oauthStore: SqliteOAuthStore;
   private readonly resourceServerUrl: URL;
+  private readonly authorizationFailures: number[] = [];
 
   constructor(
     private readonly config: OAuthConfig,
@@ -145,7 +150,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
   ) {
     this.resourceServerUrl = resourceUrlFromServerUrl(resourceServerUrl);
     this.oauthStore = new SqliteOAuthStore(stateDir);
-    this.oauthStore.reconcileOwnerCredential(config.ownerToken);
+    this.ownerCredentialChanged = this.oauthStore.reconcileOwnerCredential(config.ownerToken);
     this.clientsStore = new SqliteOAuthClientsStore(this.oauthStore, config.allowedRedirectHosts);
   }
 
@@ -154,7 +159,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     params: AuthorizationParams,
     res: Response,
   ): Promise<void> {
-    setAuthorizationResponseHeaders(res);
+    setAuthorizationResponseHeaders(res, params.redirectUri);
     if (!params.resource || !checkResourceAllowed({ requestedResource: params.resource, configuredResource: this.resourceServerUrl })) {
       throw new InvalidRequestError("Invalid or missing OAuth resource");
     }
@@ -176,7 +181,34 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     }
 
     const providedToken = String(res.req.body?.owner_token ?? "");
-    if (!safeEquals(providedToken, this.config.ownerToken)) {
+    const now = Date.now();
+    const tokenMatches = safeEquals(providedToken, this.config.ownerToken);
+    while (
+      this.authorizationFailures.length > 0 &&
+      this.authorizationFailures[0]! <= now - AUTH_FAILURE_WINDOW_MS
+    ) {
+      this.authorizationFailures.shift();
+    }
+    if (!tokenMatches && this.authorizationFailures.length >= MAX_AUTH_FAILURES_PER_WINDOW) {
+      const retryAfterSeconds = Math.max(
+        1,
+        Math.ceil((this.authorizationFailures[0]! + AUTH_FAILURE_WINDOW_MS - now) / 1_000),
+      );
+      res.status(429).setHeader("Retry-After", String(retryAfterSeconds));
+      res.setHeader("Content-Type", "text/html; charset=utf-8");
+      res.send(
+        formHtml({
+          error: "Too many failed attempts. Wait before trying again.",
+          clientName: client.client_name ?? client.client_id,
+          scopes: params.scopes ?? this.config.scopes,
+          resource: params.resource,
+          fields: authorizationFormFields(client, params),
+        }),
+      );
+      return;
+    }
+    if (!tokenMatches) {
+      this.authorizationFailures.push(now);
       res.status(401).setHeader("Content-Type", "text/html; charset=utf-8");
       res.send(
         formHtml({
@@ -189,6 +221,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
       );
       return;
     }
+    this.authorizationFailures.length = 0;
 
     const code = `code-${randomUUID()}`;
     this.codes.set(code, {

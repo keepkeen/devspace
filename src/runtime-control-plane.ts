@@ -1,5 +1,9 @@
 import express, { Router } from "express";
-import { validInternalDiagnosticsToken, validInternalRevocationToken } from "./internal-auth.js";
+import {
+  validInternalConfigReloadToken,
+  validInternalDiagnosticsToken,
+  validInternalRevocationToken,
+} from "./internal-auth.js";
 import type { RuntimeDiagnostics } from "./runtime-diagnostics.js";
 import { DEVSPACE_VERSION } from "./version.js";
 
@@ -13,6 +17,14 @@ interface ProcessUsage {
   sessions: number;
   running: number;
   limit: number;
+}
+
+interface ProcessOutputUsage {
+  outputs: number;
+  activeOutputs: number;
+  storedBytes: number;
+  droppedBytes: number;
+  maxStorageBytes: number;
 }
 
 interface WorkspaceUsage {
@@ -37,19 +49,37 @@ interface RevocationCounts {
   refreshTokens: number;
 }
 
+interface AllowedRootsReloadResult {
+  changed: boolean;
+  added: number;
+  removed: number;
+  invalidatedWorkspaces: number;
+  terminatedProcesses: number;
+  cleanupFailures: number;
+  cleanupPending: number;
+}
+
 export interface RuntimeControlPlaneOptions {
   ownerToken: string;
   generation: string;
+  runtimeConfig: {
+    toolMode: "codex" | "full" | "minimal";
+    widgets: "full" | "changes" | "off";
+  };
+  allowedRootsRevision(): string;
+  allowedRootsCleanupPending(): number;
   isClosing(): boolean;
   workspaceDatabaseReady(): boolean;
   oauthDatabaseReady(): boolean;
   mcpUsage(): McpUsage;
   processUsage(): ProcessUsage;
+  processOutputUsage(): ProcessOutputUsage;
   workspaceUsage(): WorkspaceUsage;
   oauthUsage(): OAuthUsage;
+  reloadAllowedRoots(): Promise<AllowedRootsReloadResult>;
   revokeAll(): RevocationCounts;
   runtimeDiagnostics: RuntimeDiagnostics;
-  onGlobalRevocation(counts: RevocationCounts): void;
+  onGlobalRevocation(counts: RevocationCounts): void | Promise<void>;
 }
 
 export function createRuntimeControlPlane(options: RuntimeControlPlaneOptions): Router {
@@ -76,6 +106,7 @@ export function createRuntimeControlPlane(options: RuntimeControlPlaneOptions): 
     }
     const mcpUsage = options.mcpUsage();
     const processUsage = options.processUsage();
+    const processOutputUsage = options.processOutputUsage();
     const workspaceUsage = options.workspaceUsage();
     const oauthUsage = options.oauthUsage();
     res.setHeader("Cache-Control", "no-store");
@@ -83,6 +114,11 @@ export function createRuntimeControlPlane(options: RuntimeControlPlaneOptions): 
       generatedAt: new Date().toISOString(),
       version: DEVSPACE_VERSION,
       generation: options.generation,
+      runtimeConfig: {
+        ...options.runtimeConfig,
+        allowedRootsRevision: options.allowedRootsRevision(),
+        allowedRootsCleanupPending: options.allowedRootsCleanupPending(),
+      },
       uptimeSeconds: Math.floor(process.uptime()),
       usage: {
         mcpSessions: {
@@ -94,6 +130,14 @@ export function createRuntimeControlPlane(options: RuntimeControlPlaneOptions): 
           active: processUsage.sessions,
           running: processUsage.running,
           limit: finiteLimit(processUsage.limit),
+        },
+        processOutput: {
+          active: processOutputUsage.storedBytes,
+          used: processOutputUsage.storedBytes,
+          limit: processOutputUsage.maxStorageBytes,
+          outputs: processOutputUsage.outputs,
+          activeOutputs: processOutputUsage.activeOutputs,
+          droppedBytes: processOutputUsage.droppedBytes,
         },
         workspaces: {
           active: workspaceUsage.activePersisted,
@@ -113,7 +157,7 @@ export function createRuntimeControlPlane(options: RuntimeControlPlaneOptions): 
     });
   });
 
-  router.post("/internal/security/revoke", express.json({ limit: "1kb" }), (req, res) => {
+  router.post("/internal/security/revoke", express.json({ limit: "1kb" }), async (req, res) => {
     if (!validInternalRevocationToken(options.ownerToken, req.header("x-devspace-internal-token"))) {
       res.status(404).json({ error: "not_found" });
       return;
@@ -124,8 +168,26 @@ export function createRuntimeControlPlane(options: RuntimeControlPlaneOptions): 
     }
     const revoked = options.revokeAll();
     res.setHeader("Cache-Control", "no-store");
-    options.onGlobalRevocation(revoked);
+    await options.onGlobalRevocation(revoked);
     res.json({ ok: true, revoked });
+  });
+
+  router.post("/internal/config/reload-roots", async (req, res) => {
+    if (!validInternalConfigReloadToken(options.ownerToken, req.header("x-devspace-internal-token"))) {
+      res.status(404).json({ error: "not_found" });
+      return;
+    }
+    try {
+      const reload = await options.reloadAllowedRoots();
+      res.setHeader("Cache-Control", "no-store");
+      if (reload.cleanupPending > 0) {
+        res.status(409).json({ error: "allowed_roots_cleanup_incomplete", reload });
+        return;
+      }
+      res.json({ ok: true, reload });
+    } catch {
+      res.status(500).json({ error: "allowed_roots_reload_failed" });
+    }
   });
 
   return router;

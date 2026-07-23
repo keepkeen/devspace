@@ -44,6 +44,9 @@ assert.equal(initial.toolMode, "minimal");
 assert.equal(initial.widgets, "changes");
 assert.deepEqual(initial.projectDocFallbackFilenames, []);
 assert.equal(initial.resources.maxMcpSessions, 12);
+assert.equal(initial.resources.maxProcessOutputFileBytes, 64 * 1024 * 1024);
+assert.equal(initial.resources.maxProcessOutputStorageBytes, 1024 * 1024 * 1024);
+assert.equal(initial.resources.completedProcessOutputTtlMs, 24 * 60 * 60 * 1_000);
 
 const next = validateAdminConfig({
   ...initial,
@@ -57,12 +60,16 @@ const next = validateAdminConfig({
     maxProcessSessions: 10,
     maxProcessSessionsPerClient: 10,
     maxProcessSessionsPerWorkspace: 5,
+    maxProcessOutputFileBytes: 2_097_152,
+    maxProcessOutputStorageBytes: 4_194_304,
+    completedProcessOutputTtlMs: 120_000,
   },
 });
 assert.deepEqual(next.allowedRoots, [realpathSync(rootB), realpathSync(rootA)]);
 
 const saved = saveAdminConfig(next, env);
 assert.equal(saved.restartRequired, true);
+assert.equal(saved.rootsChanged, true);
 assert.deepEqual(saved.config.allowedRoots, [realpathSync(rootB), realpathSync(rootA)]);
 assert.deepEqual(saved.config.projectDocFallbackFilenames, ["TEAM_GUIDE.md"]);
 assert.equal(lstatSync(join(configDir, "config.json")).mode & 0o777, 0o600);
@@ -71,8 +78,13 @@ assert.deepEqual(persisted.futureSetting, { preserve: true });
 assert.equal(persisted.publicBaseUrl, "https://example.test");
 assert.equal(persisted.resources.cleanupIntervalMs, 1234);
 assert.equal(persisted.resources.maxMcpSessions, 20);
+assert.equal(persisted.resources.maxProcessOutputFileBytes, 2_097_152);
+assert.equal(persisted.resources.maxProcessOutputStorageBytes, 4_194_304);
+assert.equal(persisted.resources.completedProcessOutputTtlMs, 120_000);
 assert.deepEqual(persisted.projectDocFallbackFilenames, ["TEAM_GUIDE.md"]);
-assert.equal(saveAdminConfig(next, env).restartRequired, false);
+const unchangedSave = saveAdminConfig(next, env);
+assert.equal(unchangedSave.restartRequired, false);
+assert.equal(unchangedSave.rootsChanged, false);
 
 assert.equal(
   loadAdminConfig({ ...env, DEVSPACE_TOOL_MODE: "full", DEVSPACE_WIDGETS: "off" }).toolMode,
@@ -86,15 +98,35 @@ assert.equal(
   loadAdminConfig({ ...env, DEVSPACE_MAX_MCP_SESSIONS: "7" }).resources.maxMcpSessions,
   7,
 );
+const outputOverrideEnv = {
+  ...env,
+  DEVSPACE_MAX_PROCESS_OUTPUT_FILE_BYTES: "1048576",
+  DEVSPACE_MAX_PROCESS_OUTPUT_STORAGE_BYTES: "8388608",
+  DEVSPACE_COMPLETED_PROCESS_OUTPUT_TTL_SECONDS: "60",
+};
+assert.equal(loadAdminConfig(outputOverrideEnv).resources.maxProcessOutputFileBytes, 1_048_576);
+assert.equal(loadAdminConfig(outputOverrideEnv).resources.maxProcessOutputStorageBytes, 8_388_608);
+assert.equal(loadAdminConfig(outputOverrideEnv).resources.completedProcessOutputTtlMs, 60_000);
 assert.deepEqual(
   adminConfigOverridePaths({
     ...env,
     DEVSPACE_TOOL_MODE: "full",
     DEVSPACE_WIDGETS: "off",
     DEVSPACE_MAX_MCP_SESSIONS: "7",
+    DEVSPACE_MAX_PROCESS_OUTPUT_FILE_BYTES: "1048576",
+    DEVSPACE_MAX_PROCESS_OUTPUT_STORAGE_BYTES: "8388608",
+    DEVSPACE_COMPLETED_PROCESS_OUTPUT_TTL_SECONDS: "60",
     DEVSPACE_PROJECT_DOC_FALLBACK_FILENAMES: "LOCAL_RULES.md",
   }),
-  ["projectDocFallbackFilenames", "toolMode", "widgets", "resources.maxMcpSessions"],
+  [
+    "projectDocFallbackFilenames",
+    "toolMode",
+    "widgets",
+    "resources.maxMcpSessions",
+    "resources.maxProcessOutputFileBytes",
+    "resources.maxProcessOutputStorageBytes",
+    "resources.completedProcessOutputTtlMs",
+  ],
 );
 
 const overriddenEnv = { ...env, DEVSPACE_TOOL_MODE: "full" };
@@ -125,6 +157,20 @@ assert.equal(concurrentResults.filter((result) => result.status === "fulfilled")
 const rejectedConcurrent = concurrentResults.find((result) => result.status === "rejected");
 assert(rejectedConcurrent?.status === "rejected");
 assert(rejectedConcurrent.reason instanceof AdminConfigConflictError);
+
+const firstSaveConfigDir = join(testDir, "first-save-config");
+const firstSaveEnv = {
+  DEVSPACE_CONFIG_DIR: firstSaveConfigDir,
+  DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+};
+const firstSaveSnapshot = await loadAdminConfigSnapshot(firstSaveEnv);
+const firstSaveResult = await saveAdminConfigIfMatch({
+  ...firstSaveSnapshot.config,
+  widgets: "off",
+}, firstSaveSnapshot.revision, firstSaveEnv);
+assert.equal(firstSaveResult.config.widgets, "off");
+assert.equal(existsSync(join(firstSaveConfigDir, "config.json")), true);
+assert.equal(JSON.parse(readFileSync(join(firstSaveConfigDir, "config.json"), "utf8")).widgets, "off");
 
 const conflictConfigDir = join(testDir, "conflict-config");
 mkdirSync(conflictConfigDir);
@@ -185,6 +231,18 @@ assertValidationError({
   ...next,
   resources: { ...next.resources, maxMcpSessions: 1_025 },
 }, "resources.maxMcpSessions");
+assertValidationError({
+  ...next,
+  resources: { ...next.resources, maxProcessOutputFileBytes: 4_194_305 },
+}, "resources.maxProcessOutputFileBytes");
+assertValidationError({
+  ...next,
+  resources: { ...next.resources, maxProcessOutputStorageBytes: 10 * 1024 * 1024 * 1024 + 1 },
+}, "resources.maxProcessOutputStorageBytes");
+assertValidationError({
+  ...next,
+  resources: { ...next.resources, completedProcessOutputTtlMs: 999 },
+}, "resources.completedProcessOutputTtlMs");
 
 function assertValidationError(input: unknown, field: string): void {
   assert.throws(

@@ -254,6 +254,8 @@ h1 {
   font-size: 12px;
 }
 .inline-banner.error { border-color: #e5c2bf; background: var(--danger-soft); color: var(--danger); }
+.inline-banner.warning { border-color: #e1cfa7; background: var(--warning-soft); color: #725018; }
+.inline-banner.neutral { border-color: var(--border); background: var(--surface-muted); color: var(--text-secondary); }
 
 .notice {
   padding: 13px 15px;
@@ -572,6 +574,7 @@ input[aria-invalid="true"] { border-color: var(--danger); }
   .notice.success { border-color: #365d43; color: #8bd0a3; }
   .notice.warning { border-color: #5b4724; color: #dfb76d; }
   .notice.error { border-color: #623936; color: #ef918b; }
+  .inline-banner.warning { border-color: #5b4724; color: #dfb76d; }
 }
 
 @media (max-width: 800px) {

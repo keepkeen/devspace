@@ -8,6 +8,7 @@ import Database from "better-sqlite3";
 import { loadConfig } from "./config.js";
 import { databasePath } from "./db/client.js";
 import { GitWorktreeError, removeManagedWorktree } from "./git-worktrees.js";
+import { MAX_PROJECT_INSTRUCTION_BYTES } from "./project-instructions.js";
 import { SqliteWorkspaceStore, type WorkspaceStore } from "./workspace-store.js";
 import { ensureCheckoutWorkspaceRoot, WorkspaceRegistry } from "./workspaces.js";
 import { formatPathForPrompt } from "./skills.js";
@@ -36,6 +37,23 @@ try {
     "---\nname: workspace-skill\ndescription: Workspace test skill.\n---\n\n# Skill\n",
   );
   await writeFile(join(agentDir, "skills", "workspace-skill", "reference.md"), "reference\n");
+  const mutableSkillManifest = join(agentDir, "skills", "mutable-skill", "SKILL.md");
+  await mkdir(join(agentDir, "skills", "mutable-skill"), { recursive: true });
+  await writeFile(
+    mutableSkillManifest,
+    "---\nname: mutable-skill\ndescription: Must remain stable while loading.\n---\n",
+  );
+  const mutableMetadataSkillDir = join(agentDir, "skills", "mutable-metadata-skill");
+  await mkdir(join(mutableMetadataSkillDir, "agents"), { recursive: true });
+  await writeFile(
+    join(mutableMetadataSkillDir, "SKILL.md"),
+    "---\nname: mutable-metadata-skill\ndescription: Policy must remain stable while loading.\n---\n",
+  );
+  const mutableOpenAiMetadata = join(mutableMetadataSkillDir, "agents", "openai.yaml");
+  await writeFile(
+    mutableOpenAiMetadata,
+    "interface:\n  display_name: Before discovery\npolicy:\n  allow_implicit_invocation: false\n",
+  );
   await mkdir(join(root, ".devspace", "agents"), { recursive: true });
   await writeFile(
     join(root, ".devspace", "agents", "reviewer.md"),
@@ -90,6 +108,114 @@ try {
   assert.equal(concurrentCheckoutB.reused, true);
   const otherOwnerCheckout = await registry.openWorkspace("client-b", root);
   assert.notEqual(otherOwnerCheckout.workspace.id, workspace.id);
+
+  const hotReloadConfig = { ...config, allowedRoots: [root] };
+  const hotReloadStore = new SqliteWorkspaceStore(join(root, ".hot-reload-state"));
+  const hotReloadRegistry = new WorkspaceRegistry(hotReloadConfig, hotReloadStore);
+  const revokedWorkspace = (await hotReloadRegistry.openWorkspace(ownerClientId, root)).workspace;
+  assert.throws(() => hotReloadRegistry.applyAllowedRoots([]), /At least one allowed root/);
+  assert.equal(hotReloadRegistry.getWorkspace(ownerClientId, revokedWorkspace.id).id, revokedWorkspace.id);
+  const hotReloadResult = hotReloadRegistry.applyAllowedRoots([outsideRoot]);
+  assert.equal(hotReloadResult.changed, true);
+  assert.equal(hotReloadResult.added, 1);
+  assert.equal(hotReloadResult.removed, 1);
+  assert.deepEqual(hotReloadResult.invalidated, [{
+    workspaceId: revokedWorkspace.id,
+    ownerClientId,
+  }]);
+  assert.equal(hotReloadStore.getSession(revokedWorkspace.id, ownerClientId), undefined);
+  assert.throws(
+    () => hotReloadRegistry.getWorkspace(ownerClientId, revokedWorkspace.id),
+    /Unknown workspaceId/,
+  );
+  await assert.rejects(hotReloadRegistry.openWorkspace(ownerClientId, root), /outside allowed roots/);
+  const addedWorkspace = await hotReloadRegistry.openWorkspace(ownerClientId, await realpath(outsideRoot));
+  assert.equal(addedWorkspace.workspace.root, await realpath(outsideRoot));
+  assert.equal(hotReloadRegistry.applyAllowedRoots([outsideRoot]).changed, false);
+  hotReloadStore.close();
+
+  const historicalMissingRoot = join(root, "previously-allowed-but-missing");
+  const historicalConfig = { ...config, allowedRoots: [root, historicalMissingRoot] };
+  const historicalRegistry = new WorkspaceRegistry(historicalConfig);
+  const historicalUpdate = historicalRegistry.applyAllowedRoots([
+    root,
+    historicalMissingRoot,
+    outsideRoot,
+  ]);
+  assert.equal(historicalUpdate.changed, true);
+  assert(historicalConfig.allowedRoots.includes(historicalMissingRoot));
+  assert.throws(
+    () => historicalRegistry.applyAllowedRoots([
+      ...historicalConfig.allowedRoots,
+      join(outsideRoot, "new-missing-root"),
+    ]),
+    /ENOENT/,
+  );
+
+  const retryStore = new SqliteWorkspaceStore(join(root, ".hot-reload-retry-state"));
+  const retryRegistry = new WorkspaceRegistry({ ...config, allowedRoots: [root] }, retryStore);
+  const retryWorkspace = (await retryRegistry.openWorkspace(ownerClientId, root)).workspace;
+  const closeSessions = retryStore.closeSessions.bind(retryStore);
+  let failCloseOnce = true;
+  retryStore.closeSessions = (sessions) => {
+    if (failCloseOnce) {
+      failCloseOnce = false;
+      throw new Error("injected close failure");
+    }
+    return closeSessions(sessions);
+  };
+  const failedRetry = retryRegistry.applyAllowedRoots([outsideRoot]);
+  assert.equal(failedRetry.persistenceFailures, 1);
+  assert.deepEqual(failedRetry.invalidated, [{
+    workspaceId: retryWorkspace.id,
+    ownerClientId,
+  }]);
+  // Re-authorizing the root must not resurrect an ID whose revocation failed
+  // to persist on the first attempt.
+  const reconciledRetry = retryRegistry.applyAllowedRoots([root]);
+  assert.equal(reconciledRetry.changed, true);
+  assert.equal(reconciledRetry.persistenceFailures, 0);
+  assert.deepEqual(reconciledRetry.invalidated, [{
+    workspaceId: retryWorkspace.id,
+    ownerClientId,
+  }]);
+  assert.equal(retryStore.getSession(retryWorkspace.id, ownerClientId), undefined);
+  assert.throws(
+    () => retryRegistry.getWorkspace(ownerClientId, retryWorkspace.id),
+    /Unknown workspaceId/,
+  );
+  retryStore.close();
+
+  const leasedHotReloadConfig = { ...config, allowedRoots: [root] };
+  const leasedHotReloadRegistry = new WorkspaceRegistry(leasedHotReloadConfig);
+  const leasedHotReloadWorkspace = (
+    await leasedHotReloadRegistry.openWorkspace(ownerClientId, root)
+  ).workspace;
+  let releaseHotReloadOperation!: () => void;
+  let markHotReloadOperationStarted!: () => void;
+  const hotReloadOperationStarted = new Promise<void>((resolveStarted) => {
+    markHotReloadOperationStarted = resolveStarted;
+  });
+  const hotReloadOperationBarrier = new Promise<void>((resolveOperation) => {
+    releaseHotReloadOperation = resolveOperation;
+  });
+  const leasedHotReloadOperation = leasedHotReloadRegistry.withWorkspaceOperation(
+    ownerClientId,
+    leasedHotReloadWorkspace.id,
+    async () => {
+      markHotReloadOperationStarted();
+      await hotReloadOperationBarrier;
+      return "finished";
+    },
+  );
+  await hotReloadOperationStarted;
+  leasedHotReloadRegistry.applyAllowedRoots([outsideRoot]);
+  assert.throws(
+    () => leasedHotReloadRegistry.getWorkspace(ownerClientId, leasedHotReloadWorkspace.id),
+    /Unknown workspaceId/,
+  );
+  releaseHotReloadOperation();
+  assert.equal(await leasedHotReloadOperation, "finished");
 
   const lifecycleRegistry = new WorkspaceRegistry(config);
   const lifecycleWorkspace = (await lifecycleRegistry.openWorkspace(ownerClientId, root)).workspace;
@@ -168,23 +294,63 @@ try {
   const workspaceSkill = workspace.skills.find((skill) => skill.name === "workspace-skill");
   assert(workspaceSkill);
   const promptedSkillPath = formatPathForPrompt(workspaceSkill.filePath);
-  const workspaceSkillRead = registry.resolveReadPath(workspace, promptedSkillPath);
-  assert.equal(workspaceSkillRead.skillRead?.isSkillFile, true);
-  assert.equal(workspaceSkillRead.absolutePath, workspaceSkill.filePath);
+  assert.throws(
+    () => registry.resolveReadPath(workspace, promptedSkillPath),
+    /must be loaded with load_skill.*skillId=/i,
+  );
   const workspaceSkillReference = join(workspaceSkill.baseDir, "reference.md");
   assert.throws(
     () => registry.resolveReadPath(workspace, workspaceSkillReference),
-    /outside (workspace root|allowed roots)/i,
+    /load_skill activates skillId=/i,
   );
-  registry.markReadPathLoaded(workspace, workspaceSkillRead, false);
   assert.throws(
     () => registry.resolveReadPath(workspace, workspaceSkillReference),
-    /outside (workspace root|allowed roots)/i,
+    /load_skill activates skillId=/i,
   );
-  registry.markReadPathLoaded(workspace, workspaceSkillRead, true);
+  const loadedWorkspaceSkill = await registry.loadSkill(
+    ownerClientId,
+    workspace.id,
+    workspaceSkill.skillId,
+  );
+  assert.equal(loadedWorkspaceSkill.skill.skillId, workspaceSkill.skillId);
+  assert.match(loadedWorkspaceSkill.content, /workspace-skill/);
+  const skillActivatedWorkspace = registry.getWorkspace(ownerClientId, workspace.id);
+  const workspaceSkillRead = registry.resolveReadPath(skillActivatedWorkspace, promptedSkillPath);
+  assert.equal(workspaceSkillRead.skillRead?.isSkillFile, true);
+  assert.equal(workspaceSkillRead.absolutePath, workspaceSkill.filePath);
   assert.equal(
-    registry.resolveReadPath(workspace, workspaceSkillReference).absolutePath,
+    registry.resolveReadPath(skillActivatedWorkspace, workspaceSkillReference).absolutePath,
     workspaceSkillReference,
+  );
+  const mutableSkill = skillActivatedWorkspace.skills.find((skill) => skill.name === "mutable-skill");
+  assert(mutableSkill);
+  await writeFile(
+    mutableSkillManifest,
+    "---\nname: mutable-skill\ndescription: Changed after discovery.\n---\n",
+  );
+  await assert.rejects(
+    registry.loadSkill(ownerClientId, workspace.id, mutableSkill.skillId),
+    /changed after open_workspace/,
+  );
+  assert.throws(
+    () => registry.resolveReadPath(skillActivatedWorkspace, mutableSkill.filePath),
+    /must be loaded with load_skill/i,
+  );
+  const mutableMetadataSkill = skillActivatedWorkspace.skills.find(
+    (skill) => skill.name === "mutable-metadata-skill",
+  );
+  assert(mutableMetadataSkill);
+  await writeFile(
+    mutableOpenAiMetadata,
+    "interface:\n  display_name: After discovery\npolicy:\n  allow_implicit_invocation: true\n",
+  );
+  await assert.rejects(
+    registry.loadSkill(ownerClientId, workspace.id, mutableMetadataSkill.skillId),
+    /OpenAI metadata changed after open_workspace; reopen the workspace/,
+  );
+  assert.throws(
+    () => registry.resolveReadPath(skillActivatedWorkspace, join(mutableMetadataSkill.baseDir, "reference.md")),
+    /load_skill activates skillId=/i,
   );
 
   const priorityDirectory = join(root, "instruction-priority");
@@ -201,6 +367,18 @@ try {
     [{
       path: join(canonicalRoot, "instruction-priority", "AGENTS.override.md"),
       content: "override instructions\n",
+    }],
+  );
+  await writeFile(join(priorityDirectory, "AGENTS.override.md"), " \n\t");
+  const priorityFallbackInstructions = await registry.loadApplicableAgentsFiles(
+    workspace,
+    ["instruction-priority/file.txt"],
+  );
+  assert.deepEqual(
+    priorityFallbackInstructions.map((file) => ({ path: file.path, content: file.content })),
+    [{
+      path: join(canonicalRoot, "instruction-priority", "AGENTS.md"),
+      content: "ordinary instructions\n",
     }],
   );
 
@@ -257,6 +435,114 @@ try {
       .map((file) => file.content),
     ["root fallback instructions\n"],
   );
+
+  const emptyGlobalAgentDir = join(root, ".empty-global-agent");
+  const emptyGlobalProject = join(root, "empty-global-project");
+  await mkdir(emptyGlobalAgentDir, { recursive: true });
+  await mkdir(emptyGlobalProject);
+  await writeFile(
+    join(emptyGlobalAgentDir, "AGENTS.override.md"),
+    " ".repeat(MAX_PROJECT_INSTRUCTION_BYTES + 1),
+  );
+  await writeFile(join(emptyGlobalAgentDir, "AGENTS.md"), "global fallback instructions\n");
+  const emptyGlobalConfig = loadConfig({
+    DEVSPACE_CONFIG_DIR: join(root, ".empty-global-config"),
+    DEVSPACE_ALLOWED_ROOTS: root,
+    DEVSPACE_AGENT_DIR: emptyGlobalAgentDir,
+    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+    PORT: "1",
+  });
+  const emptyGlobalOpen = await new WorkspaceRegistry(emptyGlobalConfig).openWorkspace(
+    ownerClientId,
+    emptyGlobalProject,
+  );
+  const canonicalEmptyGlobalAgentDir = await realpath(emptyGlobalAgentDir);
+  assert.deepEqual(
+    emptyGlobalOpen.agentsFiles.map((file) => ({ path: file.path, content: file.content })),
+    [{
+      path: join(canonicalEmptyGlobalAgentDir, "AGENTS.md"),
+      content: "global fallback instructions\n",
+    }],
+  );
+
+  const budgetAgentDir = join(root, ".budget-agent");
+  const exactBudgetProject = join(root, "exact-budget-project");
+  const beyondBudgetProject = join(root, "beyond-budget-project");
+  const nestedBudgetProject = join(root, "nested-budget-project");
+  const globalBudgetContent = "g".repeat(16);
+  await mkdir(budgetAgentDir, { recursive: true });
+  await mkdir(exactBudgetProject);
+  await mkdir(beyondBudgetProject);
+  await mkdir(join(nestedBudgetProject, "nested"), { recursive: true });
+  await writeFile(join(budgetAgentDir, "AGENTS.md"), globalBudgetContent);
+  await writeFile(
+    join(exactBudgetProject, "AGENTS.md"),
+    "r".repeat(MAX_PROJECT_INSTRUCTION_BYTES - Buffer.byteLength(globalBudgetContent, "utf8")),
+  );
+  await writeFile(
+    join(beyondBudgetProject, "AGENTS.md"),
+    "r".repeat(MAX_PROJECT_INSTRUCTION_BYTES - Buffer.byteLength(globalBudgetContent, "utf8") + 1),
+  );
+  const budgetConfig = loadConfig({
+    DEVSPACE_CONFIG_DIR: join(root, ".budget-config"),
+    DEVSPACE_ALLOWED_ROOTS: root,
+    DEVSPACE_AGENT_DIR: budgetAgentDir,
+    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+    PORT: "1",
+  });
+  const budgetRegistry = new WorkspaceRegistry(budgetConfig);
+  const exactBudgetOpen = await budgetRegistry.openWorkspace(ownerClientId, exactBudgetProject);
+  assert.equal(
+    exactBudgetOpen.agentsFiles.reduce(
+      (bytes, file) => bytes + Buffer.byteLength(file.content, "utf8"),
+      0,
+    ),
+    MAX_PROJECT_INSTRUCTION_BYTES,
+  );
+  await assert.rejects(
+    budgetRegistry.openWorkspace(ownerClientId, beyondBudgetProject),
+    new RegExp(`instruction chain exceeds the ${MAX_PROJECT_INSTRUCTION_BYTES}-byte UTF-8 limit`),
+  );
+
+  const nestedRootContent = "p".repeat(17);
+  const nestedContent = "n".repeat(
+    MAX_PROJECT_INSTRUCTION_BYTES -
+      Buffer.byteLength(globalBudgetContent, "utf8") -
+      Buffer.byteLength(nestedRootContent, "utf8"),
+  );
+  await writeFile(join(nestedBudgetProject, "AGENTS.md"), nestedRootContent);
+  await writeFile(join(nestedBudgetProject, "nested", "AGENTS.md"), nestedContent);
+  const nestedBudgetOpen = await budgetRegistry.openWorkspace(ownerClientId, nestedBudgetProject);
+  const exactNestedInstructions = await budgetRegistry.loadApplicableAgentsFiles(
+    nestedBudgetOpen.workspace,
+    ["nested/file.txt"],
+  );
+  assert.deepEqual(exactNestedInstructions.map((file) => file.content), [nestedContent]);
+  await budgetRegistry.markAgentsFilesDelivered(nestedBudgetOpen.workspace, exactNestedInstructions);
+  const exactNestedAcknowledgement = await budgetRegistry.loadApplicableAgentsFiles(
+    nestedBudgetOpen.workspace,
+    ["nested/file.txt"],
+    { requireAcknowledged: true },
+  );
+  const exactNestedToken = await budgetRegistry.createInstructionAcknowledgement(
+    nestedBudgetOpen.workspace,
+    exactNestedAcknowledgement,
+  );
+  await budgetRegistry.acknowledgeInstructions(nestedBudgetOpen.workspace, exactNestedToken);
+  await writeFile(join(nestedBudgetProject, "nested", "AGENTS.md"), `${nestedContent}x`);
+  await assert.rejects(
+    budgetRegistry.loadApplicableAgentsFiles(nestedBudgetOpen.workspace, ["nested/file.txt"]),
+    new RegExp(`instruction chain exceeds the ${MAX_PROJECT_INSTRUCTION_BYTES}-byte UTF-8 limit`),
+  );
+  await assert.rejects(
+    budgetRegistry.loadApplicableAgentsFiles(
+      nestedBudgetOpen.workspace,
+      ["nested/file.txt"],
+      { requireAcknowledged: true },
+    ),
+    /nested[/\\]AGENTS\.md requires .*total 32769 bytes/,
+  );
+
   const nestedInstructions = await registry.loadApplicableAgentsFiles(workspace, ["nested/file.txt"]);
   assert.deepEqual(nestedInstructions.map(({ path, content }) => ({ path, content })), [{
     path: join(canonicalRoot, "nested", "AGENTS.md"),
@@ -642,7 +928,7 @@ try {
         ownerClientId,
         "ws_escaped_checkout",
       ),
-      /Path is outside allowed roots/,
+      /Unknown workspaceId/,
     );
     escapedStore.close();
 

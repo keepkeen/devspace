@@ -2,6 +2,7 @@ import { basename } from "node:path";
 
 export const MAX_PROJECT_DOC_FALLBACK_FILENAMES = 16;
 export const MAX_PROJECT_DOC_FALLBACK_FILENAME_LENGTH = 128;
+export const MAX_PROJECT_INSTRUCTION_BYTES = 32 * 1024;
 
 const BUILTIN_PROJECT_INSTRUCTION_FILENAMES = [
   "AGENTS.override.md",
@@ -52,4 +53,8 @@ export function normalizeProjectDocFallbackFilenames(
 
 export function projectInstructionFilenames(fallbacks: readonly string[]): string[] {
   return [...BUILTIN_PROJECT_INSTRUCTION_FILENAMES, ...fallbacks];
+}
+
+export function hasProjectInstructionContent(content: string): boolean {
+  return content.trim().length > 0;
 }

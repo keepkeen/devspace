@@ -25,11 +25,50 @@ try {
   testPersistenceAndTokenHashing(join(root, "persistence"));
   testExpiredTokenCleanup(join(root, "expiration"));
   testTransactionalTokenRotation(join(root, "rotation"));
+  testRedirectSchemeValidation(join(root, "redirect-schemes"));
   await testAuthorizationResponseHardening(join(root, "approval-headers"));
+  await testAuthorizationThrottling(join(root, "approval-throttling"));
   await testProviderRestartRotationAndRevocation(join(root, "provider"));
   await testOwnerCredentialChangeAndRevokeAll(join(root, "owner-change"));
 } finally {
   await rm(root, { recursive: true, force: true });
+}
+
+async function testAuthorizationThrottling(stateDir: string): Promise<void> {
+  const provider = new SingleUserOAuthProvider(oauthConfig, mcpUrl, stateDir);
+  const client = await provider.clientsStore.registerClient?.({
+    redirect_uris: [redirectUri],
+    client_name: "ChatGPT",
+  });
+  assert.ok(client);
+  const params = {
+    redirectUri,
+    codeChallenge: "challenge",
+    scopes: ["devspace"],
+    resource: mcpUrl,
+  };
+  try {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const failed = fakeAuthorizationResponse("POST", { owner_token: "wrong" });
+      await provider.authorize(client, params, failed.response);
+      assert.equal((failed.response as unknown as { statusCode: number }).statusCode, 401);
+    }
+    const limited = fakeAuthorizationResponse("POST", { owner_token: oauthConfig.ownerToken });
+    await provider.authorize(client, params, limited.response);
+    assert.equal((limited.response as unknown as { statusCode: number }).statusCode, 302);
+    assert.equal(limited.headers.has("retry-after"), false);
+
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const failed = fakeAuthorizationResponse("POST", { owner_token: "wrong-again" });
+      await provider.authorize(client, params, failed.response);
+    }
+    const throttledFailure = fakeAuthorizationResponse("POST", { owner_token: "still-wrong" });
+    await provider.authorize(client, params, throttledFailure.response);
+    assert.equal((throttledFailure.response as unknown as { statusCode: number }).statusCode, 429);
+    assert.match(throttledFailure.headers.get("retry-after") ?? "", /^\d+$/u);
+  } finally {
+    provider.close();
+  }
 }
 
 async function testDatabaseConfiguration(stateDir: string): Promise<void> {
@@ -145,10 +184,29 @@ function testExpiredTokenCleanup(stateDir: string): void {
 
   const reopened = new SqliteOAuthStore(stateDir);
   try {
+    assert.equal(reopened.getClient(client.client_id)?.client_id, client.client_id);
     assert.equal(reopened.getAccessToken("expired-access-hash"), undefined);
     assert.equal(reopened.getRefreshToken("expired-refresh-hash"), undefined);
   } finally {
     reopened.close();
+  }
+}
+
+function testRedirectSchemeValidation(stateDir: string): void {
+  const store = new SqliteOAuthStore(stateDir);
+  const clients = new SqliteOAuthClientsStore(store, oauthConfig.allowedRedirectHosts);
+  try {
+    assert.throws(
+      () => clients.registerClient({ redirect_uris: ["http://chatgpt.com/connector/oauth/test"] }),
+      /redirect_uri is not allowed/,
+    );
+    assert.throws(
+      () => clients.registerClient({ redirect_uris: ["javascript://chatgpt.com/connector/oauth/test"] }),
+      /redirect_uri is not allowed/,
+    );
+    assert.doesNotThrow(() => clients.registerClient({ redirect_uris: ["http://127.0.0.1:8765/callback"] }));
+  } finally {
+    store.close();
   }
 }
 
@@ -346,10 +404,14 @@ async function testOwnerCredentialChangeAndRevokeAll(stateDir: string): Promise<
     stateDir,
   );
   try {
-    assert.equal(await changedProvider.clientsStore.getClient?.(replacement.client_id), undefined);
+    assert.equal(
+      (await changedProvider.clientsStore.getClient?.(replacement.client_id))?.client_id,
+      replacement.client_id,
+    );
+    assert.equal(changedProvider.ownerCredentialChanged, true);
     await assert.rejects(changedProvider.verifyAccessToken(replacementTokens.access_token), InvalidTokenError);
     assert.deepEqual(changedProvider.diagnosticSnapshot(), {
-      clients: 0,
+      clients: 1,
       accessTokens: 0,
       refreshTokens: 0,
       expiredAccessTokens: 0,
@@ -402,6 +464,10 @@ function assertAuthorizationHeaders(headers: Map<string, string>): void {
   assert.equal(headers.get("cache-control"), "no-store");
   assert.equal(headers.get("pragma"), "no-cache");
   assert.match(headers.get("content-security-policy") ?? "", /frame-ancestors 'none'/);
+  assert.match(
+    headers.get("content-security-policy") ?? "",
+    /form-action 'self' https:\/\/chatgpt\.com/,
+  );
   assert.equal(headers.get("x-frame-options"), "DENY");
   assert.equal(headers.get("x-content-type-options"), "nosniff");
   assert.equal(headers.get("referrer-policy"), "no-referrer");

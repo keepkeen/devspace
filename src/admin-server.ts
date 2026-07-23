@@ -32,6 +32,7 @@ import {
 } from "./admin-runtime.js";
 import { logEvent } from "./logger.js";
 import { DEVSPACE_VERSION } from "./version.js";
+import { allowedRootsRevision } from "./roots.js";
 
 const CAPABILITY_HEADER = "x-devspace-admin-capability";
 const CSRF_HEADER = "x-devspace-admin-csrf";
@@ -111,6 +112,7 @@ export async function startAdminServer(
     host: initialConfig.host,
     port: initialConfig.port,
     ownerToken: initialConfig.oauth.ownerToken,
+    processShutdownGraceMs: initialConfig.resources.processShutdownGraceMs,
   });
   const capability = randomBytes(32).toString("base64url");
   const capabilityState = { available: true };
@@ -157,7 +159,12 @@ export async function startAdminServer(
     }
   });
 
-  server.requestTimeout = 10_000;
+  // Root-policy reload waits for bounded SIGTERM/SIGKILL cleanup (up to roughly
+  // two process grace periods), so the local admin request must outlive it.
+  server.requestTimeout = Math.min(
+    2_147_000_000,
+    Math.max(20_000, initialConfig.resources.processShutdownGraceMs * 2 + 10_000),
+  );
   server.headersTimeout = 10_000;
   server.keepAliveTimeout = 5_000;
 
@@ -254,6 +261,7 @@ async function handleApiRequest(
     sendJson(response, 200, {
       config: snapshot.config,
       revision: snapshot.revision,
+      rootsRevision: allowedRootsRevision(snapshot.config.allowedRoots),
       overrides: adminConfigOverridePaths(context.env),
       warnings: adminConfigWarnings(snapshot.config),
     });
@@ -340,9 +348,21 @@ async function handleApiRequest(
     }
     try {
       const saved = await saveAdminConfigIfMatch(body.config, ifMatch, context.env);
+      let rootsReloaded = !saved.rootsChanged;
+      if (saved.rootsChanged) {
+        try {
+          await context.backendClient.reloadAllowedRoots();
+          rootsReloaded = true;
+        } catch (error) {
+          if (!(error instanceof AdminBackendProxyError)) throw error;
+        }
+      }
       response.setHeader("ETag", quoteEtag(saved.revision));
       sendJson(response, 200, {
         ...saved,
+        rootsRevision: allowedRootsRevision(saved.config.allowedRoots),
+        rootsReloaded,
+        restartRequired: saved.restartRequired || !rootsReloaded,
         overrides: adminConfigOverridePaths(context.env),
         warnings: adminConfigWarnings(saved.config),
       });

@@ -1,5 +1,9 @@
 import { request as httpRequest } from "node:http";
-import { internalDiagnosticsToken, internalRevocationToken } from "./internal-auth.js";
+import {
+  internalConfigReloadToken,
+  internalDiagnosticsToken,
+  internalRevocationToken,
+} from "./internal-auth.js";
 
 const MAX_INTERNAL_RESPONSE_BYTES = 256 * 1_024;
 
@@ -16,6 +20,7 @@ export class AdminBackendProxyError extends Error {
 
 export interface AdminBackendClient {
   diagnostics(): Promise<unknown>;
+  reloadAllowedRoots(): Promise<unknown>;
   revokeAllClientsAndTokens(): Promise<unknown>;
 }
 
@@ -23,23 +28,41 @@ export interface HttpAdminBackendClientOptions {
   host: string;
   port: number;
   ownerToken: string;
+  processShutdownGraceMs: number;
 }
 
 export class HttpAdminBackendClient implements AdminBackendClient {
   private readonly host: string | undefined;
   private readonly port: number;
   private readonly internalToken: string;
+  private readonly configReloadToken: string;
   private readonly revocationToken: string;
+  private readonly configReloadTimeoutMs: number;
 
   constructor(options: HttpAdminBackendClientOptions) {
     this.host = internalLoopbackHost(options.host);
     this.port = options.port;
     this.internalToken = deriveInternalAdminToken(options.ownerToken);
+    this.configReloadToken = internalConfigReloadToken(options.ownerToken);
     this.revocationToken = internalRevocationToken(options.ownerToken);
+    this.configReloadTimeoutMs = Math.min(
+      2_147_000_000,
+      Math.max(15_000, options.processShutdownGraceMs * 2 + 5_000),
+    );
   }
 
   async diagnostics(): Promise<unknown> {
     return redactDiagnosticValue(await this.request("GET", "/internal/diagnostics"));
+  }
+
+  async reloadAllowedRoots(): Promise<unknown> {
+    return redactDiagnosticValue(await this.request(
+      "POST",
+      "/internal/config/reload-roots",
+      undefined,
+      this.configReloadToken,
+      this.configReloadTimeoutMs,
+    ));
   }
 
   async revokeAllClientsAndTokens(): Promise<unknown> {
@@ -56,6 +79,7 @@ export class HttpAdminBackendClient implements AdminBackendClient {
     path: string,
     body?: unknown,
     internalToken = this.internalToken,
+    timeoutMs = 3_000,
   ): Promise<unknown> {
     if (!this.host) {
       return Promise.reject(new AdminBackendProxyError(
@@ -71,7 +95,7 @@ export class HttpAdminBackendClient implements AdminBackendClient {
         port: this.port,
         path,
         method,
-        timeout: 3_000,
+        timeout: timeoutMs,
         headers: {
           "x-devspace-internal-token": internalToken,
           accept: "application/json",

@@ -5,18 +5,113 @@ import { resolve } from "node:path";
 import {
   OPEN_WORKSPACE_ANNOTATIONS,
   SHOW_CHANGES_ANNOTATIONS,
-  combineBatchResultWithInstructions,
+  MAX_SKILL_CATALOG_CHARACTERS,
+  buildWorkspaceSkillCatalog,
+  combineBatchItemsWithInstructions,
   containsBatchedToolCall,
   commandInstructionScopePaths,
-  isCompleteReadResult,
+  jsonRpcRequestId,
+  processInputInstructionScopePaths,
+  processInputPolicyViolation,
+  processResult,
+  recoverableWorkspaceError,
+  toolSurface,
   readinessSnapshot,
   workspaceOperationId,
   workspaceAppAssetPaths,
 } from "./server.js";
+import type { Skill } from "./skills.js";
+import { UnknownWorkspaceError } from "./workspaces.js";
+import { isLoopbackProxyPeer } from "./logger.js";
+
+assert.equal(isLoopbackProxyPeer("127.0.0.1"), true);
+assert.equal(isLoopbackProxyPeer("127.12.34.56"), true);
+assert.equal(isLoopbackProxyPeer("::1"), true);
+assert.equal(isLoopbackProxyPeer("::ffff:127.0.0.1"), true);
+assert.equal(isLoopbackProxyPeer("10.0.0.1"), false);
+assert.equal(isLoopbackProxyPeer("::ffff:10.0.0.1"), false);
+
+const catalogSkills: Skill[] = Array.from({ length: 80 }, (_, index) => ({
+  skillId: `skill_${String(index).padStart(64, "0")}`,
+  manifestHash: String(index).padStart(64, "0"),
+  name: index < 2 ? "duplicate" : `skill-${index}`,
+  description: `Skill ${index} ${"description ".repeat(80)}`,
+  filePath: `/tmp/catalog/scope-${index}/SKILL.md`,
+  baseDir: `/tmp/catalog/scope-${index}`,
+  source: index % 2 === 0 ? "repo" : "user",
+  scope: index % 2 === 0 ? "repo" : "user",
+  sourceRoot: "/tmp/catalog",
+  allowImplicitInvocation: index !== 1,
+  disableModelInvocation: index === 1,
+  sourceInfo: {
+    path: `/tmp/catalog/scope-${index}/SKILL.md`,
+    source: index % 2 === 0 ? "repo" : "user",
+    scope: index % 2 === 0 ? "project" : "user",
+    origin: "top-level",
+    baseDir: "/tmp/catalog",
+  },
+}));
+const boundedCatalog = buildWorkspaceSkillCatalog(catalogSkills);
+assert.ok(boundedCatalog.characters <= MAX_SKILL_CATALOG_CHARACTERS);
+assert.equal(JSON.stringify(boundedCatalog.skills).length, boundedCatalog.characters);
+assert.equal(boundedCatalog.totalSkills, catalogSkills.length);
+assert.ok(boundedCatalog.omittedSkills > 0);
+assert.equal(boundedCatalog.truncated, true);
+assert.equal(boundedCatalog.skills[0]?.name, "duplicate");
+assert.equal(boundedCatalog.skills[1]?.name, "duplicate");
+assert.equal(boundedCatalog.skills[1]?.allowImplicitInvocation, false);
+
+const recoverableProcessResult = processResult({
+  output: "head\ntail\n",
+  outputTruncated: true,
+  running: false,
+  exitCode: 0,
+  wallTimeMs: 100,
+  originalTokenCount: 50_000,
+  outputOmittedBytes: 100_000,
+  outputId: "output-test-id",
+  totalOutputBytes: 200_000,
+  storedOutputBytes: 200_000,
+  droppedBytes: 0,
+  timedOut: false,
+  stdinClosed: true,
+});
+assert.match(recoverableProcessResult, /read_process_output/);
+assert.match(recoverableProcessResult, /outputId=output-test-id/);
+assert.match(processResult({
+  output: "tail",
+  outputTruncated: false,
+  running: false,
+  exitCode: 0,
+  wallTimeMs: 100,
+  originalTokenCount: 1,
+  outputOmittedBytes: 0,
+  outputId: "quota-output",
+  totalOutputBytes: 20,
+  storedOutputBytes: 10,
+  droppedBytes: 10,
+  timedOut: false,
+  stdinClosed: true,
+}), /10 bytes were irrecoverably dropped/);
+assert.match(processResult({
+  output: "",
+  outputTruncated: false,
+  running: true,
+  sessionId: 42,
+  wallTimeMs: 100,
+  originalTokenCount: 0,
+  outputOmittedBytes: 0,
+  totalOutputBytes: 0,
+  storedOutputBytes: 0,
+  droppedBytes: 0,
+  timedOut: false,
+  stdinClosed: true,
+}), /Stdin is closed; poll only/);
 
 const shellWorkspaceRoot = mkdtempSync(resolve(tmpdir(), "devspace-shell-scopes-"));
 mkdirSync(resolve(shellWorkspaceRoot, "nested"));
 mkdirSync(resolve(shellWorkspaceRoot, "foo", "bar"), { recursive: true });
+mkdirSync(resolve(shellWorkspaceRoot, "bar"), { recursive: true });
 const staticShellScopes = commandInstructionScopePaths(
   shellWorkspaceRoot,
   "cd nested && pwd",
@@ -39,27 +134,217 @@ const missingShellScopes = commandInstructionScopePaths(
   shellWorkspaceRoot,
   undefined,
 );
-assert.ok("error" in missingShellScopes);
-assert.match(missingShellScopes.error.content[0]?.type === "text" ? missingShellScopes.error.content[0].text : "", /does not yet exist/);
+assert.ok("paths" in missingShellScopes);
+assert.ok(missingShellScopes.paths.includes(resolve(shellWorkspaceRoot, "future")));
 const ambiguousChainedShellScopes = commandInstructionScopePaths(
   shellWorkspaceRoot,
-  "cd foo && cd bar && pwd",
+  "cd foo && cd missing && pwd",
   shellWorkspaceRoot,
   undefined,
 );
-assert.ok("error" in ambiguousChainedShellScopes);
+assert.ok("paths" in ambiguousChainedShellScopes);
+assert.ok(ambiguousChainedShellScopes.paths.includes(resolve(shellWorkspaceRoot, "foo", "missing")));
+assert.deepEqual(
+  commandInstructionScopePaths(
+    shellWorkspaceRoot,
+    "/bin/bash -i",
+    shellWorkspaceRoot,
+    undefined,
+  ),
+  { paths: ["."] },
+);
 
-assert.equal(isCompleteReadResult({}, undefined), true);
-assert.equal(isCompleteReadResult({ offset: 1 }, undefined), false);
-assert.equal(isCompleteReadResult({ limit: 100 }, undefined), false);
 assert.equal(
-  isCompleteReadResult({}, { truncation: { truncated: true } }),
-  false,
+  processInputInstructionScopePaths(shellWorkspaceRoot, undefined, {
+    cwd: shellWorkspaceRoot,
+    scopePaths: [shellWorkspaceRoot],
+  }),
+  undefined,
 );
+const interruptInput = processInputInstructionScopePaths(shellWorkspaceRoot, "\u0003", {
+    cwd: shellWorkspaceRoot,
+    scopePaths: [shellWorkspaceRoot],
+  });
+assert.ok(interruptInput && "paths" in interruptInput);
+assert.equal(interruptInput.preparedInput.charsToWrite, "\u0003");
+const interactiveInputScopes = processInputInstructionScopePaths(
+  shellWorkspaceRoot,
+  "cd nested\npwd\n",
+  {
+    cwd: shellWorkspaceRoot,
+    scopePaths: [shellWorkspaceRoot],
+  },
+);
+assert.ok(interactiveInputScopes && "paths" in interactiveInputScopes);
+assert.deepEqual(interactiveInputScopes.paths, [
+  shellWorkspaceRoot,
+  resolve(shellWorkspaceRoot, "nested"),
+]);
+const retainedInteractiveScopes = processInputInstructionScopePaths(
+  shellWorkspaceRoot,
+  "cd bar\n",
+  {
+    cwd: shellWorkspaceRoot,
+    scopePaths: [shellWorkspaceRoot, resolve(shellWorkspaceRoot, "foo")],
+  },
+);
+assert.ok(retainedInteractiveScopes && "paths" in retainedInteractiveScopes);
+assert.deepEqual(retainedInteractiveScopes.paths, [
+  shellWorkspaceRoot,
+  resolve(shellWorkspaceRoot, "foo"),
+  resolve(shellWorkspaceRoot, "bar"),
+]);
+assert.equal(retainedInteractiveScopes.preparedInput.nextCwd, resolve(shellWorkspaceRoot, "bar"));
+
+const firstInputFragment = processInputInstructionScopePaths(
+  shellWorkspaceRoot,
+  "c",
+  {
+    cwd: shellWorkspaceRoot,
+    scopePaths: [shellWorkspaceRoot],
+    inputMode: "shell",
+    pendingInput: "",
+    inputRevision: 0,
+  },
+);
+assert.ok(firstInputFragment && "paths" in firstInputFragment);
+assert.equal(firstInputFragment.preparedInput.charsToWrite, "");
+assert.equal(firstInputFragment.preparedInput.pendingInput, "c");
+const completedInputFragment = processInputInstructionScopePaths(
+  shellWorkspaceRoot,
+  "d nested\n",
+  {
+    cwd: shellWorkspaceRoot,
+    scopePaths: [shellWorkspaceRoot],
+    inputMode: "shell",
+    pendingInput: "c",
+    inputRevision: 1,
+  },
+);
+assert.ok(completedInputFragment && "paths" in completedInputFragment);
+assert.equal(completedInputFragment.preparedInput.charsToWrite, "cd nested\n");
+assert.equal(completedInputFragment.preparedInput.nextCwd, resolve(shellWorkspaceRoot, "nested"));
+assert.ok(completedInputFragment.paths.includes(resolve(shellWorkspaceRoot, "nested")));
+assert.equal(processInputPolicyViolation(completedInputFragment.preparedInput), undefined);
+
+const flushedInputFragment = processInputInstructionScopePaths(
+  shellWorkspaceRoot,
+  undefined,
+  {
+    cwd: shellWorkspaceRoot,
+    scopePaths: [shellWorkspaceRoot],
+    inputMode: "shell",
+    pendingInput: "cd nested",
+    inputRevision: 1,
+  },
+  { flushPending: true },
+);
+assert.ok(flushedInputFragment && "paths" in flushedInputFragment);
+assert.equal(flushedInputFragment.preparedInput.charsToWrite, "cd nested");
+assert.equal(flushedInputFragment.preparedInput.pendingInput, "");
+assert.equal(flushedInputFragment.preparedInput.nextCwd, resolve(shellWorkspaceRoot, "nested"));
+
+const dangerousInputFragment = processInputInstructionScopePaths(
+  shellWorkspaceRoot,
+  " -rf nested/file\n",
+  {
+    cwd: shellWorkspaceRoot,
+    scopePaths: [shellWorkspaceRoot],
+    inputMode: "shell",
+    pendingInput: "rm",
+    inputRevision: 1,
+  },
+);
+assert.ok(dangerousInputFragment && "paths" in dangerousInputFragment);
+assert.match(
+  processInputPolicyViolation(dangerousInputFragment.preparedInput) ?? "",
+  /blocked by command policy/i,
+);
+const multilineDangerousInput = processInputInstructionScopePaths(
+  shellWorkspaceRoot,
+  "echo ok\nrm -rf nested/file\n",
+  {
+    cwd: shellWorkspaceRoot,
+    scopePaths: [shellWorkspaceRoot],
+    inputMode: "shell",
+    pendingInput: "",
+    inputRevision: 0,
+  },
+);
+assert.ok(multilineDangerousInput && "paths" in multilineDangerousInput);
+assert.match(
+  processInputPolicyViolation(multilineDangerousInput.preparedInput) ?? "",
+  /blocked by command policy/i,
+);
+const outsideWriteInput = processInputInstructionScopePaths(
+  shellWorkspaceRoot,
+  `touch ${resolve(shellWorkspaceRoot, "..", "outside-write.txt")}\n`,
+  {
+    cwd: shellWorkspaceRoot,
+    scopePaths: [shellWorkspaceRoot],
+    inputMode: "shell",
+    pendingInput: "",
+    inputRevision: 0,
+  },
+);
+assert.ok(outsideWriteInput && "paths" in outsideWriteInput);
+assert.match(
+  processInputPolicyViolation(outsideWriteInput.preparedInput, {
+    cwd: shellWorkspaceRoot,
+    workspaceRoot: shellWorkspaceRoot,
+  }) ?? "",
+  /outside the workspace/i,
+);
+const opaqueInteractiveCwd = processInputInstructionScopePaths(
+  shellWorkspaceRoot,
+  "eval cd ..\ntouch escaped\n",
+  {
+    cwd: shellWorkspaceRoot,
+    scopePaths: [shellWorkspaceRoot],
+    inputMode: "shell",
+    pendingInput: "",
+    inputRevision: 0,
+  },
+);
+assert.ok(opaqueInteractiveCwd && "error" in opaqueInteractiveCwd);
+assert.match(
+  opaqueInteractiveCwd.error.content[0]?.type === "text"
+    ? opaqueInteractiveCwd.error.content[0].text
+    : "",
+  /can change an interactive cwd without a verifiable path/i,
+);
+const chainedOpaqueInteractiveCwd = processInputInstructionScopePaths(
+  shellWorkspaceRoot,
+  "true && eval cd ..\ntouch escaped\n",
+  {
+    cwd: shellWorkspaceRoot,
+    scopePaths: [shellWorkspaceRoot],
+    inputMode: "shell",
+    pendingInput: "",
+    inputRevision: 0,
+  },
+);
+assert.ok(chainedOpaqueInteractiveCwd && "error" in chainedOpaqueInteractiveCwd);
+
 assert.equal(
-  isCompleteReadResult({}, { truncation: { truncated: false } }),
-  true,
+  processInputInstructionScopePaths(shellWorkspaceRoot, 'print("$TARGET")\n', {
+    cwd: shellWorkspaceRoot,
+    scopePaths: [shellWorkspaceRoot],
+    inputMode: "opaque",
+    pendingInput: "",
+    inputRevision: 0,
+  }),
+  undefined,
 );
+const dynamicInteractiveInputScopes = processInputInstructionScopePaths(
+  shellWorkspaceRoot,
+  'cd "$TARGET"\n',
+  {
+    cwd: shellWorkspaceRoot,
+    scopePaths: [shellWorkspaceRoot],
+  },
+);
+assert.ok(dynamicInteractiveInputScopes && "error" in dynamicInteractiveInputScopes);
 
 assert.deepEqual(OPEN_WORKSPACE_ANNOTATIONS, {
   readOnlyHint: false,
@@ -127,6 +412,36 @@ assert.equal(workspaceOperationId({
   params: { name: "close_workspace", arguments: { workspaceId: "ws_test" } },
 }), undefined);
 assert.equal(workspaceOperationId([{ method: "tools/call" }]), undefined);
+assert.equal(jsonRpcRequestId({ jsonrpc: "2.0", id: 42 }), 42);
+assert.equal(jsonRpcRequestId({ jsonrpc: "2.0", id: "call-1" }), "call-1");
+assert.equal(jsonRpcRequestId([{ jsonrpc: "2.0", id: 42 }]), null);
+assert.match(
+  recoverableWorkspaceError(new UnknownWorkspaceError("ws_stale")) ?? "",
+  /call open_workspace with the original exact project path/,
+);
+assert.match(
+  recoverableWorkspaceError(new UnknownWorkspaceError("ws_stale")) ?? "",
+  /replace the old ID.*retry the failed tool call once/,
+);
+assert.equal(recoverableWorkspaceError(new Error("database failure")), undefined);
+
+const commonTools = [
+  "batch_inspect", "batch_read", "close_workspace", "open_workspace",
+  "read", "read_process_output", "write_stdin",
+];
+assert.deepEqual(toolSurface({ toolMode: "codex", widgets: "off", skillsEnabled: true }), [
+  "apply_patch", ...commonTools, "exec_command", "load_skill",
+].sort());
+assert.deepEqual(toolSurface({ toolMode: "full", widgets: "off", skillsEnabled: true }), [
+  "bash", ...commonTools, "edit", "glob", "grep", "load_skill", "ls", "write",
+].sort());
+assert.deepEqual(toolSurface({ toolMode: "minimal", widgets: "off", skillsEnabled: true }), [
+  "bash", ...commonTools, "edit", "load_skill", "write",
+].sort());
+const changesSurface = toolSurface({ toolMode: "codex", widgets: "changes", skillsEnabled: false });
+assert.ok(changesSurface.includes("show_changes"));
+assert.equal(changesSurface.includes("load_skill"), false);
+assert.equal(changesSurface.some((name) => name.startsWith("ui://")), false);
 assert.equal(containsBatchedToolCall([
   { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "close_workspace", arguments: { workspaceId: "ws_test" } } },
   { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "exec_command", arguments: { workspaceId: "ws_test", command: "pwd" } } },
@@ -141,16 +456,30 @@ assert.equal(publicAssets.has("admin.html"), false);
 assert.equal([...publicAssets].some((path) => /(^|\/)admin-[^/]+\.(?:js|css)$/.test(path)), false);
 assert.equal([...publicAssets].every((path) => path.startsWith("assets/")), true);
 
-const combinedBatch = combineBatchResultWithInstructions("result", false, "instructions");
+const batchItem = { index: 0, operation: "read", path: "file.ts", ok: true, result: "result", truncated: false };
+const combinedBatch = combineBatchItemsWithInstructions([batchItem], false, "instructions");
 assert.equal(combinedBatch.instructionsDelivered, true);
-assert.match(combinedBatch.result, /result\n\ninstructions/);
+assert.equal(combinedBatch.items[0]?.result, "result");
+assert.equal(combinedBatch.instructions, "instructions");
 
-const oversizedInstructions = combineBatchResultWithInstructions(
-  "result",
+const oversizedInstructions = combineBatchItemsWithInstructions(
+  [{ ...batchItem, result: "r".repeat(48_000) }],
   false,
   "x".repeat(60_000),
 );
 assert.equal(oversizedInstructions.instructionsDelivered, false);
 assert.equal(oversizedInstructions.truncated, true);
-assert.ok(oversizedInstructions.result.length <= 48_000);
-assert.match(oversizedInstructions.result, /Use read on one target path/);
+assert.equal(oversizedInstructions.instructions, undefined);
+assert.match(oversizedInstructions.warning ?? "", /Use read on one target path/);
+assert.ok(
+  (oversizedInstructions.items[0]?.result.length ?? 0) + (oversizedInstructions.warning?.length ?? 0) <= 48_000,
+);
+
+const budgetedBatch = combineBatchItemsWithInstructions(
+  [{ ...batchItem, result: "r".repeat(48_000) }],
+  false,
+  "i".repeat(1_000),
+);
+assert.equal(budgetedBatch.instructionsDelivered, true);
+assert.equal(budgetedBatch.truncated, true);
+assert.ok((budgetedBatch.items[0]?.result.length ?? 0) + (budgetedBatch.instructions?.length ?? 0) <= 48_000);

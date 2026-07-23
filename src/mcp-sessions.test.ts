@@ -98,6 +98,33 @@ await delayedClose;
 assert.equal(delayedCloseResolved, true);
 assert.equal(delayedRegistry.size, 0);
 
+const activeCloseRegistry = new McpSessionRegistry<FakeTransport>({ maxSessions: 2 });
+const activeCloseTransport = createTransport();
+activeCloseRegistry.register("active-close", ownerClientId, activeCloseTransport);
+const preActiveCloseReservation = activeCloseRegistry.tryReserve(ownerClientId);
+assert(preActiveCloseReservation);
+assert.deepEqual(await activeCloseRegistry.closeActive(), [{ sessionId: "active-close" }]);
+assert.equal(activeCloseTransport.closeCalls, 1);
+assert.throws(
+  () => activeCloseRegistry.register(
+    "reserved-before-active-close",
+    ownerClientId,
+    createTransport(),
+    preActiveCloseReservation,
+  ),
+  /reservation is no longer valid/,
+);
+const postActiveCloseReservation = activeCloseRegistry.tryReserve(ownerClientId);
+assert(postActiveCloseReservation);
+activeCloseRegistry.register(
+  "after-active-close",
+  ownerClientId,
+  createTransport(),
+  postActiveCloseReservation,
+);
+assert.equal(activeCloseRegistry.get("after-active-close", ownerClientId) !== undefined, true);
+await activeCloseRegistry.closeAll();
+
 const transportCloseRegistry = new McpSessionRegistry<FakeTransport>();
 transportCloseRegistry.register("unexpected-close", ownerClientId, createTransport());
 assert.equal(
@@ -339,7 +366,10 @@ detachedHungRegistry.register("detached-hung", ownerClientId, {
 const detachedHungResults = await detachedHungRegistry.closeIdle(0);
 assert.equal(detachedHungDisposition, "intentional");
 assert.match(String(detachedHungResults[0]?.error), /Timed out closing MCP session/);
-assert.equal(detachedHungRegistry.size, 1);
+assert.equal(detachedHungRegistry.size, 0);
+const afterDetachedHung = detachedHungRegistry.tryReserve();
+assert(afterDetachedHung);
+detachedHungRegistry.releaseReservation(afterDetachedHung);
 
 const perClient = new McpSessionRegistry<FakeTransport>({
   maxSessions: 3,
@@ -383,6 +413,5 @@ perClientActive.register("active-client-a", "client-a", createTransport());
 assert(perClientActive.acquire("active-client-a", "client-a"));
 assert.deepEqual(await perClientActive.reserveWithIdleReclaim("client-a"), {});
 await perClientActive.closeAll();
-assert.equal(detachedHungRegistry.tryReserve(), undefined);
 assert.deepEqual(await detachedHungRegistry.closeAll(), []);
-assert.equal(detachedHungRegistry.size, 1);
+assert.equal(detachedHungRegistry.size, 0);

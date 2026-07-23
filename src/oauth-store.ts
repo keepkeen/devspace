@@ -49,8 +49,10 @@ function redirectHostAllowed(redirectUri: string, allowedHosts: string[]): boole
     return false;
   }
 
-  if (["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname)) return true;
-  return allowedHosts.includes(parsed.hostname);
+  if (["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname)) {
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  }
+  return parsed.protocol === "https:" && allowedHosts.includes(parsed.hostname);
 }
 
 export class SqliteOAuthStore {
@@ -195,8 +197,9 @@ export class SqliteOAuthStore {
 
   /**
    * Reconciles the configured owner credential with its salted verifier. A
-   * changed credential invalidates every registered client and token in the
-   * same database transaction.
+   * changed credential revokes every issued token in the same transaction,
+   * while preserving public dynamic client registrations so browser clients
+   * can reauthorize without having to forget and recreate the connector.
    */
   reconcileOwnerCredential(ownerToken: string): boolean {
     const reconcile = this.database.sqlite.transaction(() => {
@@ -212,7 +215,8 @@ export class SqliteOAuthStore {
       const candidate = deriveOwnerCredentialVerifier(ownerToken, row.salt);
       if (verifiersEqual(candidate, row.verifier)) return false;
 
-      this.database.sqlite.prepare("delete from oauth_clients").run();
+      this.database.sqlite.prepare("delete from oauth_access_tokens").run();
+      this.database.sqlite.prepare("delete from oauth_refresh_tokens").run();
       this.saveOwnerCredential(ownerToken);
       return true;
     });

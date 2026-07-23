@@ -46,7 +46,7 @@ The control panel provides:
 - project-instruction fallback filenames
 - tool mode (`codex`, `full`, or `minimal`)
 - widget mode (`full`, `changes`, or `off`)
-- MCP, process, command-runtime, resident-workspace, and worktree limits
+- MCP, process, persisted-output, command-runtime, resident-workspace, and worktree limits
 - per-OAuth-client MCP, process, and active-workspace quotas
 - active resource counts, quota usage, recent sanitized failures, and a redacted diagnostic bundle
 - one-click revocation of every registered OAuth client and access/refresh token
@@ -56,7 +56,10 @@ Configuration documents use `schemaVersion: 1`. Legacy documents are migrated
 with a versioned backup, and failed writes roll back. Admin reads return a
 revision/ETag and saves use compare-and-swap, so a CLI or second panel cannot
 silently overwrite newer changes. Saving reports whether a DevSpace restart is
-required. When the enrolled user launchd service
+required. Allowed-root changes are the exception: the backend applies them
+immediately, and also watches atomic config-file replacements made by the CLI.
+Removing a root invalidates affected workspace sessions and terminates their
+running commands. When the enrolled user launchd service
 is loaded, the panel also offers an explicitly confirmed **Save and restart**
 action. The operation uses a one-time confirmation token and fixed `launchctl`
 arguments. Success requires a new launchd PID, a changed `/readyz` generation,
@@ -106,9 +109,11 @@ MCP clients discover metadata from:
 Workspace and MCP resources are owned by the OAuth `clientId`. Reauthorizing the
 same registered client preserves access; a separately registered client cannot
 reuse another client's MCP session, workspace, or process identifiers.
-Changing the Owner password and restarting DevSpace invalidates all previously
-registered clients and tokens. The local Admin panel can revoke them immediately
-without changing the password.
+Changing the Owner password and restarting DevSpace revokes all access and refresh
+tokens, but preserves public OAuth client registrations so ChatGPT and other MCP
+clients can reauthorize without recreating their connector. The local Admin panel's
+"revoke all" action deliberately removes both clients and tokens when a complete
+reset is required.
 
 ## Resource Lifecycle and Limits
 
@@ -122,6 +127,9 @@ without changing the password.
 | `DEVSPACE_MAX_PROCESS_SESSIONS` | `32` | Maximum retained process sessions. |
 | `DEVSPACE_MAX_PROCESS_SESSIONS_PER_CLIENT` | `16` | Maximum retained process sessions owned by one OAuth client. |
 | `DEVSPACE_MAX_PROCESS_SESSIONS_PER_WORKSPACE` | `8` | Per-workspace process limit. |
+| `DEVSPACE_MAX_PROCESS_OUTPUT_FILE_BYTES` | `67108864` | Maximum durable output for one process (64 MiB; capped at 1 GiB). |
+| `DEVSPACE_MAX_PROCESS_OUTPUT_STORAGE_BYTES` | `1073741824` | Total durable process-output storage (1 GiB; capped at 10 GiB). |
+| `DEVSPACE_COMPLETED_PROCESS_OUTPUT_TTL_SECONDS` | `86400` | Retain completed process output for 24 hours. |
 | `DEVSPACE_MAX_COMMAND_RUNTIME_SECONDS` | `3600` | Hard upper runtime for every command. |
 | `DEVSPACE_PROCESS_SHUTDOWN_GRACE_SECONDS` | `5` | SIGTERM grace period before SIGKILL. |
 | `DEVSPACE_HTTP_DRAIN_TIMEOUT_SECONDS` | `30` | Drain deadline before remaining HTTP sockets are closed. |
@@ -141,6 +149,10 @@ stays open so its changes remain manageable.
 Within each project directory, DevSpace loads at most one instruction file in
 this order: `AGENTS.override.md`, `AGENTS.md`, `CLAUDE.md`, then configured
 fallback filenames. Uppercase `.MD` compatibility names are also recognized.
+Whitespace-only candidates are skipped. The effective global, root, and nested
+instruction chain has a combined 32 KiB UTF-8 budget and is never silently
+truncated. Blank candidates are scanned with a 1 MiB hard limit so a huge file
+cannot consume unbounded memory while being classified as empty.
 
 Configure fallbacks in `~/.devspace/config.json`:
 
@@ -184,9 +196,9 @@ cached nested instructions when later tools enter their directory scope.
 
 | Value | Behavior |
 | --- | --- |
-| `codex` | Default. Codex-style unified exec surface: `open_workspace`, `read`, `batch_read`, `batch_inspect`, `apply_patch`, `exec_command`, and `write_stdin`. Best for browser MCP hosts (ChatGPT) that have no per-command approval surface. `exec_command` returns a `sessionId` for long-running processes; poll with `write_stdin`. A small command policy blocks `rm -f`, `sudo`, and pipe-to-shell. |
-| `full` | Dedicated file tools: `open_workspace`, `read`, `batch_read`, `batch_inspect`, `write`, `edit`, `grep`, `glob`, `ls`, `bash`, and `write_stdin`. |
-| `minimal` | `open_workspace`, `read`, `batch_read`, `batch_inspect`, `write`, `edit`, `bash`, and `write_stdin`. Clients can use bounded batch inspection or `bash` with `rg`, `find`, and `ls`. |
+| `codex` | Default. Codex-style unified exec surface: `open_workspace`, `close_workspace`, `read`, `batch_read`, `batch_inspect`, `load_skill`, `apply_patch`, `exec_command`, `write_stdin`, and `read_process_output`. Best for browser MCP hosts (ChatGPT) that have no per-command approval surface. `exec_command` returns a `sessionId` for long-running processes; poll with `write_stdin`. |
+| `full` | Dedicated file tools: `open_workspace`, `close_workspace`, `read`, `batch_read`, `batch_inspect`, `load_skill`, `write`, `edit`, `grep`, `glob`, `ls`, `bash`, `write_stdin`, and `read_process_output`. |
+| `minimal` | `open_workspace`, `close_workspace`, `read`, `batch_read`, `batch_inspect`, `load_skill`, `write`, `edit`, `bash`, `write_stdin`, and `read_process_output`. Clients can use bounded batch inspection or `bash` with `rg`, `find`, and `ls`. |
 
 `DEVSPACE_MINIMAL_TOOLS` remains a backward-compatible alias when
 `DEVSPACE_TOOL_MODE` is unset: `1` selects `minimal` and `0` selects `full`.
@@ -198,16 +210,28 @@ Codex-mode commands run without a PTY by default. Set `tty: true` on
 `node-pty` dependency; `write_stdin` can send input, poll output, and resize PTY
 sessions.
 
+`exec_command` and `bash` accept a bounded `stdin` string for multiline Python,
+SQL, SSH, and similar payloads. Supplying `stdin` closes the pipe by default so
+programs waiting for EOF can finish; set `closeStdin: false` when additional
+`write_stdin` calls will follow. `write_stdin` can later set `closeStdin: true`.
+PTY input must remain open because DevSpace does not emulate EOF with Ctrl-D.
+
 ### Command policy (codex and bash modes)
 
 Shell commands are split at control operators (`&&`, `||`, `|`, `;`,
-subshells) and each segment is classified. `rm -f`, `sudo`, and piping into
-`bash`/`sh` are blocked and the model is told to use edit/write instead. This is
-a workflow guardrail, not a security boundary. OAuth and the roots allowlist
-constrain MCP identity and dedicated file tools, but shell commands run with
-the DevSpace OS user's permissions. If hard shell filesystem confinement is
-required, run DevSpace under a dedicated OS account or container with only the
-approved roots mounted.
+subshells) and each segment is classified. `sudo`, forced or recursive `rm`,
+and piping content into a shell are blocked. Normal shell writes, redirection,
+and commands such as `mkdir`, `touch`, `cp`, and `mv` are allowed. Literal
+targets for common direct writes are canonicalized and rejected when they leave
+the workspace, including through a symlink.
+
+This is an accident-prevention guardrail, not an operating-system sandbox.
+Dynamic targets, command substitutions, and opaque scripts run with the
+DevSpace OS user's permissions and cannot be fully confined by shell parsing.
+OAuth and the roots allowlist constrain MCP identity and dedicated file tools,
+but permitted shell commands run with the DevSpace OS user's permissions. If
+hard shell filesystem confinement is required, run DevSpace under a dedicated
+OS account or container with only the approved roots mounted.
 
 ## Widgets
 
@@ -219,6 +243,11 @@ approved roots mounted.
 | `changes` | Enables the aggregate `show_changes` tool and attaches widget UI to `open_workspace` and `show_changes`. |
 | `off` | Disables widget UI. |
 
+Widget `_meta` is presentation-only. DevSpace does not duplicate heavy body
+text in `_meta.card.payload.content`; widgets consume the top-level tool result.
+Hosts that do not render ChatGPT Apps may ignore `_meta` without losing the
+model-visible result or any state required for a later tool call.
+
 ## Skills
 
 | Variable | Purpose |
@@ -227,16 +256,19 @@ approved roots mounted.
 | `DEVSPACE_SUBAGENTS` | Set to `1` to expose configured agent profiles as Subagents. Experimental and disabled by default. |
 | `DEVSPACE_AGENT_DIR` | Defaults to `~/.codex`; its `skills` child is loaded for compatibility. |
 | `DEVSPACE_SKILL_PATHS` | Optional comma-separated additional skill directories. |
+| `DEVSPACE_DISABLED_SKILL_PATHS` | Optional comma-separated Skill directories or `SKILL.md` paths to disable. Relative paths resolve from the opened workspace. |
+| `DEVSPACE_ADMIN_SKILLS_DIR` | Admin-managed Skill root. Defaults to `/etc/codex/skills`. |
 
-DevSpace discovers standard Agent Skills from:
+DevSpace discovers standard Agent Skills from, in order:
 
+- repository-ancestor `.agents/skills` directories, from the most specific approved root/repository boundary to the opened workspace
 - `~/.agents/skills`
-- project `.agents/skills`
-- `~/.devspace/skills`
+- `DEVSPACE_ADMIN_SKILLS_DIR`
+- the Skill directory bundled with DevSpace
 
 It also keeps compatibility with:
 
-- the bundled `subagent-delegation` skill when `DEVSPACE_SUBAGENTS=1`, unless `~/.devspace/skills/subagent-delegation/SKILL.md` exists
+- `~/.devspace/skills`
 - `DEVSPACE_AGENT_DIR/skills`, defaulting to `~/.codex/skills`
 - additional paths from `DEVSPACE_SKILL_PATHS`
 
@@ -258,6 +290,14 @@ Starter profile templates are available under `examples/agents/`. Copy or adapt
 them into one of the active profile directories before use.
 
 Legacy project paths such as `.pi/skills` can be added through `DEVSPACE_SKILL_PATHS` when needed.
+
+Each manifest requires non-empty string `name` and `description` frontmatter.
+Duplicate names are retained and distinguished by stable ID, path, source, and
+scope. Optional `agents/openai.yaml` is supported; set
+`policy.allow_implicit_invocation: false` to require an explicit user request.
+The `open_workspace` Skill catalog is limited to 8,000 serialized characters.
+ChatGPT web loads a selected manifest of at most 64 KiB with `load_skill`; only
+a complete, successful load opens access to that Skill's support files.
 
 Example:
 

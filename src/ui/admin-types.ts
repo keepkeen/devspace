@@ -7,6 +7,9 @@ export interface AdminResourceLimits {
   maxProcessSessions: number;
   maxProcessSessionsPerClient: number;
   maxProcessSessionsPerWorkspace: number;
+  maxProcessOutputFileBytes: number;
+  maxProcessOutputStorageBytes: number;
+  completedProcessOutputTtlMs: number;
   maxCommandRuntimeMs: number;
   maxResidentWorkspaces: number;
   maxActiveWorkspacesPerClient: number;
@@ -77,6 +80,7 @@ export interface AdminStatusResponse {
 export interface AdminConfigEnvelope {
   config: AdminConfig;
   revision: string;
+  rootsRevision: string;
   overrides?: string[];
   warnings?: Record<string, string>;
 }
@@ -85,6 +89,9 @@ export interface AdminConfigSavedResponse {
   config: AdminConfig;
   revision: string;
   restartRequired: boolean;
+  rootsRevision: string;
+  rootsChanged?: boolean;
+  rootsReloaded?: boolean;
   overrides?: string[];
   warnings?: Record<string, string>;
 }
@@ -130,9 +137,16 @@ export interface AdminDiagnostics {
   version?: string;
   generation?: string;
   uptimeSeconds?: number | null;
+  runtimeConfig?: {
+    toolMode: ToolMode;
+    widgets: WidgetMode;
+    allowedRootsRevision?: string;
+    allowedRootsCleanupPending?: number;
+  };
   usage?: {
     mcpSessions?: AdminUsageMetric & { reserved?: number | null };
     processSessions?: AdminUsageMetric;
+    processOutput?: AdminUsageMetric & { outputs?: number | null; activeOutputs?: number | null; droppedBytes?: number | null };
     workspaces?: AdminUsageMetric & { resident?: number | null; closing?: number | null };
     oauth?: { clients?: number | null; accessTokens?: number | null; refreshTokens?: number | null; expiredRecords?: number | null };
   };

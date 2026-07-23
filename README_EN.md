@@ -274,6 +274,9 @@ The expected workflow is:
 3. ChatGPT reuses that `workspaceId` for reads, searches, edits, and commands.
 4. The workspace survives normal ChatGPT transport reconnects and can be reused
    in later conversations by the same authorized client.
+   If the ChatGPT app is deleted, refreshed, or re-authorized as a new OAuth
+   client, discard any rejected old `workspaceId` and call `open_workspace`
+   again immediately.
 5. `close_workspace` is used only when you explicitly ask to release it.
    Unused workspaces may also expire after the configured idle period.
 
@@ -294,11 +297,15 @@ use separate Git worktrees.
 When a workspace opens, DevSpace returns root-level instructions such as
 `AGENTS.md` or `CLAUDE.md`. Nested instructions are loaded only when ChatGPT
 enters that directory, which avoids scanning an entire large repository up
-front.
+front. Whitespace-only files are skipped, the combined global/root/nested
+instruction chain is limited to 32 KiB, and interactive `write_stdin` input is
+gated when a running process may enter a newly instructed directory.
 
-DevSpace also advertises matching local Skills. ChatGPT must first read the
-Skill's `SKILL.md`; after that, it may read the Skill's supporting files and
-follow its workflow. See the detailed
+DevSpace also advertises matching local Skills. ChatGPT web has no Codex
+`$skill` or `/skills` picker, so the model calls `load_skill` to load one
+complete `SKILL.md`. Supporting files remain unavailable until that succeeds.
+Duplicate names are preserved and distinguished by `skillId`, path, and scope.
+See the detailed
 [ChatGPT coding workflow](./docs/chatgpt-coding-workflow.md).
 
 ### Tool modes
@@ -309,9 +316,27 @@ follow its workflow. See the detailed
 | `full` | Separate read, write, edit, search, list, and Bash tools | Useful for MCP clients that prefer explicit tools. |
 | `minimal` | A smaller set of essential file and command tools | Use when you want the smallest tool surface. |
 
+For multiline Python, SQL, or SSH scripts, the model can use the structured
+`stdin` field on `exec_command`/`bash` instead of fragile nested quoting. Stdin
+closes by default after an initial payload; set `closeStdin: false` to continue
+through `write_stdin`, which can append data or close the stream. PTY sessions
+do not emulate EOF with Ctrl-D.
+
 When several independent files or searches are already known, `batch_read` and
 `batch_inspect` reduce MCP round trips. DevSpace does not force batching when
 the next file depends on the result of the previous search.
+
+DevSpace keeps each large model-visible payload in one place so the same file
+or command output does not consume context in both `content` and
+`structuredContent`. Single reads, Skill loads, and process tools put body text
+in `content`, while structured results retain only follow-up state and handles.
+Batch tools instead keep per-item bodies in `structuredContent.items[]`; their
+text `content` is only a completion summary and there is no concatenated
+aggregate `result`. `_meta` is optional ChatGPT component data and can be
+ignored by ordinary MCP clients. Clients that consumed the old duplicate
+fields must follow these result locations; see the
+[ChatGPT coding workflow](./docs/chatgpt-coding-workflow.md) for the full contract.
+Each loaded `SKILL.md` is capped at 64 KiB.
 
 ## Keep it running
 
@@ -356,7 +381,7 @@ node dist/cli.js admin
 
 DevSpace opens a one-time URL on localhost. The panel can:
 
-- add and remove allowed folders;
+- add and remove allowed folders, applied live without a restart;
 - choose tool and widget modes;
 - set MCP, process, workspace, command, and worktree limits;
 - show backend, tunnel, quota, and recent failure status;
@@ -365,8 +390,10 @@ DevSpace opens a one-time URL on localhost. The panel can:
 - restart an explicitly enrolled macOS `launchd` backend and verify the new PID
   and readiness generation.
 
-Saving settings does not silently restart the backend. Changes that affect the
-running server take effect after a verified restart. On macOS, backend control
+Saving settings does not silently restart the backend. Allowed-root changes are
+hot-reloaded: additions are available immediately, while removals invalidate
+affected workspaces and terminate their running commands. Other runtime changes
+take effect after a verified restart. On macOS, backend control
 must be explicitly enabled for the admin process, for example:
 
 ```bash
@@ -393,9 +420,9 @@ The comparison is against upstream commit
 | Safer lifecycle | Workspace operation leases, exclusive close, request draining, process termination, and cleanup rules prevent resources from being closed while still in use. |
 | Real resource limits | Global and per-client limits cover MCP sessions, workspaces, processes, worktrees, output, and command runtime. Hung commands receive `SIGTERM` and then `SIGKILL` after a grace period. |
 | Client isolation | OAuth ownership is enforced for MCP sessions, workspaces, processes, and stored state. One client cannot reuse another client's IDs. |
-| Project instructions | Root instructions load immediately; nested `AGENTS.md`/`CLAUDE.md` files load lazily and mutations wait until new instructions are acknowledged. |
-| Local Skills | Standard Skill directories are advertised safely, and supporting files stay unavailable until the model has read the matching `SKILL.md`. |
-| Safer shell workflow | High-risk command patterns are blocked, command output is bounded, and background/PTY sessions can be polled or interrupted. |
+| Project instructions | Root instructions load immediately, empty files are skipped, the chain is capped at 32 KiB, and nested instructions gate mutations, commands, and interactive process input. |
+| Local Skills | Skills come from repository ancestors within an approved root plus user, Admin, and DevSpace bundled scopes; duplicate names remain visible, the catalog is capped at 8,000 characters, and ChatGPT web loads a selected Skill through `load_skill`. |
+| Safer shell workflow | High-risk command patterns are blocked and inline output stays bounded; background/PTY sessions can be polled or interrupted, while durable output is replayable by opaque `outputId` through `read_process_output`. |
 | Admin panel | A localhost-only React panel manages roots and limits, detects concurrent config edits with revision/ETag checks, verifies restarts, and exposes sanitized diagnostics. |
 | OAuth hardening | Approval pages cannot be framed, expired records are cleaned up, the owner can revoke every client and token in one action, and tokens are stored as hashes. |
 | Observable behavior | Structured request/tool logs, hashed client identities, readiness generations, resource usage, recent sanitized failures, and downloadable diagnostics. |
@@ -459,6 +486,9 @@ Common environment variables:
 | `DEVSPACE_WIDGETS` | `full` | `full`, `changes`, or `off`. |
 | `DEVSPACE_MAX_MCP_SESSIONS` | `64` | Global live MCP session limit. |
 | `DEVSPACE_MAX_PROCESS_SESSIONS` | `32` | Global retained process limit. |
+| `DEVSPACE_MAX_PROCESS_OUTPUT_FILE_BYTES` | `67108864` | Durable complete-output limit per process (64 MiB). |
+| `DEVSPACE_MAX_PROCESS_OUTPUT_STORAGE_BYTES` | `1073741824` | Total durable process-output storage limit (1 GiB). |
+| `DEVSPACE_COMPLETED_PROCESS_OUTPUT_TTL_SECONDS` | `86400` | Retention for completed process output (24 hours). |
 | `DEVSPACE_MAX_COMMAND_RUNTIME_SECONDS` | `3600` | Hard command runtime limit. |
 
 See the full [configuration reference](./docs/configuration.md).

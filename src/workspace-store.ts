@@ -49,6 +49,8 @@ export interface WorkspaceStore {
   deleteSession(id: string, ownerClientId: string): boolean;
   countManagedWorktrees(): number;
   countActiveSessions?(ownerClientId?: string): number;
+  listActiveSessions?(): WorkspaceSession[];
+  closeSessions?(sessions: Array<{ id: string; ownerClientId: string }>): number;
   listExpiredSessions(before: string, limit: number): WorkspaceSession[];
   deleteClosedSessions?(before: string, limit: number): number;
   isReady(): boolean;
@@ -287,6 +289,32 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
         .prepare("select count(*) as count from workspace_sessions where status = 'active' and owner_client_id = ?")
         .get(ownerClientId);
     return (row as { count: number }).count;
+  }
+
+  listActiveSessions(): WorkspaceSession[] {
+    return this.database.db
+      .select()
+      .from(workspaceSessions)
+      .where(eq(workspaceSessions.status, "active"))
+      .all()
+      .map(rowToWorkspaceSession);
+  }
+
+  closeSessions(sessions: Array<{ id: string; ownerClientId: string }>): number {
+    if (sessions.length === 0) return 0;
+    const now = new Date().toISOString();
+    const close = this.database.sqlite.prepare(
+      `update workspace_sessions
+       set status = 'closed', last_used_at = ?
+       where id = ? and owner_client_id = ? and status = 'active'`,
+    );
+    const closeAll = this.database.sqlite.transaction(
+      (entries: Array<{ id: string; ownerClientId: string }>) => entries.reduce(
+        (count, entry) => count + close.run(now, entry.id, entry.ownerClientId).changes,
+        0,
+      ),
+    );
+    return closeAll.immediate(sessions);
   }
 
   listExpiredSessions(before: string, limit: number): WorkspaceSession[] {

@@ -1,17 +1,24 @@
-import { randomUUID } from "node:crypto";
-import { realpathSync, type Stats } from "node:fs";
-import type { WorkspaceMode, WorkspaceStore } from "./workspace-store.js";
+import { createHash, randomUUID } from "node:crypto";
+import { realpathSync, statSync, type Stats } from "node:fs";
+import type { WorkspaceMode, WorkspaceSession, WorkspaceStore } from "./workspace-store.js";
 import { lstat, mkdir, readFile, realpath, stat } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import type { ServerConfig } from "./config.js";
 import { createManagedWorktree, removeManagedWorktree } from "./git-worktrees.js";
-import { projectInstructionFilenames } from "./project-instructions.js";
+import {
+  hasProjectInstructionContent,
+  MAX_PROJECT_INSTRUCTION_BYTES,
+  projectInstructionFilenames,
+} from "./project-instructions.js";
 import { assertAllowedPath, isPathInsideRoot, resolveAllowedPath } from "./roots.js";
 import {
+  computeSkillOpenAiMetadataHash,
   loadWorkspaceSkills,
   markSkillActivated,
   resolveSkillReadPath,
+  SKILL_DISCOVERY_LIMITS,
   type LoadedSkills,
+  type Skill,
   type SkillReadResolution,
 } from "./skills.js";
 import {
@@ -89,6 +96,11 @@ export interface WorkspaceReadPath {
   skillRead?: SkillReadResolution;
 }
 
+export interface LoadedWorkspaceSkill {
+  skill: Skill;
+  content: string;
+}
+
 export interface OpenWorkspaceInput {
   path: string;
   mode?: WorkspaceMode;
@@ -109,6 +121,27 @@ export interface WorkspaceUsageSnapshot {
   maxResident: number;
 }
 
+export interface AllowedRootsUpdateResult {
+  changed: boolean;
+  added: number;
+  removed: number;
+  persistenceFailures: number;
+  invalidated: Array<{ workspaceId: string; ownerClientId: string }>;
+}
+
+export class UnknownWorkspaceError extends Error {
+  readonly code = "unknown_workspace";
+
+  constructor(readonly workspaceId: string) {
+    super(
+      `Unknown workspaceId: ${workspaceId}. It may no longer be authorized for this app connection. ` +
+      "Discard it, call open_workspace with the original exact project path, replace the old ID, " +
+      "reload any matching skill, and retry the failed tool call once.",
+    );
+    this.name = "UnknownWorkspaceError";
+  }
+}
+
 interface WorkspaceLifecycleState {
   ownerClientId: string;
   phase: "open" | "closing";
@@ -121,6 +154,7 @@ const MAX_INSTRUCTION_VERSIONS_PER_WORKSPACE = 1_024;
 const MAX_PENDING_INSTRUCTION_ACKNOWLEDGEMENTS = 32;
 const INSTRUCTION_ACKNOWLEDGEMENT_TTL_MS = 10 * 60_000;
 const CLOSED_WORKSPACE_HISTORY_RETENTION_MS = 30 * 24 * 60 * 60_000;
+const MAX_EMPTY_INSTRUCTION_SCAN_BYTES = 1024 * 1024;
 
 type PathStats = Stats;
 type DirectoryOps = {
@@ -141,6 +175,7 @@ export class WorkspaceRegistry {
     fingerprint: string;
     content: string;
   }>();
+  private readonly pendingSessionClosures = new Map<string, WorkspaceSession>();
   private pendingManagedWorktrees = 0;
 
   constructor(
@@ -162,6 +197,10 @@ export class WorkspaceRegistry {
   getWorkspace(ownerClientId: string, workspaceId: string): Workspace {
     const workspace = this.workspaces.get(workspaceId);
     if (workspace?.ownerClientId === ownerClientId) {
+      if (!this.workspaceRootAllowed(workspace.root, workspace.mode, workspace.sourceRoot)) {
+        this.invalidateWorkspace(workspaceId, ownerClientId, workspace.root);
+        throw new UnknownWorkspaceError(workspaceId);
+      }
       workspace.lastUsedAt = Date.now();
       this.store?.touchSession(workspaceId, ownerClientId);
       return workspace;
@@ -169,10 +208,16 @@ export class WorkspaceRegistry {
 
     const session = this.store?.getSession(workspaceId, ownerClientId);
     if (!session) {
-      throw new Error(`Unknown workspaceId: ${workspaceId}. Call open_workspace first.`);
+      throw new UnknownWorkspaceError(workspaceId);
     }
 
-    const root = this.assertWorkspaceRootAllowed(session.root, session.mode, session.sourceRoot);
+    let root: string;
+    try {
+      root = this.assertWorkspaceRootAllowed(session.root, session.mode, session.sourceRoot);
+    } catch {
+      this.invalidateWorkspace(workspaceId, ownerClientId, session.root);
+      throw new UnknownWorkspaceError(workspaceId);
+    }
     const restoredWorkspace: Workspace = {
       id: session.id,
       ownerClientId: session.ownerClientId,
@@ -207,6 +252,71 @@ export class WorkspaceRegistry {
     return restoredWorkspace;
   }
 
+  applyAllowedRoots(nextRoots: string[]): AllowedRootsUpdateResult {
+    const previous = [...this.config.allowedRoots];
+    const normalized = normalizeAllowedRoots(nextRoots, previous);
+    const changed = !sameStringArray(previous, normalized);
+    if (changed) {
+      // Publish the new authorization snapshot before inspecting or closing old
+      // sessions so no new operation can enter a root that was just removed.
+      this.config.allowedRoots = normalized;
+    }
+    const sessions = this.store?.listActiveSessions?.() ?? Array.from(this.workspaces.values()).map(
+      (workspace): WorkspaceSession => ({
+        id: workspace.id,
+        ownerClientId: workspace.ownerClientId,
+        root: workspace.root,
+        status: "active",
+        mode: workspace.mode,
+        sourceRoot: workspace.sourceRoot,
+        baseRef: workspace.worktree?.baseRef,
+        baseSha: workspace.worktree?.baseSha,
+        managed: workspace.worktree?.managed ?? false,
+        createdAt: new Date(workspace.lastUsedAt).toISOString(),
+        lastUsedAt: new Date(workspace.lastUsedAt).toISOString(),
+      }),
+    );
+    const revoked = sessions.filter(
+      (session) => !this.workspaceRootAllowed(session.root, session.mode, session.sourceRoot),
+    );
+    for (const session of revoked) {
+      this.pendingSessionClosures.set(workspaceIdentity(session.id, session.ownerClientId), session);
+    }
+    const pendingClosures = Array.from(this.pendingSessionClosures.values());
+    const identities = pendingClosures.map(({ id, ownerClientId }) => ({ id, ownerClientId }));
+    let persistenceFailures = 0;
+    try {
+      if (this.store?.closeSessions) {
+        this.store.closeSessions(identities);
+      } else {
+        for (const session of pendingClosures) this.store?.closeSession(session.id, session.ownerClientId);
+      }
+      this.pendingSessionClosures.clear();
+    } catch {
+      // The narrower in-memory policy remains authoritative. Return every
+      // revoked identity so process cleanup can proceed, then let the caller
+      // retry persistent-session reconciliation.
+      persistenceFailures = 1;
+    }
+    for (const session of pendingClosures) {
+      this.evictWorkspace(session.id, session.root);
+    }
+
+    const previousSet = new Set(previous);
+    const nextSet = new Set(normalized);
+    return {
+      changed,
+      added: normalized.filter((root) => !previousSet.has(root)).length,
+      removed: previous.filter((root) => !nextSet.has(root)).length,
+      persistenceFailures,
+      invalidated: pendingClosures.map(({ id, ownerClientId }) => ({ workspaceId: id, ownerClientId })),
+    };
+  }
+
+  pendingAllowedRootsCleanupCount(): number {
+    return this.pendingSessionClosures.size;
+  }
+
   resolvePath(workspace: Workspace, inputPath: string): string {
     const absolutePath = resolveAllowedPath(inputPath, workspace.root, [workspace.root]);
     if (!isPathInsideRoot(absolutePath, workspace.root)) {
@@ -221,13 +331,34 @@ export class WorkspaceRegistry {
       workspace.skills,
       workspace.activatedSkillDirs,
       inputPath,
+      workspace.root,
     );
     if (skillRead) {
+      if (
+        skillRead.isSkillFile &&
+        !workspace.activatedSkillDirs.has(resolve(skillRead.skill.baseDir))
+      ) {
+        throw new Error(
+          `Advertised Skill manifests must be loaded with load_skill so their discovery hash can be verified. Use skillId=${skillRead.skill.skillId}.`,
+        );
+      }
       return {
         absolutePath: skillRead.absolutePath,
         readRoots: [workspace.root, skillRead.skill.baseDir],
         skillRead,
       };
+    }
+
+    const workspaceAbsolutePath = resolveAllowedPath(inputPath, workspace.root, [workspace.root]);
+    const lockedSkill = workspace.skills.find((skill) =>
+      workspaceAbsolutePath !== skill.filePath &&
+      isPathInsideRoot(workspaceAbsolutePath, skill.baseDir) &&
+      !workspace.activatedSkillDirs.has(resolve(skill.baseDir))
+    );
+    if (lockedSkill) {
+      throw new Error(
+        `Skill support files are unavailable until load_skill activates skillId=${lockedSkill.skillId}.`,
+      );
     }
 
     try {
@@ -272,14 +403,53 @@ export class WorkspaceRegistry {
     throw new Error(`Path cannot be confined to workspace root: ${inputPath}`);
   }
 
-  markReadPathLoaded(
-    workspace: Workspace,
-    readPath: WorkspaceReadPath,
-    complete: boolean,
-  ): void {
-    if (complete && readPath.skillRead?.isSkillFile) {
-      markSkillActivated(workspace.activatedSkillDirs, readPath.skillRead.skill);
+  async loadSkill(
+    ownerClientId: string,
+    workspaceId: string,
+    skillId: string,
+  ): Promise<LoadedWorkspaceSkill> {
+    const workspace = this.getWorkspace(ownerClientId, workspaceId);
+    const skill = workspace.skills.find((candidate) => candidate.skillId === skillId);
+    if (!skill) {
+      throw new Error(`Unknown skillId for workspace ${workspaceId}: ${skillId}`);
     }
+
+    const canonicalBaseDir = await realpath(skill.baseDir);
+    const canonicalManifest = await realpath(skill.filePath);
+    if (
+      !isPathInsideRoot(canonicalManifest, canonicalBaseDir) ||
+      canonicalManifest !== skill.filePath
+    ) {
+      throw new Error(`Skill manifest is no longer confined to its advertised directory: ${skillId}`);
+    }
+
+    const manifestStats = await stat(canonicalManifest);
+    if (!manifestStats.isFile()) {
+      throw new Error(`Skill manifest is no longer a regular file: ${skillId}`);
+    }
+    if (manifestStats.size > SKILL_DISCOVERY_LIMITS.maxSkillBytes) {
+      throw new Error(`Skill manifest exceeds the ${SKILL_DISCOVERY_LIMITS.maxSkillBytes}-byte limit: ${skillId}`);
+    }
+
+    const content = await readFile(canonicalManifest, "utf8");
+    if (Buffer.byteLength(content, "utf8") > SKILL_DISCOVERY_LIMITS.maxSkillBytes) {
+      throw new Error(`Skill manifest exceeds the ${SKILL_DISCOVERY_LIMITS.maxSkillBytes}-byte limit: ${skillId}`);
+    }
+    const manifestHash = createHash("sha256").update(content).digest("hex");
+    if (manifestHash !== skill.manifestHash) {
+      throw new Error(`Skill manifest changed after open_workspace; reopen the workspace before loading it: ${skillId}`);
+    }
+    const openAiMetadataHash = computeSkillOpenAiMetadataHash(canonicalBaseDir);
+    if (!skill.openAiMetadataHash || openAiMetadataHash !== skill.openAiMetadataHash) {
+      throw new Error(
+        `Skill OpenAI metadata changed after open_workspace; reopen the workspace before loading it: ${skillId}`,
+      );
+    }
+
+    // Activation is intentionally last: support files only become readable after
+    // one complete, successful manifest read.
+    markSkillActivated(workspace.activatedSkillDirs, skill);
+    return { skill, content };
   }
 
   async loadApplicableAgentsFiles(
@@ -287,25 +457,30 @@ export class WorkspaceRegistry {
     inputPaths: string[],
     options: { requireAcknowledged?: boolean } = {},
   ): Promise<ApplicableAgentsFile[]> {
-    const directories = new Set<string>();
+    const targetDirectories = new Set<string>();
     for (const inputPath of inputPaths) {
       const absolutePath = this.resolvePath(workspace, inputPath);
       const targetDirectory = await canonicalInstructionDirectory(absolutePath, workspace.root);
-      for (const directory of ancestorDirectories(workspace.root, targetDirectory)) {
-        directories.add(directory);
-      }
+      targetDirectories.add(targetDirectory);
     }
 
     const loaded: ApplicableAgentsFile[] = [];
+    const loadedPaths = new Set<string>();
+    let loadedBytes = 0;
     const knownVersions = options.requireAcknowledged
       ? workspace.acknowledgedInstructionVersions
       : workspace.deliveredInstructionVersions;
-    for (const directory of directories) {
-      const instructionPaths = await this.instructionPathsForDirectory(workspace.root, directory);
-      for (const path of instructionPaths) {
-        const file = await this.readCachedInstruction(path);
+    for (const targetDirectory of [...targetDirectories].sort()) {
+      const chain = await this.loadInstructionChain(workspace.root, targetDirectory);
+      for (const file of chain) {
+        const { path } = file;
         if (knownVersions.get(path) === file.fingerprint) continue;
-        loaded.push({ path, content: file.content, fingerprint: file.fingerprint });
+        if (loadedPaths.has(path)) continue;
+        const fileBytes = Buffer.byteLength(file.content, "utf8");
+        assertInstructionFitsBudget(path, loadedBytes, fileBytes, "instruction response");
+        loaded.push(file);
+        loadedPaths.add(path);
+        loadedBytes += fileBytes;
       }
     }
     return loaded;
@@ -315,6 +490,17 @@ export class WorkspaceRegistry {
     workspace: Workspace,
     files: ApplicableAgentsFile[],
   ): Promise<void> {
+    await this.assertCurrentInstructionChainsWithinBudget(workspace, files);
+    let deliveredBytes = 0;
+    for (const file of files) {
+      const current = await this.readCachedInstruction(file.path);
+      if (current.fingerprint !== file.fingerprint) {
+        throw new Error("Applicable project instructions changed while marking them delivered. Retry the tool.");
+      }
+      const fileBytes = Buffer.byteLength(file.content, "utf8");
+      assertInstructionFitsBudget(file.path, deliveredBytes, fileBytes, "instruction response");
+      deliveredBytes += fileBytes;
+    }
     for (const file of files) {
       setBoundedMap(workspace.deliveredInstructionVersions, file.path, file.fingerprint, MAX_INSTRUCTION_VERSIONS_PER_WORKSPACE);
     }
@@ -328,13 +514,18 @@ export class WorkspaceRegistry {
     workspace: Workspace,
     files: ApplicableAgentsFile[],
   ): Promise<string> {
+    await this.assertCurrentInstructionChainsWithinBudget(workspace, files);
     const token = `instructions_${randomUUID()}`;
     const versionedFiles = [];
+    let acknowledgementBytes = 0;
     for (const file of files) {
       const current = await this.readCachedInstruction(file.path);
       if (current.fingerprint !== file.fingerprint) {
         throw new Error("Applicable project instructions changed while preparing instructionToken. Retry the tool.");
       }
+      const fileBytes = Buffer.byteLength(file.content, "utf8");
+      assertInstructionFitsBudget(file.path, acknowledgementBytes, fileBytes, "instruction acknowledgement");
+      acknowledgementBytes += fileBytes;
       versionedFiles.push({ path: file.path, fingerprint: file.fingerprint, content: file.content });
     }
     workspace.pendingInstructionAcknowledgements.set(token, {
@@ -363,6 +554,7 @@ export class WorkspaceRegistry {
         throw new Error("Applicable project instructions changed. Retry the tool without instructionToken.");
       }
     }
+    await this.assertCurrentInstructionChainsWithinBudget(workspace, pending.files);
     for (const file of pending.files) {
       setBoundedMap(workspace.deliveredInstructionVersions, file.path, file.fingerprint, MAX_INSTRUCTION_VERSIONS_PER_WORKSPACE);
       setBoundedMap(workspace.acknowledgedInstructionVersions, file.path, file.fingerprint, MAX_INSTRUCTION_VERSIONS_PER_WORKSPACE);
@@ -617,7 +809,10 @@ export class WorkspaceRegistry {
           const cleanup = await removeManagedWorktree({
             sourceRoot: worktree.sourceRoot,
             worktreePath: worktree.path,
-            config: this.config,
+            config: {
+              ...this.config,
+              allowedRoots: [...this.config.allowedRoots, worktree.sourceRoot],
+            },
           });
           if (!cleanup.removed && cleanup.reason !== "missing") {
             throw new Error(`Created worktree could not be rolled back (${cleanup.reason}).`);
@@ -672,6 +867,11 @@ export class WorkspaceRegistry {
 
     const agentsFiles = await this.loadInitialAgentsFiles(workspace.root);
     await this.markInitialAgentsFilesLoaded(workspace, agentsFiles);
+    workspace.root = this.assertWorkspaceRootAllowed(
+      workspace.root,
+      workspace.mode,
+      workspace.sourceRoot,
+    );
     const availableAgentsFiles: AvailableAgentsFile[] = [];
     const instructionScan = lazyInstructionScan();
     if (input.mode === "checkout" && input.canonicalRoot && this.store?.createOrReuseCheckoutSession) {
@@ -735,10 +935,34 @@ export class WorkspaceRegistry {
     return assertAllowedPath(realpathSync(root), canonicalAllowedRoots);
   }
 
-  private async loadInitialAgentsFiles(root: string): Promise<LoadedAgentsFile[]> {
+  private workspaceRootAllowed(root: string, mode: WorkspaceMode, sourceRoot: string | undefined): boolean {
+    try {
+      this.assertWorkspaceRootAllowed(root, mode, sourceRoot);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private invalidateWorkspace(workspaceId: string, ownerClientId: string, root: string): void {
+    this.store?.closeSession(workspaceId, ownerClientId);
+    this.evictWorkspace(workspaceId, root);
+  }
+
+  private evictWorkspace(workspaceId: string, root: string): void {
+    this.workspaces.delete(workspaceId);
+    this.lifecycleStates.delete(workspaceId);
+    this.removeCheckoutWorkspaceId(workspaceId);
+    this.purgeInstructionCachesForUnusedRoot(root);
+  }
+
+  private async loadInitialAgentsFiles(root: string): Promise<ApplicableAgentsFile[]> {
+    return this.loadInstructionChain(root, root);
+  }
+
+  private async loadGlobalAgentsFile(): Promise<ApplicableAgentsFile | undefined> {
     const agentDir = resolve(this.config.agentDir);
     const resolvedAgentDir = (await tryRealpath(agentDir)) ?? agentDir;
-    const loadedFiles: LoadedAgentsFile[] = [];
 
     for (const name of projectInstructionFilenames([])) {
       const candidate = join(agentDir, name);
@@ -748,35 +972,62 @@ export class WorkspaceRegistry {
         const path = await realpath(candidate);
         if (!isPathInsideRoot(path, resolvedAgentDir)) continue;
         if (!(await stat(path)).isFile()) continue;
-        loadedFiles.push({ path, content: await readFile(path, "utf8") });
-        break;
+        const file = await this.readCachedInstruction(path);
+        if (!hasProjectInstructionContent(file.content)) continue;
+        return { path, content: file.content, fingerprint: file.fingerprint };
       } catch (error) {
         if (!isMissingPathError(error)) throw error;
       }
     }
+    return undefined;
+  }
 
-    for (const path of await this.instructionPathsForDirectory(root, root)) {
-      const file = await this.readCachedInstruction(path);
-      loadedFiles.push({ path, content: file.content });
+  private async loadInstructionChain(root: string, targetDirectory: string): Promise<ApplicableAgentsFile[]> {
+    const loadedFiles: ApplicableAgentsFile[] = [];
+    let loadedBytes = 0;
+    const globalFile = await this.loadGlobalAgentsFile();
+    if (globalFile) {
+      const fileBytes = Buffer.byteLength(globalFile.content, "utf8");
+      assertInstructionFitsBudget(globalFile.path, loadedBytes, fileBytes, "instruction chain");
+      loadedFiles.push(globalFile);
+      loadedBytes += fileBytes;
     }
 
+    for (const directory of ancestorDirectories(root, targetDirectory)) {
+      const file = await this.instructionFileForDirectory(root, directory);
+      if (!file) continue;
+      const fileBytes = Buffer.byteLength(file.content, "utf8");
+      assertInstructionFitsBudget(file.path, loadedBytes, fileBytes, "instruction chain");
+      loadedFiles.push(file);
+      loadedBytes += fileBytes;
+    }
     return loadedFiles;
+  }
+
+  private async assertCurrentInstructionChainsWithinBudget(
+    workspace: Workspace,
+    files: Array<{ path: string }>,
+  ): Promise<void> {
+    const targets = new Set<string>();
+    for (const file of files) {
+      targets.add(isPathInsideRoot(file.path, workspace.root) ? dirname(file.path) : workspace.root);
+    }
+    for (const target of [...targets].sort()) {
+      await this.loadInstructionChain(workspace.root, target);
+    }
   }
 
   private async markInitialAgentsFilesLoaded(
     workspace: Workspace,
-    files: LoadedAgentsFile[],
+    files: ApplicableAgentsFile[],
   ): Promise<void> {
-    const canonicalRoot = await realpath(workspace.root);
     for (const file of files) {
-      if (!isPathInsideRoot(file.path, canonicalRoot)) continue;
       try {
         const resolvedPath = await realpath(file.path);
-        if (!isPathInsideRoot(resolvedPath, canonicalRoot)) continue;
-        const metadata = await stat(resolvedPath);
-        const fingerprint = statsFingerprint(metadata);
-        setBoundedMap(workspace.deliveredInstructionVersions, resolvedPath, fingerprint, MAX_INSTRUCTION_VERSIONS_PER_WORKSPACE);
-        setBoundedMap(workspace.acknowledgedInstructionVersions, resolvedPath, fingerprint, MAX_INSTRUCTION_VERSIONS_PER_WORKSPACE);
+        const current = await this.readCachedInstruction(resolvedPath);
+        if (current.fingerprint !== file.fingerprint) continue;
+        setBoundedMap(workspace.deliveredInstructionVersions, resolvedPath, file.fingerprint, MAX_INSTRUCTION_VERSIONS_PER_WORKSPACE);
+        setBoundedMap(workspace.acknowledgedInstructionVersions, resolvedPath, file.fingerprint, MAX_INSTRUCTION_VERSIONS_PER_WORKSPACE);
       } catch {
         // The initial loader already returned safe fallback content. A later
         // path-based check will retry if this file becomes readable.
@@ -784,17 +1035,12 @@ export class WorkspaceRegistry {
     }
   }
 
-  private async instructionPathsForDirectory(root: string, directory: string): Promise<string[]> {
+  private async instructionFileForDirectory(root: string, directory: string): Promise<ApplicableAgentsFile | undefined> {
     const resolvedRoot = await realpath(root);
     const resolvedDirectory = await realpath(directory);
-    if (!isPathInsideRoot(resolvedDirectory, resolvedRoot)) return [];
+    if (!isPathInsideRoot(resolvedDirectory, resolvedRoot)) return undefined;
     const directoryStats = await stat(resolvedDirectory);
-    const fingerprint = statsFingerprint(directoryStats);
-    const cached = this.instructionDirectoryCache.get(resolvedDirectory);
-    if (cached?.fingerprint === fingerprint) {
-      refreshMapEntry(this.instructionDirectoryCache, resolvedDirectory, cached);
-      return cached.files;
-    }
+    const fingerprintParts = [statsFingerprint(directoryStats)];
 
     const discoveredFiles: string[] = [];
     for (const name of projectInstructionFilenames(this.config.projectDocFallbackFilenames)) {
@@ -804,6 +1050,9 @@ export class WorkspaceRegistry {
         if (!candidateStats.isFile()) continue;
         const resolvedPath = await realpath(candidate);
         if (!isPathInsideRoot(resolvedPath, resolvedRoot)) continue;
+        const file = await this.readCachedInstruction(resolvedPath);
+        fingerprintParts.push(`${name}:${resolvedPath}:${file.fingerprint}`);
+        if (!hasProjectInstructionContent(file.content)) continue;
         discoveredFiles.push(resolvedPath);
         break;
       } catch (error) {
@@ -811,9 +1060,18 @@ export class WorkspaceRegistry {
       }
     }
     const files = discoveredFiles;
-    this.instructionDirectoryCache.set(resolvedDirectory, { fingerprint, files });
-    this.trimInstructionCaches();
-    return files;
+    const fingerprint = fingerprintParts.join("\0");
+    const cached = this.instructionDirectoryCache.get(resolvedDirectory);
+    if (cached?.fingerprint === fingerprint) {
+      refreshMapEntry(this.instructionDirectoryCache, resolvedDirectory, cached);
+    } else {
+      this.instructionDirectoryCache.set(resolvedDirectory, { fingerprint, files });
+      this.trimInstructionCaches();
+    }
+    const path = files[0];
+    if (!path) return undefined;
+    const file = await this.readCachedInstruction(path);
+    return { path, content: file.content, fingerprint: file.fingerprint };
   }
 
   private async readCachedInstruction(path: string): Promise<{
@@ -827,7 +1085,20 @@ export class WorkspaceRegistry {
       refreshMapEntry(this.instructionFileCache, path, cached);
       return cached;
     }
-    const entry = { fingerprint, content: await readFile(path, "utf8") };
+    let content: string;
+    if (metadata.size > MAX_PROJECT_INSTRUCTION_BYTES) {
+      if (metadata.size > MAX_EMPTY_INSTRUCTION_SCAN_BYTES) {
+        assertInstructionFitsBudget(path, 0, metadata.size, "instruction file");
+      }
+      const oversizedCandidate = await readFile(path, "utf8");
+      if (hasProjectInstructionContent(oversizedCandidate)) {
+        assertInstructionFitsBudget(path, 0, metadata.size, "instruction file");
+      }
+      content = "";
+    } else {
+      content = await readFile(path, "utf8");
+    }
+    const entry = { fingerprint, content };
     this.instructionFileCache.set(path, entry);
     this.trimInstructionCaches();
     return entry;
@@ -934,6 +1205,41 @@ function tryRealpathSync(path: string): string | undefined {
   }
 }
 
+function normalizeAllowedRoots(roots: string[], previouslyAllowedRoots: string[]): string[] {
+  if (roots.length === 0) throw new Error("At least one allowed root is required.");
+  const previous = new Set(previouslyAllowedRoots.map((root) => resolve(root)));
+  const normalized = Array.from(new Set(roots.map((root) => {
+    const absolute = resolve(root);
+    let canonical: string;
+    try {
+      canonical = realpathSync(absolute);
+    } catch (error) {
+      // A configured root may disappear between startup and a later unrelated
+      // root edit. Preserve that already-granted lexical path, but never accept
+      // a newly added path that cannot be canonicalized.
+      if (isMissingPathError(error) && previous.has(absolute)) return absolute;
+      throw error;
+    }
+    if (!statSync(canonical).isDirectory()) {
+      throw new Error(`Allowed root must be a directory: ${root}`);
+    }
+    if (dirname(canonical) === canonical) {
+      throw new Error("The filesystem root cannot be allowed.");
+    }
+    return canonical;
+  })));
+  if (normalized.length === 0) throw new Error("At least one allowed root is required.");
+  return normalized;
+}
+
+function sameStringArray(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function workspaceIdentity(workspaceId: string, ownerClientId: string): string {
+  return `${ownerClientId}\0${workspaceId}`;
+}
+
 function lazyInstructionScan(): InstructionScanResult {
   return {
     complete: true,
@@ -980,6 +1286,21 @@ function ancestorDirectories(root: string, target: string): string[] {
 
 function statsFingerprint(metadata: Stats): string {
   return `${metadata.dev}:${metadata.ino}:${metadata.size}:${metadata.mtimeMs}:${metadata.ctimeMs}`;
+}
+
+function assertInstructionFitsBudget(
+  path: string,
+  consumedBytes: number,
+  fileBytes: number,
+  context: string,
+): void {
+  const totalBytes = consumedBytes + fileBytes;
+  if (totalBytes <= MAX_PROJECT_INSTRUCTION_BYTES) return;
+  throw new Error(
+    `Project ${context} exceeds the ${MAX_PROJECT_INSTRUCTION_BYTES}-byte UTF-8 limit: ` +
+    `${path} requires ${fileBytes} bytes after ${consumedBytes} bytes of earlier instructions ` +
+    `(total ${totalBytes} bytes). Empty or shorten this file before retrying.`,
+  );
 }
 
 function setBoundedMap<K, V>(map: Map<K, V>, key: K, value: V, limit: number): void {

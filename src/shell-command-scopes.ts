@@ -75,26 +75,8 @@ export function analyzeShellCommandScopes(
       hasDynamicCwd = true;
     }
 
-    const commandWord = executableCommandWord(words);
-    if (
-      commandWord?.dynamic ||
-      hasUnsupportedExecutionWrapperOptions(words) ||
-      runsOpaqueShellCode(words) ||
-      containsCommandSubstitution(words)
-    ) {
-      addUnresolved(words.map((word) => word.raw).join(" "), "unsupported-syntax");
-      hasDynamicCwd = true;
-    }
-
     const scopeCommand = findScopeCommand(words);
-    if (!scopeCommand) {
-      const hiddenScopeWord = unsupportedScopeWord(words);
-      if (hiddenScopeWord) {
-        addUnresolved(hiddenScopeWord.raw, "unsupported-syntax");
-        hasDynamicCwd = true;
-      }
-      continue;
-    }
+    if (!scopeCommand) continue;
 
     const { name, target, unsupported } = scopeCommand;
     if (unsupported) {
@@ -224,25 +206,6 @@ function mutatesCdPath(words: ShellWord[]): boolean {
   );
 }
 
-function runsOpaqueShellCode(words: ShellWord[]): boolean {
-  const executable = executableCommandWord(words);
-  if (!executable || executable.dynamic) return false;
-  const command = executable.word.value;
-  if (["alias", "eval", "source", "."].includes(command)) return true;
-  if (/(?:^|\/)\S+\.sh$/.test(command)) return true;
-  return /(?:^|\/)[A-Za-z0-9_-]*sh$/.test(command);
-}
-
-function hasUnsupportedExecutionWrapperOptions(words: ShellWord[]): boolean {
-  let index = 0;
-  while (index < words.length && isAssignment(words[index])) index += 1;
-  const wrapper = words[index]?.value;
-  if (wrapper !== "env" && wrapper !== "exec") return false;
-  return words.slice(index + 1).some((word) =>
-    !word.dynamic && word.value.startsWith("-") && word.value !== "--"
-  );
-}
-
 function executableCommandWord(
   words: ShellWord[],
 ): { word: ShellWord; index: number; dynamic: boolean } | undefined {
@@ -281,27 +244,6 @@ function executableCommandWord(
     }
     return { word, index, dynamic: false };
   }
-}
-
-function containsCommandSubstitution(words: ShellWord[]): boolean {
-  return words.some((word) =>
-    word.dynamic && /(?:\$\(|`)/.test(word.raw)
-  );
-}
-
-function unsupportedScopeWord(words: ShellWord[]): ShellWord | undefined {
-  const index = words.findIndex((word) =>
-    !word.dynamic && (word.value === "cd" || word.value === "pushd")
-  );
-  if (index <= 0) return undefined;
-  const prefixes = words.slice(0, index);
-  const reserved = new Set([
-    "!", "{", "if", "then", "elif", "else", "do", "while", "until", "time",
-  ]);
-  const redirection = /^(?:\{[A-Za-z_][A-Za-z0-9_]*\}|\d*)?(?:<|>|<>|>>|<<<?)/;
-  return reserved.has(prefixes[0]?.value) || prefixes.every((word) => redirection.test(word.value))
-    ? words[index]
-    : undefined;
 }
 
 function splitIntoSimpleCommands(command: string): ShellWord[][] {
@@ -420,7 +362,7 @@ interface HeredocSpec {
  * Recognize the common static-delimiter forms and remove their body lines
  * before looking for cwd-changing commands.
  */
-function stripHeredocBodies(command: string): string {
+export function stripHeredocBodies(command: string): string {
   const pending: HeredocSpec[] = [];
   let output = "";
   let index = 0;

@@ -7,16 +7,16 @@ import {
   isEditTool,
   isReadTool,
   isWriteTool,
-  payloadText,
   summaryNumber,
+  toolResultText,
+  type AnyToolResultCard,
   type HostContext,
-  type ToolResultCard,
 } from "./card-types.js";
 
 type ThemeType = "light" | "dark";
 
 interface PayloadRendererOptions {
-  card: ToolResultCard;
+  card: AnyToolResultCard;
   hostContext?: HostContext;
   errorMessage?: string | null;
 }
@@ -63,7 +63,7 @@ function HeavyPayload({
     return <DiffPayload patch={patch} themeType={themeType} />;
   }
 
-  const text = payloadText(card.payload);
+  const text = toolResultText(card);
   if (!text) return <StatusLine message="No details available." />;
 
   if (isReadTool(card.tool)) {

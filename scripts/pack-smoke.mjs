@@ -62,6 +62,7 @@ try {
 async function smokeServe(cliPath, installRoot) {
   const port = await availablePort();
   const configDir = join(installRoot, "config");
+  const stateDir = join(installRoot, "state");
   const workspaceRoot = join(installRoot, "workspace");
   mkdirSync(configDir);
   mkdirSync(workspaceRoot);
@@ -80,11 +81,16 @@ async function smokeServe(cliPath, installRoot) {
 
   const child = spawn(process.execPath, [cliPath, "serve"], {
     cwd: installRoot,
-    env: {
+    env: smokeEnvironment({
       ...process.env,
+      HOST: "host-must-come-from-the-fixture",
+      PORT: "port-must-come-from-the-fixture",
+      DEVSPACE_TOOL_MODE: "mode-must-come-from-the-fixture",
+    }, {
       DEVSPACE_CONFIG_DIR: configDir,
+      DEVSPACE_STATE_DIR: stateDir,
       DEVSPACE_LOG_LEVEL: "silent",
-    },
+    }),
     stdio: ["ignore", "pipe", "pipe"],
   });
   let output = "";
@@ -115,6 +121,14 @@ async function smokeServe(cliPath, installRoot) {
       if (child.exitCode === null) child.kill("SIGKILL");
     }
   }
+}
+
+function smokeEnvironment(inheritedEnv, overrides) {
+  const scrubbed = Object.fromEntries(Object.entries(inheritedEnv).filter(([name]) => {
+    const normalized = name.toUpperCase();
+    return normalized !== "HOST" && normalized !== "PORT" && !normalized.startsWith("DEVSPACE_");
+  }));
+  return { ...scrubbed, ...overrides };
 }
 
 function availablePort() {

@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 import { createServer, type Server } from "node:http";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { startAdminServer, type RunningAdminServer } from "../../src/admin-server.js";
@@ -10,7 +10,10 @@ interface Fixture {
   configPath: string;
   mcpServer: Server;
   root: string;
+  hotAllowedRoot: string;
   restartCount(): number;
+  rootsReloadCount(): number;
+  setRootsCleanupPending(value: number): void;
 }
 
 let fixture: Fixture;
@@ -43,6 +46,46 @@ test("preserves local edits when a config revision conflicts", async ({ page }) 
 
   await page.getByRole("button", { name: "放弃本地修改并载入最新配置" }).click();
   await expect(page.locator("#tool-mode")).toHaveValue("minimal");
+});
+
+test("edits process-output quotas as bytes and retention as seconds", async ({ page }) => {
+  await page.goto(fixture.admin.url);
+  await expect(page.locator("#maxProcessOutputFileBytes")).toHaveValue("67108864");
+  await expect(page.locator("#maxProcessOutputStorageBytes")).toHaveValue("1073741824");
+  await expect(page.locator("#completedProcessOutputTtlMs")).toHaveValue("86400");
+
+  await page.locator("#maxProcessOutputFileBytes").fill("1048576");
+  await page.locator("#maxProcessOutputStorageBytes").fill("2097152");
+  await page.locator("#completedProcessOutputTtlMs").fill("3600");
+  await page.getByRole("button", { name: "保存", exact: true }).click();
+  await expect(page.getByRole("status").filter({ hasText: "设置已保存" })).toBeVisible();
+
+  const persisted = JSON.parse(readFileSync(fixture.configPath, "utf8"));
+  expect(persisted.resources.maxProcessOutputFileBytes).toBe(1_048_576);
+  expect(persisted.resources.maxProcessOutputStorageBytes).toBe(2_097_152);
+  expect(persisted.resources.completedProcessOutputTtlMs).toBe(3_600_000);
+});
+
+test("hot-reloads allowed roots without offering save and restart", async ({ page }) => {
+  await page.goto(fixture.admin.url);
+  await page.locator("#new-root").fill(fixture.hotAllowedRoot);
+  await page.locator("#new-root").locator("xpath=..").getByRole("button", { name: "添加" }).click();
+  await expect(page.getByRole("button", { name: "保存并重启" })).toBeHidden();
+  await page.getByRole("button", { name: "保存", exact: true }).click();
+  await expect(page.getByRole("status").filter({ hasText: "新设置已经生效" })).toBeVisible();
+  expect(fixture.rootsReloadCount()).toBe(1);
+  expect(fixture.restartCount()).toBe(0);
+  expect(JSON.parse(readFileSync(fixture.configPath, "utf8")).allowedRoots).toContain(
+    realpathSync(fixture.hotAllowedRoot),
+  );
+});
+
+test("keeps incomplete root cleanup visible after refresh", async ({ page }) => {
+  fixture.setRootsCleanupPending(1);
+  await page.goto(fixture.admin.url);
+  await expect(page.getByRole("status").filter({ hasText: "后台清理尚未完成" })).toBeVisible();
+  await page.reload();
+  await expect(page.getByRole("status").filter({ hasText: "后台清理尚未完成" })).toBeVisible();
 });
 
 test("traps keyboard focus and confirms a verified restart", async ({ page }) => {
@@ -86,12 +129,56 @@ test("recovers after a status network failure", async ({ page }) => {
   await expect(page.getByText("已就绪", { exact: true })).toBeVisible();
 });
 
+test("retries bootstrap after the browser comes online", async ({ page }) => {
+  await page.route("**/api/session", (route) => route.abort("failed"));
+  await page.goto(fixture.admin.url);
+  await expect(page.getByRole("heading", { name: "无法打开管理面板" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "重试连接" })).toBeVisible();
+  await expect(page).toHaveURL(/\/$/);
+
+  await page.unroute("**/api/session");
+  await page.evaluate(() => window.dispatchEvent(new Event("online")));
+  await expect(page.getByRole("heading", { name: "管理控制面板" })).toBeVisible();
+  await page.locator("#tool-mode").selectOption("full");
+  await page.evaluate(() => window.dispatchEvent(new Event("online")));
+  await expect(page.locator("#tool-mode")).toHaveValue("full");
+});
+
+test("links numeric validation errors to their fields", async ({ page }) => {
+  await page.goto(fixture.admin.url);
+  await page.locator("#maxMcpSessions").fill("1");
+  await page.getByRole("button", { name: "保存", exact: true }).click();
+
+  const field = page.locator("#maxMcpSessionsPerClient");
+  await expect(field).toHaveAttribute("aria-invalid", "true");
+  await expect(field).toHaveAttribute("aria-describedby", /maxMcpSessionsPerClient-errors/);
+  await expect(page.locator("#maxMcpSessionsPerClient-errors")).toContainText("Per-client MCP sessions");
+});
+
+test("distinguishes saved tool settings from the active backend mode", async ({ page }) => {
+  await page.goto(fixture.admin.url);
+  await expect(page.getByRole("status").filter({ hasText: "ChatGPT 应用仍可能缓存工具定义" })).toBeVisible();
+
+  await page.locator("#tool-mode").selectOption("full");
+  await page.getByRole("button", { name: "保存", exact: true }).click();
+  const notice = page.getByRole("status").filter({ hasText: "后端仍运行：工具模式 Codex，结果卡片 完整显示；需重启" });
+  await expect(notice).toBeVisible();
+  await expect(notice).toContainText("重启后在 ChatGPT 应用中刷新工具。");
+
+  await page.getByRole("button", { name: "重启服务" }).click();
+  await page.getByRole("button", { name: "确认重启" }).click();
+  await expect(page.getByRole("status").filter({ hasText: "后端已运行当前保存的工具配置" })).toBeVisible();
+  await expect(notice).toBeHidden();
+});
+
 async function createFixture(): Promise<Fixture> {
   const root = mkdtempSync(join(tmpdir(), "devspace-admin-browser-"));
   const configDir = join(root, "config");
   const allowedRoot = join(root, "project");
+  const hotAllowedRoot = join(root, "hot-project");
   mkdirSync(configDir);
   mkdirSync(allowedRoot);
+  mkdirSync(hotAllowedRoot);
 
   const mcpServer = createServer((request, response) => {
     if (request.url === "/readyz") {
@@ -124,6 +211,12 @@ async function createFixture(): Promise<Fixture> {
   }, null, 2));
 
   let restartCount = 0;
+  let rootsReloadCount = 0;
+  let rootsCleanupPending = 0;
+  let runtimeConfig: {
+    toolMode: "codex" | "full" | "minimal";
+    widgets: "full" | "changes" | "off";
+  } = { toolMode: "codex", widgets: "full" };
   const admin = await startAdminServer({
     env: { DEVSPACE_CONFIG_DIR: configDir },
     staticDir: resolve("dist/admin-ui"),
@@ -137,6 +230,8 @@ async function createFixture(): Promise<Fixture> {
       }),
       restartBackend: async () => {
         restartCount += 1;
+        const saved = JSON.parse(readFileSync(configPath, "utf8"));
+        runtimeConfig = { toolMode: saved.toolMode, widgets: saved.widgets };
         return {
           id: `browser-restart-${restartCount}`,
           target: "backend",
@@ -150,6 +245,7 @@ async function createFixture(): Promise<Fixture> {
       diagnostics: async () => ({
         generatedAt: new Date().toISOString(),
         generation: "browser-generation",
+        runtimeConfig: { ...runtimeConfig, allowedRootsCleanupPending: rootsCleanupPending },
         usage: {
           mcpSessions: { active: 1, reserved: 0, limit: 8 },
           processSessions: { active: 0, limit: 16 },
@@ -158,9 +254,22 @@ async function createFixture(): Promise<Fixture> {
         },
         recentFailures: [],
       }),
+      reloadAllowedRoots: async () => {
+        rootsReloadCount += 1;
+        return { ok: true };
+      },
       revokeAllClientsAndTokens: async () => ({ ok: true }),
     },
   });
 
-  return { admin, configPath, mcpServer, root, restartCount: () => restartCount };
+  return {
+    admin,
+    configPath,
+    mcpServer,
+    root,
+    hotAllowedRoot,
+    restartCount: () => restartCount,
+    rootsReloadCount: () => rootsReloadCount,
+    setRootsCleanupPending: (value) => { rootsCleanupPending = value; },
+  };
 }

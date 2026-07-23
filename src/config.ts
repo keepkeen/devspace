@@ -26,6 +26,9 @@ export interface ResourceLimitsConfig {
   maxProcessSessions: number;
   maxProcessSessionsPerClient: number;
   maxProcessSessionsPerWorkspace: number;
+  maxProcessOutputFileBytes: number;
+  maxProcessOutputStorageBytes: number;
+  completedProcessOutputTtlMs: number;
   maxCommandRuntimeMs: number;
   processShutdownGraceMs: number;
   httpDrainTimeoutMs: number;
@@ -54,6 +57,8 @@ export interface ServerConfig {
   worktreeRoot: string;
   skillsEnabled: boolean;
   skillPaths: string[];
+  disabledSkillPaths: string[];
+  adminSkillsDir: string;
   devspaceSkillsDir: string;
   devspaceAgentsDir: string;
   subagents: boolean;
@@ -250,6 +255,25 @@ function parseResourceLimits(
       "DEVSPACE_MAX_PROCESS_SESSIONS_PER_WORKSPACE",
       RESOURCE_LIMIT_MAXIMUMS.maxProcessSessionsPerWorkspace,
     ),
+    maxProcessOutputFileBytes: parsePositiveInteger(
+      env.DEVSPACE_MAX_PROCESS_OUTPUT_FILE_BYTES,
+      configured?.maxProcessOutputFileBytes ?? 64 * 1024 * 1024,
+      "DEVSPACE_MAX_PROCESS_OUTPUT_FILE_BYTES",
+      RESOURCE_LIMIT_MAXIMUMS.maxProcessOutputFileBytes,
+    ),
+    maxProcessOutputStorageBytes: parsePositiveInteger(
+      env.DEVSPACE_MAX_PROCESS_OUTPUT_STORAGE_BYTES,
+      configured?.maxProcessOutputStorageBytes ?? 1024 * 1024 * 1024,
+      "DEVSPACE_MAX_PROCESS_OUTPUT_STORAGE_BYTES",
+      RESOURCE_LIMIT_MAXIMUMS.maxProcessOutputStorageBytes,
+    ),
+    completedProcessOutputTtlMs: env.DEVSPACE_COMPLETED_PROCESS_OUTPUT_TTL_SECONDS === undefined
+      ? configured?.completedProcessOutputTtlMs ?? 24 * 60 * 60 * 1_000
+      : seconds(
+        env.DEVSPACE_COMPLETED_PROCESS_OUTPUT_TTL_SECONDS,
+        24 * 60 * 60,
+        "DEVSPACE_COMPLETED_PROCESS_OUTPUT_TTL_SECONDS",
+      ),
     maxCommandRuntimeMs: env.DEVSPACE_MAX_COMMAND_RUNTIME_SECONDS === undefined
       ? configured?.maxCommandRuntimeMs ?? 60 * 60 * 1_000
       : seconds(env.DEVSPACE_MAX_COMMAND_RUNTIME_SECONDS, 60 * 60, "DEVSPACE_MAX_COMMAND_RUNTIME_SECONDS"),
@@ -293,6 +317,11 @@ function assertResourceLimits(resources: ResourceLimitsConfig): void {
   if (resources.maxProcessSessionsPerWorkspace > resources.maxProcessSessionsPerClient) {
     throw new Error(
       "DEVSPACE_MAX_PROCESS_SESSIONS_PER_WORKSPACE cannot exceed DEVSPACE_MAX_PROCESS_SESSIONS_PER_CLIENT",
+    );
+  }
+  if (resources.maxProcessOutputFileBytes > resources.maxProcessOutputStorageBytes) {
+    throw new Error(
+      "DEVSPACE_MAX_PROCESS_OUTPUT_FILE_BYTES cannot exceed DEVSPACE_MAX_PROCESS_OUTPUT_STORAGE_BYTES",
     );
   }
 }
@@ -393,7 +422,15 @@ export function loadConfigForAdmin(env: NodeJS.ProcessEnv = process.env): Server
     stateDir: resolve(expandHomePath(env.DEVSPACE_STATE_DIR ?? files.config.stateDir ?? defaultStateDir())),
     worktreeRoot: resolve(expandHomePath(env.DEVSPACE_WORKTREE_ROOT ?? files.config.worktreeRoot ?? defaultWorktreeRoot())),
     skillsEnabled: env.DEVSPACE_SKILLS === undefined ? true : parseBoolean(env.DEVSPACE_SKILLS, "DEVSPACE_SKILLS"),
-    skillPaths: parsePathList(env.DEVSPACE_SKILL_PATHS),
+    skillPaths:
+      env.DEVSPACE_SKILL_PATHS === undefined
+        ? files.config.skillPaths ?? []
+        : parsePathList(env.DEVSPACE_SKILL_PATHS),
+    disabledSkillPaths:
+      env.DEVSPACE_DISABLED_SKILL_PATHS === undefined
+        ? files.config.disabledSkillPaths ?? []
+        : parsePathList(env.DEVSPACE_DISABLED_SKILL_PATHS),
+    adminSkillsDir: env.DEVSPACE_ADMIN_SKILLS_DIR ?? files.config.adminSkillsDir ?? "/etc/codex/skills",
     devspaceSkillsDir: devspaceSkillsDir(env),
     devspaceAgentsDir: devspaceAgentsDir(env),
     subagents:

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 
@@ -43,4 +44,11 @@ export function assertAllowedPath(path: string, allowedRoots: string[]): string 
 export function resolveAllowedPath(inputPath: string, cwd: string, allowedRoots: string[]): string {
   const absolutePath = resolve(cwd, inputPath);
   return assertAllowedPath(absolutePath, allowedRoots);
+}
+
+export function allowedRootsRevision(allowedRoots: string[]): string {
+  return createHash("sha256")
+    .update([...allowedRoots].sort().join("\0"))
+    .digest("hex")
+    .slice(0, 16);
 }

@@ -49,6 +49,22 @@ try {
     });
     assert.equal(second.countActiveSessions(), 2);
     assert.equal(second.countActiveSessions("client-b"), 1);
+    assert.deepEqual(
+      second.listActiveSessions()
+        .map(({ id, ownerClientId }) => ({ id, ownerClientId }))
+        .sort((left, right) => left.id.localeCompare(right.id)),
+      [
+        { id: "ws-a", ownerClientId: "client-a" },
+        { id: "ws-b", ownerClientId: "client-b" },
+      ],
+    );
+    assert.equal(second.closeSessions([
+      { id: "ws-a", ownerClientId: "wrong-client" },
+      { id: "ws-b", ownerClientId: "client-b" },
+    ]), 1);
+    assert.equal(second.getSession("ws-a", "client-a")?.status, "active");
+    assert.equal(second.getSession("ws-b", "client-b"), undefined);
+    assert.equal(second.closeSessions([]), 0);
 
     assert.equal(first.closeSession("ws-a", "client-a"), true);
     first.createSession({
@@ -59,7 +75,7 @@ try {
     });
     assert.equal(first.countActiveSessions("client-a"), 1);
 
-    assert.equal(second.closeSession("ws-b", "client-b"), true);
+    assert.equal(second.closeSession("ws-b", "client-b"), false);
     const future = new Date(Date.now() + 1_000).toISOString();
     assert.equal(first.deleteClosedSessions(future, 1), 1);
     assert.equal(first.deleteClosedSessions(future, 1), 1);

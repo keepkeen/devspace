@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { open, readFile, stat, unlink } from "node:fs/promises";
+import { mkdir, open, readFile, stat, unlink } from "node:fs/promises";
 import { realpathSync, statSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { z } from "zod";
@@ -27,6 +27,9 @@ export interface AdminResourceLimits {
   maxProcessSessions: number;
   maxProcessSessionsPerClient: number;
   maxProcessSessionsPerWorkspace: number;
+  maxProcessOutputFileBytes: number;
+  maxProcessOutputStorageBytes: number;
+  completedProcessOutputTtlMs: number;
   maxCommandRuntimeMs: number;
   maxResidentWorkspaces: number;
   maxActiveWorkspacesPerClient: number;
@@ -89,6 +92,9 @@ const adminConfigSchema = z.object({
     maxProcessSessions: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxProcessSessions),
     maxProcessSessionsPerClient: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxProcessSessionsPerClient),
     maxProcessSessionsPerWorkspace: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxProcessSessionsPerWorkspace),
+    maxProcessOutputFileBytes: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxProcessOutputFileBytes),
+    maxProcessOutputStorageBytes: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxProcessOutputStorageBytes),
+    completedProcessOutputTtlMs: z.number().int().min(1_000).max(MAX_TIMER_MS),
     maxCommandRuntimeMs: z.number().int().min(MIN_COMMAND_RUNTIME_MS).max(MAX_TIMER_MS),
     maxResidentWorkspaces: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxResidentWorkspaces),
     maxActiveWorkspacesPerClient: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxActiveWorkspacesPerClient),
@@ -121,6 +127,7 @@ export async function saveAdminConfigIfMatch(
 ): Promise<{
   config: AdminConfig;
   restartRequired: boolean;
+  rootsChanged: boolean;
   revision: string;
 }> {
   return withConfigLock(env, async () => {
@@ -182,6 +189,10 @@ export function validateAdminConfig(input: unknown): AdminConfig {
     fields["resources.maxProcessSessionsPerWorkspace"] =
       "Per-workspace process sessions cannot exceed per-client process sessions.";
   }
+  if (parsed.resources.maxProcessOutputFileBytes > parsed.resources.maxProcessOutputStorageBytes) {
+    fields["resources.maxProcessOutputFileBytes"] =
+      "The per-output file limit cannot exceed total process-output storage.";
+  }
   if (Object.keys(fields).length > 0) throw new AdminConfigValidationError(fields);
 
   return {
@@ -223,6 +234,10 @@ export function adminConfigWarnings(config: AdminConfig): AdminConfigWarnings {
     warnings["resources.maxProcessSessionsPerWorkspace"] =
       "Per-workspace process sessions exceed the per-client process-session limit.";
   }
+  if (config.resources.maxProcessOutputFileBytes > config.resources.maxProcessOutputStorageBytes) {
+    warnings["resources.maxProcessOutputFileBytes"] =
+      "The per-output file limit exceeds total process-output storage.";
+  }
   return warnings;
 }
 
@@ -243,6 +258,9 @@ export function adminConfigOverridePaths(env: NodeJS.ProcessEnv = process.env): 
     ["maxProcessSessions", "DEVSPACE_MAX_PROCESS_SESSIONS"],
     ["maxProcessSessionsPerClient", "DEVSPACE_MAX_PROCESS_SESSIONS_PER_CLIENT"],
     ["maxProcessSessionsPerWorkspace", "DEVSPACE_MAX_PROCESS_SESSIONS_PER_WORKSPACE"],
+    ["maxProcessOutputFileBytes", "DEVSPACE_MAX_PROCESS_OUTPUT_FILE_BYTES"],
+    ["maxProcessOutputStorageBytes", "DEVSPACE_MAX_PROCESS_OUTPUT_STORAGE_BYTES"],
+    ["completedProcessOutputTtlMs", "DEVSPACE_COMPLETED_PROCESS_OUTPUT_TTL_SECONDS"],
     ["maxCommandRuntimeMs", "DEVSPACE_MAX_COMMAND_RUNTIME_SECONDS"],
     ["maxResidentWorkspaces", "DEVSPACE_MAX_RESIDENT_WORKSPACES"],
     ["maxActiveWorkspacesPerClient", "DEVSPACE_MAX_ACTIVE_WORKSPACES_PER_CLIENT"],
@@ -258,7 +276,7 @@ export function saveAdminConfig(
   input: unknown,
   env: NodeJS.ProcessEnv = process.env,
   options: { lockHeld?: boolean } = {},
-): { config: AdminConfig; restartRequired: boolean } {
+): { config: AdminConfig; restartRequired: boolean; rootsChanged: boolean } {
   if (!options.lockHeld) {
     return withDevspaceConfigLockSync(env, () => saveAdminConfig(input, env, { lockHeld: true }));
   }
@@ -292,6 +310,8 @@ export function saveAdminConfig(
   const persistedMaxProcessSessions = resources.maxProcessSessions ?? 32;
   const persistedPerClientProcess = resources.maxProcessSessionsPerClient ?? 16;
   const persistedPerWorkspace = resources.maxProcessSessionsPerWorkspace ?? 8;
+  const persistedProcessOutputFileBytes = resources.maxProcessOutputFileBytes ?? 64 * 1024 * 1024;
+  const persistedProcessOutputStorageBytes = resources.maxProcessOutputStorageBytes ?? 1024 * 1024 * 1024;
   if (persistedPerClientMcp > persistedMaxMcpSessions) {
     throw new AdminConfigValidationError({
       "resources.maxMcpSessionsPerClient":
@@ -316,6 +336,12 @@ export function saveAdminConfig(
         "The saved per-workspace limit cannot exceed the saved per-client process-session limit after environment overrides are removed.",
     });
   }
+  if (persistedProcessOutputFileBytes > persistedProcessOutputStorageBytes) {
+    throw new AdminConfigValidationError({
+      "resources.maxProcessOutputFileBytes":
+        "The saved per-output file limit cannot exceed saved total process-output storage after environment overrides are removed.",
+    });
+  }
   writeDevspaceConfig(
     nextConfig,
     env,
@@ -326,7 +352,8 @@ export function saveAdminConfig(
 
   return {
     config: saved,
-    restartRequired: !configValuesEqual(previous, saved),
+    restartRequired: !configValuesEqual(configWithoutAllowedRoots(previous), configWithoutAllowedRoots(saved)),
+    rootsChanged: !configValuesEqual(previous.allowedRoots, saved.allowedRoots),
   };
 }
 
@@ -357,6 +384,11 @@ function configValuesEqual(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
+function configWithoutAllowedRoots(config: AdminConfig): Omit<AdminConfig, "allowedRoots"> {
+  const { allowedRoots: _allowedRoots, ...remaining } = config;
+  return remaining;
+}
+
 function pickAdminResourceLimits(resources: AdminResourceLimits): AdminResourceLimits {
   return {
     maxMcpSessions: resources.maxMcpSessions,
@@ -364,6 +396,9 @@ function pickAdminResourceLimits(resources: AdminResourceLimits): AdminResourceL
     maxProcessSessions: resources.maxProcessSessions,
     maxProcessSessionsPerClient: resources.maxProcessSessionsPerClient,
     maxProcessSessionsPerWorkspace: resources.maxProcessSessionsPerWorkspace,
+    maxProcessOutputFileBytes: resources.maxProcessOutputFileBytes,
+    maxProcessOutputStorageBytes: resources.maxProcessOutputStorageBytes,
+    completedProcessOutputTtlMs: resources.completedProcessOutputTtlMs,
     maxCommandRuntimeMs: resources.maxCommandRuntimeMs,
     maxResidentWorkspaces: resources.maxResidentWorkspaces,
     maxActiveWorkspacesPerClient: resources.maxActiveWorkspacesPerClient,
@@ -389,6 +424,7 @@ async function withConfigLock<T>(
   const lockPath = `${devspaceConfigPath(env)}.lock`;
   const token = `${process.pid}:${randomBytes(16).toString("hex")}`;
   const deadline = Date.now() + CONFIG_LOCK_WAIT_MS;
+  await mkdir(dirname(lockPath), { recursive: true });
 
   while (true) {
     try {

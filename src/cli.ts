@@ -223,8 +223,7 @@ async function serve(): Promise<void> {
   }
 
   const { createServer } = await import("./server.js");
-  const config = loadConfig();
-  const { app, beginClose, close, localAgentProviders } = createServer(config);
+  const { app, config, beginClose, close, localAgentProviders } = createServer();
   const httpServer = app.listen(config.port, config.host, () => {
     console.log(`devspace listening on http://${config.host}:${config.port}/mcp`);
     console.log(`public base url: ${config.publicBaseUrl}`);

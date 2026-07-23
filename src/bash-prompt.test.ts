@@ -21,14 +21,15 @@ const toolNames = {
   ls: "ls",
   shell: "bash",
   writeStdin: "write_stdin",
+  readProcessOutput: "read_process_output",
 };
 
 const fullDescription = buildBashToolDescription({
   toolNames,
   hasInspectionTools: true,
 });
-assert.match(fullDescription, /^Use this when/);
-assert.match(fullDescription, /Prefer read, grep, glob, and ls/);
+assert.match(fullDescription, /^Run terminal commands/);
+assert.match(fullDescription, /Prefer read\/grep\/glob\/ls/);
 assert.match(fullDescription, /run_in_background/);
 assert.ok(fullDescription.length < 500);
 assert.doesNotMatch(fullDescription, /Call open_workspace/);
@@ -38,8 +39,8 @@ const minimalDescription = buildBashToolDescription({
   toolNames,
   hasInspectionTools: false,
 });
-assert.match(minimalDescription, /rg, find, ls, or tree/);
-assert.match(minimalDescription, /read for direct reads/);
+assert.match(minimalDescription, /rg\/find\/ls/);
+assert.match(minimalDescription, /read for reads/);
 
 const instructions = buildBashServerInstructions({
   toolNames,
@@ -47,7 +48,8 @@ const instructions = buildBashServerInstructions({
 });
 assert.match(instructions, /do not persist/);
 assert.match(instructions, /write_stdin/);
-assert.match(instructions, /rm -f/);
+assert.match(instructions, /Normal workspace shell writes are allowed/);
+assert.match(instructions, /unknown, stop polling/);
 assert.match(instructions, new RegExp(String(BASH_DEFAULT_TIMEOUT_SECONDS)));
 
 assert.equal(
@@ -61,14 +63,14 @@ const lifecycle = buildWorkspaceLifecycleInstruction({
   openWorkspace: "open_workspace",
   closeWorkspace: "close_workspace",
 });
-assert.match(lifecycle, /project on the user's local machine/);
-assert.match(lifecycle, /call open_workspace with the exact project path/);
-assert.match(lifecycle, /do not probe the path through a host sandbox or code interpreter/);
-assert.match(lifecycle, /reuses an active checkout workspace/);
-assert.match(lifecycle, /only after the user explicitly asks/);
-assert.match(lifecycle, /never call it automatically at the end of a turn, task, or conversation/);
-assert.doesNotMatch(lifecycle, /definitely no longer needed/);
-assert.match(lifecycle, /code interpreters, remain appropriate for work unrelated/);
+assert.match(lifecycle, /For local-project work use DevSpace/);
+assert.match(lifecycle, /not hosted Python/);
+assert.match(lifecycle, /Call open_workspace with the exact path once/);
+assert.match(lifecycle, /MCP session is rejected, reconnect and retry once/);
+assert.match(lifecycle, /workspaceId is unknown/);
+assert.match(lifecycle, /replace the ID/);
+assert.match(lifecycle, /Never call close_workspace unless the user asks/);
+assert.ok(lifecycle.length < 500);
 
 assert.equal(resolveBashTimeoutSeconds(undefined), BASH_DEFAULT_TIMEOUT_SECONDS);
 assert.equal(resolveBashTimeoutSeconds(30), 30);
@@ -81,22 +83,37 @@ const codex = buildCodexServerInstructions({
   read: "read",
   batchRead: "batch_read",
   batchInspect: "batch_inspect",
+  loadSkill: "load_skill",
+  readProcessOutput: "read_process_output",
   writeStdin: "write_stdin",
 });
-assert.match(codex, /batch_read for 2–8 known files/);
-assert.match(codex, /prefer batch_read or batch_inspect/);
-assert.match(codex, /iterative discovery/);
-assert.match(codex, /loaded lazily/);
+assert.match(codex, /batch_read\/batch_inspect for 2–8 independent targets/);
+assert.match(codex, /dependent discovery iterative/);
+assert.match(codex, /nested instructions arrive on first access/);
+assert.match(codex, /load_skill/);
+assert.match(codex, /read_process_output/);
+assert.match(codex, /page outputId/);
 assert.match(codex, /instructionToken/);
-assert.match(codex, /workingDirectory \(not workdir\)/);
-assert.match(codex, /yieldTimeMs \(not yield_time_ms\)/);
-assert.match(codex, /sessionId \(not session_id\)/);
-assert.match(codex, /workspaceId/);
+assert.match(codex, /workingDirectory, stdin, closeStdin, yieldTimeMs, maxOutputTokens, sessionId/);
+assert.match(codex, /multiline Python, SQL, or SSH payloads/);
+assert.match(codex, /PTY input requires closeStdin=false/);
 assert.match(codex, /does not persist/);
-assert.match(codex, /sandbox_permissions/);
-assert.match(codex, /rm -f/);
+assert.match(codex, /sandbox, approval, shell, and login fields/);
+assert.match(codex, /dangerous commands stay blocked/);
+assert.match(codex, /Unknown process session: stop polling/);
+assert.match(codex, /After backend restart or workspace recovery/);
+assert.ok(codex.length < 1_000);
 assert.doesNotMatch(codex, /once per project folder|including across turns/);
 assert.doesNotMatch(codex, /run_in_background/);
 assert.doesNotMatch(codex, /HEREDOC/);
+
+const codexWithoutSkills = buildCodexServerInstructions({
+  read: "read",
+  batchRead: "batch_read",
+  batchInspect: "batch_inspect",
+  readProcessOutput: "read_process_output",
+  writeStdin: "write_stdin",
+});
+assert.doesNotMatch(codexWithoutSkills, /load_skill|matching skill|explicit-only/);
 
 console.log("bash-prompt tests passed");

@@ -54,7 +54,7 @@ export function logEvent(
 }
 
 export function requestIp(req: Request, trustProxy: boolean): string | undefined {
-  if (trustProxy) {
+  if (trustProxy && isLoopbackProxyPeer(req.socket.remoteAddress)) {
     const cfConnectingIp = firstHeaderValue(req.header("cf-connecting-ip"));
     if (cfConnectingIp) return cfConnectingIp;
 
@@ -63,6 +63,14 @@ export function requestIp(req: Request, trustProxy: boolean): string | undefined
   }
 
   return req.ip ?? req.socket.remoteAddress;
+}
+
+export function isLoopbackProxyPeer(address: string | undefined): boolean {
+  if (!address) return false;
+  const normalized = address.toLowerCase();
+  if (normalized === "::1") return true;
+  const ipv4 = normalized.startsWith("::ffff:") ? normalized.slice(7) : normalized;
+  return /^127(?:\.\d{1,3}){3}$/u.test(ipv4);
 }
 
 export function requestPath(req: Request): string {

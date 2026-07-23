@@ -34,9 +34,11 @@ const testDir = mkdtempSync(join(tmpdir(), "devspace-admin-server-test-"));
 const configDir = join(testDir, "config");
 const staticDir = join(testDir, "static");
 const allowedRoot = join(testDir, "project");
+const hotAllowedRoot = join(testDir, "hot-project");
 mkdirSync(configDir);
 mkdirSync(staticDir);
 mkdirSync(allowedRoot);
+mkdirSync(hotAllowedRoot);
 writeFileSync(join(staticDir, "admin.html"), "<!doctype html><title>Admin</title>");
 writeFileSync(join(testDir, "outside.txt"), "must not be served");
 symlinkSync(join(testDir, "outside.txt"), join(staticDir, "outside.txt"));
@@ -89,6 +91,7 @@ const runtimeManager = {
   },
 };
 let revokeCount = 0;
+let rootsReloadCount = 0;
 const backendClient = {
   diagnostics: async () => ({
     generatedAt: "2026-07-22T00:00:00.000Z",
@@ -98,6 +101,10 @@ const backendClient = {
     recentFailures: [{ at: "2026-07-22T00:00:00.000Z", event: "test_failure", category: "test" }],
     ownerToken: "must-be-redacted",
   }),
+  reloadAllowedRoots: async () => {
+    rootsReloadCount += 1;
+    return { reloaded: true };
+  },
   revokeAllClientsAndTokens: async () => {
     revokeCount += 1;
     return { revoked: true };
@@ -206,6 +213,26 @@ try {
   });
   assert.equal(missingRevision.status, 428);
 
+  config.allowedRoots = [allowedRoot, hotAllowedRoot];
+  const rootsOnlyUpdate = await request(url, {
+    method: "PUT",
+    path: "/api/config",
+    headers: {
+      cookie,
+      origin,
+      "content-type": "application/json",
+      "if-match": `"${configEnvelope.revision}"`,
+      "x-devspace-admin-csrf": sessionBody.csrfToken,
+    },
+    body: JSON.stringify({ config }),
+  });
+  assert.equal(rootsOnlyUpdate.status, 200);
+  const rootsOnlyBody = JSON.parse(rootsOnlyUpdate.body);
+  assert.equal(rootsOnlyBody.restartRequired, false);
+  assert.equal(rootsOnlyBody.rootsChanged, true);
+  assert.equal(rootsOnlyBody.rootsReloaded, true);
+  assert.equal(rootsReloadCount, 1);
+
   config.resources.maxMcpSessions = 10;
   const update = await request(url, {
     method: "PUT",
@@ -214,7 +241,7 @@ try {
       cookie,
       origin,
       "content-type": "application/json",
-      "if-match": `"${configEnvelope.revision}"`,
+      "if-match": `"${rootsOnlyBody.revision}"`,
       "x-devspace-admin-csrf": sessionBody.csrfToken,
     },
     body: JSON.stringify({ config }),

@@ -16,6 +16,9 @@ const overrideSources: Record<string, string> = {
   "resources.maxProcessSessions": "DEVSPACE_MAX_PROCESS_SESSIONS",
   "resources.maxProcessSessionsPerClient": "DEVSPACE_MAX_PROCESS_SESSIONS_PER_CLIENT",
   "resources.maxProcessSessionsPerWorkspace": "DEVSPACE_MAX_PROCESS_SESSIONS_PER_WORKSPACE",
+  "resources.maxProcessOutputFileBytes": "DEVSPACE_MAX_PROCESS_OUTPUT_FILE_BYTES",
+  "resources.maxProcessOutputStorageBytes": "DEVSPACE_MAX_PROCESS_OUTPUT_STORAGE_BYTES",
+  "resources.completedProcessOutputTtlMs": "DEVSPACE_COMPLETED_PROCESS_OUTPUT_TTL_SECONDS",
   "resources.maxCommandRuntimeMs": "DEVSPACE_MAX_COMMAND_RUNTIME_SECONDS",
   "resources.maxResidentWorkspaces": "DEVSPACE_MAX_RESIDENT_WORKSPACES",
   "resources.maxActiveWorkspacesPerClient": "DEVSPACE_MAX_ACTIVE_WORKSPACES_PER_CLIENT",
@@ -48,20 +51,20 @@ export function AddField({ id, label, value, onChange, onAdd, placeholder, help,
   return <div className="add-field"><label htmlFor={id}>{label}</label><div className="input-action-row"><input id={id} type="text" value={value} onChange={(event) => onChange(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); onAdd(); } }} placeholder={placeholder} autoComplete="off" spellCheck={false} aria-describedby={`${id}-${error ? "error" : "help"}`} aria-invalid={Boolean(error)} disabled={disabled} /><button type="button" className="secondary-button" onClick={onAdd} disabled={disabled}>添加</button></div><p id={`${id}-help`} className="field-help">{help}</p>{error && <p id={`${id}-error`} className="field-error">{error}</p>}</div>;
 }
 
-export function FieldMeta({ path, overrides, warnings, issues }: { path: string; overrides: string[]; warnings: Record<string, string>; issues: Map<string, string[]> }): React.JSX.Element | null {
+export function FieldMeta({ id, path, overrides, warnings, issues }: { id?: string; path: string; overrides: string[]; warnings: Record<string, string>; issues: Map<string, string[]> }): React.JSX.Element | null {
   const override = overrides.includes(path);
   const warning = warnings[path];
   const errors = issues.get(path) ?? [];
   if (!override && !warning && errors.length === 0) return null;
-  return <div className="field-meta">{override && <span className="source-label" title={`由 ${overrideSources[path] ?? "启动环境"} 控制`}>环境变量 · {overrideSources[path] ?? path}</span>}{warning && <span className="inline-warning">{warning}</span>}{errors.map((message, index) => <span className="field-error" key={`${message}-${index}`}>{message}</span>)}</div>;
+  return <div className="field-meta" id={id}>{override && <span className="source-label" title={`由 ${overrideSources[path] ?? "启动环境"} 控制`}>环境变量 · {overrideSources[path] ?? path}</span>}{warning && <span className="inline-warning">{warning}</span>}{errors.map((message, index) => <span className="field-error" key={`${message}-${index}`}>{message}</span>)}</div>;
 }
 
 export function SelectField<T extends string>({ id, label, value, description, options, onChange, disabled, meta }: { id: string; label: string; value: T; description: string; options: Array<readonly [T, string]>; onChange(value: T): void; disabled?: boolean; meta?: ReactNode }): React.JSX.Element {
   return <div className="field"><label htmlFor={id}>{label}</label><select id={id} value={value} disabled={disabled} onChange={(event) => onChange(event.target.value as T)}>{options.map(([optionValue, optionLabel]) => <option key={optionValue} value={optionValue}>{optionLabel}</option>)}</select><p className="field-help">{description}</p>{meta}</div>;
 }
 
-export function CenteredState({ title, detail, busy = false, tone = "neutral" }: { title: string; detail: string; busy?: boolean; tone?: "neutral" | "error" }): React.JSX.Element {
-  return <main className="centered-state" role={tone === "error" ? "alert" : "status"}><div className={`state-icon ${tone}`} aria-hidden="true">{busy ? "" : "!"}</div><h1>{title}</h1><p>{detail}</p></main>;
+export function CenteredState({ title, detail, busy = false, tone = "neutral", children }: { title: string; detail: string; busy?: boolean; tone?: "neutral" | "error"; children?: ReactNode }): React.JSX.Element {
+  return <main className="centered-state" role={tone === "error" ? "alert" : "status"}><div className={`state-icon ${tone}`} aria-hidden="true">{busy ? "" : "!"}</div><h1>{title}</h1><p>{detail}</p>{children}</main>;
 }
 
 export function backendPresentation(backend: AdminBackendRuntime | undefined): { value: string; tone: "success" | "warning" | "danger" | "neutral" } {

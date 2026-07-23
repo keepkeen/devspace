@@ -4,19 +4,19 @@ import {
   applyHostFonts,
   applyHostStyleVariables,
 } from "@modelcontextprotocol/ext-apps";
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import {
+  isBatchTool,
+  isDisplayToolName,
   isEditTool,
   isExpandableCard,
   isPatchTool,
   isReadTool,
   isReviewTool,
-  isToolName,
-  isToolResultCard,
   isWriteTool,
-  payloadText,
+  toolResultCard,
+  toolResultText,
+  type AnyToolResultCard,
   type HostContext,
-  type ToolName,
   type ToolResultCard,
 } from "./card-types.js";
 import { renderIcon, toolIcons } from "./icons.js";
@@ -29,7 +29,7 @@ import "./workspace-app.css";
 
 interface MountedPayload {
   update(options: {
-    card: ToolResultCard;
+    card: AnyToolResultCard;
     hostContext?: HostContext;
     errorMessage?: string | null;
     visibleFileCount?: number;
@@ -41,7 +41,7 @@ let app: App | null = null;
 let connected = false;
 let connectionError: string | null = null;
 let hostContext: HostContext | undefined;
-let card: ToolResultCard | null = null;
+let card: AnyToolResultCard | null = null;
 let expanded = false;
 let reviewFilesExpanded = false;
 let errorMessage: string | null = null;
@@ -67,14 +67,8 @@ async function boot(): Promise<void> {
   );
 
   app.ontoolresult = (result) => {
-    const structuredContent = getStructuredContent<Partial<ToolResultCard>>(result);
-    const metaCard = cardFromMeta(result);
-    const structured = metaCard
-      ? { ...structuredContent, ...metaCard }
-      : structuredContent;
-    const tool = toolNameFromMeta(result);
-
-    if (!tool || !isToolResultCard(structured)) {
+    const nextCard = toolResultCard(result);
+    if (!nextCard) {
       card = null;
       expanded = false;
       reviewFilesExpanded = false;
@@ -83,9 +77,8 @@ async function boot(): Promise<void> {
       return;
     }
 
-    const nextCard = { ...structured, tool };
     card = nextCard;
-    expanded = isReviewTool(tool) && isExpandableCard(nextCard);
+    expanded = isReviewTool(nextCard.tool) && isExpandableCard(nextCard);
     reviewFilesExpanded = false;
     errorMessage = null;
     render();
@@ -153,7 +146,7 @@ function render(): void {
     return;
   }
 
-  const display = getToolDisplay(card);
+  const display = getCardDisplay(card);
   if (isReviewTool(card.tool)) {
     renderReviewCard(card, display);
     return;
@@ -277,7 +270,7 @@ async function renderPayloadIfNeeded(): Promise<void> {
     if (target !== currentPayloadContainer || !card) return;
 
     currentPayload = mountReviewPayload(target, {
-      card,
+      card: card as ToolResultCard,
       hostContext,
       errorMessage,
       visibleFileCount,
@@ -285,7 +278,7 @@ async function renderPayloadIfNeeded(): Promise<void> {
     return;
   }
 
-  const text = payloadText(card.payload);
+  const text = toolResultText(card);
   if (!text) {
     renderStatus(target, "No details available.");
     return;
@@ -294,7 +287,7 @@ async function renderPayloadIfNeeded(): Promise<void> {
   renderPrePayload(target, text, card.tool);
 }
 
-function shouldUseHeavyPayload(card: ToolResultCard): boolean {
+function shouldUseHeavyPayload(card: AnyToolResultCard): boolean {
   return isReadTool(card.tool) || isEditTool(card.tool) || isWriteTool(card.tool);
 }
 
@@ -327,8 +320,10 @@ function renderPrePayload(
   container.replaceChildren(element("pre", { className: `text-payload ${tool}`, text }));
 }
 
-function renderHeaderSummary(card: ToolResultCard): HTMLElement {
-  const summary = getToolHeaderSummary(card);
+function renderHeaderSummary(card: AnyToolResultCard): HTMLElement {
+  const summary = isDisplayToolName(card.tool)
+    ? getToolHeaderSummary(card as ToolResultCard)
+    : additionalToolHeaderSummary(card);
 
   if (summary.kind === "diff") {
     const stats = element("span", { className: "stats" });
@@ -348,7 +343,7 @@ function renderHeaderSummary(card: ToolResultCard): HTMLElement {
   return meta;
 }
 
-function renderReviewCard(card: ToolResultCard, display: ToolDisplay): void {
+function renderReviewCard(card: AnyToolResultCard, display: ToolDisplay): void {
   unmountPayload();
 
   const files = card.files ?? [];
@@ -445,7 +440,7 @@ function setPayloadLoading(container: HTMLElement, loading: boolean): void {
   if (button) button.setAttribute("aria-busy", String(loading));
 }
 
-function workspacePayloadText(card: ToolResultCard): string {
+function workspacePayloadText(card: AnyToolResultCard): string {
   const agentsFiles = card.agentsFiles ?? [];
   const availableAgentsFiles = card.availableAgentsFiles ?? [];
   const skills = card.skills ?? [];
@@ -467,7 +462,7 @@ function workspacePayloadText(card: ToolResultCard): string {
 }
 
 function formatAgentsFilesForPayload(
-  agentsFiles: NonNullable<ToolResultCard["agentsFiles"]>,
+  agentsFiles: NonNullable<AnyToolResultCard["agentsFiles"]>,
 ): string {
   return agentsFiles
     .map((file) => {
@@ -478,20 +473,45 @@ function formatAgentsFilesForPayload(
     .join("\n\n");
 }
 
-function toolNameFromMeta(result: CallToolResult): ToolName | undefined {
-  const meta = result._meta as Record<string, unknown> | undefined;
-  const tool = meta?.tool;
-  return isToolName(tool) ? tool : undefined;
+function getCardDisplay(card: AnyToolResultCard): ToolDisplay {
+  if (isDisplayToolName(card.tool)) return getToolDisplay(card as ToolResultCard);
+
+  if (card.tool === "batch_read") {
+    return {
+      icon: toolIcons.readFile,
+      title: "Read files",
+      tone: "read",
+    };
+  }
+  if (card.tool === "batch_inspect") {
+    return {
+      icon: toolIcons.search,
+      title: "Inspected workspace",
+      tone: "search",
+    };
+  }
+  return {
+    icon: toolIcons.terminal,
+    title: "Read process output",
+    label: card.outputId,
+    tone: "shell",
+  };
 }
 
-function cardFromMeta(result: CallToolResult): Partial<ToolResultCard> | undefined {
-  const meta = result._meta as Record<string, unknown> | undefined;
-  const metaCard = meta?.card;
-  return metaCard && typeof metaCard === "object" ? metaCard : undefined;
-}
+function additionalToolHeaderSummary(
+  card: AnyToolResultCard,
+): ReturnType<typeof getToolHeaderSummary> {
+  if (isBatchTool(card.tool)) {
+    const count = card.items?.length;
+    return count === undefined
+      ? { kind: "empty" }
+      : { kind: "text", text: `${count} item${count === 1 ? "" : "s"}` };
+  }
 
-function getStructuredContent<T>(result: CallToolResult): T | undefined {
-  return result.structuredContent as T | undefined;
+  const storedBytes = typeof card.storedBytes === "number" ? card.storedBytes : undefined;
+  return storedBytes === undefined
+    ? { kind: "empty" }
+    : { kind: "text", text: `${storedBytes} bytes retained` };
 }
 
 function element<K extends keyof HTMLElementTagNameMap>(
@@ -518,4 +538,3 @@ function element<K extends keyof HTMLElementTagNameMap>(
   }
   return node;
 }
-

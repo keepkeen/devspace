@@ -185,6 +185,10 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
     const entry = this.sessions.get(sessionId);
     if (!entry) return undefined;
     this.sessions.delete(sessionId);
+    const inFlightClosing = this.inFlightClosings.get(sessionId);
+    if (entry.closing && inFlightClosing?.ownerClientId === entry.ownerClientId) {
+      this.inFlightClosings.delete(sessionId);
+    }
     return entry.closing ? "intentional" : "unexpected";
   }
 
@@ -209,13 +213,18 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
 
   async closeAll(): Promise<McpSessionCloseResult[]> {
     this.seal();
+    return this.closeActive();
+  }
+
+  async closeActive(): Promise<McpSessionCloseResult[]> {
+    this.reservations.clear();
     const allClosings = new Set<Promise<McpSessionCloseResult>>();
-    for (const [sessionId, closing] of this.inFlightClosings) {
+    for (const [sessionId, closing] of [...this.inFlightClosings]) {
       allClosings.add(closeSession(sessionId, closing.underlying, this.closeTimeoutMs));
     }
     const initiatedClosings: Array<Promise<McpSessionCloseResult>> = [];
 
-    for (const [sessionId, entry] of this.sessions) {
+    for (const [sessionId, entry] of [...this.sessions]) {
       const closing = this.beginClosing(sessionId, entry);
       allClosings.add(closing.promise);
       if (closing.initiated) initiatedClosings.push(closing.promise);

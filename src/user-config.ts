@@ -52,6 +52,9 @@ const devspaceUserConfigSchema = z.object({
   stateDir: z.string().optional(),
   worktreeRoot: z.string().optional(),
   agentDir: z.string().optional(),
+  skillPaths: z.array(z.string().trim().min(1)).optional(),
+  disabledSkillPaths: z.array(z.string().trim().min(1)).optional(),
+  adminSkillsDir: z.string().trim().min(1).optional(),
   projectDocFallbackFilenames: projectDocFallbackFilenamesSchema.optional(),
   project_doc_fallback_filenames: projectDocFallbackFilenamesSchema.optional(),
   subagents: z.boolean().optional(),
@@ -63,6 +66,9 @@ const devspaceUserConfigSchema = z.object({
     maxProcessSessions: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxProcessSessions).optional(),
     maxProcessSessionsPerClient: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxProcessSessionsPerClient).optional(),
     maxProcessSessionsPerWorkspace: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxProcessSessionsPerWorkspace).optional(),
+    maxProcessOutputFileBytes: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxProcessOutputFileBytes).optional(),
+    maxProcessOutputStorageBytes: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxProcessOutputStorageBytes).optional(),
+    completedProcessOutputTtlMs: z.number().int().min(1_000).max(MAX_TIMER_MS).optional(),
     maxCommandRuntimeMs: z.number().int().min(MIN_COMMAND_RUNTIME_MS).max(MAX_TIMER_MS).optional(),
     maxResidentWorkspaces: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxResidentWorkspaces).optional(),
     maxActiveWorkspacesPerClient: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxActiveWorkspacesPerClient).optional(),
@@ -84,6 +90,9 @@ export interface DevspaceUserConfig {
   stateDir?: string;
   worktreeRoot?: string;
   agentDir?: string;
+  skillPaths?: string[];
+  disabledSkillPaths?: string[];
+  adminSkillsDir?: string;
   projectDocFallbackFilenames?: string[];
   project_doc_fallback_filenames?: string[];
   subagents?: boolean;
@@ -95,6 +104,9 @@ export interface DevspaceUserConfig {
     maxProcessSessions?: number;
     maxProcessSessionsPerClient?: number;
     maxProcessSessionsPerWorkspace?: number;
+    maxProcessOutputFileBytes?: number;
+    maxProcessOutputStorageBytes?: number;
+    completedProcessOutputTtlMs?: number;
     maxCommandRuntimeMs?: number;
     maxResidentWorkspaces?: number;
     maxActiveWorkspacesPerClient?: number;

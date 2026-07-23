@@ -89,12 +89,24 @@ model can follow them and retry safely with the returned one-time
 `instructionToken`. The token prevents parallel mutations from bypassing a
 newly discovered instruction scope.
 
+Whitespace-only instruction files are ignored so the next filename in priority
+order can apply. The complete effective chain—global, project root, and nested
+files—is limited to 32 KiB of UTF-8 content. DevSpace rejects an over-budget
+chain instead of silently truncating instructions.
+
 Shell calls also inspect literal `cd` and `pushd` targets before execution.
 Dynamic targets such as `cd "$TARGET"`, `cd $(command)`, or `cd ~/path` are
 rejected because their instruction scope cannot be established safely; pass a
 literal `workingDirectory` or literal shell path instead. Cwd destinations must
 already exist, inherited `CDPATH` is removed, and opaque nested-shell forms
 fail closed. Create a directory in one call and enter it in a later call.
+The same check applies to writable `write_stdin` input. DevSpace retains the
+current directory of recognized interactive shells and buffers incomplete input
+until a newline, so splitting `cd` across MCP calls cannot bypass the gate.
+Interactive directory changes must use one standalone literal `cd` per line.
+Other processes such as Python REPLs receive opaque stdin without shell parsing.
+Polling and a separate Ctrl-C call remain available without an instruction
+acknowledgement.
 
 This avoids recursively scanning large repositories during `open_workspace`
 while keeping scoped instructions explicit and inspectable.
@@ -103,17 +115,35 @@ while keeping scoped instructions explicit and inspectable.
 
 Skills are enabled by default for coding-agent workflows.
 
-DevSpace discovers standard Agent Skills from:
+DevSpace discovers standard Agent Skills in this order:
 
-- `~/.agents/skills`
-- project `.agents/skills`
-- `~/.devspace/skills`
+- project `.agents/skills` directories from the approved repository boundary down to the opened workspace
+- user Skills in `~/.agents/skills`
+- Admin Skills in `DEVSPACE_ADMIN_SKILLS_DIR` (default `/etc/codex/skills`)
+- Skills bundled with DevSpace
 
 It also keeps compatibility with:
 
-- the bundled `subagent-delegation` skill when `DEVSPACE_SUBAGENTS=1`, unless `~/.devspace/skills/subagent-delegation/SKILL.md` exists
+- `~/.devspace/skills`
 - `DEVSPACE_AGENT_DIR/skills`, defaulting to `~/.codex/skills`
 - additional paths from `DEVSPACE_SKILL_PATHS`
+
+Relative configured paths resolve from the opened workspace, not from the
+server process directory. `DEVSPACE_DISABLED_SKILL_PATHS` disables exact Skill
+directories or `SKILL.md` paths. Discovery is depth/entry bounded, follows a
+symlinked Skill directory only as one Skill root, rejects symlink escapes from
+support-file reads, and detects cycles.
+Repository ancestors above the most specific matching allowed root are never
+scanned or exposed.
+
+Every `SKILL.md` must start with valid YAML frontmatter containing non-empty
+string `name` and `description` values. Optional `agents/openai.yaml` metadata
+is loaded; `policy.allow_implicit_invocation: false` keeps the Skill available
+for an explicit user request but prevents the model from selecting it
+implicitly. Skills with the same name are all retained with distinct stable
+`skillId`, path, source, and scope values.
+Invalid, oversized, or escaping OpenAI metadata fails closed by disabling
+implicit invocation while leaving explicit user selection available.
 
 When Subagents are enabled, DevSpace discovers agent profiles
 from `~/.devspace/agents/*.md` and project `.devspace/agents/*.md`.
@@ -127,11 +157,18 @@ before use.
 
 Legacy project paths such as `.pi/skills` can be added through `DEVSPACE_SKILL_PATHS` when needed.
 
-When `open_workspace` returns matching skills, the model should read the
-advertised `SKILL.md` before following that skill. `~/...` advertised paths are
-accepted. A skill activates only after a successful, complete, unbounded, and
-untruncated `SKILL.md` read; partial and batch reads do not activate its
-supporting files.
+`open_workspace` returns a deterministic Skill catalog capped at 8,000
+serialized characters and reports how many entries were omitted. Descriptions
+are shortened before whole entries are omitted. An exact user-provided Skill
+name can still be passed to `load_skill` even if its catalog entry was omitted.
+
+For ChatGPT web, the model should call `load_skill` with the advertised
+`skillId` before following a Skill. The tool atomically reads the complete
+`SKILL.md` (maximum 64 KiB) and only then activates access to support files. An exact `name` is
+also accepted when it identifies one Skill; duplicate names require `skillId`.
+This is DevSpace's explicit replacement for Codex's `$skill` and `/skills`
+surfaces. Direct and batch reads cannot bypass `load_skill`; activation and
+manifest access go through it so the discovery-time hash can be checked.
 
 Skill paths may be outside the workspace. DevSpace only permits reading:
 
@@ -151,31 +188,83 @@ By default DevSpace runs in `DEVSPACE_TOOL_MODE=codex`, the Codex-style unified
 exec surface best suited to browser MCP hosts like ChatGPT. It exposes:
 
 - `open_workspace`
+- `close_workspace`
 - `read`
 - `batch_read`
 - `batch_inspect`
+- `load_skill`
 - `apply_patch`
 - `exec_command`
 - `write_stdin`
+- `read_process_output`
 
 Use `batch_read` when 2–8 file paths are already known, and `batch_inspect` when
 2–8 independent grep, glob, or directory-list operations are already known.
 Do not batch an iterative investigation when each next target depends on the
 previous result.
 
+### Result payload contract
+
+Large model-visible text has one canonical location. DevSpace does not mirror
+file contents, Skill manifests, or process output between MCP `content` and
+`structuredContent`:
+
+- `read` and `load_skill` return their body in text `content`; structured data
+  contains only compact identifiers, status, and other follow-up metadata.
+- `batch_read` and `batch_inspect` return a short text completion summary and
+  keep each independent result in `structuredContent.items[]`. There is no
+  concatenated aggregate `structuredContent.result`.
+- `exec_command`, `bash`, and `write_stdin` return the current inline output in
+  text `content`. Their structured data contains process state such as
+  `sessionId`, `running`, `exitCode`, timing/truncation metrics, and `outputId`,
+  but no copy of the inline output.
+- `read_process_output` returns the requested UTF-8 page in text `content` and
+  keeps only paging metadata in `structuredContent`: `outputId`, `offset`,
+  `nextOffset`, `eof`, `status`, `totalBytes`, `storedBytes`, and
+  `droppedBytes`.
+
+`_meta` is reserved for optional widget presentation and is not a source of
+model-visible state or body text. Widgets read the top-level result instead of
+requiring a duplicate `_meta.card.payload.content`. Plain MCP clients may
+ignore `_meta`; structured batch consumers must read `items[]` rather than the
+removed aggregate field. This layout reduces prompt and transport overhead
+without changing workspace, process, or paging semantics.
+
 In this mode, `write`, `edit`, `bash`, `grep`, `glob`, and `ls` are not
 registered. `exec_command` returns a process session ID when a command is still
 running after its yield window. Use `write_stdin` to poll it, send input, resize
 a PTY, or send Ctrl-C. Set `tty: true` only for commands that need a terminal.
-A small command policy blocks `rm -f`, `sudo`, and pipe-to-shell and tells the
-model to use `apply_patch` instead.
+For multiline Python, SQL, or remote SSH scripts, pass the body through the
+structured `stdin` field instead of nesting shell quotes. Pipe stdin closes by
+default after the initial payload; set `closeStdin: false` only when later
+`write_stdin` calls must add data. PTY sessions cannot use automatic EOF.
+A small command policy blocks `sudo`, forced or recursive `rm`, and
+pipe-to-shell. Normal workspace shell writes are allowed; explicit literal
+targets for common mutations and redirections are rejected if they leave the
+workspace.
+
+`maxOutputTokens` limits only the current inline process response and defaults
+to 10,000 tokens. Short output is returned in full; long output keeps a
+head/tail summary inside a 1 MiB UTF-8 in-memory content cap. Every process that
+produces output also returns an opaque `outputId` whose retained UTF-8 bytes can
+be replayed with `read_process_output(workspaceId, outputId, offset, limit)`.
+The page body is in text `content`; structured paging metadata deliberately
+does not repeat it. Use the returned `nextOffset` for the next page. Output
+ownership is checked against both the OAuth client and workspace; no local log
+path is exposed.
+`droppedBytes` is nonzero only when the per-output or total durable disk quota
+was reached, meaning those bytes cannot be recovered. Completed output uses its
+own TTL and remains available after the short-lived process session is removed
+or after the backend restarts.
 
 Use `DEVSPACE_TOOL_MODE=full` to expose the dedicated file and shell tools:
 
 - `open_workspace`
+- `close_workspace`
 - `read`
 - `batch_read`
 - `batch_inspect`
+- `load_skill`
 - `write`
 - `edit`
 - `grep`
@@ -183,10 +272,12 @@ Use `DEVSPACE_TOOL_MODE=full` to expose the dedicated file and shell tools:
 - `ls`
 - `bash`
 - `write_stdin`
+- `read_process_output`
 
-Use `DEVSPACE_TOOL_MODE=minimal` for `open_workspace`, `read`, `batch_read`,
-`batch_inspect`, `write`, `edit`, `bash`, and `write_stdin` (clients can use
-the bounded batch inspection tool or `bash` with `rg`, `find`, and `ls`).
+Use `DEVSPACE_TOOL_MODE=minimal` for `open_workspace`, `close_workspace`,
+`read`, `batch_read`, `batch_inspect`, `load_skill`, `write`, `edit`, `bash`,
+`write_stdin`, and `read_process_output` (clients can use the bounded batch
+inspection tool or `bash` with `rg`, `find`, and `ls`).
 
 ## Show Changes
 
@@ -220,12 +311,11 @@ Behavior is aligned with Codex's unified exec surface:
 - shell env vars / aliases do **not** persist
 - long-running processes return a `sessionId`; poll with `write_stdin`
 - truncated output reports approximate original token count and omitted bytes
-- a small command policy blocks `rm -f`, `sudo`, and pipe-to-shell
+- a small command policy blocks forced/recursive `rm`, `sudo`, and pipe-to-shell
 - independent commands should be issued as parallel tool calls; dependent ones use `&&`
-- HEREDOC is allowed for git commit / `gh pr` message bodies only
+- HEREDOC and normal workspace shell writes are allowed
 - do not sleep-poll; use session + `write_stdin` instead
 
 In `full` / `minimal` modes, `bash` defaults to a 120s timeout (max 600) and
-supports `run_in_background`. File writes for project source should go through
-`apply_patch` (codex) or edit/write (full/minimal) rather than shell redirection,
-`tee`, `sed -i`, or generated scripts.
+supports `run_in_background`. Shell writes are allowed under the same command
+policy; `apply_patch` or edit/write remain preferable for precise reviewed edits.

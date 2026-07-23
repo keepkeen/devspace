@@ -6,6 +6,8 @@ export const RESOURCE_LIMIT_MAXIMUMS = {
   maxProcessSessions: 256,
   maxProcessSessionsPerClient: 256,
   maxProcessSessionsPerWorkspace: 256,
+  maxProcessOutputFileBytes: 1024 * 1024 * 1024,
+  maxProcessOutputStorageBytes: 10 * 1024 * 1024 * 1024,
   maxResidentWorkspaces: 4_096,
   maxActiveWorkspacesPerClient: 4_096,
   maxManagedWorktrees: 1_024,

@@ -1,5 +1,9 @@
 import { spawn } from "node:child_process";
+import { resolve } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { resolveShellCommand, terminateProcessTree } from "./process-platform.js";
+import { ProcessOutputQuotaError, type ProcessOutputStore } from "./process-output-store.js";
+import { tokenizeSegment, unwrapCommandWrappers } from "./command-policy.js";
 
 const DEFAULT_EXEC_YIELD_MS = 10_000;
 const DEFAULT_INTERACTIVE_YIELD_MS = 250;
@@ -9,10 +13,11 @@ const DEFAULT_POLL_YIELD_MS = 5_000;
 const MAX_COMMAND_YIELD_MS = 600_000;
 const MAX_POLL_YIELD_MS = 110_000;
 const DEFAULT_MAX_OUTPUT_TOKENS = 10_000;
-const DEFAULT_BUFFER_CHARACTERS = 1_000_000;
+const DEFAULT_BUFFER_BYTES = 1024 * 1024;
 const COMPLETED_SESSION_TTL_MS = 5 * 60 * 1_000;
 const DEFAULT_COLUMNS = 80;
 const DEFAULT_ROWS = 24;
+export const MAX_PROCESS_INPUT_BYTES = 1024 * 1024;
 
 export interface StartCommandInput {
   ownerClientId: string;
@@ -26,6 +31,19 @@ export interface StartCommandInput {
   yieldTimeMs?: number;
   maxOutputTokens?: number;
   runtimeLimitMs?: number;
+  instructionScopePaths?: string[];
+  instructionInputMode?: "shell" | "opaque";
+  /** Initial standard input. When provided, stdin is closed by default after writing. */
+  stdin?: string;
+  closeStdin?: boolean;
+}
+
+export interface PreparedProcessInput {
+  expectedRevision: number;
+  pendingInput: string;
+  charsToWrite: string;
+  nextCwd: string;
+  instructionScopePaths: string[];
 }
 
 export interface WriteStdinInput {
@@ -37,6 +55,9 @@ export interface WriteStdinInput {
   rows?: number;
   yieldTimeMs?: number;
   maxOutputTokens?: number;
+  closeStdin?: boolean;
+  instructionScopePaths?: string[];
+  preparedInput?: PreparedProcessInput;
 }
 
 export interface ProcessSnapshot {
@@ -51,11 +72,31 @@ export interface ProcessSnapshot {
   originalTokenCount: number;
   /** Bytes dropped from the middle of the output by the head/tail buffer. */
   outputOmittedBytes: number;
+  /** Opaque identifier for replaying durable output through read_process_output. */
+  outputId?: string;
+  /** Exact UTF-8 bytes observed across the full process lifetime. */
+  totalOutputBytes: number;
+  /** Exact bytes retained in durable storage. */
+  storedOutputBytes: number;
+  /** Exact bytes irrecoverably dropped after a durable-storage quota was reached. */
+  droppedBytes: number;
+  outputStorageError?: string;
   timedOut: boolean;
+  stdinClosed: boolean;
+}
+
+export interface ProcessInstructionContext {
+  cwd: string;
+  scopePaths: string[];
+  inputMode: "shell" | "opaque";
+  pendingInput: string;
+  inputRevision: number;
+  stdinClosed: boolean;
 }
 
 interface ManagedProcess {
   write(data: string): void;
+  end?(): void;
   kill(signal?: NodeJS.Signals): void;
   resize?(columns: number, rows: number): void;
 }
@@ -64,6 +105,12 @@ interface ProcessSession {
   id: number;
   ownerClientId: string;
   workspaceId: string;
+  cwd: string;
+  instructionScopePaths: string[];
+  instructionInputMode: "shell" | "opaque";
+  pendingInput: string;
+  inputRevision: number;
+  stdinClosed: boolean;
   process?: ManagedProcess;
   startedAt: number;
   columns: number;
@@ -79,9 +126,16 @@ interface ProcessSession {
   escalationTimer?: NodeJS.Timeout;
   timedOut: boolean;
   cancelRequested: boolean;
+  outputId?: string;
+  totalOutputBytes: number;
+  quotaDroppedBytes: number;
+  durableQuotaReached: boolean;
+  outputStorageError?: string;
 }
 
 export interface ProcessSessionManagerOptions {
+  maxBufferBytes?: number;
+  /** @deprecated Use maxBufferBytes. Kept for internal callers during migration. */
   maxBufferCharacters?: number;
   completedSessionTtlMs?: number;
   maxSessions?: number;
@@ -89,6 +143,7 @@ export interface ProcessSessionManagerOptions {
   maxSessionsPerWorkspace?: number;
   maxRuntimeMs?: number;
   terminationGraceMs?: number;
+  outputStore?: ProcessOutputStore;
 }
 
 export interface ProcessSessionUsageSnapshot {
@@ -118,8 +173,23 @@ function terminalSize(value: number | undefined, fallback: number): number {
   return value;
 }
 
+function assertProcessInputSize(value: string | undefined): void {
+  if (value !== undefined && Buffer.byteLength(value, "utf8") > MAX_PROCESS_INPUT_BYTES) {
+    throw new Error(`Process input exceeds the ${MAX_PROCESS_INPUT_BYTES}-byte limit.`);
+  }
+}
+
 function workspaceKey(ownerClientId: string, workspaceId: string): string {
   return `${ownerClientId}\u0000${workspaceId}`;
+}
+
+export function isInteractiveShellCommand(command: string): boolean {
+  const words = unwrapCommandWrappers(tokenizeSegment(command.trim()));
+  const executable = words.shift()?.split("/").at(-1);
+  if (!executable || !["sh", "bash", "zsh", "dash", "ksh", "fish"].includes(executable)) {
+    return false;
+  }
+  return words.every((word) => word === "--" || /^--?[A-Za-z][A-Za-z-]*$/u.test(word));
 }
 
 function processEnvironment(input?: {
@@ -147,44 +217,52 @@ function processEnvironment(input?: {
   return environment;
 }
 
-function codePointLength(value: string): number {
-  return Array.from(value).length;
-}
-
-function sliceCodePoints(value: string, start: number, end?: number): string {
-  return Array.from(value).slice(start, end).join("");
-}
-
-function takeHead(value: string, count: number): string {
-  if (count <= 0) return "";
-  return sliceCodePoints(value, 0, count);
-}
-
-function takeTail(value: string, count: number): string {
-  if (count <= 0) return "";
-  const characters = Array.from(value);
-  return characters.slice(Math.max(0, characters.length - count)).join("");
-}
-
-function splitBudget(maxCharacters: number): { head: number; tail: number } {
+function splitBudget(maxUnits: number): { head: number; tail: number } {
   return {
-    head: Math.ceil(maxCharacters / 2),
-    tail: Math.floor(maxCharacters / 2),
+    head: Math.ceil(maxUnits / 2),
+    tail: Math.floor(maxUnits / 2),
   };
 }
 
-function formatHeadTail(head: string, tail: string, omittedCharacters: number): string {
-  if (omittedCharacters <= 0) return head + tail;
-  return `${head}\n... output truncated (${omittedCharacters} characters omitted) ...\n${tail}`;
+function formatHeadTail(head: string, tail: string, omittedBytes: number): string {
+  if (omittedBytes <= 0) return head + tail;
+  return `${head}\n... output truncated (${omittedBytes} bytes omitted) ...\n${tail}`;
+}
+
+function takeUtf8Head(value: string, maxBytes: number): string {
+  if (maxBytes <= 0) return "";
+  let bytes = 0;
+  let result = "";
+  for (const character of value) {
+    const characterBytes = Buffer.byteLength(character, "utf8");
+    if (bytes + characterBytes > maxBytes) break;
+    result += character;
+    bytes += characterBytes;
+  }
+  return result;
+}
+
+function takeUtf8Tail(value: string, maxBytes: number): string {
+  if (maxBytes <= 0) return "";
+  const characters = Array.from(value);
+  let bytes = 0;
+  let start = characters.length;
+  while (start > 0) {
+    const characterBytes = Buffer.byteLength(characters[start - 1]!, "utf8");
+    if (bytes + characterBytes > maxBytes) break;
+    bytes += characterBytes;
+    start -= 1;
+  }
+  return characters.slice(start).join("");
 }
 
 export class HeadTailBuffer {
   private head = "";
   private tail = "";
-  private totalCharacters = 0;
+  private totalBytes = 0;
 
-  constructor(private readonly maxCharacters: number) {
-    if (!Number.isInteger(maxCharacters) || maxCharacters < 1) {
+  constructor(private readonly maxBytes: number) {
+    if (!Number.isInteger(maxBytes) || maxBytes < 1) {
       throw new Error("Head/tail buffer limit must be a positive integer.");
     }
   }
@@ -192,93 +270,107 @@ export class HeadTailBuffer {
   append(output: string): void {
     if (!output) return;
 
-    const previousTotal = this.totalCharacters;
-    this.totalCharacters += codePointLength(output);
+    const previousTotal = this.totalBytes;
+    this.totalBytes += Buffer.byteLength(output, "utf8");
 
-    if (this.totalCharacters <= this.maxCharacters) {
+    if (this.totalBytes <= this.maxBytes) {
       this.head += output;
       return;
     }
 
-    const budget = splitBudget(this.maxCharacters);
-    if (previousTotal <= this.maxCharacters) {
+    const budget = splitBudget(this.maxBytes);
+    if (previousTotal <= this.maxBytes) {
       const fullOutput = this.head + output;
-      this.head = takeHead(fullOutput, budget.head);
-      this.tail = takeTail(fullOutput, budget.tail);
+      this.head = takeUtf8Head(fullOutput, budget.head);
+      this.tail = takeUtf8Tail(fullOutput, budget.tail);
       return;
     }
 
-    this.tail = takeTail(this.tail + output, budget.tail);
+    this.tail = takeUtf8Tail(this.tail + output, budget.tail);
   }
 
   hasOutput(): boolean {
-    return this.totalCharacters > 0;
+    return this.totalBytes > 0;
   }
 
-  drain(maxCharacters: number): { output: string; truncated: boolean; omittedCharacters: number } {
-    if (!Number.isInteger(maxCharacters) || maxCharacters < 1) {
+  drain(maxBytes: number): { output: string; truncated: boolean; omittedBytes: number } {
+    if (!Number.isInteger(maxBytes) || maxBytes < 1) {
       throw new Error("Output limit must be a positive integer.");
     }
 
     const omittedByBuffer = Math.max(
       0,
-      this.totalCharacters - codePointLength(this.head) - codePointLength(this.tail),
+      this.totalBytes - Buffer.byteLength(this.head, "utf8") - Buffer.byteLength(this.tail, "utf8"),
     );
     const retained = formatHeadTail(this.head, this.tail, omittedByBuffer);
-    const output = truncateOutput(retained, maxCharacters);
+    const output = truncateOutput(retained, maxBytes);
     const truncated = omittedByBuffer > 0 || output.truncated;
-    const omittedCharacters = omittedByBuffer + (output.truncated ? output.omittedCharacters : 0);
+    const omittedBytes = omittedByBuffer + (output.truncated ? output.omittedBytes : 0);
 
     this.head = "";
     this.tail = "";
-    this.totalCharacters = 0;
+    this.totalBytes = 0;
 
-    return { output: output.output, truncated, omittedCharacters };
+    return { output: output.output, truncated, omittedBytes };
   }
 }
 
-function truncateOutput(output: string, maxCharacters: number): {
+function truncateOutput(output: string, maxBytes: number): {
   output: string;
   truncated: boolean;
-  omittedCharacters: number;
+  omittedBytes: number;
 } {
-  const outputCharacters = codePointLength(output);
-  if (outputCharacters <= maxCharacters) return { output, truncated: false, omittedCharacters: 0 };
+  const outputBytes = Buffer.byteLength(output, "utf8");
+  if (outputBytes <= maxBytes) return { output, truncated: false, omittedBytes: 0 };
 
   const marker = "\n... output truncated ...\n";
-  const markerCharacters = codePointLength(marker);
-  const available = Math.max(0, maxCharacters - markerCharacters);
+  const markerBytes = Buffer.byteLength(marker, "utf8");
+  if (markerBytes >= maxBytes) {
+    return {
+      output: takeUtf8Head(marker, maxBytes),
+      truncated: true,
+      omittedBytes: outputBytes,
+    };
+  }
+  const available = maxBytes - markerBytes;
   const budget = splitBudget(available);
-  const omittedCharacters = Math.max(0, outputCharacters - maxCharacters);
+  const head = takeUtf8Head(output, budget.head);
+  const tail = takeUtf8Tail(output, budget.tail);
+  const omittedBytes = Math.max(
+    0,
+    outputBytes - Buffer.byteLength(head, "utf8") - Buffer.byteLength(tail, "utf8"),
+  );
   return {
-    output: takeHead(output, budget.head) + marker + takeTail(output, budget.tail),
+    output: head + marker + tail,
     truncated: true,
-    omittedCharacters,
+    omittedBytes,
   };
 }
 
 export class ProcessSessionManager {
   private readonly sessions = new Map<number, ProcessSession>();
-  private readonly maxBufferCharacters: number;
+  private readonly maxBufferBytes: number;
   private readonly completedSessionTtlMs: number;
   private readonly maxSessions: number;
   private readonly maxSessionsPerClient: number;
   private readonly maxSessionsPerWorkspace: number;
   private readonly maxRuntimeMs: number;
   private readonly terminationGraceMs: number;
+  private readonly outputStore?: ProcessOutputStore;
   private nextSessionId = 1;
   private shuttingDown = false;
   private shutdownPromise?: Promise<void>;
   private readonly closingWorkspaces = new Set<string>();
 
   constructor(options: ProcessSessionManagerOptions = {}) {
-    this.maxBufferCharacters = options.maxBufferCharacters ?? DEFAULT_BUFFER_CHARACTERS;
+    this.maxBufferBytes = options.maxBufferBytes ?? options.maxBufferCharacters ?? DEFAULT_BUFFER_BYTES;
     this.completedSessionTtlMs = options.completedSessionTtlMs ?? COMPLETED_SESSION_TTL_MS;
     this.maxSessions = options.maxSessions ?? Number.POSITIVE_INFINITY;
     this.maxSessionsPerClient = options.maxSessionsPerClient ?? Number.POSITIVE_INFINITY;
     this.maxSessionsPerWorkspace = options.maxSessionsPerWorkspace ?? Number.POSITIVE_INFINITY;
     this.maxRuntimeMs = options.maxRuntimeMs ?? 60 * 60 * 1_000;
     this.terminationGraceMs = options.terminationGraceMs ?? 5_000;
+    this.outputStore = options.outputStore;
   }
 
   async start(input: StartCommandInput): Promise<ProcessSnapshot> {
@@ -286,7 +378,6 @@ export class ProcessSessionManager {
     if (this.closingWorkspaces.has(workspaceKey(input.ownerClientId, input.workspaceId))) {
       throw new Error("Workspace is closing and cannot start new processes.");
     }
-    this.reapCompletedSessions();
     if (this.sessions.size >= this.maxSessions) {
       throw new Error(`Process session limit reached (${this.maxSessions}).`);
     }
@@ -302,6 +393,11 @@ export class ProcessSessionManager {
     if (workspaceSessions >= this.maxSessionsPerWorkspace) {
       throw new Error(`Process session limit reached for this workspace (${this.maxSessionsPerWorkspace}).`);
     }
+    assertProcessInputSize(input.stdin);
+    const closeStdin = input.closeStdin ?? input.stdin !== undefined;
+    if (input.tty && closeStdin) {
+      throw new Error("PTY stdin cannot be closed reliably. Set closeStdin=false or run without tty.");
+    }
     const session = this.createSession(input);
     this.sessions.set(session.id, session);
 
@@ -309,7 +405,11 @@ export class ProcessSessionManager {
       if (input.tty && process.platform !== "win32") await this.startPty(session, input);
       else this.startPipe(session, input);
       this.startRuntimeTimer(session, input.runtimeLimitMs);
+      if (input.stdin) session.process?.write(input.stdin);
+      if (closeStdin) this.closeProcessStdin(session);
     } catch (error) {
+      session.process?.kill("SIGTERM");
+      this.finalizeDurableOutput(session);
       this.sessions.delete(session.id);
       throw error;
     }
@@ -324,9 +424,28 @@ export class ProcessSessionManager {
 
   async write(input: WriteStdinInput): Promise<ProcessSnapshot> {
     const session = this.getOwnedSession(input.ownerClientId, input.workspaceId, input.sessionId);
-    const chars = input.chars ?? "";
+    if (
+      input.preparedInput &&
+      input.preparedInput.expectedRevision !== session.inputRevision
+    ) {
+      throw new Error("Process input changed concurrently; retry write_stdin.");
+    }
+    const chars = input.preparedInput?.charsToWrite ?? input.chars ?? "";
+    assertProcessInputSize(input.chars);
+    assertProcessInputSize(chars);
+    assertProcessInputSize(input.preparedInput?.pendingInput);
+    if (input.closeStdin && chars.includes("\u0003")) {
+      throw new Error("Send Ctrl-C and closeStdin in separate write_stdin calls.");
+    }
+    if (session.stdinClosed && chars.length > 0) {
+      throw new Error(`Process session ${session.id} stdin is already closed.`);
+    }
+    if (input.closeStdin && !session.process?.end) {
+      throw new Error(`Process session ${session.id} is a PTY and its stdin cannot be closed reliably.`);
+    }
     const interactionRequested =
-      chars.length > 0 || input.columns !== undefined || input.rows !== undefined;
+      (input.chars ?? "").length > 0 || input.closeStdin === true ||
+      input.columns !== undefined || input.rows !== undefined;
 
     if (input.columns !== undefined || input.rows !== undefined) {
       session.columns = terminalSize(input.columns, session.columns);
@@ -342,7 +461,23 @@ export class ProcessSessionManager {
       session.process?.kill("SIGINT");
     }
     const writableChars = chars.replaceAll("\u0003", "");
-    if (writableChars && session.running) session.process?.write(writableChars);
+    if (writableChars && session.running) {
+      session.process?.write(writableChars);
+      for (const scopePath of input.preparedInput?.instructionScopePaths ?? input.instructionScopePaths ?? []) {
+        const normalizedPath = resolve(session.cwd, scopePath);
+        if (!session.instructionScopePaths.includes(normalizedPath)) {
+          session.instructionScopePaths.push(normalizedPath);
+        }
+      }
+    }
+    if (input.closeStdin && !session.stdinClosed) {
+      this.closeProcessStdin(session);
+    }
+    if (input.preparedInput) {
+      session.pendingInput = input.preparedInput.pendingInput;
+      session.cwd = input.preparedInput.nextCwd;
+      session.inputRevision += 1;
+    }
 
     if ((interactionRequested || !session.buffer.hasOutput()) && session.running) {
       const fallback = interactionRequested ? DEFAULT_INTERACTIVE_YIELD_MS : DEFAULT_POLL_YIELD_MS;
@@ -354,6 +489,22 @@ export class ProcessSessionManager {
     const snapshot = this.consume(session, input.maxOutputTokens);
     if (!session.running) this.removeSession(session.id);
     return snapshot;
+  }
+
+  instructionContext(
+    ownerClientId: string,
+    workspaceId: string,
+    sessionId: number,
+  ): ProcessInstructionContext {
+    const session = this.getOwnedSession(ownerClientId, workspaceId, sessionId);
+    return {
+      cwd: session.cwd,
+      scopePaths: [...session.instructionScopePaths],
+      inputMode: session.instructionInputMode,
+      pendingInput: session.pendingInput,
+      inputRevision: session.inputRevision,
+      stdinClosed: session.stdinClosed,
+    };
   }
 
   terminate(ownerClientId: string, workspaceId: string, sessionId: number): void {
@@ -391,6 +542,10 @@ export class ProcessSessionManager {
     return sessions.length;
   }
 
+  blockWorkspace(ownerClientId: string, workspaceId: string): void {
+    this.closingWorkspaces.add(workspaceKey(ownerClientId, workspaceId));
+  }
+
   hasActive(ownerClientId: string, workspaceId: string): boolean {
     return Array.from(this.sessions.values()).some(
       (session) => session.running && session.ownerClientId === ownerClientId && session.workspaceId === workspaceId,
@@ -413,6 +568,16 @@ export class ProcessSessionManager {
         },
       }),
     };
+  }
+
+  flushOutput(ownerClientId: string, workspaceId: string, outputId: string): void {
+    const session = Array.from(this.sessions.values()).find(
+      (candidate) =>
+        candidate.outputId === outputId &&
+        candidate.ownerClientId === ownerClientId &&
+        candidate.workspaceId === workspaceId,
+    );
+    if (session) this.flushDurableOutput(session);
   }
 
   reopenWorkspace(ownerClientId: string, workspaceId: string): void {
@@ -448,10 +613,21 @@ export class ProcessSessionManager {
       id: this.nextSessionId++,
       ownerClientId: input.ownerClientId,
       workspaceId: input.workspaceId,
+      cwd: input.cwd,
+      instructionScopePaths: [...new Set(
+        (input.instructionScopePaths ?? [input.cwd]).map((path) => resolve(input.cwd, path)),
+      )],
+      instructionInputMode: input.instructionInputMode ?? "opaque",
+      pendingInput: "",
+      inputRevision: 0,
+      stdinClosed: false,
+      totalOutputBytes: 0,
+      quotaDroppedBytes: 0,
+      durableQuotaReached: false,
       startedAt: Date.now(),
       columns: terminalSize(input.columns, DEFAULT_COLUMNS),
       rows: terminalSize(input.rows, DEFAULT_ROWS),
-      buffer: new HeadTailBuffer(this.maxBufferCharacters),
+      buffer: new HeadTailBuffer(this.maxBufferBytes),
       running: true,
       timedOut: false,
       cancelRequested: false,
@@ -477,15 +653,31 @@ export class ProcessSessionManager {
       detached,
     });
 
+    child.stdin?.on("error", (error: NodeJS.ErrnoException) => {
+      session.stdinClosed = true;
+      if (error.code === "EPIPE" || error.code === "ERR_STREAM_DESTROYED") return;
+      this.append(session, `Process stdin failed: ${error.message}\n`);
+    });
+    child.stdin?.on("close", () => {
+      session.stdinClosed = true;
+    });
+
     session.process = {
       write: (data) => {
         child.stdin?.write(data);
       },
+      end: () => {
+        child.stdin?.end();
+      },
       kill: (signal = "SIGTERM") => terminateProcessTree(child, signal, detached),
       resize: input.tty ? () => undefined : undefined,
     };
-    child.stdout?.on("data", (data: Buffer) => this.append(session, data.toString("utf8")));
-    child.stderr?.on("data", (data: Buffer) => this.append(session, data.toString("utf8")));
+    const stdoutDecoder = new StringDecoder("utf8");
+    const stderrDecoder = new StringDecoder("utf8");
+    child.stdout?.on("data", (data: Buffer) => this.append(session, stdoutDecoder.write(data)));
+    child.stderr?.on("data", (data: Buffer) => this.append(session, stderrDecoder.write(data)));
+    child.stdout?.on("end", () => this.append(session, stdoutDecoder.end()));
+    child.stderr?.on("end", () => this.append(session, stderrDecoder.end()));
     child.on("error", (error) => this.append(session, `${error.message}\n`));
     child.on("close", (code, signal) => this.finish(session, code ?? undefined, signal ?? undefined));
     if (session.cancelRequested) session.process.kill("SIGTERM");
@@ -532,11 +724,22 @@ export class ProcessSessionManager {
     if (session.cancelRequested) session.process.kill("SIGTERM");
   }
 
+  private closeProcessStdin(session: ProcessSession): void {
+    if (session.stdinClosed) return;
+    if (!session.process?.end) {
+      throw new Error(`Process session ${session.id} stdin cannot be closed.`);
+    }
+    session.process.end();
+    session.stdinClosed = true;
+  }
+
   private finish(session: ProcessSession, exitCode?: number, signal?: string): void {
     if (!session.running) return;
     session.running = false;
+    session.stdinClosed = true;
     session.exitCode = exitCode;
     session.signal = signal;
+    this.finalizeDurableOutput(session);
     session.resolveExit();
     if (session.runtimeTimer) clearTimeout(session.runtimeTimer);
     if (session.escalationTimer) clearTimeout(session.escalationTimer);
@@ -549,18 +752,43 @@ export class ProcessSessionManager {
   }
 
   private append(session: ProcessSession, output: string): void {
+    if (!output) return;
+    const outputBytes = Buffer.byteLength(output, "utf8");
+    session.totalOutputBytes += outputBytes;
     session.buffer.append(output);
+    if (!this.outputStore || session.outputStorageError) return;
+    if (session.durableQuotaReached) {
+      session.quotaDroppedBytes += outputBytes;
+      return;
+    }
+    try {
+      session.outputId ??= this.outputStore.create({
+        ownerClientId: session.ownerClientId,
+        workspaceId: session.workspaceId,
+      });
+      this.outputStore.append(session.outputId, output);
+    } catch (error) {
+      if (error instanceof ProcessOutputQuotaError) {
+        session.durableQuotaReached = true;
+        session.quotaDroppedBytes += outputBytes;
+      } else {
+        session.outputStorageError = error instanceof Error ? error.message : String(error);
+        session.buffer.append(`\nDurable process output failed: ${session.outputStorageError}\n`);
+      }
+    }
   }
 
   private consume(session: ProcessSession, maxOutputTokens?: number): ProcessSnapshot {
+    this.flushDurableOutput(session);
     const limit = boundedInteger(maxOutputTokens, DEFAULT_MAX_OUTPUT_TOKENS, 100_000);
-    const maxCharacters = Math.max(256, limit * 4);
-    const buffered = session.buffer.drain(maxCharacters);
+    const maxBytes = Math.max(256, limit * 4);
+    const buffered = session.buffer.drain(maxBytes);
     // Codex reports original_token_count + output_omitted_bytes so the model
-    // knows how much it lost. Approximate tokens at ~4 chars each; omitted bytes
-    // are character-count based (close enough for codepoints vs bytes).
-    const totalCharacters = codePointLength(buffered.output) + buffered.omittedCharacters;
-    const originalTokenCount = Math.ceil(totalCharacters / 4);
+    // knows how much it lost. Approximate tokens at roughly four UTF-8 bytes.
+    const originalTokenCount = Math.ceil(
+      (Buffer.byteLength(buffered.output, "utf8") + buffered.omittedBytes) / 4,
+    );
+    const durable = this.durableMetadata(session);
 
     return {
       sessionId: session.running ? session.id : undefined,
@@ -571,16 +799,70 @@ export class ProcessSessionManager {
       signal: session.signal,
       wallTimeMs: Date.now() - session.startedAt,
       originalTokenCount,
-      outputOmittedBytes: buffered.omittedCharacters,
+      outputOmittedBytes: buffered.omittedBytes,
+      outputId: session.outputId,
+      totalOutputBytes: durable.totalBytes,
+      storedOutputBytes: durable.storedBytes,
+      droppedBytes: durable.droppedBytes,
+      outputStorageError: session.outputStorageError,
       timedOut: session.timedOut,
+      stdinClosed: session.stdinClosed,
     };
+  }
+
+  private flushDurableOutput(session: ProcessSession): void {
+    // Output chunks are persisted as they arrive. This method remains as the
+    // synchronization point used before snapshots and read_process_output.
+  }
+
+  private finalizeDurableOutput(session: ProcessSession): void {
+    this.flushDurableOutput(session);
+    if (!this.outputStore || !session.outputId) return;
+    try {
+      this.outputStore.complete(session.outputId);
+    } catch (error) {
+      session.outputStorageError ??= error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  private durableMetadata(session: ProcessSession): {
+    totalBytes: number;
+    storedBytes: number;
+    droppedBytes: number;
+  } {
+    if (!this.outputStore || !session.outputId) {
+      return {
+        totalBytes: session.totalOutputBytes,
+        storedBytes: 0,
+        droppedBytes: session.quotaDroppedBytes,
+      };
+    }
+    try {
+      const metadata = this.outputStore.metadata(
+        session.ownerClientId,
+        session.workspaceId,
+        session.outputId,
+      );
+      return {
+        totalBytes: session.totalOutputBytes,
+        storedBytes: metadata.storedBytes,
+        droppedBytes: metadata.droppedBytes + session.quotaDroppedBytes,
+      };
+    } catch (error) {
+      session.outputStorageError ??= error instanceof Error ? error.message : String(error);
+      return {
+        totalBytes: session.totalOutputBytes,
+        storedBytes: 0,
+        droppedBytes: session.quotaDroppedBytes,
+      };
+    }
   }
 
   private getOwnedSession(ownerClientId: string, workspaceId: string, sessionId: number): ProcessSession {
     const session = this.sessions.get(sessionId);
-    if (!session) throw new Error(`Unknown process session: ${sessionId}`);
+    if (!session) throw unknownProcessSessionError(sessionId);
     if (session.ownerClientId !== ownerClientId || session.workspaceId !== workspaceId) {
-      throw new Error(`Unknown process session: ${sessionId}`);
+      throw unknownProcessSessionError(sessionId);
     }
     return session;
   }
@@ -591,12 +873,6 @@ export class ProcessSessionManager {
     if (session?.runtimeTimer) clearTimeout(session.runtimeTimer);
     if (session?.escalationTimer) clearTimeout(session.escalationTimer);
     this.sessions.delete(sessionId);
-  }
-
-  private reapCompletedSessions(): void {
-    for (const [sessionId, session] of this.sessions) {
-      if (!session.running) this.removeSession(sessionId);
-    }
   }
 
   private startRuntimeTimer(session: ProcessSession, requestedRuntimeMs: number | undefined): void {
@@ -673,4 +949,12 @@ export class ProcessSessionManager {
       if (timer) clearTimeout(timer);
     }
   }
+}
+
+function unknownProcessSessionError(sessionId: number): Error {
+  return new Error(
+    `Unknown process session: ${sessionId}. This sessionId cannot be polled again. ` +
+    "Stop calling write_stdin for it, inspect any earlier outputId with read_process_output, " +
+    "then rerun the original command from the beginning.",
+  );
 }

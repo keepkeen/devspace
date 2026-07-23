@@ -31,6 +31,19 @@ export function getToolDisplay(card: ToolResultCard): ToolDisplay {
         label: card.root ?? card.path,
         tone: "workspace",
       };
+    case "close_workspace":
+      return {
+        icon: toolIcons.folderOpen,
+        title: "Closed workspace",
+        label: card.workspaceId,
+        tone: "workspace",
+      };
+    case "load_skill":
+      return {
+        icon: toolIcons.readFile,
+        title: "Loaded skill",
+        tone: "read",
+      };
     case "read":
       return {
         icon: toolIcons.readFile,
@@ -197,4 +210,3 @@ function durationLabel(durationMs: number | undefined): string | undefined {
   if (durationMs < 1_000) return `${Math.round(durationMs)}ms`;
   return `${(durationMs / 1_000).toFixed(durationMs < 10_000 ? 1 : 0)}s`;
 }
-

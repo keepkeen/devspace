@@ -134,11 +134,26 @@ To regenerate setup:
 node dist/cli.js init --force
 ```
 
+Changing the Owner password revokes issued access and refresh tokens but keeps
+registered OAuth clients, so an existing ChatGPT connector can reauthorize.
+
+## `invalid_client` While Reconnecting ChatGPT
+
+This error occurs before Owner-password validation. It means ChatGPT cached an
+OAuth `client_id` that is no longer registered, usually after the Admin panel's
+**revoke all clients and tokens** action or after replacing the state database.
+
+Close the authorization page, remove the current DevSpace connection or app in
+ChatGPT, and add it again. Clicking **Connect** alone may reuse the stale client
+ID. DevSpace then accepts a fresh dynamic client registration and shows the
+normal Owner-password approval page.
+
 ## Unknown `workspaceId`
 
-`workspaceId` values are session identifiers. If the server restarts and the
-client receives an unknown workspace error, call `open_workspace` again for that
-project.
+`workspaceId` values are scoped to the OAuth client that opened them. Normal MCP
+transport reconnects do not invalidate them. If ChatGPT refreshes or
+re-authorizes the app as a new OAuth client, an older ID is intentionally
+rejected; discard it and call `open_workspace` again for that project.
 
 Workspace session metadata is persisted, but clients should still treat
 `open_workspace` as the way to begin a fresh working session.
@@ -197,15 +212,16 @@ Skills are enabled by default. Check:
 DEVSPACE_SKILLS=1 node dist/cli.js serve
 ```
 
-DevSpace looks in standard Agent Skills locations:
+DevSpace checks these standard Agent Skills layers:
 
+- project `.agents/skills` directories from the approved repository boundary to workspace
 - `~/.agents/skills`
-- project `.agents/skills`
-- `~/.devspace/skills`
+- `DEVSPACE_ADMIN_SKILLS_DIR` (default `/etc/codex/skills`)
+- Skills bundled with DevSpace
 
 It also checks compatibility and custom paths:
 
-- the bundled `subagent-delegation` skill when `DEVSPACE_SUBAGENTS=1`, unless `~/.devspace/skills/subagent-delegation/SKILL.md` exists
+- `~/.devspace/skills`
 - `DEVSPACE_AGENT_DIR/skills`, defaulting to `~/.codex/skills`
 - additional paths from `DEVSPACE_SKILL_PATHS`
 
@@ -222,8 +238,13 @@ Copy or adapt them into one of the active profile directories before use.
 
 Legacy project paths such as `.pi/skills` can be added through `DEVSPACE_SKILL_PATHS` when needed.
 
-If a skill appears in `open_workspace`, the model must read that skill's
-`SKILL.md` before reading other files inside the skill directory.
+If a Skill appears in `open_workspace`, ChatGPT web should call `load_skill`
+with its `skillId` before reading other files inside the Skill directory.
+Duplicate names require the ID. Skills marked
+`allowImplicitInvocation=false` remain available only for explicit user
+requests. Check `DEVSPACE_DISABLED_SKILL_PATHS` when an expected Skill is
+missing; the catalog also reports entries omitted by its 8,000-character
+budget.
 
 ## Review Card Does Not Appear
 
@@ -236,3 +257,18 @@ DEVSPACE_WIDGETS=full
 The aggregate `show_changes` tool is only exposed with
 `DEVSPACE_WIDGETS=changes`. Plain MCP clients may ignore ChatGPT Apps widget
 metadata and only show text results.
+
+## A Batch Tool Shows Only a Summary
+
+`batch_read` and `batch_inspect` intentionally keep their independent payloads
+in `structuredContent.items[]`. Text `content` contains only a short completion
+summary, and the former concatenated `structuredContent.result` is not emitted.
+Update clients or adapters that only display text content, or use single-item
+tools when structured results are unavailable.
+
+Other heavy results also have one canonical model-visible location: single
+read, Skill, and process bodies are in text `content`, while process state and
+output paging fields remain structured. Do not fall back to
+`_meta.card.payload.content`; `_meta` is optional widget presentation and may be
+absent. For durable output, display the page from `read_process_output` text
+`content` and continue with structured `nextOffset` until `eof` is true.

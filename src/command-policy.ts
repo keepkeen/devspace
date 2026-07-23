@@ -9,15 +9,17 @@
  *
  * - segment evaluation so a broad allow rule never authorizes a destructive tail
  * - a small built-in denylist for commands that are dangerous even for a
- *   trusted OAuth-authenticated connection (`rm -f`, `sudo`, pipe-to-shell)
+ *   trusted OAuth-authenticated connection (forced/recursive `rm`, `sudo`, pipe-to-shell)
  * - wrapper recursion through `sudo` / `env` / `trap` / `nohup`
  * - an optional workspace prefix-allow list for auto-approved command prefixes
  *
  * The model is a browser agent with no per-command approval surface, so the
- * classifier is a workflow guardrail (refuses a few obviously-bad shapes and
- * nudges toward edit/write), not a security boundary. The filesystem roots
- * allowlist + OAuth remain the real security boundary.
+ * classifier is a workflow guardrail, not a filesystem sandbox. Normal shell
+ * writes are allowed; direct literal targets are checked separately against
+ * the workspace. Opaque scripts still run with the DevSpace OS user's access.
  */
+
+import { stripHeredocBodies } from "./shell-command-scopes.js";
 
 export type CommandDecision = "allow" | "deny";
 
@@ -36,7 +38,7 @@ export interface CommandPolicyResult {
  * of a segment. See DANGEROUS_PATTERNS for the fine-grained rules.
  */
 const DENY_ADVICE =
-  "Use the edit/write tools for file changes, or ask the user before running destructive commands.";
+  "Use a non-destructive project-scoped command, or ask the user before running destructive commands.";
 
 /**
  * Describes a dangerous command shape. `test` receives the effective tokens of
@@ -48,60 +50,87 @@ interface DangerousPattern {
   test: (tokens: string[]) => boolean;
 }
 
-const rmForce: DangerousPattern = {
-  id: "rm-force",
-  reason: "rm -f style commands are not permitted (unpredictable destructive deletion).",
+const rmDangerous: DangerousPattern = {
+  id: "rm-dangerous",
+  reason: "Forced or recursive rm commands are not permitted (unpredictable destructive deletion).",
   test: (tokens) => {
-    if (tokens[0] !== "rm") return false;
-    return tokens.slice(1).some((t) => /^-.*[fF].*$/.test(t));
+    if (commandBasename(tokens[0]) !== "rm") return false;
+    return tokens.slice(1).some((token) =>
+      token === "--force" ||
+      token === "--recursive" ||
+      (/^-[^-]/u.test(token) && /[fFrR]/u.test(token))
+    );
   },
 };
 
 const pipeToShell: DangerousPattern = {
   id: "pipe-to-shell",
   reason: "Piping remote or untrusted content into a shell is not permitted.",
-  test: (tokens) =>
-    tokens.length >= 2 &&
-    isShellProgram(tokens[0]) &&
-    (tokens[1] === "-c" ||
-      tokens[1] === "-lc" ||
-      tokens.slice(1).includes("eval")),
+  test: () => false,
 };
 
-const SHELL_PROGRAMS = new Set(["bash", "sh", "zsh", "dash"]);
+const SHELL_PROGRAMS = new Set(["bash", "sh", "zsh", "dash", "ksh", "fish"]);
 
 function isShellProgram(program: string | undefined): boolean {
   if (!program) return false;
-  return SHELL_PROGRAMS.has(program.split("/").at(-1) ?? program);
+  return SHELL_PROGRAMS.has(commandBasename(program));
 }
 
 const sudoRoot: DangerousPattern = {
   id: "sudo",
   reason: "sudo is not permitted in this workspace.",
-  test: (tokens) => tokens[0] === "sudo",
+  test: (tokens) => commandBasename(tokens[0]) === "sudo",
 };
 
-const dangerousPatterns: DangerousPattern[] = [rmForce, pipeToShell, sudoRoot];
+const dangerousPatterns: DangerousPattern[] = [rmDangerous, sudoRoot];
 
 /**
  * Wrappers that modify or delegate execution. Codex's heuristic recurses
  * through these to inspect the underlying command. We strip them so
  * `sudo rm -f` and `env rm -f` are caught the same as `rm -f`.
  */
-const WRAPPER_COMMANDS = new Set(["sudo", "env", "trap", "nohup", "exec", "command"]);
+const WRAPPER_COMMANDS = new Set(["sudo", "env", "nohup", "exec", "command", "builtin", "nice"]);
 
-function unwrapWrappers(tokens: string[]): string[] {
+export function unwrapCommandWrappers(tokens: string[]): string[] {
   let i = 0;
+  while (i < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/u.test(tokens[i]!)) i += 1;
   // Skip leading wrapper commands and their flag-like arguments until we reach
   // the real command. `env VAR=1 rm -f` -> `rm -f`; `sudo -E rm` -> `rm`.
-  while (i < tokens.length && WRAPPER_COMMANDS.has(tokens[i])) {
+  while (i < tokens.length && WRAPPER_COMMANDS.has(commandBasename(tokens[i]))) {
+    const wrapper = commandBasename(tokens[i]);
     i += 1;
-    // Consume env-style VAR=value assignments and -flags that belong to the wrapper.
-    while (i < tokens.length && (tokens[i].startsWith("-") || /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[i]))) {
+    while (i < tokens.length) {
+      const token = tokens[i]!;
+      if (token === "--") {
+        i += 1;
+        break;
+      }
+      if (wrapper === "env" && (token === "-u" || token === "--unset" || token === "-C" || token === "--chdir")) {
+        i += 2;
+        continue;
+      }
+      if (wrapper === "nice" && (token === "-n" || token === "--adjustment")) {
+        i += 2;
+        continue;
+      }
+      if (token.startsWith("-") || /^[A-Za-z_][A-Za-z0-9_]*=/u.test(token)) {
+        i += 1;
+        continue;
+      }
+      break;
+    }
+    while (i < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/u.test(tokens[i]!)) {
       i += 1;
     }
   }
   return tokens.slice(i);
+}
+
+const unwrapWrappers = unwrapCommandWrappers;
+
+function commandBasename(program: string | undefined): string {
+  if (!program) return "";
+  return (program.split(/[\\/]/u).at(-1) ?? program).replace(/\.exe$/iu, "").toLowerCase();
 }
 
 /**
@@ -148,6 +177,14 @@ export function splitCommandSegments(command: string): string[] {
       continue;
     }
 
+    if (ch === "\n" || ch === "\r") {
+      if (current.trim()) segments.push(current.trim());
+      current = "";
+      if (ch === "\r" && next === "\n") i += 2;
+      else i += 1;
+      continue;
+    }
+
     if (ch === "(") {
       depth += 1;
       // Drop the paren — its contents are treated as a nested segment list.
@@ -166,6 +203,12 @@ export function splitCommandSegments(command: string): string[] {
       if (current.trim()) segments.push(current.trim());
       current = "";
       i += 2;
+      continue;
+    }
+    if (ch === "&" && command[i - 1] !== ">" && next !== ">") {
+      if (current.trim()) segments.push(current.trim());
+      current = "";
+      i += 1;
       continue;
     }
     if (ch === "|" && next === "|") {
@@ -269,18 +312,9 @@ function evaluateSegment(
   const tokens = tokenizeSegment(segment);
   if (tokens.length === 0) return { decision: "allow", reason: "" };
 
-  // Explicit prefix allow wins (Codex: bypass only when every segment is
-  // rule-allowed). Match against the raw segment tokens so allow rules can
-  // cover wrapper forms the model might use.
-  for (const prefix of allowPrefixes) {
-    if (matchesPrefix(tokens, prefix)) {
-      return { decision: "allow", reason: "" };
-    }
-  }
-
   // Deny sudo before unwrapping — sudo itself is never allowed, even when the
   // inner command would otherwise be fine.
-  if (tokens[0] === "sudo") {
+  if (commandBasename(unwrapWrappers(tokens)[0]) === "sudo" || commandBasename(tokens[0]) === "sudo") {
     return {
       decision: "deny",
       reason: sudoRoot.reason,
@@ -290,7 +324,7 @@ function evaluateSegment(
   }
 
   // Also deny if a later wrapper in a chain reintroduces sudo (e.g. env sudo …).
-  if (tokens.includes("sudo")) {
+  if (tokens.some((token) => commandBasename(token) === "sudo")) {
     return {
       decision: "deny",
       reason: sudoRoot.reason,
@@ -313,6 +347,14 @@ function evaluateSegment(
     }
   }
 
+  // Explicit allow rules may bypass ordinary workflow checks, but never the
+  // hard sudo/deletion rules above.
+  for (const prefix of allowPrefixes) {
+    if (matchesPrefix(tokens, prefix)) {
+      return { decision: "allow", reason: "" };
+    }
+  }
+
   return { decision: "allow", reason: "" };
 }
 
@@ -324,8 +366,16 @@ function evaluateSegment(
 export function classifyCommand(
   command: string,
   allowPrefixes: string[][] = [],
+  depth = 0,
 ): CommandPolicyResult {
-  const pipedShell = findPipedShellSegment(command);
+  if (depth < 4) {
+    for (const nestedCommand of extractShellCommandSubstitutions(stripQuotedHeredocBodies(command))) {
+      const nested = classifyCommand(nestedCommand, allowPrefixes, depth + 1);
+      if (nested.decision === "deny") return nested;
+    }
+  }
+  const policyCommand = stripHeredocBodies(command);
+  const pipedShell = findPipedShellSegment(policyCommand);
   if (pipedShell) {
     return {
       decision: "deny",
@@ -334,12 +384,145 @@ export function classifyCommand(
       matchedSegment: pipedShell,
     };
   }
-  const segments = splitCommandSegments(command);
+  const segments = splitCommandSegments(policyCommand);
   for (const segment of segments) {
     const result = evaluateSegment(segment, allowPrefixes);
     if (result.decision === "deny") return result;
+    if (depth < 4) {
+      const payload = staticShellPayload(tokenizeSegment(segment));
+      if (payload) {
+        const nested = classifyCommand(payload, allowPrefixes, depth + 1);
+        if (nested.decision === "deny") return nested;
+      }
+      const effective = unwrapWrappers(tokenizeSegment(segment));
+      if (commandBasename(effective[0]) === "eval" && effective.length > 1) {
+        const payload = effective.slice(effective[1] === "--" ? 2 : 1).join(" ");
+        const nested = classifyCommand(payload, allowPrefixes, depth + 1);
+        if (nested.decision === "deny") return nested;
+      }
+      if (commandBasename(effective[0]) === "trap" && effective[1]) {
+        const nested = classifyCommand(effective[1], allowPrefixes, depth + 1);
+        if (nested.decision === "deny") return nested;
+      }
+      const envPayload = staticEnvSplitPayload(tokenizeSegment(segment));
+      if (envPayload) {
+        const nested = classifyCommand(envPayload, allowPrefixes, depth + 1);
+        if (nested.decision === "deny") return nested;
+      }
+    }
   }
   return { decision: "allow", reason: "" };
+}
+
+function staticEnvSplitPayload(tokens: string[]): string | undefined {
+  let index = 0;
+  while (/^[A-Za-z_][A-Za-z0-9_]*=/u.test(tokens[index] ?? "")) index += 1;
+  if (commandBasename(tokens[index]) !== "env") return undefined;
+  for (index += 1; index < tokens.length; index += 1) {
+    const token = tokens[index]!;
+    if (token === "-S" || token === "--split-string") return tokens[index + 1];
+    if (token.startsWith("--split-string=")) return token.slice("--split-string=".length);
+  }
+  return undefined;
+}
+
+function staticShellPayload(tokens: string[]): string | undefined {
+  const effective = unwrapWrappers(tokens);
+  if (!isShellProgram(effective[0])) return undefined;
+  const optionIndex = effective.findIndex((token, index) =>
+    index > 0 && /^-[^-]*c/u.test(token)
+  );
+  return optionIndex >= 0 ? effective[optionIndex + 1] : undefined;
+}
+
+export function extractShellCommandSubstitutions(command: string): string[] {
+  const substitutions: string[] = [];
+  let quote: "'" | '"' | null = null;
+  for (let index = 0; index < command.length; index += 1) {
+    const character = command[index]!;
+    if (quote === "'") {
+      if (character === "'") quote = null;
+      continue;
+    }
+    if (character === "'" && quote === null) {
+      quote = "'";
+      continue;
+    }
+    if (character === '"') {
+      quote = quote === '"' ? null : '"';
+      continue;
+    }
+    if (character === "\\") {
+      index += 1;
+      continue;
+    }
+    if (character === "`") {
+      const end = command.indexOf("`", index + 1);
+      if (end > index) {
+        substitutions.push(command.slice(index + 1, end));
+        index = end;
+      }
+      continue;
+    }
+    if (character !== "$" || command[index + 1] !== "(") continue;
+    let depth = 1;
+    let cursor = index + 2;
+    let nestedQuote: "'" | '"' | null = null;
+    for (; cursor < command.length && depth > 0; cursor += 1) {
+      const nestedCharacter = command[cursor]!;
+      if (nestedQuote === "'") {
+        if (nestedCharacter === "'") nestedQuote = null;
+        continue;
+      }
+      if (nestedQuote === '"') {
+        if (nestedCharacter === "\\") cursor += 1;
+        else if (nestedCharacter === '"') nestedQuote = null;
+        continue;
+      }
+      if (nestedCharacter === "'" && nestedQuote === null) {
+        nestedQuote = "'";
+        continue;
+      }
+      if (nestedCharacter === '"') {
+        nestedQuote = '"';
+        continue;
+      }
+      if (command[cursor] === "\\") {
+        cursor += 1;
+        continue;
+      }
+      if (nestedCharacter === "(" && command[cursor - 1] === "$") depth += 1;
+      if (nestedCharacter === ")") depth -= 1;
+    }
+    if (depth === 0) {
+      substitutions.push(command.slice(index + 2, cursor - 1));
+      index = cursor - 1;
+    }
+  }
+  return substitutions;
+}
+
+function stripQuotedHeredocBodies(command: string): string {
+  const lines = command.split("\n");
+  const output: string[] = [];
+  const pending: Array<{ delimiter: string; stripTabs: boolean }> = [];
+  for (const line of lines) {
+    if (pending.length > 0) {
+      const spec = pending[0]!;
+      const candidate = spec.stripTabs ? line.replace(/^\t+/u, "") : line;
+      if (candidate === spec.delimiter) {
+        pending.shift();
+        output.push("");
+      }
+      continue;
+    }
+    output.push(line);
+    const pattern = /<<(-)?\s*(['"])([^'"\s]+)\2/gu;
+    for (const match of line.matchAll(pattern)) {
+      pending.push({ delimiter: match[3]!, stripTabs: Boolean(match[1]) });
+    }
+  }
+  return output.join("\n");
 }
 
 function findPipedShellSegment(command: string): string | undefined {
