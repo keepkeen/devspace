@@ -27,6 +27,6 @@ export function buildCodexServerInstructions(options: {
   return [
     `Follow all returned instructions. Read/open instructions need no retry. If a blocked mutation/command returns instructionToken, review returned instructions and retry with it. Batch 2–8 independent known targets.${loadSkill ? ` Call ${loadSkill}(workspaceId,skillId); explicit-only needs user request.` : ""}`,
     `Long jobs use process sessionId/${writeStdin}, not MCP session; page outputId with ${readProcessOutput}. If process sessionId is unknown, stop polling, read prior outputId, verify effects before rerun.`,
-    "Writes allowed; command checks are accident guardrails, not a security boundary.",
+    "Keep writes/temp files in workspace; use stdout/outputId for long output. Never inspect DevSpace internal state. Checks are guardrails, not a sandbox.",
   ].join(" ");
 }

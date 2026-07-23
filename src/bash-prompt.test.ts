@@ -50,7 +50,10 @@ assert.match(
   fixedSurface,
   /If process sessionId is unknown, stop polling, read prior outputId, verify effects before rerun/,
 );
-assert.match(fixedSurface, /command checks are accident guardrails, not a security boundary/);
+assert.match(fixedSurface, /Keep writes[/]temp files in workspace/);
+assert.match(fixedSurface, /use stdout[/]outputId for long output/);
+assert.match(fixedSurface, /Never inspect DevSpace internal state/);
+assert.match(fixedSurface, /Checks are guardrails, not a sandbox/);
 assert.ok(fixedSurface.length < 800);
 assert.doesNotMatch(fixedSurface, /dangerous commands (?:remain|stay) blocked|all dangerous commands/i);
 assert.doesNotMatch(fixedSurface, /once per project folder|including across turns/);
@@ -61,8 +64,8 @@ const worstCaseInitialize =
   `${lifecycle} ${fixedSurface}` +
   " After the final file change, call show_changes once before replying; not after each edit.";
 assert.ok(
-  Buffer.byteLength(worstCaseInitialize, "utf8") < 900,
-  `worst-case initialize instructions must be under 900 bytes; got ${Buffer.byteLength(worstCaseInitialize, "utf8")}`,
+  Buffer.byteLength(worstCaseInitialize, "utf8") < 950,
+  `worst-case initialize instructions must be under 950 bytes; got ${Buffer.byteLength(worstCaseInitialize, "utf8")}`,
 );
 
 const codexWithoutSkills = buildCodexServerInstructions({

@@ -1,4 +1,5 @@
 import { lstatSync, readlinkSync, realpathSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import {
   delegatedCommandPayloads,
@@ -18,6 +19,11 @@ import {
 } from "./shell-command-analysis.js";
 
 export interface ShellWriteTargetViolation {
+  target: string;
+  reason: string;
+}
+
+export interface ShellProtectedPathViolation {
   target: string;
   reason: string;
 }
@@ -49,6 +55,177 @@ export function validateShellWriteTargets(
     if (isShellAnalysisLimitError(error)) return analysisLimitViolation();
     throw error;
   }
+}
+
+/**
+ * Reject statically visible command paths that enter DevSpace's own state.
+ *
+ * Like the write-target check, this is defense in depth rather than a sandbox.
+ * Dynamic expansions and opaque scripts cannot be confined without OS-level
+ * isolation. Callers may explicitly exempt the current confirmed managed
+ * worktree subtree.
+ */
+export function validateShellProtectedPaths(
+  command: string,
+  cwd: string,
+  workspaceRoot: string,
+  protectedRoots: string[],
+  allowedProtectedSubtrees: string[] = [],
+): ShellProtectedPathViolation | undefined {
+  const canonicalWorkspaceRoot = realpathSync(workspaceRoot);
+  const canonicalProtectedRoots = protectedRoots.map((root) =>
+    resolvePotentialTarget(resolve(root))
+  );
+  const canonicalAllowedProtectedSubtrees = allowedProtectedSubtrees.map((root) =>
+    resolvePotentialTarget(resolve(root))
+  ).filter((root) => isWithin(canonicalWorkspaceRoot, root));
+  try {
+    return validateProtectedCommand(
+      command,
+      cwd,
+      canonicalProtectedRoots,
+      canonicalAllowedProtectedSubtrees,
+      0,
+    );
+  } catch (error) {
+    if (isShellAnalysisLimitError(error)) return protectedAnalysisLimitViolation();
+    throw error;
+  }
+}
+
+function validateProtectedCommand(
+  command: string,
+  cwd: string,
+  canonicalProtectedRoots: string[],
+  canonicalAllowedProtectedSubtrees: string[],
+  depth: number,
+): ShellProtectedPathViolation | undefined {
+  const preprocessed = preprocessHeredocs(command);
+  if (preprocessed.exceededLimit || depth > MAX_SHELL_ANALYSIS_DEPTH) {
+    return protectedAnalysisLimitViolation();
+  }
+  for (const payload of extractNestedShellSyntax(preprocessed.command)) {
+    const nested = validateProtectedNested(
+      payload,
+      cwd,
+      canonicalProtectedRoots,
+      canonicalAllowedProtectedSubtrees,
+      depth,
+    );
+    if (nested) return nested;
+  }
+
+  let currentCwd = cwd;
+  for (const segment of splitShellSegments(preprocessed.command)) {
+    for (const payload of extractNestedShellSyntax(segment)) {
+      const nested = validateProtectedNested(
+        payload,
+        currentCwd,
+        canonicalProtectedRoots,
+        canonicalAllowedProtectedSubtrees,
+        depth,
+      );
+      if (nested) return nested;
+    }
+    const rawTokens = tokenizeShellSegment(segment);
+    const markers = heredocMarkers(rawTokens, preprocessed.documents);
+    const tokens = withoutHeredocMarkers(rawTokens, preprocessed.documents);
+    const effective = unwrap(withoutRedirections(tokens));
+
+    const visiblePaths = [
+      ...extractAnsiQuotedLiteralPaths(segment),
+      ...literalPathCandidates(tokens),
+    ];
+    for (const target of visiblePaths) {
+      if (pathEntersProtectedRoot(
+        target,
+        currentCwd,
+        canonicalProtectedRoots,
+        canonicalAllowedProtectedSubtrees,
+      )) {
+        return {
+          target,
+          reason: `Command path enters protected DevSpace internal state: ${target}`,
+        };
+      }
+    }
+
+    for (const payload of delegatedCommandPayloads(tokens)) {
+      const nested = validateProtectedNested(
+        payload,
+        currentCwd,
+        canonicalProtectedRoots,
+        canonicalAllowedProtectedSubtrees,
+        depth,
+      );
+      if (nested) return nested;
+    }
+
+    const heredocShell = isShellProgram(effective[0]) && !shellIsParseOnly(tokens);
+    if (heredocShell) {
+      for (const payload of extractHereStringPayloads(segment)) {
+        const nested = validateProtectedNested(
+          payload,
+          currentCwd,
+          canonicalProtectedRoots,
+          canonicalAllowedProtectedSubtrees,
+          depth,
+        );
+        if (nested) return nested;
+      }
+    }
+    for (const marker of markers) {
+      const document = preprocessed.documents.get(marker);
+      if (!document) continue;
+      if (heredocShell) {
+        const nested = validateProtectedNested(
+          document.body,
+          currentCwd,
+          canonicalProtectedRoots,
+          canonicalAllowedProtectedSubtrees,
+          depth,
+        );
+        if (nested) return nested;
+      } else if (document.expandable) {
+        for (const payload of extractNestedShellSyntax(document.body)) {
+          const nested = validateProtectedNested(
+            payload,
+            currentCwd,
+            canonicalProtectedRoots,
+            canonicalAllowedProtectedSubtrees,
+            depth,
+          );
+          if (nested) return nested;
+        }
+      }
+    }
+
+    const program = programBasename(effective[0]);
+    if (program === "cd" || program === "pushd") {
+      const directory = nonOptionOperands(effective.slice(1))[0];
+      if (directory && isLiteralPathCandidate(directory)) {
+        currentCwd = resolveLiteralPath(directory, currentCwd);
+      }
+    }
+  }
+  return undefined;
+}
+
+function validateProtectedNested(
+  payload: string,
+  cwd: string,
+  canonicalProtectedRoots: string[],
+  canonicalAllowedProtectedSubtrees: string[],
+  depth: number,
+): ShellProtectedPathViolation | undefined {
+  if (depth >= MAX_SHELL_ANALYSIS_DEPTH) return protectedAnalysisLimitViolation();
+  return validateProtectedCommand(
+    payload,
+    cwd,
+    canonicalProtectedRoots,
+    canonicalAllowedProtectedSubtrees,
+    depth + 1,
+  );
 }
 
 function validateCommand(
@@ -299,6 +476,133 @@ function isCheckableTarget(target: string): boolean {
   return Boolean(target) && !/[\$`*?\[\]{}]/u.test(target) && !target.startsWith("~");
 }
 
+function literalPathCandidates(tokens: string[]): string[] {
+  const candidates = new Set<string>();
+  for (const token of tokens) {
+    const withoutRedirection = token.replace(
+      /^(?:\d+|\{[A-Za-z_][A-Za-z0-9_]*\})?(?:<<<|<<|<>|<|>>?|>\|)&?/u,
+      "",
+    );
+    addLiteralPathCandidate(candidates, withoutRedirection);
+
+    const equalsIndex = withoutRedirection.indexOf("=");
+    if (equalsIndex >= 0) {
+      addLiteralPathCandidate(candidates, withoutRedirection.slice(equalsIndex + 1));
+    }
+
+    if (withoutRedirection.startsWith("-")) {
+      const absoluteIndex = withoutRedirection.indexOf("/");
+      if (absoluteIndex >= 0) {
+        addLiteralPathCandidate(candidates, withoutRedirection.slice(absoluteIndex));
+      }
+    }
+  }
+  return [...candidates];
+}
+
+function addLiteralPathCandidate(candidates: Set<string>, candidate: string): void {
+  if (isLiteralPathCandidate(candidate)) candidates.add(candidate);
+}
+
+function isLiteralPathCandidate(candidate: string): boolean {
+  return Boolean(candidate) && !/[\$`*?\[\]{}]/u.test(candidate);
+}
+
+function extractAnsiQuotedLiteralPaths(segment: string): string[] {
+  const paths: string[] = [];
+  let quote: "'" | '"' | null = null;
+  for (let index = 0; index < segment.length; index += 1) {
+    const character = segment[index]!;
+    if (quote) {
+      if (character === "\\" && quote === '"') index += 1;
+      else if (character === quote) quote = null;
+      continue;
+    }
+    if (character === "\\") {
+      index += 1;
+      continue;
+    }
+    if (character === "'" || character === '"') {
+      quote = character;
+      continue;
+    }
+    if (character !== "$" || segment[index + 1] !== "'") continue;
+
+    let cursor = index;
+    let decoded = "";
+    for (;;) {
+      cursor += 2;
+      let body = "";
+      for (; cursor < segment.length; cursor += 1) {
+        const current = segment[cursor]!;
+        if (current === "\\" && cursor + 1 < segment.length) {
+          body += current + segment[cursor + 1]!;
+          cursor += 1;
+          continue;
+        }
+        if (current === "'") break;
+        body += current;
+      }
+      if (cursor >= segment.length) break;
+      decoded += decodeAnsiCString(body);
+      if (segment[cursor + 1] !== "$" || segment[cursor + 2] !== "'") break;
+      cursor += 1;
+    }
+    if (isLiteralPathCandidate(decoded)) paths.push(decoded);
+    index = cursor;
+  }
+  return paths;
+}
+
+function decodeAnsiCString(value: string): string {
+  return value.replace(
+    /\\(?:x[0-9A-Fa-f]{1,2}|u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8}|[0-7]{1,3}|[abefnrtv\\'"?])/gu,
+    (escape) => {
+      const body = escape.slice(1);
+      if (body.startsWith("x")) return String.fromCodePoint(Number.parseInt(body.slice(1), 16));
+      if (body.startsWith("u") || body.startsWith("U")) {
+        const codePoint = Number.parseInt(body.slice(1), 16);
+        return codePoint <= 0x10ffff ? String.fromCodePoint(codePoint) : escape;
+      }
+      if (/^[0-7]/u.test(body)) return String.fromCodePoint(Number.parseInt(body, 8));
+      const simpleEscapes: Record<string, string> = {
+        a: "\u0007",
+        b: "\b",
+        e: "\u001b",
+        f: "\f",
+        n: "\n",
+        r: "\r",
+        t: "\t",
+        v: "\u000b",
+        "\\": "\\",
+        "'": "'",
+        '"': '"',
+        "?": "?",
+      };
+      return simpleEscapes[body] ?? escape;
+    },
+  );
+}
+
+function resolveLiteralPath(candidate: string, cwd: string): string {
+  if (candidate === "~") return homedir();
+  if (candidate.startsWith("~/")) return resolve(homedir(), candidate.slice(2));
+  return isAbsolute(candidate) ? resolve(candidate) : resolve(cwd, candidate);
+}
+
+function pathEntersProtectedRoot(
+  target: string,
+  cwd: string,
+  canonicalProtectedRoots: string[],
+  canonicalAllowedProtectedSubtrees: string[],
+): boolean {
+  const canonicalTarget = resolvePotentialTarget(resolveLiteralPath(target, cwd));
+  if (canonicalAllowedProtectedSubtrees.some((root) => isWithin(root, canonicalTarget))) {
+    return false;
+  }
+  return canonicalProtectedRoots.some((root) => isWithin(root, canonicalTarget));
+}
+
 function isAllowedDeviceTarget(target: string): boolean {
   return target === "/dev/null" || target === "/dev/stdout" || target === "/dev/stderr" ||
     /^\/dev\/fd\/\d+$/u.test(target);
@@ -352,5 +656,12 @@ function analysisLimitViolation(): ShellWriteTargetViolation {
   return {
     target: "<analysis-limit>",
     reason: "Shell write target analysis exceeded its bounded nesting or size limit.",
+  };
+}
+
+function protectedAnalysisLimitViolation(): ShellProtectedPathViolation {
+  return {
+    target: "<analysis-limit>",
+    reason: "Protected DevSpace path analysis exceeded its bounded nesting or size limit.",
   };
 }

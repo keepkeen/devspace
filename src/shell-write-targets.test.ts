@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { validateShellWriteTargets } from "./shell-write-targets.js";
+import {
+  validateShellProtectedPaths,
+  validateShellWriteTargets,
+} from "./shell-write-targets.js";
 
 const root = await mkdtemp(join(tmpdir(), "devspace-shell-write-targets-"));
 const outside = await mkdtemp(join(tmpdir(), "devspace-shell-write-outside-"));
@@ -12,6 +15,18 @@ try {
   await writeFile(join(root, "source.txt"), "source\n");
   await symlink(outside, join(root, "outside-link"));
   await symlink(join(outside, "missing"), join(root, "dangling-link"));
+  const protectedRoot = join(outside, ".devspace");
+  const stateRoot = join(outside, "state");
+  const managedWorktree = join(protectedRoot, "worktrees", "current");
+  const siblingWorktree = join(protectedRoot, "worktrees", "sibling");
+  await mkdir(managedWorktree, { recursive: true });
+  await mkdir(siblingWorktree, { recursive: true });
+  await mkdir(stateRoot, { recursive: true });
+  await writeFile(join(protectedRoot, "auth.json"), "secret\n");
+  await writeFile(join(stateRoot, "metadata.sqlite"), "database\n");
+  await writeFile(join(managedWorktree, "project.txt"), "project\n");
+  await symlink(protectedRoot, join(root, "internal-link"));
+  await symlink(join(protectedRoot, "auth.json"), join(root, "secret-file-link"));
 
   const allowed = [
     "touch file.txt",
@@ -112,6 +127,66 @@ try {
     root,
   );
   assert.equal(ambiguousViolation?.target, "<analysis-limit>");
+
+  const protectedRoots = [protectedRoot, stateRoot];
+  const protectedCommands = [
+    `cat ${join(protectedRoot, "auth.json")}`,
+    `grep secret --file=${join(protectedRoot, "auth.json")}`,
+    `sqlite3 ${join(stateRoot, "metadata.sqlite")} .tables`,
+    `bash -lc 'cat ${join(protectedRoot, "auth.json")}'`,
+    "cat internal-link/auth.json",
+    "cat secret-file-link",
+    `cat $'${join(protectedRoot, "auth.json")}'`,
+    `cat $'\\x2f${join(protectedRoot, "auth.json").slice(1)}'`,
+    `cat $'\\x2f'$'${join(protectedRoot, "auth.json").slice(1)}'`,
+    `cat ${join(siblingWorktree, "project.txt")}`,
+  ];
+  for (const command of protectedCommands) {
+    const violation = validateShellProtectedPaths(command, root, root, protectedRoots);
+    assert(violation, `${command} should be rejected as protected internal state`);
+    assert.match(violation.reason, /protected DevSpace internal state/i);
+  }
+
+  assert.equal(
+    validateShellProtectedPaths(
+      `cat ${join(outside, "readable-source.txt")}`,
+      root,
+      root,
+      protectedRoots,
+    ),
+    undefined,
+    "ordinary reads outside the workspace remain available",
+  );
+  assert.equal(
+    validateShellProtectedPaths(
+      `printf '%s\\n' $${join(protectedRoot, "auth.json")}`,
+      root,
+      root,
+      protectedRoots,
+    ),
+    undefined,
+    "an unquoted $/ path is relative and must not be mistaken for ANSI-C quoting",
+  );
+  assert(
+    validateShellProtectedPaths(
+      "cat .devspace/auth.json",
+      outside,
+      outside,
+      protectedRoots,
+    ),
+    "an ancestor checkout must not make protected internal state readable",
+  );
+  assert.equal(
+    validateShellProtectedPaths(
+      "cat project.txt",
+      managedWorktree,
+      managedWorktree,
+      protectedRoots,
+      [managedWorktree],
+    ),
+    undefined,
+    "the current managed worktree remains available inside a protected root",
+  );
 } finally {
   await rm(root, { recursive: true, force: true });
   await rm(outside, { recursive: true, force: true });

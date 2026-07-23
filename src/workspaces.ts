@@ -10,7 +10,12 @@ import {
   MAX_PROJECT_INSTRUCTION_BYTES,
   projectInstructionFilenames,
 } from "./project-instructions.js";
-import { assertAllowedPath, isPathInsideRoot, resolveAllowedPath } from "./roots.js";
+import {
+  AccessDeniedError,
+  assertAllowedPath,
+  isPathInsideRoot,
+  resolveAllowedPath,
+} from "./roots.js";
 import {
   computeSkillOpenAiMetadataHash,
   loadWorkspaceSkills,
@@ -192,11 +197,18 @@ export class WorkspaceRegistry {
     const options = typeof input === "string" ? { path: input } : input;
     const mode = options.mode ?? "checkout";
 
-    if (mode === "worktree") {
-      return this.openWorktreeWorkspace(ownerClientId, options.path, options.baseRef);
-    }
+    try {
+      if (mode === "worktree") {
+        return await this.openWorktreeWorkspace(ownerClientId, options.path, options.baseRef);
+      }
 
-    return this.openCheckoutWorkspace(ownerClientId, options.path);
+      return await this.openCheckoutWorkspace(ownerClientId, options.path);
+    } catch (error) {
+      if (!(error instanceof AccessDeniedError)) throw error;
+      throw new AccessDeniedError(
+        `${error.message}. Open the original approved project path. For an isolated checkout, use mode="worktree" and reuse the returned workspaceId; do not open DevSpace's internal worktree directory. If this is a different project, ask the user to add its project root.`,
+      );
+    }
   }
 
   getWorkspace(ownerClientId: string, workspaceId: string): Workspace {

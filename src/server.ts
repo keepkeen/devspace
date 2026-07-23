@@ -35,7 +35,10 @@ import {
   buildWorkspaceLifecycleInstruction,
 } from "./bash-prompt.js";
 import { classifyCommand } from "./command-policy.js";
-import { validateShellWriteTargets } from "./shell-write-targets.js";
+import {
+  validateShellProtectedPaths,
+  validateShellWriteTargets,
+} from "./shell-write-targets.js";
 import { analyzeShellCommandScopes } from "./shell-command-scopes.js";
 import {
   BATCH_MAX_ITEMS,
@@ -878,7 +881,12 @@ function hasUntrackableInteractiveCwd(command: string): boolean {
 
 export function processInputPolicyViolation(
   preparedInput: PreparedProcessInput | undefined,
-  context?: { cwd: string; workspaceRoot: string },
+  context?: {
+    cwd: string;
+    workspaceRoot: string;
+    protectedRoots?: string[];
+    allowedProtectedSubtrees?: string[];
+  },
 ): string | undefined {
   const command = preparedInput?.charsToWrite;
   if (!command || command === "\u0003") return undefined;
@@ -888,9 +896,44 @@ export function processInputPolicyViolation(
   }
   if (context) {
     const violation = validateShellWriteTargets(command, context.cwd, context.workspaceRoot);
-    if (violation) return `No process input was sent. ${violation.reason}`;
+    if (violation) return `No process input was sent. ${shellWriteViolationText(violation)}`;
+    const protectedPathViolation = validateShellProtectedPaths(
+      command,
+      context.cwd,
+      context.workspaceRoot,
+      context.protectedRoots ?? [],
+      context.allowedProtectedSubtrees ?? [],
+    );
+    if (protectedPathViolation) {
+      return `No process input was sent. ${shellProtectedPathViolationText(protectedPathViolation.reason)}`;
+    }
   }
   return undefined;
+}
+
+function shellWriteViolationText(violation: { target: string; reason: string }): string {
+  if (violation.target === "<analysis-limit>") {
+    return `${violation.reason} Simplify the command or run a shorter statically inspectable command.`;
+  }
+  return `${violation.reason}. Keep temporary output inside the workspace, or return it through stdout and page long output with outputId. Splitting the command will not make an outside path writable.`;
+}
+
+function shellProtectedPathViolationText(reason: string): string {
+  return `${reason}. Use the opened project/worktree through its workspaceId; do not inspect DevSpace's internal state directory.`;
+}
+
+function protectedShellRoots(config: ServerConfig): string[] {
+  return [...new Set([
+    dirname(config.devspaceSkillsDir),
+    config.stateDir,
+    config.worktreeRoot,
+  ])];
+}
+
+function allowedProtectedShellSubtrees(workspace: Workspace): string[] {
+  return workspace.mode === "worktree" && workspace.worktree?.managed === true
+    ? [workspace.root]
+    : [];
 }
 
 function textSummary(content: ToolContent[]): {
@@ -1191,6 +1234,8 @@ function registerWriteStdinTool(
         const policyViolation = processInputPolicyViolation(inputScopes.preparedInput, {
           cwd: processContext.cwd,
           workspaceRoot: workspace.root,
+          protectedRoots: protectedShellRoots(config),
+          allowedProtectedSubtrees: allowedProtectedShellSubtrees(workspace),
         });
         if (policyViolation) {
           const content = [textBlock(policyViolation)];
@@ -1437,6 +1482,8 @@ function registerProcessTools(
           const inputPolicyViolation = processInputPolicyViolation(initialInputScopes.preparedInput, {
             cwd,
             workspaceRoot: workspace.root,
+            protectedRoots: protectedShellRoots(config),
+            allowedProtectedSubtrees: allowedProtectedShellSubtrees(workspace),
           });
           if (inputPolicyViolation) {
             return { content: [textBlock(inputPolicyViolation)], isError: true };
@@ -1486,7 +1533,45 @@ function registerProcessTools(
 
       const writeTargetViolation = validateShellWriteTargets(cmd, cwd, workspace.root);
       if (writeTargetViolation) {
-        const content = [textBlock(`No command was executed. ${writeTargetViolation.reason}`)];
+        const content = [textBlock(
+          `No command was executed. ${shellWriteViolationText(writeTargetViolation)}`,
+        )];
+        logFailedToolResponse(
+          config,
+          {
+            tool: "exec_command",
+            workspaceId,
+            workingDirectory: workingDirectory ?? ".",
+            command: cmd,
+            commandLength: cmd.length,
+          },
+          content,
+          startedAt,
+        );
+        return {
+          content,
+          isError: true,
+          structuredContent: {
+            running: false,
+            wallTimeMs: Math.round(performance.now() - startedAt),
+            outputTruncated: false,
+            droppedBytes: 0,
+            timedOut: false,
+          },
+        };
+      }
+
+      const protectedPathViolation = validateShellProtectedPaths(
+        cmd,
+        cwd,
+        workspace.root,
+        protectedShellRoots(config),
+        allowedProtectedShellSubtrees(workspace),
+      );
+      if (protectedPathViolation) {
+        const content = [textBlock(
+          `No command was executed. ${shellProtectedPathViolationText(protectedPathViolation.reason)}`,
+        )];
         logFailedToolResponse(
           config,
           {

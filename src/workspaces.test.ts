@@ -172,7 +172,17 @@ try {
     () => hotReloadRegistry.getWorkspace(ownerClientId, revokedWorkspace.id),
     /Unknown workspaceId/,
   );
-  await assert.rejects(hotReloadRegistry.openWorkspace(ownerClientId, root), /outside allowed roots/);
+  await assert.rejects(
+    hotReloadRegistry.openWorkspace(ownerClientId, root),
+    (error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      assert.match(message, /outside allowed roots/);
+      assert.match(message, /original approved project path/);
+      assert.match(message, /mode="worktree"/);
+      assert.match(message, /do not open DevSpace's internal worktree directory/);
+      return true;
+    },
+  );
   const addedWorkspace = await hotReloadRegistry.openWorkspace(ownerClientId, await realpath(outsideRoot));
   assert.equal(addedWorkspace.workspace.root, await realpath(outsideRoot));
   assert.equal(hotReloadRegistry.applyAllowedRoots([outsideRoot]).changed, false);

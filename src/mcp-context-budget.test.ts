@@ -46,6 +46,7 @@ await writeFile(join(workspaceRoot, "read-scope", "AGENTS.md"), `${scopedInstruc
 await writeFile(join(workspaceRoot, "read-scope", "payload.txt"), `${scopedPayloadNeedle}\n`);
 await writeFile(join(workspaceRoot, "payload.txt"), `${readNeedle}\n`);
 await writeFile(join(workspaceRoot, "batch.txt"), `${batchNeedle}\n`);
+await writeFile(join(configDir, "internal.txt"), "private DevSpace state\n");
 await writeFile(
   join(workspaceRoot, ".agents", "skills", "context-budget", "SKILL.md"),
   `---\nname: context-budget\ndescription: Context budget fixture.\n---\n\n${skillNeedle}\n`,
@@ -336,6 +337,53 @@ try {
   assert.equal(outsideWrite.isError, true);
   assert.match(toolText(outsideWrite), /^No command was executed\./);
   assert.match(JSON.stringify(outsideWrite.content), /outside the workspace/i);
+  assert.match(toolText(outsideWrite), /inside the workspace|stdout.*outputId/is);
+  assert.match(toolText(outsideWrite), /Splitting the command will not/is);
+
+  const protectedRead = await client.callTool({
+    name: "exec_command",
+    arguments: {
+      workspaceId,
+      cmd: `cat ${JSON.stringify(join(configDir, "internal.txt"))}`,
+    },
+  });
+  assert.equal(protectedRead.isError, true);
+  assert.match(toolText(protectedRead), /protected DevSpace internal state/i);
+  assert.match(toolText(protectedRead), /workspaceId.*do not inspect/is);
+
+  const protectedInitialStdin = await client.callTool({
+    name: "exec_command",
+    arguments: {
+      workspaceId,
+      cmd: "bash",
+      stdin: `cat ${JSON.stringify(join(configDir, "internal.txt"))}\n`,
+      closeStdin: true,
+    },
+  });
+  assert.equal(protectedInitialStdin.isError, true);
+  assert.match(toolText(protectedInitialStdin), /protected DevSpace internal state/i);
+
+  const interactiveShell = await client.callTool({
+    name: "exec_command",
+    arguments: { workspaceId, cmd: "bash", yieldTimeMs: 0 },
+  });
+  const interactiveSessionId = (interactiveShell.structuredContent as { sessionId?: unknown } | undefined)
+    ?.sessionId;
+  assert.equal(typeof interactiveSessionId, "number");
+  const protectedInteractiveInput = await client.callTool({
+    name: "write_stdin",
+    arguments: {
+      workspaceId,
+      sessionId: interactiveSessionId,
+      chars: `cat ${JSON.stringify(join(configDir, "internal.txt"))}\n`,
+    },
+  });
+  assert.equal(protectedInteractiveInput.isError, true);
+  assert.match(toolText(protectedInteractiveInput), /protected DevSpace internal state/i);
+  await client.callTool({
+    name: "write_stdin",
+    arguments: { workspaceId, sessionId: interactiveSessionId, chars: "exit\n", yieldTimeMs: 1_000 },
+  });
 
   const nestedGate = await client.callTool({
     name: "exec_command",
@@ -379,7 +427,28 @@ try {
   const dirtyWorkspaceId = String(
     (dirtyWorkspace.structuredContent as { workspaceId?: unknown } | undefined)?.workspaceId ?? "",
   );
+  const dirtyWorkspaceRoot = String(
+    (dirtyWorkspace.structuredContent as { root?: unknown } | undefined)?.root ?? "",
+  );
   assert.ok(dirtyWorkspaceId);
+  assert.ok(dirtyWorkspaceRoot);
+  const siblingManagedRead = await client.callTool({
+    name: "exec_command",
+    arguments: {
+      workspaceId,
+      cmd: `cat ${JSON.stringify(join(dirtyWorkspaceRoot, "AGENTS.md"))}`,
+    },
+  });
+  assert.equal(siblingManagedRead.isError, true);
+  assert.match(toolText(siblingManagedRead), /protected DevSpace internal state/i);
+  const managedRead = await client.callTool({
+    name: "exec_command",
+    arguments: {
+      workspaceId: dirtyWorkspaceId,
+      cmd: `cat ${JSON.stringify(join(dirtyWorkspaceRoot, "AGENTS.md"))}`,
+    },
+  });
+  assert.notEqual(managedRead.isError, true);
   const dirtyWrite = await client.callTool({
     name: "exec_command",
     arguments: { workspaceId: dirtyWorkspaceId, cmd: "printf dirty > dirty.txt" },
