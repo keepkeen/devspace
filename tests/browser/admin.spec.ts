@@ -33,19 +33,19 @@ test.afterEach(async () => {
 test("preserves local edits when a config revision conflicts", async ({ page }) => {
   await page.goto(fixture.admin.url);
   await expect(page.getByRole("heading", { name: "管理控制面板" })).toBeVisible();
-  await page.locator("#tool-mode").selectOption("full");
+  await page.locator("#widget-mode").selectOption("off");
 
   const external = JSON.parse(readFileSync(fixture.configPath, "utf8"));
-  external.toolMode = "minimal";
+  external.widgets = "changes";
   writeFileSync(fixture.configPath, JSON.stringify(external, null, 2));
 
   await page.getByRole("button", { name: "保存", exact: true }).click();
   const alert = page.getByRole("alert").filter({ hasText: "无法保存设置" });
   await expect(alert).toBeVisible();
-  await expect(page.locator("#tool-mode")).toHaveValue("full");
+  await expect(page.locator("#widget-mode")).toHaveValue("off");
 
   await page.getByRole("button", { name: "放弃本地修改并载入最新配置" }).click();
-  await expect(page.locator("#tool-mode")).toHaveValue("minimal");
+  await expect(page.locator("#widget-mode")).toHaveValue("changes");
 });
 
 test("edits process-output quotas as bytes and retention as seconds", async ({ page }) => {
@@ -64,6 +64,23 @@ test("edits process-output quotas as bytes and retention as seconds", async ({ p
   expect(persisted.resources.maxProcessOutputFileBytes).toBe(1_048_576);
   expect(persisted.resources.maxProcessOutputStorageBytes).toBe(2_097_152);
   expect(persisted.resources.completedProcessOutputTtlMs).toBe(3_600_000);
+});
+
+test("saves an explicit user instruction file and requires restart", async ({ page }) => {
+  const instructionsPath = join(fixture.root, "USER_INSTRUCTIONS.md");
+  writeFileSync(instructionsPath, "Use the explicit DevSpace user instructions.\n");
+  await page.goto(fixture.admin.url);
+
+  await expect(page.locator("#user-instructions-path")).toHaveValue("");
+  await page.locator("#user-instructions-path").fill(instructionsPath);
+  await expect(page.getByRole("button", { name: "保存并重启" })).toBeVisible();
+  await page.getByRole("button", { name: "保存", exact: true }).click();
+
+  await expect(page.getByRole("status").filter({ hasText: "需要重启后才能完全生效" })).toBeVisible();
+  expect(JSON.parse(readFileSync(fixture.configPath, "utf8")).userInstructionsPath).toBe(
+    realpathSync(instructionsPath),
+  );
+  expect(fixture.restartCount()).toBe(0);
 });
 
 test("hot-reloads allowed roots without offering save and restart", async ({ page }) => {
@@ -139,9 +156,9 @@ test("retries bootstrap after the browser comes online", async ({ page }) => {
   await page.unroute("**/api/session");
   await page.evaluate(() => window.dispatchEvent(new Event("online")));
   await expect(page.getByRole("heading", { name: "管理控制面板" })).toBeVisible();
-  await page.locator("#tool-mode").selectOption("full");
+  await page.locator("#widget-mode").selectOption("off");
   await page.evaluate(() => window.dispatchEvent(new Event("online")));
-  await expect(page.locator("#tool-mode")).toHaveValue("full");
+  await expect(page.locator("#widget-mode")).toHaveValue("off");
 });
 
 test("links numeric validation errors to their fields", async ({ page }) => {
@@ -155,19 +172,18 @@ test("links numeric validation errors to their fields", async ({ page }) => {
   await expect(page.locator("#maxMcpSessionsPerClient-errors")).toContainText("Per-client MCP sessions");
 });
 
-test("distinguishes saved tool settings from the active backend mode", async ({ page }) => {
+test("distinguishes saved widget settings from the active backend configuration", async ({ page }) => {
   await page.goto(fixture.admin.url);
-  await expect(page.getByRole("status").filter({ hasText: "ChatGPT 应用仍可能缓存工具定义" })).toBeVisible();
+  await expect(page.getByRole("status").filter({ hasText: "后端已运行当前保存的结果卡片配置" })).toBeVisible();
 
-  await page.locator("#tool-mode").selectOption("full");
+  await page.locator("#widget-mode").selectOption("off");
   await page.getByRole("button", { name: "保存", exact: true }).click();
-  const notice = page.getByRole("status").filter({ hasText: "后端仍运行：工具模式 Codex，结果卡片 完整显示；需重启" });
+  const notice = page.getByRole("status").filter({ hasText: "后端仍运行：结果卡片 完整显示；需重启" });
   await expect(notice).toBeVisible();
-  await expect(notice).toContainText("重启后在 ChatGPT 应用中刷新工具。");
 
   await page.getByRole("button", { name: "重启服务" }).click();
   await page.getByRole("button", { name: "确认重启" }).click();
-  await expect(page.getByRole("status").filter({ hasText: "后端已运行当前保存的工具配置" })).toBeVisible();
+  await expect(page.getByRole("status").filter({ hasText: "后端已运行当前保存的结果卡片配置" })).toBeVisible();
   await expect(notice).toBeHidden();
 });
 
@@ -214,9 +230,8 @@ async function createFixture(): Promise<Fixture> {
   let rootsReloadCount = 0;
   let rootsCleanupPending = 0;
   let runtimeConfig: {
-    toolMode: "codex" | "full" | "minimal";
     widgets: "full" | "changes" | "off";
-  } = { toolMode: "codex", widgets: "full" };
+  } = { widgets: "full" };
   const admin = await startAdminServer({
     env: { DEVSPACE_CONFIG_DIR: configDir },
     staticDir: resolve("dist/admin-ui"),
@@ -231,7 +246,7 @@ async function createFixture(): Promise<Fixture> {
       restartBackend: async () => {
         restartCount += 1;
         const saved = JSON.parse(readFileSync(configPath, "utf8"));
-        runtimeConfig = { toolMode: saved.toolMode, widgets: saved.widgets };
+        runtimeConfig = { widgets: saved.widgets };
         return {
           id: `browser-restart-${restartCount}`,
           target: "backend",

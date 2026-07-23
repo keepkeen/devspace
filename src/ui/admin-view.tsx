@@ -9,7 +9,6 @@ import type {
 const overrideSources: Record<string, string> = {
   allowedRoots: "DEVSPACE_ALLOWED_ROOTS",
   projectDocFallbackFilenames: "DEVSPACE_PROJECT_DOC_FALLBACK_FILENAMES",
-  toolMode: "DEVSPACE_TOOL_MODE",
   widgets: "DEVSPACE_WIDGETS",
   "resources.maxMcpSessions": "DEVSPACE_MAX_MCP_SESSIONS",
   "resources.maxMcpSessionsPerClient": "DEVSPACE_MAX_MCP_SESSIONS_PER_CLIENT",

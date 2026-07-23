@@ -10,7 +10,7 @@ import { databasePath } from "./db/client.js";
 import { GitWorktreeError, removeManagedWorktree } from "./git-worktrees.js";
 import { MAX_PROJECT_INSTRUCTION_BYTES } from "./project-instructions.js";
 import { SqliteWorkspaceStore, type WorkspaceStore } from "./workspace-store.js";
-import { ensureCheckoutWorkspaceRoot, WorkspaceRegistry } from "./workspaces.js";
+import { ensureCheckoutWorkspaceRoot, UnknownWorkspaceError, WorkspaceRegistry } from "./workspaces.js";
 import { formatPathForPrompt } from "./skills.js";
 
 const execFileAsync = promisify(execFile);
@@ -18,6 +18,16 @@ const root = await mkdtemp(join(tmpdir(), "devspace-workspace-test-"));
 const outsideRoot = await mkdtemp(join(tmpdir(), "devspace-workspace-outside-test-"));
 const canonicalRoot = await realpath(root);
 const ownerClientId = "client-a";
+
+assert.equal(
+  new UnknownWorkspaceError("ws_old").message,
+  "Unknown workspaceId: ws_old. It may have expired or no longer belong to this app connection. Discard it " +
+    "and call open_workspace with the original exact project path. If this conversation still has that " +
+    "revision's complete agentsFiles, pass its instructionRevision as knownInstructionRevision; otherwise omit " +
+    "knownInstructionRevision so the instructions are returned again; replace the old ID and retry the failed " +
+    "tool call once. If a skill applies, call load_skill with {workspaceId: newWorkspaceId, " +
+    "skillId: currentSkillId} using the reopened skills catalog before reading support files.",
+);
 
 try {
   const agentDir = join(root, ".pi", "agent");
@@ -30,6 +40,7 @@ try {
     await symlink("skills/AGENTS.md", join(agentDir, "AGENTS.md"));
   }
   await writeFile(join(agentDir, "AGENTS.override.md"), "global override instructions\n");
+  const userInstructionsPath = join(agentDir, "AGENTS.override.md");
   await writeFile(join(root, "AGENTS.md"), "root instructions\n");
   await mkdir(join(agentDir, "skills", "workspace-skill"), { recursive: true });
   await writeFile(
@@ -77,6 +88,7 @@ try {
     DEVSPACE_ALLOWED_ROOTS: root,
     DEVSPACE_WORKTREE_ROOT: join(root, ".devspace", "worktrees"),
     DEVSPACE_AGENT_DIR: agentDir,
+    DEVSPACE_USER_INSTRUCTIONS_PATH: userInstructionsPath,
     DEVSPACE_SUBAGENTS: "1",
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
     PORT: "1",
@@ -93,10 +105,12 @@ try {
   );
 
   const registry = new WorkspaceRegistry(config);
-  const { workspace, agentsFiles, availableAgentsFiles, instructionScan, reused } = await registry.openWorkspace(ownerClientId, root);
+  const { workspace, agentsFiles, instructionRevision, availableAgentsFiles, instructionScan, reused } = await registry.openWorkspace(ownerClientId, root);
   assert.equal(reused, false);
+  assert.match(instructionRevision, /^sha256-v1:[A-Za-z0-9_-]{43}$/);
   const sequentialCheckout = await registry.openWorkspace(ownerClientId, root);
   assert.equal(sequentialCheckout.reused, true);
+  assert.equal(sequentialCheckout.instructionRevision, instructionRevision);
   assert.equal(sequentialCheckout.workspace.id, workspace.id);
   const [concurrentCheckoutA, concurrentCheckoutB] = await Promise.all([
     registry.openWorkspace(ownerClientId, root),
@@ -108,6 +122,36 @@ try {
   assert.equal(concurrentCheckoutB.reused, true);
   const otherOwnerCheckout = await registry.openWorkspace("client-b", root);
   assert.notEqual(otherOwnerCheckout.workspace.id, workspace.id);
+
+  const revisionProject = join(root, "revision-project");
+  const revisionInstructionsPath = join(root, "user-revision.md");
+  await mkdir(revisionProject);
+  await writeFile(revisionInstructionsPath, "revision one\n");
+  const revisionConfig = loadConfig({
+    DEVSPACE_CONFIG_DIR: join(root, ".revision-config"),
+    DEVSPACE_ALLOWED_ROOTS: root,
+    DEVSPACE_USER_INSTRUCTIONS_PATH: revisionInstructionsPath,
+    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+    PORT: "1",
+  });
+  const revisionRegistry = new WorkspaceRegistry(revisionConfig);
+  const firstRevisionOpen = await revisionRegistry.openWorkspace(ownerClientId, revisionProject);
+  await writeFile(revisionInstructionsPath, "revision two is different\n");
+  const secondRevisionOpen = await revisionRegistry.openWorkspace(ownerClientId, revisionProject);
+  assert.notEqual(secondRevisionOpen.instructionRevision, firstRevisionOpen.instructionRevision);
+  assert.deepEqual(secondRevisionOpen.agentsFiles.map((file) => file.content), ["revision two is different\n"]);
+  const alternateRevisionInstructionsPath = join(root, "alternate-user-revision.md");
+  await writeFile(alternateRevisionInstructionsPath, "revision two is different\n");
+  const alternateRevisionConfig = loadConfig({
+    DEVSPACE_CONFIG_DIR: join(root, ".alternate-revision-config"),
+    DEVSPACE_ALLOWED_ROOTS: root,
+    DEVSPACE_USER_INSTRUCTIONS_PATH: alternateRevisionInstructionsPath,
+    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+    PORT: "1",
+  });
+  const alternateRevisionOpen = await new WorkspaceRegistry(alternateRevisionConfig)
+    .openWorkspace(ownerClientId, revisionProject);
+  assert.notEqual(alternateRevisionOpen.instructionRevision, secondRevisionOpen.instructionRevision);
 
   const hotReloadConfig = { ...config, allowedRoots: [root] };
   const hotReloadStore = new SqliteWorkspaceStore(join(root, ".hot-reload-state"));
@@ -449,6 +493,7 @@ try {
     DEVSPACE_CONFIG_DIR: join(root, ".empty-global-config"),
     DEVSPACE_ALLOWED_ROOTS: root,
     DEVSPACE_AGENT_DIR: emptyGlobalAgentDir,
+    DEVSPACE_USER_INSTRUCTIONS_PATH: join(emptyGlobalAgentDir, "AGENTS.md"),
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
     PORT: "1",
   });
@@ -487,6 +532,7 @@ try {
     DEVSPACE_CONFIG_DIR: join(root, ".budget-config"),
     DEVSPACE_ALLOWED_ROOTS: root,
     DEVSPACE_AGENT_DIR: budgetAgentDir,
+    DEVSPACE_USER_INSTRUCTIONS_PATH: join(budgetAgentDir, "AGENTS.md"),
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
     PORT: "1",
   });
@@ -656,6 +702,42 @@ try {
     assert.deepEqual(
       unsafeWorkspace.agentsFiles.map((file) => file.content),
       ["root instructions\n"],
+    );
+
+    const skillOnlyAgentDirProject = join(root, "skill-only-agent-dir-project");
+    await mkdir(skillOnlyAgentDirProject);
+    const skillOnlyAgentDirConfig = loadConfig({
+      DEVSPACE_CONFIG_DIR: join(root, ".skill-only-agent-dir-home"),
+      DEVSPACE_ALLOWED_ROOTS: root,
+      DEVSPACE_AGENT_DIR: agentDir,
+      DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+      PORT: "1",
+    });
+    const skillOnlyAgentDirOpen = await new WorkspaceRegistry(skillOnlyAgentDirConfig)
+      .openWorkspace(ownerClientId, skillOnlyAgentDirProject);
+    assert.deepEqual(skillOnlyAgentDirOpen.agentsFiles, []);
+
+    const missingInstructionsConfig = loadConfig({
+      DEVSPACE_CONFIG_DIR: join(root, ".missing-user-instructions-home"),
+      DEVSPACE_ALLOWED_ROOTS: root,
+      DEVSPACE_USER_INSTRUCTIONS_PATH: join(root, "missing-user-instructions.md"),
+      DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+      PORT: "1",
+    });
+    await assert.rejects(
+      new WorkspaceRegistry(missingInstructionsConfig).openWorkspace(ownerClientId, root),
+      /ENOENT/,
+    );
+    const directoryInstructionsConfig = loadConfig({
+      DEVSPACE_CONFIG_DIR: join(root, ".directory-user-instructions-home"),
+      DEVSPACE_ALLOWED_ROOTS: root,
+      DEVSPACE_USER_INSTRUCTIONS_PATH: agentDir,
+      DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+      PORT: "1",
+    });
+    await assert.rejects(
+      new WorkspaceRegistry(directoryInstructionsConfig).openWorkspace(ownerClientId, root),
+      /must be a file/,
     );
 
     const workspaceLeak = join(root, "workspace-leak.txt");
@@ -938,6 +1020,7 @@ try {
       DEVSPACE_ALLOWED_ROOTS: aliasRoot,
       DEVSPACE_WORKTREE_ROOT: join(aliasRoot, ".devspace", "alias-worktrees"),
       DEVSPACE_AGENT_DIR: agentDir,
+      DEVSPACE_USER_INSTRUCTIONS_PATH: userInstructionsPath,
       DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
       PORT: "1",
     });

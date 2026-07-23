@@ -1,9 +1,9 @@
 import { createHash, randomBytes } from "node:crypto";
 import { mkdir, open, readFile, stat, unlink } from "node:fs/promises";
-import { realpathSync, statSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { accessSync, constants, realpathSync, statSync } from "node:fs";
+import { dirname, isAbsolute, resolve } from "node:path";
 import { z } from "zod";
-import { loadConfigForAdmin, type ToolMode, type WidgetMode } from "./config.js";
+import { loadConfigForAdmin, type WidgetMode } from "./config.js";
 import { expandHomePath } from "./roots.js";
 import {
   MAX_TIMER_MS,
@@ -38,8 +38,8 @@ export interface AdminResourceLimits {
 
 export interface AdminConfig {
   allowedRoots: string[];
+  userInstructionsPath: string | null;
   projectDocFallbackFilenames: string[];
-  toolMode: ToolMode;
   widgets: WidgetMode;
   resources: AdminResourceLimits;
 }
@@ -77,6 +77,7 @@ export interface AdminConfigSnapshot {
 
 const adminConfigSchema = z.object({
   allowedRoots: z.array(z.string().trim().min(1)).min(1).max(128),
+  userInstructionsPath: z.string().trim().min(1).max(4_096).nullable(),
   projectDocFallbackFilenames: z.array(
     z.string()
       .trim()
@@ -84,7 +85,6 @@ const adminConfigSchema = z.object({
       .max(MAX_PROJECT_DOC_FALLBACK_FILENAME_LENGTH)
       .refine(isValidProjectDocFallbackFilename, "Must be a filename without path separators."),
   ).max(MAX_PROJECT_DOC_FALLBACK_FILENAMES),
-  toolMode: z.enum(["minimal", "full", "codex"]),
   widgets: z.enum(["off", "changes", "full"]),
   resources: z.object({
     maxMcpSessions: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxMcpSessions),
@@ -106,8 +106,8 @@ export function loadAdminConfig(env: NodeJS.ProcessEnv = process.env): AdminConf
   const config = loadConfigForAdmin(env);
   return parseAdminConfigShape({
     allowedRoots: config.allowedRoots,
+    userInstructionsPath: config.userInstructionsPath,
     projectDocFallbackFilenames: config.projectDocFallbackFilenames,
-    toolMode: config.toolMode,
     widgets: config.widgets,
     resources: pickAdminResourceLimits(config.resources),
   });
@@ -170,6 +170,22 @@ export function validateAdminConfig(input: unknown): AdminConfig {
   if (allowedRoots.length === 0 && Object.keys(fields).length === 0) {
     fields.allowedRoots = "At least one allowed root is required.";
   }
+  let userInstructionsPath = parsed.userInstructionsPath;
+  if (userInstructionsPath) {
+    try {
+      const expandedPath = expandHomePath(userInstructionsPath);
+      if (!isAbsolute(expandedPath)) throw new Error("path must be absolute");
+      const canonicalPath = realpathSync(resolve(expandedPath));
+      if (!statSync(canonicalPath).isFile()) {
+        fields.userInstructionsPath = "User instructions must be an existing readable file.";
+      } else {
+        accessSync(canonicalPath, constants.R_OK);
+        userInstructionsPath = canonicalPath;
+      }
+    } catch {
+      fields.userInstructionsPath = "User instructions must be an existing readable file.";
+    }
+  }
   if (
     parsed.resources.maxProcessSessionsPerWorkspace >
     parsed.resources.maxProcessSessions
@@ -198,6 +214,7 @@ export function validateAdminConfig(input: unknown): AdminConfig {
   return {
     ...parsed,
     allowedRoots,
+    userInstructionsPath,
     projectDocFallbackFilenames: normalizeProjectDocFallbackFilenames(
       parsed.projectDocFallbackFilenames,
     ),
@@ -216,6 +233,18 @@ export function adminConfigWarnings(config: AdminConfig): AdminConfigWarnings {
       }
     } catch {
       warnings[`allowedRoots.${index}`] = "This path is no longer an existing directory.";
+    }
+  }
+  if (config.userInstructionsPath) {
+    try {
+      const canonicalPath = realpathSync(resolve(expandHomePath(config.userInstructionsPath)));
+      if (!statSync(canonicalPath).isFile()) {
+        warnings.userInstructionsPath = "This path is no longer a readable file.";
+      } else {
+        accessSync(canonicalPath, constants.R_OK);
+      }
+    } catch {
+      warnings.userInstructionsPath = "This path is no longer a readable file.";
     }
   }
   if (config.resources.maxProcessSessionsPerWorkspace > config.resources.maxProcessSessions) {
@@ -244,11 +273,9 @@ export function adminConfigWarnings(config: AdminConfig): AdminConfigWarnings {
 export function adminConfigOverridePaths(env: NodeJS.ProcessEnv = process.env): string[] {
   const paths: string[] = [];
   if (env.DEVSPACE_ALLOWED_ROOTS !== undefined) paths.push("allowedRoots");
+  if (env.DEVSPACE_USER_INSTRUCTIONS_PATH !== undefined) paths.push("userInstructionsPath");
   if (env.DEVSPACE_PROJECT_DOC_FALLBACK_FILENAMES !== undefined) {
     paths.push("projectDocFallbackFilenames");
-  }
-  if (env.DEVSPACE_TOOL_MODE !== undefined || env.DEVSPACE_MINIMAL_TOOLS !== undefined) {
-    paths.push("toolMode");
   }
   if (env.DEVSPACE_WIDGETS !== undefined) paths.push("widgets");
 
@@ -285,7 +312,7 @@ export function saveAdminConfig(
   const overridePaths = adminConfigOverridePaths(env);
   const overrideFields: Record<string, string> = {};
   for (const path of overridePaths) {
-    if (!configValuesEqual(valueAtPath(config, path), valueAtPath(previous, path))) {
+    if (!configValuesEqualAtPath(path, valueAtPath(config, path), valueAtPath(previous, path))) {
       overrideFields[path] = "This setting is controlled by an environment variable.";
     }
   }
@@ -300,10 +327,12 @@ export function saveAdminConfig(
   }
   const nextConfig = { ...files.config, resources };
   if (!overridePaths.includes("allowedRoots")) nextConfig.allowedRoots = config.allowedRoots;
+  if (!overridePaths.includes("userInstructionsPath")) {
+    nextConfig.userInstructionsPath = config.userInstructionsPath;
+  }
   if (!overridePaths.includes("projectDocFallbackFilenames")) {
     nextConfig.projectDocFallbackFilenames = config.projectDocFallbackFilenames;
   }
-  if (!overridePaths.includes("toolMode")) nextConfig.toolMode = config.toolMode;
   if (!overridePaths.includes("widgets")) nextConfig.widgets = config.widgets;
   const persistedMaxMcpSessions = resources.maxMcpSessions ?? 64;
   const persistedPerClientMcp = resources.maxMcpSessionsPerClient ?? 8;
@@ -372,8 +401,8 @@ function parseAdminConfigShape(input: unknown): AdminConfig {
 function valueAtPath(config: AdminConfig, path: string): unknown {
   if (
     path === "allowedRoots" ||
+    path === "userInstructionsPath" ||
     path === "projectDocFallbackFilenames" ||
-    path === "toolMode" ||
     path === "widgets"
   ) return config[path];
   const resourceKey = path.slice("resources.".length) as keyof AdminResourceLimits;
@@ -382,6 +411,21 @@ function valueAtPath(config: AdminConfig, path: string): unknown {
 
 function configValuesEqual(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function configValuesEqualAtPath(path: string, left: unknown, right: unknown): boolean {
+  if (path !== "userInstructionsPath") return configValuesEqual(left, right);
+  return configValuesEqual(canonicalPathForComparison(left), canonicalPathForComparison(right));
+}
+
+function canonicalPathForComparison(value: unknown): unknown {
+  if (typeof value !== "string") return value;
+  const absolutePath = resolve(expandHomePath(value));
+  try {
+    return realpathSync(absolutePath);
+  } catch {
+    return absolutePath;
+  }
 }
 
 function configWithoutAllowedRoots(config: AdminConfig): Omit<AdminConfig, "allowedRoots"> {

@@ -11,7 +11,6 @@ import type {
   AdminSessionResponse,
   AdminStatusResponse,
   AdminValidationIssue,
-  ToolMode,
   WidgetMode,
 } from "./admin-types.js";
 import {
@@ -94,7 +93,6 @@ const builtinInstructionFilenames = new Set([
   "AGENTS.override.md", "AGENTS.override.MD", "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD",
 ]);
 
-const toolModeLabels: Record<ToolMode, string> = { codex: "Codex", full: "完整", minimal: "精简" };
 const widgetModeLabels: Record<WidgetMode, string> = { full: "完整显示", changes: "仅文件变更", off: "关闭" };
 
 function AdminApp(): React.JSX.Element {
@@ -220,9 +218,9 @@ function AdminForm({
     return result;
   }, [saveState]);
   const activeRuntimeConfig = diagnostics?.diagnostics.runtimeConfig;
-  const runtimeConfigMismatch = Boolean(
+  const widgetConfigMismatch = Boolean(
     activeRuntimeConfig &&
-    (activeRuntimeConfig.toolMode !== savedConfig.toolMode || activeRuntimeConfig.widgets !== savedConfig.widgets),
+    activeRuntimeConfig.widgets !== savedConfig.widgets,
   );
   const rootsPolicyMismatch = Boolean(
     activeRuntimeConfig?.allowedRootsRevision &&
@@ -592,6 +590,15 @@ function AdminForm({
             <AddField id="new-root" label="添加目录" value={newRoot} onChange={(value) => { setNewRoot(value); setRootError(null); }} onAdd={addRoot} placeholder="/Users/you/code/project" help="请输入本机目录的绝对路径。" error={rootError} disabled={overrides.includes("allowedRoots")} />
           </div>
           <div className="subsection divided">
+            <div className="subsection-heading"><div><h3>用户级说明文件</h3><p>可选的单个本机说明文件，会先于项目 AGENTS.md 加载；留空不会读取 ~/.codex/AGENTS.md。保存后需重启后端。</p></div></div>
+            <div className="field">
+              <label htmlFor="user-instructions-path">说明文件路径</label>
+              <input id="user-instructions-path" type="text" value={config.userInstructionsPath ?? ""} placeholder="~/.devspace/AGENTS.md" disabled={overrides.includes("userInstructionsPath")} aria-invalid={(issuesByPath.get("userInstructionsPath")?.length ?? 0) > 0} aria-describedby={`user-instructions-path-help${(issuesByPath.get("userInstructionsPath")?.length ?? 0) > 0 ? " user-instructions-path-errors" : ""}`} onChange={(event) => { setConfig((current) => ({ ...current, userInstructionsPath: event.target.value || null })); beginEdit(["userInstructionsPath"]); }} />
+              <p id="user-instructions-path-help" className="field-help">支持 ~ 或绝对路径；文件必须已存在且可读。环境变量 DEVSPACE_USER_INSTRUCTIONS_PATH 会锁定此项。</p>
+              <FieldMeta id="user-instructions-path-errors" path="userInstructionsPath" overrides={overrides} warnings={warnings} issues={issuesByPath} />
+            </div>
+          </div>
+          <div className="subsection divided">
             <div className="subsection-heading"><div><h3>项目说明回退文件</h3><p>找不到 AGENTS.md 时，按顺序查找这些文件名；留空可关闭回退。</p></div><FieldMeta path="projectDocFallbackFilenames" overrides={overrides} warnings={warnings} issues={issuesByPath} /></div>
             {config.projectDocFallbackFilenames.length > 0 ? <div className="filename-list">{config.projectDocFallbackFilenames.map((filename, index) => <div className="filename-chip" key={`${filename}-${index}`}><span className="order-index">{index + 1}</span><code>{filename}</code><button type="button" aria-label={`移除回退文件 ${filename}`} onClick={() => removeFilename(index)} disabled={overrides.includes("projectDocFallbackFilenames")}>×</button><FieldMeta path={`projectDocFallbackFilenames.${index}`} overrides={overrides} warnings={warnings} issues={issuesByPath} /></div>)}</div> : <p className="empty-copy">未配置回退文件。</p>}
             <AddField id="new-filename" label="添加回退文件名" value={newFilename} onChange={(value) => { setNewFilename(value); setFilenameError(null); }} onAdd={addFilename} placeholder="TEAM_GUIDE.md" help="仅输入文件名，不要包含路径分隔符。" error={filenameError} disabled={overrides.includes("projectDocFallbackFilenames")} />
@@ -599,10 +606,9 @@ function AdminForm({
         </section>
 
         <section className="panel" id="tools" aria-labelledby="tools-heading">
-          <SectionHeading kicker="TOOLS & INSTRUCTIONS" title="工具与说明" description="控制模型可用的工具集合及 ChatGPT 中的结果卡片。" />
-          {activeRuntimeConfig && <div className={`inline-banner ${runtimeConfigMismatch ? "warning" : "neutral"}`} role="status">{runtimeConfigMismatch ? <><strong>后端仍运行：工具模式 {toolModeLabels[activeRuntimeConfig.toolMode]}，结果卡片 {widgetModeLabels[activeRuntimeConfig.widgets]}；需重启。</strong> 重启后在 ChatGPT 应用中刷新工具。</> : <>后端已运行当前保存的工具配置。ChatGPT 应用仍可能缓存工具定义；如显示未更新，请刷新工具。</>}</div>}
-          <div className="field-grid two-columns">
-            <SelectField<ToolMode> id="tool-mode" label="工具模式" value={config.toolMode} description="Codex 用 apply_patch / exec_command 替代 write / edit / bash 等分散工具；保存后需重启后端，并在 ChatGPT 中刷新应用工具。" options={[["codex", "Codex"], ["full", "完整"], ["minimal", "精简"]]} onChange={(value) => { setConfig((current) => ({ ...current, toolMode: value })); beginEdit(["toolMode"]); }} disabled={overrides.includes("toolMode")} meta={<FieldMeta path="toolMode" overrides={overrides} warnings={warnings} issues={issuesByPath} />} />
+          <SectionHeading kicker="TOOLS & INSTRUCTIONS" title="工具与说明" description="控制 ChatGPT 中的结果卡片。" />
+          {activeRuntimeConfig && <div className={`inline-banner ${widgetConfigMismatch ? "warning" : "neutral"}`} role="status">{widgetConfigMismatch ? <><strong>后端仍运行：结果卡片 {widgetModeLabels[activeRuntimeConfig.widgets]}；需重启。</strong></> : <>后端已运行当前保存的结果卡片配置。</>}</div>}
+          <div className="field-grid">
             <SelectField<WidgetMode> id="widget-mode" label="结果卡片" value={config.widgets} description="控制工具调用详情和文件变更的展示。" options={[["full", "完整显示"], ["changes", "仅文件变更"], ["off", "关闭"]]} onChange={(value) => { setConfig((current) => ({ ...current, widgets: value })); beginEdit(["widgets"]); }} disabled={overrides.includes("widgets")} meta={<FieldMeta path="widgets" overrides={overrides} warnings={warnings} issues={issuesByPath} />} />
           </div>
         </section>

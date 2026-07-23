@@ -1,4 +1,19 @@
 import path from "node:path";
+import {
+  delegatedCommandPayloads,
+  extractHereStringPayloads,
+  extractNestedShellSyntax,
+  heredocMarkers,
+  isShellProgram,
+  isShellAnalysisLimitError,
+  MAX_SHELL_ANALYSIS_DEPTH,
+  preprocessHeredocs,
+  shellIsParseOnly,
+  splitShellSegments,
+  tokenizeShellSegment,
+  unwrapShellWrappers,
+  withoutHeredocMarkers,
+} from "./shell-command-analysis.js";
 
 export type UnresolvedShellCwdReason =
   | "dynamic-path"
@@ -52,6 +67,25 @@ export function analyzeShellCommandScopes(
   command: string,
   initialCwd: string,
   workspaceRoot: string,
+  depth = 0,
+): ShellCommandScopeAnalysis {
+  try {
+    return analyzeShellCommandScopesUnchecked(command, initialCwd, workspaceRoot, depth);
+  } catch (error) {
+    if (!isShellAnalysisLimitError(error)) throw error;
+    return {
+      staticCwds: [],
+      staticCwdAlternatives: [],
+      unresolvedCwds: [{ fragment: String(MAX_SHELL_ANALYSIS_DEPTH), reason: "analysis-limit" }],
+    };
+  }
+}
+
+function analyzeShellCommandScopesUnchecked(
+  command: string,
+  initialCwd: string,
+  workspaceRoot: string,
+  depth: number,
 ): ShellCommandScopeAnalysis {
   const normalizedRoot = path.resolve(workspaceRoot);
   const possibleCwds = new Set([path.resolve(initialCwd)]);
@@ -69,10 +103,23 @@ export function analyzeShellCommandScopes(
     unresolvedCwds.push({ fragment, reason });
   };
 
-  for (const words of splitIntoSimpleCommands(command)) {
+  const preprocessed = preprocessHeredocs(command);
+  if (preprocessed.exceededLimit || depth > MAX_SHELL_ANALYSIS_DEPTH) {
+    addUnresolved(String(MAX_SHELL_ANALYSIS_DEPTH), "analysis-limit");
+    return { staticCwds, staticCwdAlternatives, unresolvedCwds };
+  }
+
+  for (const words of splitIntoSimpleCommands(preprocessed.command)) {
     if (mutatesCdPath(words)) {
       addUnresolved("CDPATH", "cdpath");
       hasDynamicCwd = true;
+    }
+
+    const opaqueMutation = findOpaqueScopeMutation(words);
+    if (opaqueMutation) {
+      addUnresolved(opaqueMutation.fragment, opaqueMutation.reason);
+      hasDynamicCwd = true;
+      continue;
     }
 
     const scopeCommand = findScopeCommand(words);
@@ -143,6 +190,50 @@ export function analyzeShellCommandScopes(
     if (alternatives.length > 0) staticCwdAlternatives.push(alternatives);
   }
 
+  const nestedPayloads = new Set(extractNestedShellSyntax(preprocessed.command));
+  for (const segment of splitShellSegments(preprocessed.command)) {
+    const rawTokens = tokenizeShellSegment(segment);
+    const markers = heredocMarkers(rawTokens, preprocessed.documents);
+    const tokens = withoutHeredocMarkers(rawTokens, preprocessed.documents);
+    for (const payload of delegatedCommandPayloads(tokens)) nestedPayloads.add(payload);
+
+    const effective = unwrapShellWrappers(tokens);
+    const heredocShell = isShellProgram(effective[0]) && !shellIsParseOnly(tokens);
+    if (heredocShell) {
+      for (const payload of extractHereStringPayloads(segment)) nestedPayloads.add(payload);
+    }
+    for (const marker of markers) {
+      const document = preprocessed.documents.get(marker);
+      if (!document) continue;
+      if (heredocShell) nestedPayloads.add(document.body);
+      else if (document.expandable) {
+        for (const payload of extractNestedShellSyntax(document.body)) nestedPayloads.add(payload);
+      }
+    }
+  }
+
+  if (nestedPayloads.size > 0 && depth >= MAX_SHELL_ANALYSIS_DEPTH) {
+    addUnresolved(String(MAX_SHELL_ANALYSIS_DEPTH), "analysis-limit");
+  } else {
+    const nestedBases = [...possibleCwds];
+    for (const payload of nestedPayloads) {
+      for (const base of nestedBases) {
+        const nested = analyzeShellCommandScopes(payload, base, normalizedRoot, depth + 1);
+        for (const directory of nested.staticCwds) {
+          if (staticCwdSet.has(directory)) continue;
+          staticCwdSet.add(directory);
+          staticCwds.push(directory);
+        }
+        for (const alternatives of nested.staticCwdAlternatives) {
+          if (alternatives.length > 0) staticCwdAlternatives.push(alternatives);
+        }
+        for (const unresolved of nested.unresolvedCwds) {
+          addUnresolved(unresolved.fragment, unresolved.reason);
+        }
+      }
+    }
+  }
+
   return { staticCwds, staticCwdAlternatives, unresolvedCwds };
 }
 
@@ -181,8 +272,55 @@ function findScopeCommand(words: ShellWord[]): ScopeCommand | undefined {
   return { name, target: words[index], unsupported: words[index + 1] };
 }
 
-function isAssignment(word: ShellWord): boolean {
-  return /^[A-Za-z_][A-Za-z0-9_]*=/.test(word.value);
+function isAssignment(word: ShellWord | undefined): boolean {
+  return Boolean(word && /^[A-Za-z_][A-Za-z0-9_]*=/.test(word.value));
+}
+
+function findOpaqueScopeMutation(
+  words: ShellWord[],
+): { fragment: string; reason: UnresolvedShellCwdReason } | undefined {
+  const executable = executableCommandWord(words);
+  if (!executable) return undefined;
+  if (executable.dynamic) {
+    return { fragment: executable.word.raw, reason: "unsupported-syntax" };
+  }
+  const program = path.basename(executable.word.value);
+  const args = words.slice(executable.index + 1);
+
+  // These builtins mutate the current shell's cwd using state or code that is
+  // unavailable to this lexical analyzer.
+  if (program === "source" || program === ".") {
+    return { fragment: executable.word.raw, reason: "unsupported-syntax" };
+  }
+  if (program === "popd") {
+    return { fragment: executable.word.raw, reason: "directory-stack" };
+  }
+
+  if (program === "eval") {
+    const payload = args[0]?.value === "--" ? args.slice(1) : args;
+    if (payload.some((word) => word.dynamic)) {
+      return { fragment: executable.word.raw, reason: "unsupported-syntax" };
+    }
+  }
+
+  if (["sh", "bash", "zsh", "dash", "ksh", "fish", "ash"].includes(program)) {
+    for (let index = 0; index < args.length; index += 1) {
+      const option = args[index]!;
+      if (option.value === "--") break;
+      if (option.value === "--command" || option.value === "-c" || /^-[^-]*c[^-]*$/u.test(option.value)) {
+        const payload = args[index + 1];
+        if (!payload || payload.dynamic) {
+          return { fragment: option.raw, reason: "unsupported-syntax" };
+        }
+        break;
+      }
+      if (option.value.startsWith("--command=") && option.dynamic) {
+        return { fragment: option.raw, reason: "unsupported-syntax" };
+      }
+      if (!option.value.startsWith("-") && !option.value.startsWith("+")) break;
+    }
+  }
+  return undefined;
 }
 
 function mutatesCdPath(words: ShellWord[]): boolean {
@@ -209,8 +347,7 @@ function mutatesCdPath(words: ShellWord[]): boolean {
 function executableCommandWord(
   words: ShellWord[],
 ): { word: ShellWord; index: number; dynamic: boolean } | undefined {
-  let index = 0;
-  while (index < words.length && isAssignment(words[index])) index += 1;
+  let index = skipScopePreamble(words, 0, true);
 
   for (;;) {
     const word = words[index];
@@ -228,6 +365,7 @@ function executableCommandWord(
         const option = words[index++];
         if (option.value === "--") break;
       }
+      index = skipScopePreamble(words, index, false);
       continue;
     }
     if (word.value === "env") {
@@ -243,6 +381,27 @@ function executableCommandWord(
       continue;
     }
     return { word, index, dynamic: false };
+  }
+}
+
+function skipScopePreamble(words: ShellWord[], start: number, allowKeyword: boolean): number {
+  let index = start;
+  const keywords = new Set(["!", "{", "elif", "else", "if", "then", "until", "while", "do"]);
+  for (;;) {
+    if (isAssignment(words[index])) {
+      index += 1;
+      continue;
+    }
+    const redirection = words[index]?.value.match(/^(?:\d+|\{[A-Za-z_][A-Za-z0-9_]*\})?(?:<<<?|<>|>>?|>\||&>)(.*)$/u);
+    if (redirection) {
+      index += redirection[1] ? 1 : 2;
+      continue;
+    }
+    if (allowKeyword && keywords.has(words[index]?.value ?? "")) {
+      index += 1;
+      continue;
+    }
+    return index;
   }
 }
 

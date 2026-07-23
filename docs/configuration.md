@@ -30,7 +30,6 @@ node dist/cli.js admin --no-open
 node dist/cli.js doctor
 node dist/cli.js config get
 node dist/cli.js config set publicBaseUrl https://devspace.example.com
-node dist/cli.js config set toolMode codex
 ```
 
 ## Local Admin Panel
@@ -43,8 +42,8 @@ The control panel provides:
 
 - a refreshable overview of the local MCP service and public `/readyz` route
 - allowed workspace roots
+- an optional explicit user-level instruction file
 - project-instruction fallback filenames
-- tool mode (`codex`, `full`, or `minimal`)
 - widget mode (`full`, `changes`, or `off`)
 - MCP, process, persisted-output, command-runtime, resident-workspace, and worktree limits
 - per-OAuth-client MCP, process, and active-workspace quotas
@@ -86,6 +85,7 @@ does not start, stop, or adopt `cloudflared` processes.
 | `DEVSPACE_OAUTH_OWNER_TOKEN` | Owner password for OAuth approval. Must be at least 16 characters. |
 | `DEVSPACE_WORKTREE_ROOT` | Directory for managed Git worktrees. Defaults to `~/.devspace/worktrees`. |
 | `DEVSPACE_STATE_DIR` | Directory for SQLite state. Defaults to `~/.local/share/devspace`. |
+| `DEVSPACE_USER_INSTRUCTIONS_PATH` | Optional user-level instruction file loaded before project instructions. Supports `~` or an absolute path; unset by default. |
 | `DEVSPACE_LAUNCHD_SERVICE_LABEL` | Explicitly enrolled user launchd service that the local panel may restart; unset/empty disables control. |
 
 ## OAuth
@@ -119,11 +119,11 @@ reset is required.
 
 | Variable | Default | Purpose |
 | --- | ---: | --- |
-| `DEVSPACE_MCP_SESSION_IDLE_TIMEOUT_SECONDS` | `1800` | Close inactive MCP transports. Workspace state is unaffected. |
+| `DEVSPACE_MCP_SESSION_IDLE_TIMEOUT_SECONDS` | `1800` | Close inactive stateful MCP transports. ChatGPT OAuth clients use stateless POST requests; workspace state is unaffected. |
 | `DEVSPACE_MCP_SESSION_CLOSE_TIMEOUT_SECONDS` | `5` | Maximum wait for one transport to close. |
 | `DEVSPACE_RESOURCE_CLEANUP_INTERVAL_SECONDS` | `300` | Sweep interval for idle resources. |
-| `DEVSPACE_MAX_MCP_SESSIONS` | `64` | Maximum live MCP transports. |
-| `DEVSPACE_MAX_MCP_SESSIONS_PER_CLIENT` | `8` | Maximum MCP transports owned by one OAuth client. |
+| `DEVSPACE_MAX_MCP_SESSIONS` | `64` | Combined cap for live stateful transports and concurrent stateless ChatGPT requests. |
+| `DEVSPACE_MAX_MCP_SESSIONS_PER_CLIENT` | `8` | Per-client cap for that same combined MCP concurrency. |
 | `DEVSPACE_MAX_PROCESS_SESSIONS` | `32` | Maximum retained process sessions. |
 | `DEVSPACE_MAX_PROCESS_SESSIONS_PER_CLIENT` | `16` | Maximum retained process sessions owned by one OAuth client. |
 | `DEVSPACE_MAX_PROCESS_SESSIONS_PER_WORKSPACE` | `8` | Per-workspace process limit. |
@@ -146,13 +146,25 @@ stays open so its changes remain manageable.
 
 ## Project Instructions
 
+An optional user-level file can be configured as `userInstructionsPath` in
+`~/.devspace/config.json`, in the Admin panel, or through
+`DEVSPACE_USER_INSTRUCTIONS_PATH`. The path supports `~`, must resolve to a
+readable file, and is loaded before project instructions. It is disabled by
+default: DevSpace does not implicitly read `~/.codex/AGENTS.md`, and
+`DEVSPACE_AGENT_DIR` remains a Skill compatibility root only. A changed saved
+path takes effect after a backend restart.
+
 Within each project directory, DevSpace loads at most one instruction file in
 this order: `AGENTS.override.md`, `AGENTS.md`, `CLAUDE.md`, then configured
 fallback filenames. Uppercase `.MD` compatibility names are also recognized.
-Whitespace-only candidates are skipped. The effective global, root, and nested
+Whitespace-only candidates are skipped. The effective user, root, and nested
 instruction chain has a combined 32 KiB UTF-8 budget and is never silently
 truncated. Blank candidates are scanned with a 1 MiB hard limit so a huge file
 cannot consume unbounded memory while being classified as empty.
+
+`open_workspace` computes a stable `sha256-v1:` `instructionRevision` from the
+ordered initial instruction paths and contents. A client can use it to detect
+an unchanged initial chain and avoid retaining duplicate instruction bodies.
 
 Configure fallbacks in `~/.devspace/config.json`:
 
@@ -173,9 +185,10 @@ is removed, and dynamic or opaque cwd-changing syntax is rejected. Prefer the
 tool's `workingDirectory` field; split directory creation and execution across
 two calls when necessary.
 
-The `bash.timeout` parameter is a hard runtime limit. `exec_command` uses the
-global command runtime limit and `yieldTimeMs` only controls how long the tool
-waits before returning a process session.
+`exec_command` uses the global command runtime limit by default. Its optional
+`timeoutMs` can set a shorter per-command hard limit, but cannot exceed the
+global limit. `yieldTimeMs` only controls how long the tool waits before
+returning a process session.
 
 ## Legacy Instruction Scan Settings
 
@@ -187,47 +200,43 @@ waits before returning a process session.
 
 These variables remain accepted for configuration compatibility but are no
 longer used for a recursive workspace scan. `open_workspace` now returns
-`instructionScan.lazy=true`, loads only global/root instructions, and discovers
+`instructionScan.lazy=true`, loads only explicit user/root instructions, and discovers
 cached nested instructions when later tools enter their directory scope.
 
-## Tool Modes
+## Fixed Tool Surface
 
-`DEVSPACE_TOOL_MODE` controls the tool surface.
+DevSpace exposes one Codex-style surface: `open_workspace`, `close_workspace`,
+`read`, `batch_read`, `batch_inspect`, optional `load_skill`, `apply_patch`,
+`exec_command`, `write_stdin`, and `read_process_output`. The legacy
+`toolMode`, `DEVSPACE_TOOL_MODE`, and `DEVSPACE_MINIMAL_TOOLS` settings are
+ignored so an old configuration file can still start without changing the
+model-facing protocol.
 
-| Value | Behavior |
-| --- | --- |
-| `codex` | Default. Codex-style unified exec surface: `open_workspace`, `close_workspace`, `read`, `batch_read`, `batch_inspect`, `load_skill`, `apply_patch`, `exec_command`, `write_stdin`, and `read_process_output`. Best for browser MCP hosts (ChatGPT) that have no per-command approval surface. `exec_command` returns a `sessionId` for long-running processes; poll with `write_stdin`. |
-| `full` | Dedicated file tools: `open_workspace`, `close_workspace`, `read`, `batch_read`, `batch_inspect`, `load_skill`, `write`, `edit`, `grep`, `glob`, `ls`, `bash`, `write_stdin`, and `read_process_output`. |
-| `minimal` | `open_workspace`, `close_workspace`, `read`, `batch_read`, `batch_inspect`, `load_skill`, `write`, `edit`, `bash`, `write_stdin`, and `read_process_output`. Clients can use bounded batch inspection or `bash` with `rg`, `find`, and `ls`. |
-
-`DEVSPACE_MINIMAL_TOOLS` remains a backward-compatible alias when
-`DEVSPACE_TOOL_MODE` is unset: `1` selects `minimal` and `0` selects `full`.
-The `codex` mode must be selected through `DEVSPACE_TOOL_MODE` and always uses
-its fixed short tool names regardless of `DEVSPACE_TOOL_NAMING`.
-
-Codex-mode commands run without a PTY by default. Set `tty: true` on
+Commands run without a PTY by default. Set `tty: true` on
 `exec_command` for interactive terminal programs. PTY support uses the optional
 `node-pty` dependency; `write_stdin` can send input, poll output, and resize PTY
 sessions.
 
-`exec_command` and `bash` accept a bounded `stdin` string for multiline Python,
-SQL, SSH, and similar payloads. Supplying `stdin` closes the pipe by default so
+`exec_command` accepts a bounded `stdin` string for multiline Python, SQL, SSH,
+and similar payloads. Supplying `stdin` closes the pipe by default so
 programs waiting for EOF can finish; set `closeStdin: false` when additional
 `write_stdin` calls will follow. `write_stdin` can later set `closeStdin: true`.
 PTY input must remain open because DevSpace does not emulate EOF with Ctrl-D.
 
-### Command policy (codex and bash modes)
+### Command policy
 
 Shell commands are split at control operators (`&&`, `||`, `|`, `;`,
-subshells) and each segment is classified. `sudo`, forced or recursive `rm`,
-and piping content into a shell are blocked. Normal shell writes, redirection,
-and commands such as `mkdir`, `touch`, `cp`, and `mv` are allowed. Literal
-targets for common direct writes are canonicalized and rejected when they leave
-the workspace, including through a symlink.
+subshells) and inspected through bounded static nesting, including shell
+payloads, heredocs, substitutions, `find -exec`, and `xargs`. Executable
+`sudo`, forced or recursive `rm`, and piping content into an executing shell
+are blocked; parse-only shell checks such as `bash -n` remain available. Normal
+shell writes, redirection, and commands such as `mkdir`, `touch`, `cp`, and
+`mv` are allowed. Literal targets for common direct writes are canonicalized
+and rejected when they leave the workspace, including through a symlink.
 
 This is an accident-prevention guardrail, not an operating-system sandbox.
-Dynamic targets, command substitutions, and opaque scripts run with the
-DevSpace OS user's permissions and cannot be fully confined by shell parsing.
+Dynamic targets and opaque scripts run with the DevSpace OS user's permissions
+and cannot be fully confined by shell parsing.
 OAuth and the roots allowlist constrain MCP identity and dedicated file tools,
 but permitted shell commands run with the DevSpace OS user's permissions. If
 hard shell filesystem confinement is required, run DevSpace under a dedicated
@@ -254,7 +263,7 @@ model-visible result or any state required for a later tool call.
 | --- | --- |
 | `DEVSPACE_SKILLS` | Set to `0` to hide skills. Enabled by default. |
 | `DEVSPACE_SUBAGENTS` | Set to `1` to expose configured agent profiles as Subagents. Experimental and disabled by default. |
-| `DEVSPACE_AGENT_DIR` | Defaults to `~/.codex`; its `skills` child is loaded for compatibility. |
+| `DEVSPACE_AGENT_DIR` | Defaults to `~/.codex`; only its `skills` child is loaded for compatibility. It is not an instruction source. |
 | `DEVSPACE_SKILL_PATHS` | Optional comma-separated additional skill directories. |
 | `DEVSPACE_DISABLED_SKILL_PATHS` | Optional comma-separated Skill directories or `SKILL.md` paths to disable. Relative paths resolve from the opened workspace. |
 | `DEVSPACE_ADMIN_SKILLS_DIR` | Admin-managed Skill root. Defaults to `/etc/codex/skills`. |
@@ -339,7 +348,6 @@ DEVSPACE_OAUTH_OWNER_TOKEN="$(openssl rand -base64 32)" \
 DEVSPACE_ALLOWED_ROOTS="$HOME/personal,$HOME/work" \
 DEVSPACE_PUBLIC_BASE_URL="https://devspace.example.com" \
 DEVSPACE_WORKTREE_ROOT="$HOME/.devspace/worktrees" \
-DEVSPACE_TOOL_MODE="minimal" \
 DEVSPACE_WIDGETS="full" \
 node dist/cli.js serve
 ```

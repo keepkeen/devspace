@@ -52,13 +52,13 @@ const devspaceUserConfigSchema = z.object({
   stateDir: z.string().optional(),
   worktreeRoot: z.string().optional(),
   agentDir: z.string().optional(),
+  userInstructionsPath: z.string().trim().min(1).nullable().optional(),
   skillPaths: z.array(z.string().trim().min(1)).optional(),
   disabledSkillPaths: z.array(z.string().trim().min(1)).optional(),
   adminSkillsDir: z.string().trim().min(1).optional(),
   projectDocFallbackFilenames: projectDocFallbackFilenamesSchema.optional(),
   project_doc_fallback_filenames: projectDocFallbackFilenamesSchema.optional(),
   subagents: z.boolean().optional(),
-  toolMode: z.enum(["minimal", "full", "codex"]).optional(),
   widgets: z.enum(["off", "changes", "full"]).optional(),
   resources: z.object({
     maxMcpSessions: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxMcpSessions).optional(),
@@ -90,13 +90,13 @@ export interface DevspaceUserConfig {
   stateDir?: string;
   worktreeRoot?: string;
   agentDir?: string;
+  userInstructionsPath?: string | null;
   skillPaths?: string[];
   disabledSkillPaths?: string[];
   adminSkillsDir?: string;
   projectDocFallbackFilenames?: string[];
   project_doc_fallback_filenames?: string[];
   subagents?: boolean;
-  toolMode?: "minimal" | "full" | "codex";
   widgets?: "off" | "changes" | "full";
   resources?: {
     maxMcpSessions?: number;

@@ -266,8 +266,9 @@ OpenAI 目前把自定义 MCP 集成称为 **developer-mode app（开发者模�
 1. ChatGPT 用本地项目路径调用 `open_workspace`。
 2. DevSpace 返回 `workspaceId` 和当前目录适用的项目指令。
 3. 后续读取、搜索、编辑和命令调用都复用这个 `workspaceId`。
-4. ChatGPT 的 MCP 连接重新建立后，workspace 仍然存在；同一个已授权客户端也
-   可以在之后的对话中重新使用它。
+4. ChatGPT 的每次工具调用都可以使用新的无状态 HTTP 传输；真正需要复用的是
+   `workspaceId`，因此传输重连或旧 MCP session header 不会中断 workspace。
+   同一个已授权客户端也可以在之后的对话中重新打开并复用同一路径。
    如果你删除、刷新或重新授权了 ChatGPT 应用，新的 OAuth 客户端不能复用旧
    `workspaceId`；模型应丢弃被拒绝的 ID，并立即再次调用 `open_workspace`。
 5. 只有你明确要求释放 workspace 时，模型才应调用 `close_workspace`。长时间
@@ -286,10 +287,14 @@ worktree，否则不建议两个账号同时写入同一个项目。
 ### `AGENTS.md` 和 Skill
 
 打开 workspace 时，DevSpace 会返回根目录适用的 `AGENTS.md`、`CLAUDE.md`
-等指令。嵌套目录中的指令只在 ChatGPT 第一次进入该目录时加载，避免首次打开
-大型仓库就递归扫描所有文件夹。纯空白指令文件会跳过，全局、根目录和嵌套
+等指令。需要用户级指令时，可在管理面板或
+`DEVSPACE_USER_INSTRUCTIONS_PATH` 中显式指定一个文件；默认不会读取
+`~/.codex/AGENTS.md`，`DEVSPACE_AGENT_DIR` 只用于兼容 Skill。嵌套目录中的指令
+只在 ChatGPT 第一次进入该目录时加载，避免首次打开大型仓库就递归扫描所有文件夹。
+纯空白指令文件会跳过，用户、根目录和嵌套
 指令链合计最多 32 KiB；后台进程后续通过 `write_stdin` 进入新目录时也会先经过
-同一套指令确认。
+同一套指令确认。`open_workspace` 返回基于初始指令路径和内容生成的
+`sha256-v1:` `instructionRevision`，便于客户端识别未变化的指令链，避免重复污染上下文。
 
 DevSpace 也会告诉 ChatGPT 当前可用的本地 Skill。ChatGPT 网页端没有 Codex 的
 `$skill`/`/skills` 界面，因此模型通过 `load_skill` 完整加载对应 `SKILL.md`；
@@ -297,15 +302,14 @@ DevSpace 也会告诉 ChatGPT 当前可用的本地 Skill。ChatGPT 网页端没
 `skillId`、路径和作用域区分。详细规则见
 [ChatGPT 编码工作流](./docs/chatgpt-coding-workflow.md)。
 
-### 工具模式
+### 固定工具协议
 
-| 模式 | ChatGPT 可以使用的工具 | 建议用途 |
-| --- | --- | --- |
-| `codex` | `read`、`apply_patch`、`exec_command`、批量工具和进程轮询 | ChatGPT 和编码模型的推荐默认模式。 |
-| `full` | 独立的读取、写入、编辑、搜索、目录和 Bash 工具 | 适合偏好细粒度工具的 MCP 客户端。 |
-| `minimal` | 精简后的必要文件与命令工具 | 需要最小工具表面时使用。 |
+DevSpace 只提供一套稳定的 Codex 风格工具：`read`、`batch_read`、
+`batch_inspect`、`apply_patch`、`exec_command`、`write_stdin` 和
+`read_process_output`，再加 workspace 与可选 Skill 工具。不再按模式切换
+`bash`、`exec_command` 或文件工具名称，避免 ChatGPT 对旧工具表产生缓存混淆。
 
-需要发送多行 Python、SQL 或 SSH 脚本时，模型可使用 `exec_command`/`bash`
+需要发送多行 Python、SQL 或 SSH 脚本时，模型可使用 `exec_command`
 的结构化 `stdin` 字段，避免多层引号在远端解析失败。提供 `stdin` 后默认自动
 关闭输入流；需要继续交互时可设 `closeStdin: false`，之后通过 `write_stdin`
 追加内容或关闭输入流。PTY 不模拟 Ctrl-D 作为 EOF。
@@ -366,7 +370,7 @@ node dist/cli.js admin
 DevSpace 会打开一个仅限 localhost、带一次性令牌的管理地址。面板可以：
 
 - 添加和删除允许访问的目录；保存后热更新，无需重启；
-- 选择工具模式和组件模式；
+- 选择结果卡片模式和用户级说明文件；
 - 设置 MCP、进程、workspace、命令和 worktree 配额；
 - 查看后端、Tunnel、配额和最近失败状态；
 - 下载经过脱敏的诊断报告；
@@ -400,7 +404,7 @@ DEVSPACE_LAUNCHD_SERVICE_LABEL=com.waishnav.devspace node dist/cli.js admin
 | 完整生命周期 | workspace 操作租约、独占关闭、请求排空、进程终止和统一清理，避免资源仍在使用时被提前关闭。 |
 | 真正的资源限制 | 全局和单客户端配额覆盖 MCP 会话、workspace、进程、worktree、输出和命令时间。超时命令先接收 `SIGTERM`，宽限期后仍未退出则使用 `SIGKILL`。 |
 | 客户端身份隔离 | MCP 会话、workspace、进程和持久化状态都校验 OAuth 所有权，一个客户端不能复用另一个客户端的 ID。 |
-| 项目指令 | 根目录指令立即加载；空文件跳过；全链限制为 32 KiB；嵌套 `AGENTS.md`/`CLAUDE.md` 按路径懒加载，写入、命令及交互式 `write_stdin` 跨目录前都要确认新指令。 |
+| 项目指令 | 用户级说明显式启用且带修订号；根目录指令立即加载；空文件跳过；全链限制为 32 KiB；嵌套 `AGENTS.md`/`CLAUDE.md` 按路径懒加载，写入、命令及交互式 `write_stdin` 跨目录前都要确认新指令。 |
 | 本地 Skill | 在已批准根目录内从项目祖先发现 Skill，并支持用户、Admin 和 DevSpace bundled 来源；保留同名项并显示来源；8,000 字符目录预算避免挤占上下文；`load_skill` 为 ChatGPT 网页端提供可审计的显式加载。 |
 | 更安全的命令流程 | 阻止高风险命令模式，限制内联输出大小，并支持轮询或中断后台/PTY 进程；完整输出以受限 `outputId` 持久化，可用 `read_process_output` 分页恢复。 |
 | 管理面板 | localhost React 面板可管理目录和配额，通过 revision/ETag 防止覆盖并发配置，验证重启结果并提供脱敏诊断。 |
@@ -424,7 +428,7 @@ DevSpace 会强制执行：
 - 明确的写操作标注和 ChatGPT 确认流程。
 
 > [!WARNING]
-> `exec_command` 和 `bash` 使用运行 DevSpace 的系统用户权限。文件工具的目录
+> `exec_command` 使用运行 DevSpace 的系统用户权限。文件工具的目录
 > 允许列表并不是任意 shell 命令的操作系统级沙箱。如果需要强隔离，请使用
 > 专用系统账号，或者把 DevSpace 放进只挂载授权目录的容器/虚拟机中运行。
 
@@ -448,7 +452,6 @@ node dist/cli.js init
 node dist/cli.js doctor
 node dist/cli.js config get
 node dist/cli.js config set publicBaseUrl https://devspace.example.com
-node dist/cli.js config set toolMode codex
 node dist/cli.js admin
 ```
 
@@ -460,7 +463,6 @@ node dist/cli.js admin
 | `PORT` | `7676` | 本地 MCP 服务端口。 |
 | `DEVSPACE_ALLOWED_ROOTS` | — | 逗号分隔的授权目录。 |
 | `DEVSPACE_PUBLIC_BASE_URL` | — | 不带 `/mcp` 的公网 HTTPS 地址。 |
-| `DEVSPACE_TOOL_MODE` | `codex` | `codex`、`full` 或 `minimal`。 |
 | `DEVSPACE_WIDGETS` | `full` | `full`、`changes` 或 `off`。 |
 | `DEVSPACE_MAX_MCP_SESSIONS` | `64` | MCP 会话全局上限。 |
 | `DEVSPACE_MAX_PROCESS_SESSIONS` | `32` | 保留进程会话的全局上限。 |

@@ -1,21 +1,29 @@
 import { lstatSync, readlinkSync, realpathSync } from "node:fs";
-import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import {
-  extractShellCommandSubstitutions,
-  splitCommandSegments,
-  tokenizeSegment,
-} from "./command-policy.js";
-import { stripHeredocBodies } from "./shell-command-scopes.js";
+  delegatedCommandPayloads,
+  extractHereStringPayloads,
+  extractNestedShellSyntax,
+  heredocMarkers,
+  isShellProgram,
+  isShellAnalysisLimitError,
+  MAX_SHELL_ANALYSIS_DEPTH,
+  preprocessHeredocs,
+  programBasename as sharedProgramBasename,
+  shellIsParseOnly,
+  splitShellSegments,
+  tokenizeShellSegment,
+  unwrapShellWrappers,
+  withoutHeredocMarkers,
+} from "./shell-command-analysis.js";
 
 export interface ShellWriteTargetViolation {
   target: string;
   reason: string;
 }
 
-const WRAPPERS = new Set(["env", "trap", "nohup", "exec", "command"]);
-const SHELLS = new Set(["bash", "sh", "zsh", "dash"]);
 const ALL_OPERAND_TARGETS = new Set([
-  "mkdir", "touch", "truncate", "rm", "rmdir", "tee",
+  "mkdir", "truncate", "rm", "rmdir", "tee",
 ]);
 const FINAL_OPERAND_TARGET = new Set([
   "cp", "mv", "ln", "install", "rsync",
@@ -35,7 +43,12 @@ export function validateShellWriteTargets(
   workspaceRoot: string,
 ): ShellWriteTargetViolation | undefined {
   const canonicalRoot = realpathSync(workspaceRoot);
-  return validateCommand(stripHeredocBodies(command), cwd, canonicalRoot, 0);
+  try {
+    return validateCommand(command, cwd, canonicalRoot, 0);
+  } catch (error) {
+    if (isShellAnalysisLimitError(error)) return analysisLimitViolation();
+    throw error;
+  }
 }
 
 function validateCommand(
@@ -44,37 +57,63 @@ function validateCommand(
   canonicalRoot: string,
   depth: number,
 ): ShellWriteTargetViolation | undefined {
-  if (depth < 4) {
-    for (const payload of extractShellCommandSubstitutions(command)) {
-      const nested = validateCommand(payload, cwd, canonicalRoot, depth + 1);
-      if (nested) return nested;
-    }
+  const preprocessed = preprocessHeredocs(command);
+  if (preprocessed.exceededLimit || depth > MAX_SHELL_ANALYSIS_DEPTH) {
+    return analysisLimitViolation();
+  }
+  for (const payload of extractNestedShellSyntax(preprocessed.command)) {
+    const nested = validateNested(payload, cwd, canonicalRoot, depth);
+    if (nested) return nested;
   }
   let currentCwd = cwd;
-  for (const segment of splitCommandSegments(command)) {
-    const tokens = tokenizeSegment(segment);
+  for (const segment of splitShellSegments(preprocessed.command)) {
+    for (const payload of extractNestedShellSyntax(segment)) {
+      const nested = validateNested(payload, currentCwd, canonicalRoot, depth);
+      if (nested) return nested;
+    }
+    const rawTokens = tokenizeShellSegment(segment);
+    const markers = heredocMarkers(rawTokens, preprocessed.documents);
+    const tokens = withoutHeredocMarkers(rawTokens, preprocessed.documents);
     const redirection = redirectionTargets(segment).find((target) =>
-      isCheckableTarget(target) && !targetInsideWorkspace(target, currentCwd, canonicalRoot)
+      isCheckableTarget(target) && !isAllowedDeviceTarget(target) &&
+      !targetInsideWorkspace(target, currentCwd, canonicalRoot)
     );
     if (redirection) return outsideViolation(redirection);
 
     const effective = unwrap(withoutRedirections(tokens));
     const program = programBasename(effective[0]);
+
+    for (const payload of delegatedCommandPayloads(tokens)) {
+      const nested = validateNested(payload, currentCwd, canonicalRoot, depth);
+      if (nested) return nested;
+    }
     if (!program) continue;
-    if (depth < 4 && SHELLS.has(program)) {
-      const optionIndex = effective.findIndex((token, index) =>
-        index > 0 && /^-[^-]*c/u.test(token)
-      );
-      const payload = optionIndex >= 0 ? effective[optionIndex + 1] : undefined;
-      if (payload) {
-        const nested = validateCommand(payload, currentCwd, canonicalRoot, depth + 1);
+
+    const heredocShell = isShellProgram(effective[0]) && !shellIsParseOnly(tokens);
+    if (heredocShell) {
+      for (const payload of extractHereStringPayloads(segment)) {
+        const nested = validateNested(payload, currentCwd, canonicalRoot, depth);
         if (nested) return nested;
+      }
+    }
+    for (const marker of markers) {
+      const document = preprocessed.documents.get(marker);
+      if (!document) continue;
+      if (heredocShell) {
+        const nested = validateNested(document.body, currentCwd, canonicalRoot, depth);
+        if (nested) return nested;
+      } else if (document.expandable) {
+        for (const payload of extractNestedShellSyntax(document.body)) {
+          const nested = validateNested(payload, currentCwd, canonicalRoot, depth);
+          if (nested) return nested;
+        }
       }
     }
 
     const explicitTargets = directMutationTargets(program, effective.slice(1));
     const outside = explicitTargets.find((target) =>
-      isCheckableTarget(target) && !targetInsideWorkspace(target, currentCwd, canonicalRoot)
+      isCheckableTarget(target) && !isAllowedDeviceTarget(target) &&
+      !targetInsideWorkspace(target, currentCwd, canonicalRoot)
     );
     if (outside) return outsideViolation(outside);
 
@@ -103,13 +142,18 @@ function validateCommand(
         currentCwd = resolve(currentCwd, directory);
       }
     }
-    if (depth < 4 && program === "eval" && effective.length > 1) {
-      const payload = effective.slice(effective[1] === "--" ? 2 : 1).join(" ");
-      const nested = validateCommand(payload, currentCwd, canonicalRoot, depth + 1);
-      if (nested) return nested;
-    }
   }
   return undefined;
+}
+
+function validateNested(
+  payload: string,
+  cwd: string,
+  canonicalRoot: string,
+  depth: number,
+): ShellWriteTargetViolation | undefined {
+  if (depth >= MAX_SHELL_ANALYSIS_DEPTH) return analysisLimitViolation();
+  return validateCommand(payload, cwd, canonicalRoot, depth + 1);
 }
 
 function redirectionTargets(segment: string): string[] {
@@ -136,7 +180,7 @@ function redirectionTargets(segment: string): string[] {
     while (/\s/u.test(segment[cursor] ?? "")) cursor += 1;
     if (segment[cursor] === "&" && /\d/u.test(segment[cursor + 1] ?? "")) continue;
     if (segment[cursor] === "&") cursor += 1;
-    const target = tokenizeSegment(segment.slice(cursor))[0] ?? "";
+    const target = tokenizeShellSegment(segment.slice(cursor))[0] ?? "";
     if (!target || target === "/dev/null") continue;
     targets.push(target);
   }
@@ -160,13 +204,22 @@ function withoutRedirections(tokens: string[]): string[] {
 function directMutationTargets(program: string, args: string[]): string[] {
   const operands = nonOptionOperands(args);
   if (ALL_OPERAND_TARGETS.has(program)) return operands;
+  if (program === "touch") {
+    return operandsWithoutReferenceSource(args, new Set(["-r", "--reference"]));
+  }
+  if (program === "mv") {
+    const targetDirectory = optionValue(args, "-t", "--target-directory");
+    return [...operands, ...(targetDirectory ? [targetDirectory] : [])];
+  }
   if (FINAL_OPERAND_TARGET.has(program)) {
     const targetDirectory = optionValue(args, "-t", "--target-directory");
     return targetDirectory ? [targetDirectory] : operands.slice(-1);
   }
   if (MODE_THEN_TARGETS.has(program)) {
     const usesReference = args.some((arg) => arg === "--reference" || arg.startsWith("--reference="));
-    return usesReference ? operands : operands.slice(1);
+    return usesReference
+      ? operandsWithoutReferenceSource(args, new Set(["--reference"]))
+      : operands.slice(1);
   }
   if (program === "sed" && args.some((arg) => /^-[^-]*i/u.test(arg) || arg.startsWith("--in-place"))) {
     return operands.slice(1);
@@ -179,6 +232,27 @@ function directMutationTargets(program: string, args: string[]): string[] {
     return output ? [output.slice(3)] : [];
   }
   return [];
+}
+
+function operandsWithoutReferenceSource(args: string[], referenceOptions: Set<string>): string[] {
+  const result: string[] = [];
+  let optionsEnded = false;
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index]!;
+    if (!optionsEnded && argument === "--") {
+      optionsEnded = true;
+      continue;
+    }
+    if (!optionsEnded && referenceOptions.has(argument)) {
+      index += 1;
+      continue;
+    }
+    if (!optionsEnded && [...referenceOptions].some((option) => argument.startsWith(`${option}=`))) continue;
+    if (!optionsEnded && argument.startsWith("-") && argument !== "-") continue;
+    if (/^(?:\d+|\{[A-Za-z_][A-Za-z0-9_]*\})?(?:>>?|>\||<>)/u.test(argument)) continue;
+    result.push(argument);
+  }
+  return result;
 }
 
 function nonOptionOperands(args: string[]): string[] {
@@ -214,37 +288,20 @@ function optionValue(args: string[], short: string, long: string): string | unde
 }
 
 function unwrap(tokens: string[]): string[] {
-  let index = 0;
-  while (index < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/u.test(tokens[index]!)) index += 1;
-  while (index < tokens.length && WRAPPERS.has(programBasename(tokens[index]))) {
-    const wrapper = programBasename(tokens[index++]);
-    while (index < tokens.length) {
-      const token = tokens[index]!;
-      if (token === "--") {
-        index += 1;
-        break;
-      }
-      if (wrapper === "env" && (token === "-u" || token === "--unset" || token === "-C" || token === "--chdir")) {
-        index += 2;
-        continue;
-      }
-      if (token.startsWith("-") || (wrapper === "env" && /^[A-Za-z_][A-Za-z0-9_]*=/u.test(token))) {
-        index += 1;
-        continue;
-      }
-      break;
-    }
-  }
-  return tokens.slice(index);
+  return unwrapShellWrappers(tokens);
 }
 
 function programBasename(program: string | undefined): string {
-  if (!program) return "";
-  return (program.split(/[\\/]/u).at(-1) ?? basename(program)).replace(/\.exe$/iu, "").toLowerCase();
+  return sharedProgramBasename(program);
 }
 
 function isCheckableTarget(target: string): boolean {
   return Boolean(target) && !/[\$`*?\[\]{}]/u.test(target) && !target.startsWith("~");
+}
+
+function isAllowedDeviceTarget(target: string): boolean {
+  return target === "/dev/null" || target === "/dev/stdout" || target === "/dev/stderr" ||
+    /^\/dev\/fd\/\d+$/u.test(target);
 }
 
 function targetInsideWorkspace(target: string, cwd: string, canonicalRoot: string): boolean {
@@ -288,5 +345,12 @@ function outsideViolation(target: string): ShellWriteTargetViolation {
   return {
     target,
     reason: `Shell write target is outside the workspace: ${target}`,
+  };
+}
+
+function analysisLimitViolation(): ShellWriteTargetViolation {
+  return {
+    target: "<analysis-limit>",
+    reason: "Shell write target analysis exceeded its bounded nesting or size limit.",
   };
 }

@@ -272,8 +272,10 @@ The expected workflow is:
 1. ChatGPT calls `open_workspace` with the local project path.
 2. DevSpace returns a `workspaceId` and the applicable project instructions.
 3. ChatGPT reuses that `workspaceId` for reads, searches, edits, and commands.
-4. The workspace survives normal ChatGPT transport reconnects and can be reused
-   in later conversations by the same authorized client.
+4. Each ChatGPT tool call may use a fresh stateless HTTP transport. Continuity
+   comes from `workspaceId`, so reconnects and stale MCP session headers do not
+   interrupt the workspace. The same authorized client can reopen and reuse the
+   same path in later conversations.
    If the ChatGPT app is deleted, refreshed, or re-authorized as a new OAuth
    client, discard any rejected old `workspaceId` and call `open_workspace`
    again immediately.
@@ -295,11 +297,16 @@ use separate Git worktrees.
 ### `AGENTS.md` and Skills
 
 When a workspace opens, DevSpace returns root-level instructions such as
-`AGENTS.md` or `CLAUDE.md`. Nested instructions are loaded only when ChatGPT
+`AGENTS.md` or `CLAUDE.md`. One user-level file may be explicitly selected in
+the Admin panel or with `DEVSPACE_USER_INSTRUCTIONS_PATH`. DevSpace does not
+implicitly read `~/.codex/AGENTS.md`; `DEVSPACE_AGENT_DIR` is only a Skill
+compatibility root. Nested instructions are loaded only when ChatGPT
 enters that directory, which avoids scanning an entire large repository up
-front. Whitespace-only files are skipped, the combined global/root/nested
+front. Whitespace-only files are skipped, the combined user/root/nested
 instruction chain is limited to 32 KiB, and interactive `write_stdin` input is
-gated when a running process may enter a newly instructed directory.
+gated when a running process may enter a newly instructed directory. Each
+`open_workspace` result includes a `sha256-v1:` `instructionRevision` over the
+ordered initial path/content pairs so clients can recognize an unchanged chain.
 
 DevSpace also advertises matching local Skills. ChatGPT web has no Codex
 `$skill` or `/skills` picker, so the model calls `load_skill` to load one
@@ -308,16 +315,16 @@ Duplicate names are preserved and distinguished by `skillId`, path, and scope.
 See the detailed
 [ChatGPT coding workflow](./docs/chatgpt-coding-workflow.md).
 
-### Tool modes
+### Fixed tool contract
 
-| Mode | What ChatGPT receives | Recommended use |
-| --- | --- | --- |
-| `codex` | `read`, `apply_patch`, `exec_command`, batch tools, and process polling | Best default for ChatGPT and other coding agents. |
-| `full` | Separate read, write, edit, search, list, and Bash tools | Useful for MCP clients that prefer explicit tools. |
-| `minimal` | A smaller set of essential file and command tools | Use when you want the smallest tool surface. |
+DevSpace exposes one stable Codex-style surface: `read`, `batch_read`,
+`batch_inspect`, `apply_patch`, `exec_command`, `write_stdin`, and
+`read_process_output`, plus workspace and optional Skill tools. It no longer
+switches between `bash`, `exec_command`, or dedicated file-tool names, avoiding
+stale ChatGPT tool-schema confusion.
 
 For multiline Python, SQL, or SSH scripts, the model can use the structured
-`stdin` field on `exec_command`/`bash` instead of fragile nested quoting. Stdin
+`stdin` field on `exec_command` instead of fragile nested quoting. Stdin
 closes by default after an initial payload; set `closeStdin: false` to continue
 through `write_stdin`, which can append data or close the stream. PTY sessions
 do not emulate EOF with Ctrl-D.
@@ -382,7 +389,7 @@ node dist/cli.js admin
 DevSpace opens a one-time URL on localhost. The panel can:
 
 - add and remove allowed folders, applied live without a restart;
-- choose tool and widget modes;
+- choose the widget mode and user-level instruction file;
 - set MCP, process, workspace, command, and worktree limits;
 - show backend, tunnel, quota, and recent failure status;
 - download a redacted diagnostic report;
@@ -420,7 +427,7 @@ The comparison is against upstream commit
 | Safer lifecycle | Workspace operation leases, exclusive close, request draining, process termination, and cleanup rules prevent resources from being closed while still in use. |
 | Real resource limits | Global and per-client limits cover MCP sessions, workspaces, processes, worktrees, output, and command runtime. Hung commands receive `SIGTERM` and then `SIGKILL` after a grace period. |
 | Client isolation | OAuth ownership is enforced for MCP sessions, workspaces, processes, and stored state. One client cannot reuse another client's IDs. |
-| Project instructions | Root instructions load immediately, empty files are skipped, the chain is capped at 32 KiB, and nested instructions gate mutations, commands, and interactive process input. |
+| Project instructions | User instructions are explicit and revisioned, root instructions load immediately, empty files are skipped, the chain is capped at 32 KiB, and nested instructions gate mutations, commands, and interactive process input. |
 | Local Skills | Skills come from repository ancestors within an approved root plus user, Admin, and DevSpace bundled scopes; duplicate names remain visible, the catalog is capped at 8,000 characters, and ChatGPT web loads a selected Skill through `load_skill`. |
 | Safer shell workflow | High-risk command patterns are blocked and inline output stays bounded; background/PTY sessions can be polled or interrupted, while durable output is replayable by opaque `outputId` through `read_process_output`. |
 | Admin panel | A localhost-only React panel manages roots and limits, detects concurrent config edits with revision/ETag checks, verifies restarts, and exposes sanitized diagnostics. |
@@ -445,7 +452,7 @@ DevSpace enforces:
 - explicit write annotations and ChatGPT confirmations.
 
 > [!WARNING]
-> `exec_command` and `bash` run with the permissions of the DevSpace OS user.
+> `exec_command` runs with the permissions of the DevSpace OS user.
 > The file-tool allowlist is not an operating-system sandbox for arbitrary shell
 > commands. For hard isolation, run DevSpace under a dedicated OS account or in
 > a container/VM with only approved folders mounted.
@@ -470,7 +477,6 @@ node dist/cli.js init
 node dist/cli.js doctor
 node dist/cli.js config get
 node dist/cli.js config set publicBaseUrl https://devspace.example.com
-node dist/cli.js config set toolMode codex
 node dist/cli.js admin
 ```
 
@@ -482,7 +488,6 @@ Common environment variables:
 | `PORT` | `7676` | Local MCP server port. |
 | `DEVSPACE_ALLOWED_ROOTS` | — | Comma-separated approved folders. |
 | `DEVSPACE_PUBLIC_BASE_URL` | — | Public HTTPS origin without `/mcp`. |
-| `DEVSPACE_TOOL_MODE` | `codex` | `codex`, `full`, or `minimal`. |
 | `DEVSPACE_WIDGETS` | `full` | `full`, `changes`, or `off`. |
 | `DEVSPACE_MAX_MCP_SESSIONS` | `64` | Global live MCP session limit. |
 | `DEVSPACE_MAX_PROCESS_SESSIONS` | `32` | Global retained process limit. |

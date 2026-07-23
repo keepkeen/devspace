@@ -85,6 +85,7 @@ export interface InstructionScanResult {
 export interface WorkspaceContext {
   workspace: Workspace;
   agentsFiles: LoadedAgentsFile[];
+  instructionRevision: string;
   availableAgentsFiles: AvailableAgentsFile[];
   instructionScan: InstructionScanResult;
   reused: boolean;
@@ -134,9 +135,13 @@ export class UnknownWorkspaceError extends Error {
 
   constructor(readonly workspaceId: string) {
     super(
-      `Unknown workspaceId: ${workspaceId}. It may no longer be authorized for this app connection. ` +
-      "Discard it, call open_workspace with the original exact project path, replace the old ID, " +
-      "reload any matching skill, and retry the failed tool call once.",
+      `Unknown workspaceId: ${workspaceId}. It may have expired or no longer belong to this app connection. ` +
+      "Discard it and call open_workspace with the original exact project path. If this conversation still " +
+      "has that revision's complete agentsFiles, pass its instructionRevision as knownInstructionRevision; " +
+      "otherwise omit knownInstructionRevision so the instructions are returned again; replace the old ID and " +
+      "retry the failed tool call once. If a skill applies, call load_skill with " +
+      "{workspaceId: newWorkspaceId, skillId: currentSkillId} " +
+      "using the reopened skills catalog before reading support files.",
     );
     this.name = "UnknownWorkspaceError";
   }
@@ -908,7 +913,14 @@ export class WorkspaceRegistry {
     this.ensureLifecycleState(workspace);
     this.evictResidentWorkspaces();
 
-    return { workspace, agentsFiles, availableAgentsFiles, instructionScan, reused };
+    return {
+      workspace,
+      agentsFiles,
+      instructionRevision: computeInstructionRevision(agentsFiles),
+      availableAgentsFiles,
+      instructionScan,
+      reused,
+    };
   }
 
   private loadSkillsForWorkspace(root: string): Pick<Workspace, "skills" | "skillDiagnostics"> {
@@ -960,36 +972,25 @@ export class WorkspaceRegistry {
     return this.loadInstructionChain(root, root);
   }
 
-  private async loadGlobalAgentsFile(): Promise<ApplicableAgentsFile | undefined> {
-    const agentDir = resolve(this.config.agentDir);
-    const resolvedAgentDir = (await tryRealpath(agentDir)) ?? agentDir;
-
-    for (const name of projectInstructionFilenames([])) {
-      const candidate = join(agentDir, name);
-      try {
-        const candidateStats = await lstat(candidate);
-        if (!candidateStats.isFile() && !candidateStats.isSymbolicLink()) continue;
-        const path = await realpath(candidate);
-        if (!isPathInsideRoot(path, resolvedAgentDir)) continue;
-        if (!(await stat(path)).isFile()) continue;
-        const file = await this.readCachedInstruction(path);
-        if (!hasProjectInstructionContent(file.content)) continue;
-        return { path, content: file.content, fingerprint: file.fingerprint };
-      } catch (error) {
-        if (!isMissingPathError(error)) throw error;
-      }
+  private async loadUserInstructionsFile(): Promise<ApplicableAgentsFile | undefined> {
+    if (!this.config.userInstructionsPath) return undefined;
+    const path = await realpath(this.config.userInstructionsPath);
+    if (!(await stat(path)).isFile()) {
+      throw new Error(`User instructions path must be a file: ${this.config.userInstructionsPath}`);
     }
-    return undefined;
+    const file = await this.readCachedInstruction(path);
+    if (!hasProjectInstructionContent(file.content)) return undefined;
+    return { path, content: file.content, fingerprint: file.fingerprint };
   }
 
   private async loadInstructionChain(root: string, targetDirectory: string): Promise<ApplicableAgentsFile[]> {
     const loadedFiles: ApplicableAgentsFile[] = [];
     let loadedBytes = 0;
-    const globalFile = await this.loadGlobalAgentsFile();
-    if (globalFile) {
-      const fileBytes = Buffer.byteLength(globalFile.content, "utf8");
-      assertInstructionFitsBudget(globalFile.path, loadedBytes, fileBytes, "instruction chain");
-      loadedFiles.push(globalFile);
+    const userFile = await this.loadUserInstructionsFile();
+    if (userFile) {
+      const fileBytes = Buffer.byteLength(userFile.content, "utf8");
+      assertInstructionFitsBudget(userFile.path, loadedBytes, fileBytes, "instruction chain");
+      loadedFiles.push(userFile);
       loadedBytes += fileBytes;
     }
 
@@ -1286,6 +1287,20 @@ function ancestorDirectories(root: string, target: string): string[] {
 
 function statsFingerprint(metadata: Stats): string {
   return `${metadata.dev}:${metadata.ino}:${metadata.size}:${metadata.mtimeMs}:${metadata.ctimeMs}`;
+}
+
+function computeInstructionRevision(files: LoadedAgentsFile[]): string {
+  const hash = createHash("sha256");
+  hash.update("devspace-instructions-v1\0", "utf8");
+  for (const file of files) {
+    const path = Buffer.from(file.path, "utf8");
+    const content = Buffer.from(file.content, "utf8");
+    hash.update(`${path.byteLength}:`, "utf8");
+    hash.update(path);
+    hash.update(`${content.byteLength}:`, "utf8");
+    hash.update(content);
+  }
+  return `sha256-v1:${hash.digest("base64url")}`;
 }
 
 function assertInstructionFitsBudget(

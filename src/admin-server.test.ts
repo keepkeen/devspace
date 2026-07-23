@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer, request as httpRequest, type IncomingHttpHeaders } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -35,10 +35,12 @@ const configDir = join(testDir, "config");
 const staticDir = join(testDir, "static");
 const allowedRoot = join(testDir, "project");
 const hotAllowedRoot = join(testDir, "hot-project");
+const userInstructionsPath = join(testDir, "USER_INSTRUCTIONS.md");
 mkdirSync(configDir);
 mkdirSync(staticDir);
 mkdirSync(allowedRoot);
 mkdirSync(hotAllowedRoot);
+writeFileSync(userInstructionsPath, "Use the local project instructions.\n");
 writeFileSync(join(staticDir, "admin.html"), "<!doctype html><title>Admin</title>");
 writeFileSync(join(testDir, "outside.txt"), "must not be served");
 symlinkSync(join(testDir, "outside.txt"), join(staticDir, "outside.txt"));
@@ -187,6 +189,8 @@ try {
   const configEnvelope = JSON.parse(configResponse.body);
   const config = configEnvelope.config;
   assert.deepEqual(config.allowedRoots, [allowedRoot]);
+  assert.equal(config.userInstructionsPath, null);
+  assert.equal("toolMode" in config, false);
   assert.equal(config.widgets, "off");
   assert.deepEqual(configEnvelope.overrides, ["widgets"]);
   assert.equal(typeof configEnvelope.revision, "string");
@@ -234,6 +238,7 @@ try {
   assert.equal(rootsReloadCount, 1);
 
   config.resources.maxMcpSessions = 10;
+  config.userInstructionsPath = userInstructionsPath;
   const update = await request(url, {
     method: "PUT",
     path: "/api/config",
@@ -251,6 +256,7 @@ try {
   assert.equal(updateBody.restartRequired, true);
   assert.equal(typeof updateBody.revision, "string");
   assert.equal(JSON.parse(readFileSync(join(configDir, "config.json"), "utf8")).resources.maxMcpSessions, 10);
+  assert.equal(JSON.parse(readFileSync(join(configDir, "config.json"), "utf8")).userInstructionsPath, realpathSync(userInstructionsPath));
   assert.equal(JSON.parse(readFileSync(join(configDir, "config.json"), "utf8")).widgets, "full");
 
   const attemptedOverride = await request(url, {
@@ -316,6 +322,7 @@ try {
   const bundle = await request(url, { path: "/api/diagnostics/bundle", headers: { cookie } });
   assert.equal(bundle.status, 200);
   assert.match(String(bundle.headers["content-disposition"]), /attachment/);
+  assert.equal("toolMode" in JSON.parse(bundle.body).config, false);
   assert.doesNotMatch(bundle.body, /must-be-redacted|999/);
 
   const revoke = await request(url, {

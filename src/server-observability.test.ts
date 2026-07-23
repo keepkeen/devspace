@@ -78,6 +78,9 @@ const recoverableProcessResult = processResult({
 });
 assert.match(recoverableProcessResult, /read_process_output/);
 assert.match(recoverableProcessResult, /outputId=output-test-id/);
+assert.equal(recoverableProcessResult.match(/inline output truncated/g)?.length, 1);
+assert.equal(recoverableProcessResult.match(/recover with read_process_output/g)?.length, 1);
+assert.equal(recoverableProcessResult.match(/^\[/gm)?.length, 1);
 assert.match(processResult({
   output: "tail",
   outputTruncated: false,
@@ -426,21 +429,17 @@ assert.match(
 assert.equal(recoverableWorkspaceError(new Error("database failure")), undefined);
 
 const commonTools = [
-  "batch_inspect", "batch_read", "close_workspace", "open_workspace",
-  "read", "read_process_output", "write_stdin",
+  "apply_patch", "batch_inspect", "batch_read", "close_workspace", "exec_command",
+  "open_workspace", "read", "read_process_output", "write_stdin",
 ];
-assert.deepEqual(toolSurface({ toolMode: "codex", widgets: "off", skillsEnabled: true }), [
-  "apply_patch", ...commonTools, "exec_command", "load_skill",
+assert.deepEqual(toolSurface({ widgets: "off", skillsEnabled: true }), [
+  ...commonTools, "load_skill",
 ].sort());
-assert.deepEqual(toolSurface({ toolMode: "full", widgets: "off", skillsEnabled: true }), [
-  "bash", ...commonTools, "edit", "glob", "grep", "load_skill", "ls", "write",
-].sort());
-assert.deepEqual(toolSurface({ toolMode: "minimal", widgets: "off", skillsEnabled: true }), [
-  "bash", ...commonTools, "edit", "load_skill", "write",
-].sort());
-const changesSurface = toolSurface({ toolMode: "codex", widgets: "changes", skillsEnabled: false });
+const changesSurface = toolSurface({ widgets: "changes", skillsEnabled: false });
 assert.ok(changesSurface.includes("show_changes"));
 assert.equal(changesSurface.includes("load_skill"), false);
+assert.equal(changesSurface.includes("bash"), false);
+assert.equal(changesSurface.some((name) => ["write", "edit", "grep", "glob", "ls"].includes(name)), false);
 assert.equal(changesSurface.some((name) => name.startsWith("ui://")), false);
 assert.equal(containsBatchedToolCall([
   { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "close_workspace", arguments: { workspaceId: "ws_test" } } },

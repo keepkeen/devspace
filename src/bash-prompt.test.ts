@@ -1,85 +1,30 @@
 import assert from "node:assert/strict";
 import {
-  BASH_DEFAULT_TIMEOUT_SECONDS,
-  BASH_MAX_TIMEOUT_SECONDS,
-  BASH_DESCRIPTION_PARAM,
-  BASH_WORKING_DIRECTORY_PARAM,
-  buildBashServerInstructions,
-  buildBashToolDescription,
   buildCodexServerInstructions,
   buildWorkspaceLifecycleInstruction,
 } from "./bash-prompt.js";
-import { resolveBashTimeoutSeconds } from "./bash-tool.js";
-
-const toolNames = {
-  openWorkspace: "open_workspace",
-  read: "read",
-  write: "write",
-  edit: "edit",
-  grep: "grep",
-  glob: "glob",
-  ls: "ls",
-  shell: "bash",
-  writeStdin: "write_stdin",
-  readProcessOutput: "read_process_output",
-};
-
-const fullDescription = buildBashToolDescription({
-  toolNames,
-  hasInspectionTools: true,
-});
-assert.match(fullDescription, /^Run terminal commands/);
-assert.match(fullDescription, /Prefer read\/grep\/glob\/ls/);
-assert.match(fullDescription, /run_in_background/);
-assert.ok(fullDescription.length < 500);
-assert.doesNotMatch(fullDescription, /Call open_workspace/);
-assert.doesNotMatch(fullDescription, /git commit|HEREDOC/);
-
-const minimalDescription = buildBashToolDescription({
-  toolNames,
-  hasInspectionTools: false,
-});
-assert.match(minimalDescription, /rg\/find\/ls/);
-assert.match(minimalDescription, /read for reads/);
-
-const instructions = buildBashServerInstructions({
-  toolNames,
-  hasInspectionTools: true,
-});
-assert.match(instructions, /do not persist/);
-assert.match(instructions, /write_stdin/);
-assert.match(instructions, /Normal workspace shell writes are allowed/);
-assert.match(instructions, /unknown, stop polling/);
-assert.match(instructions, new RegExp(String(BASH_DEFAULT_TIMEOUT_SECONDS)));
-
-assert.equal(
-  BASH_DESCRIPTION_PARAM,
-  "Optional 5–10 word active-voice summary of the command.",
-);
-assert.match(BASH_WORKING_DIRECTORY_PARAM, /Defaults to the workspace root/);
-assert.match(BASH_WORKING_DIRECTORY_PARAM, /does not persist/);
 
 const lifecycle = buildWorkspaceLifecycleInstruction({
   openWorkspace: "open_workspace",
   closeWorkspace: "close_workspace",
 });
-assert.match(lifecycle, /For local-project work use DevSpace/);
+assert.equal(
+  lifecycle,
+  "Use DevSpace, not hosted Python. Call open_workspace with the exact path once; reuse workspaceId " +
+    "across turns/transports. If unknown, reopen that exact path, replace ID, retry once. " +
+    "Use close_workspace only when asked.",
+);
 assert.match(lifecycle, /not hosted Python/);
 assert.match(lifecycle, /Call open_workspace with the exact path once/);
-assert.match(lifecycle, /MCP session is rejected, reconnect and retry once/);
-assert.match(lifecycle, /workspaceId is unknown/);
-assert.match(lifecycle, /replace the ID/);
-assert.match(lifecycle, /Never call close_workspace unless the user asks/);
-assert.ok(lifecycle.length < 500);
+assert.match(lifecycle, /reuse workspaceId across turns\/transports/);
+assert.match(lifecycle, /If unknown/);
+assert.match(lifecycle, /replace ID/);
+assert.match(lifecycle, /Use close_workspace only when asked/);
+assert.doesNotMatch(lifecycle, /reconnect|MCP session is rejected/);
+assert.ok(lifecycle.length < 300);
 
-assert.equal(resolveBashTimeoutSeconds(undefined), BASH_DEFAULT_TIMEOUT_SECONDS);
-assert.equal(resolveBashTimeoutSeconds(30), 30);
-assert.equal(resolveBashTimeoutSeconds(9_999), BASH_MAX_TIMEOUT_SECONDS);
-assert.throws(() => resolveBashTimeoutSeconds(0), /positive/);
-assert.throws(() => resolveBashTimeoutSeconds(-1), /positive/);
-
-// Codex mode: only DevSpace-unknown deltas, not a full bash tutorial.
-const codex = buildCodexServerInstructions({
+// Fixed surface: only DevSpace-specific deltas, not a shell tutorial.
+const fixedSurface = buildCodexServerInstructions({
   read: "read",
   batchRead: "batch_read",
   batchInspect: "batch_inspect",
@@ -87,25 +32,38 @@ const codex = buildCodexServerInstructions({
   readProcessOutput: "read_process_output",
   writeStdin: "write_stdin",
 });
-assert.match(codex, /batch_read\/batch_inspect for 2–8 independent targets/);
-assert.match(codex, /dependent discovery iterative/);
-assert.match(codex, /nested instructions arrive on first access/);
-assert.match(codex, /load_skill/);
-assert.match(codex, /read_process_output/);
-assert.match(codex, /page outputId/);
-assert.match(codex, /instructionToken/);
-assert.match(codex, /workingDirectory, stdin, closeStdin, yieldTimeMs, maxOutputTokens, sessionId/);
-assert.match(codex, /multiline Python, SQL, or SSH payloads/);
-assert.match(codex, /PTY input requires closeStdin=false/);
-assert.match(codex, /does not persist/);
-assert.match(codex, /sandbox, approval, shell, and login fields/);
-assert.match(codex, /dangerous commands stay blocked/);
-assert.match(codex, /Unknown process session: stop polling/);
-assert.match(codex, /After backend restart or workspace recovery/);
-assert.ok(codex.length < 1_000);
-assert.doesNotMatch(codex, /once per project folder|including across turns/);
-assert.doesNotMatch(codex, /run_in_background/);
-assert.doesNotMatch(codex, /HEREDOC/);
+assert.match(fixedSurface, /Follow all returned instructions/);
+assert.match(
+  fixedSurface,
+  /Read\/open instructions need no retry/,
+);
+assert.match(
+  fixedSurface,
+  /If a blocked mutation\/command returns instructionToken, review returned instructions and retry with it/,
+);
+assert.doesNotMatch(fixedSurface, /instructions[^.]*retry with (?:the )?(?:returned )?instructionToken/i);
+assert.match(fixedSurface, /Batch 2–8 independent known targets/);
+assert.match(fixedSurface, /Call load_skill\(workspaceId,skillId\)/);
+assert.match(fixedSurface, /process sessionId\/write_stdin, not MCP session/);
+assert.match(fixedSurface, /page outputId with read_process_output/);
+assert.match(
+  fixedSurface,
+  /If process sessionId is unknown, stop polling, read prior outputId, verify effects before rerun/,
+);
+assert.match(fixedSurface, /command checks are accident guardrails, not a security boundary/);
+assert.ok(fixedSurface.length < 800);
+assert.doesNotMatch(fixedSurface, /dangerous commands (?:remain|stay) blocked|all dangerous commands/i);
+assert.doesNotMatch(fixedSurface, /once per project folder|including across turns/);
+assert.doesNotMatch(fixedSurface, /run_in_background|\bbash\b/i);
+assert.doesNotMatch(fixedSurface, /HEREDOC/);
+
+const worstCaseInitialize =
+  `${lifecycle} ${fixedSurface}` +
+  " After the final file change, call show_changes once before replying; not after each edit.";
+assert.ok(
+  Buffer.byteLength(worstCaseInitialize, "utf8") < 900,
+  `worst-case initialize instructions must be under 900 bytes; got ${Buffer.byteLength(worstCaseInitialize, "utf8")}`,
+);
 
 const codexWithoutSkills = buildCodexServerInstructions({
   read: "read",
@@ -114,6 +72,6 @@ const codexWithoutSkills = buildCodexServerInstructions({
   readProcessOutput: "read_process_output",
   writeStdin: "write_stdin",
 });
-assert.doesNotMatch(codexWithoutSkills, /load_skill|matching skill|explicit-only/);
+assert.doesNotMatch(codexWithoutSkills, /load_skill|reload skill|explicit-only/);
 
-console.log("bash-prompt tests passed");
+console.log("MCP prompt tests passed");

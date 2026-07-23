@@ -75,7 +75,7 @@ async function smokeServe(cliPath, installRoot) {
     port,
     allowedRoots: [workspaceRoot],
     publicBaseUrl: `http://127.0.0.1:${port}`,
-    toolMode: "codex",
+    toolMode: "full",
     widgets: "off",
   }));
 

@@ -18,9 +18,11 @@ const testDir = mkdtempSync(join(tmpdir(), "devspace-admin-config-test-"));
 const configDir = join(testDir, "config");
 const rootA = join(testDir, "root-a");
 const rootB = join(testDir, "root-b");
+const userInstructionsPath = join(testDir, "USER_INSTRUCTIONS.md");
 mkdirSync(configDir);
 mkdirSync(rootA);
 mkdirSync(rootB);
+writeFileSync(userInstructionsPath, "Use concise project edits.\n");
 symlinkSync(rootA, join(testDir, "root-a-link"));
 writeFileSync(join(configDir, "auth.json"), JSON.stringify({
   ownerToken: "test-owner-token-that-is-long-enough",
@@ -40,9 +42,10 @@ const initial = loadAdminConfig(env);
 assert.equal(JSON.parse(readFileSync(join(configDir, "config.json"), "utf8")).schemaVersion, 1);
 assert.equal(existsSync(join(configDir, "config.json.backup-v0")), true);
 assert.equal(JSON.parse(readFileSync(join(configDir, "config.json.backup-v0"), "utf8")).schemaVersion, undefined);
-assert.equal(initial.toolMode, "minimal");
+assert.equal("toolMode" in initial, false);
 assert.equal(initial.widgets, "changes");
 assert.deepEqual(initial.projectDocFallbackFilenames, []);
+assert.equal(initial.userInstructionsPath, null);
 assert.equal(initial.resources.maxMcpSessions, 12);
 assert.equal(initial.resources.maxProcessOutputFileBytes, 64 * 1024 * 1024);
 assert.equal(initial.resources.maxProcessOutputStorageBytes, 1024 * 1024 * 1024);
@@ -51,8 +54,8 @@ assert.equal(initial.resources.completedProcessOutputTtlMs, 24 * 60 * 60 * 1_000
 const next = validateAdminConfig({
   ...initial,
   allowedRoots: [rootB, join(testDir, "root-a-link"), rootA],
+  userInstructionsPath,
   projectDocFallbackFilenames: ["TEAM_GUIDE.md", "TEAM_GUIDE.md"],
-  toolMode: "codex",
   widgets: "full",
   resources: {
     ...initial.resources,
@@ -72,6 +75,7 @@ assert.equal(saved.restartRequired, true);
 assert.equal(saved.rootsChanged, true);
 assert.deepEqual(saved.config.allowedRoots, [realpathSync(rootB), realpathSync(rootA)]);
 assert.deepEqual(saved.config.projectDocFallbackFilenames, ["TEAM_GUIDE.md"]);
+assert.equal(saved.config.userInstructionsPath, realpathSync(userInstructionsPath));
 assert.equal(lstatSync(join(configDir, "config.json")).mode & 0o777, 0o600);
 const persisted = JSON.parse(readFileSync(join(configDir, "config.json"), "utf8"));
 assert.deepEqual(persisted.futureSetting, { preserve: true });
@@ -82,17 +86,19 @@ assert.equal(persisted.resources.maxProcessOutputFileBytes, 2_097_152);
 assert.equal(persisted.resources.maxProcessOutputStorageBytes, 4_194_304);
 assert.equal(persisted.resources.completedProcessOutputTtlMs, 120_000);
 assert.deepEqual(persisted.projectDocFallbackFilenames, ["TEAM_GUIDE.md"]);
+assert.equal(persisted.userInstructionsPath, realpathSync(userInstructionsPath));
+assert.equal(persisted.toolMode, "minimal");
 const unchangedSave = saveAdminConfig(next, env);
 assert.equal(unchangedSave.restartRequired, false);
 assert.equal(unchangedSave.rootsChanged, false);
 
 assert.equal(
-  loadAdminConfig({ ...env, DEVSPACE_TOOL_MODE: "full", DEVSPACE_WIDGETS: "off" }).toolMode,
-  "full",
-);
-assert.equal(
   loadAdminConfig({ ...env, DEVSPACE_TOOL_MODE: "full", DEVSPACE_WIDGETS: "off" }).widgets,
   "off",
+);
+assert.equal(
+  "toolMode" in loadAdminConfig({ ...env, DEVSPACE_TOOL_MODE: "full", DEVSPACE_MINIMAL_TOOLS: "1" }),
+  false,
 );
 assert.equal(
   loadAdminConfig({ ...env, DEVSPACE_MAX_MCP_SESSIONS: "7" }).resources.maxMcpSessions,
@@ -117,10 +123,11 @@ assert.deepEqual(
     DEVSPACE_MAX_PROCESS_OUTPUT_STORAGE_BYTES: "8388608",
     DEVSPACE_COMPLETED_PROCESS_OUTPUT_TTL_SECONDS: "60",
     DEVSPACE_PROJECT_DOC_FALLBACK_FILENAMES: "LOCAL_RULES.md",
+    DEVSPACE_USER_INSTRUCTIONS_PATH: userInstructionsPath,
   }),
   [
+    "userInstructionsPath",
     "projectDocFallbackFilenames",
-    "toolMode",
     "widgets",
     "resources.maxMcpSessions",
     "resources.maxProcessOutputFileBytes",
@@ -129,18 +136,17 @@ assert.deepEqual(
   ],
 );
 
-const overriddenEnv = { ...env, DEVSPACE_TOOL_MODE: "full" };
-const overridden = loadAdminConfig(overriddenEnv);
+const instructionsOverrideEnv = {
+  ...env,
+  DEVSPACE_USER_INSTRUCTIONS_PATH: userInstructionsPath,
+};
+const instructionsOverridden = loadAdminConfig(instructionsOverrideEnv);
+assert.equal(instructionsOverridden.userInstructionsPath, userInstructionsPath);
+assert.doesNotThrow(() => saveAdminConfig(instructionsOverridden, instructionsOverrideEnv));
 assert.throws(
-  () => saveAdminConfig({ ...overridden, toolMode: "minimal" }, overriddenEnv),
-  (error) => error instanceof AdminConfigValidationError && "toolMode" in error.fields,
+  () => saveAdminConfig({ ...instructionsOverridden, userInstructionsPath: null }, instructionsOverrideEnv),
+  (error) => error instanceof AdminConfigValidationError && "userInstructionsPath" in error.fields,
 );
-const savedWithOverride = saveAdminConfig({
-  ...overridden,
-  widgets: "off",
-}, overriddenEnv);
-assert.equal(savedWithOverride.config.toolMode, "full");
-assert.equal(JSON.parse(readFileSync(join(configDir, "config.json"), "utf8")).toolMode, "codex");
 
 const concurrentSnapshot = await loadAdminConfigSnapshot(env);
 const concurrentResults = await Promise.allSettled([
@@ -219,6 +225,9 @@ assert.match(adminConfigWarnings(configWithMissingRoot)["allowedRoots.0"], /no l
 assertValidationError({ ...next, allowedRoots: [] }, "allowedRoots");
 assertValidationError({ ...next, allowedRoots: [join(testDir, "missing")] }, "allowedRoots.0");
 assertValidationError({ ...next, allowedRoots: ["/"] }, "allowedRoots.0");
+assertValidationError({ ...next, userInstructionsPath: join(testDir, "missing-instructions.md") }, "userInstructionsPath");
+assertValidationError({ ...next, userInstructionsPath: rootA }, "userInstructionsPath");
+assertValidationError({ ...next, userInstructionsPath: "relative/AGENTS.md" }, "userInstructionsPath");
 assertValidationError({
   ...next,
   projectDocFallbackFilenames: ["../AGENTS.md"],

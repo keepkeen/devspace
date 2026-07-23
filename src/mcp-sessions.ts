@@ -18,6 +18,11 @@ export interface McpSessionReservation {
   readonly ownerClientId?: string;
 }
 
+export interface StatelessMcpRequestLease {
+  readonly id: symbol;
+  readonly ownerClientId: string;
+}
+
 interface McpSessionEntry<TTransport> {
   transport: TTransport;
   ownerClientId: string;
@@ -42,10 +47,12 @@ export interface McpSessionRegistryOptions {
 export interface McpSessionUsageSnapshot {
   sessions: number;
   reservations: number;
+  statelessRequests: number;
   limit: number;
   owner?: {
     sessions: number;
     reservations: number;
+    statelessRequests: number;
     limit: number;
   };
 }
@@ -57,6 +64,7 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
   private readonly maxSessions: number;
   private readonly maxSessionsPerClient: number;
   private readonly reservations = new Set<McpSessionReservation>();
+  private readonly statelessRequests = new Set<StatelessMcpRequestLease>();
   private readonly closeTimeoutMs: number;
   private sealed = false;
 
@@ -89,6 +97,23 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
     return reservation;
   }
 
+  tryAcquireStatelessRequest(ownerClientId: string): StatelessMcpRequestLease | undefined {
+    if (
+      this.sealed ||
+      this.occupiedSlots() >= this.maxSessions ||
+      this.occupiedClientSlots(ownerClientId) >= this.maxSessionsPerClient
+    ) {
+      return undefined;
+    }
+    const lease = { id: Symbol("stateless-mcp-request"), ownerClientId };
+    this.statelessRequests.add(lease);
+    return lease;
+  }
+
+  releaseStatelessRequest(lease: StatelessMcpRequestLease): void {
+    this.statelessRequests.delete(lease);
+  }
+
   async reserveWithIdleReclaim(ownerClientId: string): Promise<McpSessionReservationResult> {
     const available = this.tryReserve(ownerClientId);
     if (available) return { reservation: available };
@@ -119,6 +144,7 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
   seal(): void {
     this.sealed = true;
     this.reservations.clear();
+    this.statelessRequests.clear();
   }
 
   register(
@@ -238,11 +264,13 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
     return {
       sessions: this.size,
       reservations: this.reservations.size,
+      statelessRequests: this.statelessRequests.size,
       limit: this.maxSessions,
       ...(ownerClientId === undefined ? {} : {
         owner: {
           sessions: this.clientSessionCount(ownerClientId),
           reservations: this.clientReservationCount(ownerClientId),
+          statelessRequests: this.clientStatelessRequestCount(ownerClientId),
           limit: this.maxSessionsPerClient,
         },
       }),
@@ -316,7 +344,7 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
   }
 
   private occupiedSlots(excludedReservation?: McpSessionReservation): number {
-    let occupied = this.size;
+    let occupied = this.size + this.statelessRequests.size;
     for (const reservation of this.reservations) {
       if (reservation === excludedReservation) continue;
       if (
@@ -335,7 +363,8 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
     ownerClientId: string,
     excludedReservation?: McpSessionReservation,
   ): number {
-    let occupied = this.clientSessionCount(ownerClientId);
+    let occupied =
+      this.clientSessionCount(ownerClientId) + this.clientStatelessRequestCount(ownerClientId);
     for (const reservation of this.reservations) {
       if (reservation === excludedReservation || reservation.ownerClientId !== ownerClientId) continue;
       if (
@@ -364,6 +393,14 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
     let count = 0;
     for (const reservation of this.reservations) {
       if (reservation.ownerClientId === ownerClientId) count += 1;
+    }
+    return count;
+  }
+
+  private clientStatelessRequestCount(ownerClientId: string): number {
+    let count = 0;
+    for (const request of this.statelessRequests) {
+      if (request.ownerClientId === ownerClientId) count += 1;
     }
     return count;
   }

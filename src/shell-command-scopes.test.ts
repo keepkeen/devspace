@@ -75,6 +75,49 @@ const heredocThenCommand = analyze("cat <<'EOF'\ncd \"$TARGET\"\nEOF\ncd nested"
 assert.deepEqual(heredocThenCommand.staticCwds, [path.join(initialCwd, "nested")]);
 assert.deepEqual(heredocThenCommand.unresolvedCwds, []);
 
+for (const command of [
+  "bash -lc 'cd nested'",
+  "env bash -lc 'cd nested'",
+  "find . -exec bash -lc 'cd nested' {} \\;",
+  "find . -execdir sh -c 'cd nested' {} +",
+  "printf x | xargs sh -c 'cd nested' _",
+  "bash <<'EOF'\ncd nested\nEOF",
+  "bash <<< 'cd nested'",
+]) {
+  const result = analyze(command);
+  assert.ok(result.staticCwds.includes(path.join(initialCwd, "nested")), `${command} missed nested cwd`);
+  assert.deepEqual(result.unresolvedCwds, [], command);
+}
+assert.ok(analyze("if true; then cd nested; fi").staticCwds.includes(path.join(initialCwd, "nested")));
+assert.ok(analyze("2>/dev/null cd nested").staticCwds.includes(path.join(initialCwd, "nested")));
+
+for (const command of [
+  "bash -lc 'cd $TARGET'",
+  "find . -exec sh -c 'cd $TARGET' {} \\;",
+  "printf x | xargs sh -c 'cd $TARGET' _",
+]) {
+  assert.ok(
+    analyze(command).unresolvedCwds.some((entry) => entry.reason === "dynamic-path"),
+    `${command} did not reject dynamic nested cd`,
+  );
+}
+
+for (const [command, reason] of [
+  ["source ./changes-cwd.sh", "unsupported-syntax"],
+  ["builtin source ./changes-cwd.sh", "unsupported-syntax"],
+  [". ./changes-cwd.sh", "unsupported-syntax"],
+  ["command . ./changes-cwd.sh", "unsupported-syntax"],
+  ["popd", "directory-stack"],
+  ["builtin popd +1", "directory-stack"],
+  ['eval "$COMMAND"', "unsupported-syntax"],
+  ['bash -lc "$COMMAND"', "unsupported-syntax"],
+] as const) {
+  assert.ok(
+    analyze(command).unresolvedCwds.some((entry) => entry.reason === reason),
+    `${command} did not reject its opaque cwd mutation`,
+  );
+}
+
 assert.deepEqual(analyze("echo cd ignored").staticCwds, []);
 assert.deepEqual(analyze("echo cd ignored").unresolvedCwds, []);
 
@@ -90,18 +133,21 @@ for (const command of [
   "exec -a custom bash -c 'cd nested; pwd'",
   "ash -c 'cd nested; pwd'",
   "command eval 'cd nested'",
-  "builtin source ./changes-cwd.sh",
   "bash ./changes-cwd",
   "./changes-cwd.sh",
   "eval 'cd nested'",
-  "source ./changes-cwd.sh",
   "{fd}>out cd nested",
-  "CMD=cd; $CMD nested",
-  "$'cd' nested",
   'echo "$(c\\d nested; touch x)"',
   "shopt -s expand_aliases; alias c='cd nested'; c",
 ]) {
   assert.deepEqual(analyze(command).unresolvedCwds, [], `${command} was rejected as opaque syntax`);
+}
+
+for (const command of ["CMD=cd; $CMD nested", "$'cd' nested"]) {
+  assert.ok(
+    analyze(command).unresolvedCwds.some((entry) => entry.reason === "unsupported-syntax"),
+    `${command} did not reject a dynamic executable`,
+  );
 }
 
 for (const command of [
@@ -121,6 +167,11 @@ for (const command of [
 const capped = analyze(Array.from({ length: 18 }, (_, index) => `cd level-${index}`).join(" || "));
 assert.ok(capped.unresolvedCwds.some((entry) => entry.reason === "analysis-limit"));
 assert.ok(capped.staticCwds.length <= 64);
+
+const nestedOverflow = analyze(
+  `${Array.from({ length: 129 }, () => "echo $(printf safe)").join("; ")}; cd nested`,
+);
+assert.ok(nestedOverflow.unresolvedCwds.some((entry) => entry.reason === "analysis-limit"));
 
 for (const command of [
   "echo CDPATH=other",

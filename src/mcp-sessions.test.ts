@@ -389,8 +389,9 @@ perClient.register("client-b-session", "client-b", createTransport(), clientBRes
 assert.deepEqual(perClient.usageSnapshot("client-a"), {
   sessions: 2,
   reservations: 0,
+  statelessRequests: 0,
   limit: 3,
-  owner: { sessions: 1, reservations: 0, limit: 1 },
+  owner: { sessions: 1, reservations: 0, statelessRequests: 0, limit: 1 },
 });
 const clientAReplacement = await perClient.reserveWithIdleReclaim("client-a");
 assert.equal(clientAReplacement.reclaimed?.sessionId, "client-a-session");
@@ -413,5 +414,29 @@ perClientActive.register("active-client-a", "client-a", createTransport());
 assert(perClientActive.acquire("active-client-a", "client-a"));
 assert.deepEqual(await perClientActive.reserveWithIdleReclaim("client-a"), {});
 await perClientActive.closeAll();
+
+const statelessLimited = new McpSessionRegistry<FakeTransport>({
+  maxSessions: 2,
+  maxSessionsPerClient: 1,
+});
+const clientARequest = statelessLimited.tryAcquireStatelessRequest("client-a");
+assert(clientARequest);
+assert.equal(statelessLimited.tryAcquireStatelessRequest("client-a"), undefined);
+const clientBRequest = statelessLimited.tryAcquireStatelessRequest("client-b");
+assert(clientBRequest);
+assert.equal(statelessLimited.tryReserve("client-c"), undefined);
+assert.deepEqual(statelessLimited.usageSnapshot("client-a"), {
+  sessions: 0,
+  reservations: 0,
+  statelessRequests: 2,
+  limit: 2,
+  owner: { sessions: 0, reservations: 0, statelessRequests: 1, limit: 1 },
+});
+statelessLimited.releaseStatelessRequest(clientARequest);
+const clientAReservationAfterRelease = statelessLimited.tryReserve("client-a");
+assert(clientAReservationAfterRelease);
+statelessLimited.releaseReservation(clientAReservationAfterRelease);
+statelessLimited.releaseStatelessRequest(clientBRequest);
+assert.equal(statelessLimited.usageSnapshot().statelessRequests, 0);
 assert.deepEqual(await detachedHungRegistry.closeAll(), []);
 assert.equal(detachedHungRegistry.size, 0);

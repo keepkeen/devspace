@@ -10,14 +10,48 @@ import {
 } from "./process-sessions.js";
 import { ProcessOutputStore } from "./process-output-store.js";
 
-assert.equal(isInteractiveShellCommand("bash"), true);
-assert.equal(isInteractiveShellCommand("/bin/zsh -i"), true);
-assert.equal(isInteractiveShellCommand("python"), false);
-assert.equal(isInteractiveShellCommand("bash -lc 'echo unsafe'"), false);
-assert.equal(isInteractiveShellCommand("env bash"), true);
-assert.equal(isInteractiveShellCommand("/usr/bin/env TEST=1 /bin/sh -s"), true);
-assert.equal(isInteractiveShellCommand("command zsh"), true);
-assert.equal(isInteractiveShellCommand("nohup nice -n 5 bash"), true);
+for (const command of [
+  "bash",
+  "/bin/zsh -i",
+  "env bash",
+  "/usr/bin/env TEST=1 /bin/sh -s",
+  "command zsh",
+  "nohup nice -n 5 bash",
+  "bash -s -- name",
+  "bash --rcfile /dev/null",
+  "bash -O extglob",
+  "sh -eu",
+  "zsh --no-rcs",
+  "dash -e",
+  "ksh -o vi",
+  "fish -C 'set greeting hello'",
+  "fish --no-config",
+  "env -S 'bash -s'",
+  "find . -exec bash -s {} \\;",
+  "printf x | xargs bash -s",
+  // Malformed or unknown options are conservatively treated as shell mode.
+  "bash -c",
+  "bash --future-option value",
+]) {
+  assert.equal(isInteractiveShellCommand(command), true, command);
+}
+
+for (const command of [
+  "python",
+  "bash -lc 'echo unsafe'",
+  "bash ./script.sh",
+  "bash --rcfile /dev/null ./script.sh",
+  "sh -eu ./script.sh",
+  "zsh -f ./script.zsh",
+  "dash -- ./script.sh",
+  "ksh -R xref ./script.ksh",
+  "fish -C 'set greeting hello' ./script.fish",
+  "fish --command 'echo unsafe'",
+  "fish --command='echo unsafe'",
+  "env -S \"bash -c 'echo delegated'\"",
+]) {
+  assert.equal(isInteractiveShellCommand(command), false, command);
+}
 
 const smallBuffer = new HeadTailBuffer(100);
 smallBuffer.append("hello\n");
@@ -233,7 +267,12 @@ assert.deepEqual(
 );
 await assert.rejects(
   async () => manager.instructionContext("client-b", "workspace-a", backgroundSessionId),
-  /Unknown process session/,
+  (error: unknown) =>
+    error instanceof Error &&
+    error.message ===
+      `Unknown process session: ${backgroundSessionId}. This is a process sessionId for write_stdin, not an ` +
+        "MCP session; it cannot be polled again. Stop calling write_stdin. If an earlier response returned an " +
+        "outputId, read it with read_process_output, then verify command side effects before deciding whether to rerun.",
 );
 
 await assert.rejects(
@@ -622,6 +661,16 @@ const timeoutManager = new ProcessSessionManager({
   terminationGraceMs: 100,
 });
 try {
+  await assert.rejects(
+    timeoutManager.start({
+      ownerClientId,
+      workspaceId: "timeout-over-global-limit",
+      cwd: process.cwd(),
+      command: "echo should-not-run",
+      runtimeLimitMs: 1_001,
+    }),
+    /timeoutMs 1001 exceeds the global maximum 1000ms/,
+  );
   const timedOut = await timeoutManager.start({
     ownerClientId,
     workspaceId: "timeout",

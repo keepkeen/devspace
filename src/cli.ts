@@ -229,7 +229,6 @@ async function serve(): Promise<void> {
     console.log(`public base url: ${config.publicBaseUrl}`);
     console.log(`allowed roots: ${config.allowedRoots.join(", ")}`);
     console.log(`allowed hosts: ${config.allowedHosts.join(", ")}`);
-    console.log(`tool mode: ${config.toolMode}`);
     if (config.allowedHosts.includes("*")) {
       console.warn("warning: Host header allowlist is disabled because DEVSPACE_ALLOWED_HOSTS=*");
     }
@@ -330,7 +329,6 @@ async function runDoctor(): Promise<void> {
     console.log(`Public MCP URL: ${new URL("/mcp", config.publicBaseUrl).toString()}`);
     console.log(`Allowed roots: ${config.allowedRoots.join(", ")}`);
     console.log(`Allowed hosts: ${config.allowedHosts.join(", ")}`);
-    console.log(`Tool mode: ${config.toolMode}`);
   } catch (error) {
     console.log(`Config status: ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -341,7 +339,8 @@ function runConfigCommand(args: string[]): void {
   const files = loadDevspaceFiles();
 
   if (!subcommand || subcommand === "get") {
-    console.log(JSON.stringify(files.config, null, 2));
+    const { toolMode: _ignoredToolMode, ...config } = files.config;
+    console.log(JSON.stringify(config, null, 2));
     return;
   }
 
@@ -359,16 +358,7 @@ function runConfigCommand(args: string[]): void {
     return;
   }
 
-  if (key === "toolMode") {
-    if (value !== "minimal" && value !== "full" && value !== "codex") {
-      throw new Error("toolMode must be one of: codex, full, minimal.");
-    }
-    updateDevspaceConfig((config) => ({ ...config, toolMode: value }));
-    console.log(`Updated ${files.configPath}`);
-    return;
-  }
-
-  throw new Error("Supported config keys: publicBaseUrl, toolMode.");
+  throw new Error("Supported config keys: publicBaseUrl.");
 }
 
 function printHelp(): void {
@@ -385,7 +375,6 @@ function printHelp(): void {
       "  devspace doctor          Show config, runtime, and native dependency status",
       "  devspace config get      Print persisted config",
       "  devspace config set publicBaseUrl <url|null>",
-      "  devspace config set toolMode <codex|full|minimal>",
       "  devspace agents ls       List subagent sessions",
       "  devspace agents run <profile-or-provider-or-id> [--model <model>] <prompt>",
       "  devspace agents show <id>",

@@ -289,7 +289,6 @@ async function handleApiRequest(
         generatedAt: new Date().toISOString(),
         admin: { version: context.version, startedAt: context.startedAt },
         config: {
-          toolMode: config.toolMode,
           widgets: config.widgets,
           allowedRootCount: config.allowedRoots.length,
           projectDocFallbackFilenameCount: config.projectDocFallbackFilenames.length,

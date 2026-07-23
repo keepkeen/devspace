@@ -22,6 +22,11 @@ receive isolated workspace sessions while operating on the same local files.
 The result includes a `workspaceId`. All later file, search, edit, show-changes,
 and shell calls in that conversation should reuse the same ID.
 
+ChatGPT OAuth clients use stateless MCP HTTP requests: each tool call may arrive
+on a fresh transport, and a stale `mcp-session-id` header is ignored. The
+`workspaceId` is the durable continuity key, not the transport session. Other
+MCP hosts retain stateful Streamable HTTP behavior.
+
 Do not reopen the same folder unless:
 
 - the `workspaceId` is rejected as unknown
@@ -31,6 +36,12 @@ Do not reopen the same folder unless:
 Do not call `close_workspace` as a normal end-of-turn or end-of-conversation
 step. Call it only after the user explicitly asks to close or release the
 workspace.
+
+When the initial instruction chain is already present in the conversation,
+pass its returned `instructionRevision` as `knownInstructionRevision` on a
+recovery call. DevSpace then returns the same current revision without copying
+unchanged instruction bodies. A new conversation should omit that argument so
+it receives the full applicable instructions.
 
 ## Checkout Mode
 
@@ -70,9 +81,9 @@ to proceed with the user.
 
 ## Project Instructions
 
-When a workspace opens, DevSpace loads the first matching global instruction
-from the built-in names and the first matching project-root instruction in this
-priority order:
+When a workspace opens, DevSpace first loads the optional file explicitly
+configured by `userInstructionsPath` or `DEVSPACE_USER_INSTRUCTIONS_PATH`, then
+the first matching project-root instruction in this priority order:
 
 - `AGENTS.override.md`
 - `AGENTS.md`
@@ -90,9 +101,17 @@ model can follow them and retry safely with the returned one-time
 newly discovered instruction scope.
 
 Whitespace-only instruction files are ignored so the next filename in priority
-order can apply. The complete effective chain—global, project root, and nested
+order can apply. DevSpace does not implicitly import `~/.codex/AGENTS.md`;
+`DEVSPACE_AGENT_DIR` is used only for compatible Skill discovery. The complete
+effective chain—explicit user file, project root, and nested
 files—is limited to 32 KiB of UTF-8 content. DevSpace rejects an over-budget
 chain instead of silently truncating instructions.
+
+Every `open_workspace` result includes an `instructionRevision` beginning with
+`sha256-v1:`. It hashes the ordered initial instruction path/content pairs, so
+clients can recognize an unchanged chain across later turns without treating a
+repeated copy as new policy. A changed path or changed content produces a new
+revision.
 
 Shell calls also inspect literal `cd` and `pushd` targets before execution.
 Dynamic targets such as `cd "$TARGET"`, `cd $(command)`, or `cd ~/path` are
@@ -184,8 +203,8 @@ existing subagent sessions for that workspace.
 
 ## Tool Names
 
-By default DevSpace runs in `DEVSPACE_TOOL_MODE=codex`, the Codex-style unified
-exec surface best suited to browser MCP hosts like ChatGPT. It exposes:
+DevSpace exposes one fixed Codex-style surface for browser MCP hosts such as
+ChatGPT:
 
 - `open_workspace`
 - `close_workspace`
@@ -214,14 +233,16 @@ file contents, Skill manifests, or process output between MCP `content` and
 - `batch_read` and `batch_inspect` return a short text completion summary and
   keep each independent result in `structuredContent.items[]`. There is no
   concatenated aggregate `structuredContent.result`.
-- `exec_command`, `bash`, and `write_stdin` return the current inline output in
+- `exec_command` and `write_stdin` return the current inline output in
   text `content`. Their structured data contains process state such as
   `sessionId`, `running`, `exitCode`, timing/truncation metrics, and `outputId`,
   but no copy of the inline output.
 - `read_process_output` returns the requested UTF-8 page in text `content` and
   keeps only paging metadata in `structuredContent`: `outputId`, `offset`,
   `nextOffset`, `eof`, `status`, `totalBytes`, `storedBytes`, and
-  `droppedBytes`.
+  `droppedBytes`. `status=unknown` means the backend recovered output from an
+  interrupted process and cannot prove completion; verify side effects before
+  deciding whether to rerun.
 
 `_meta` is reserved for optional widget presentation and is not a source of
 model-visible state or body text. Widgets read the top-level result instead of
@@ -230,18 +251,21 @@ ignore `_meta`; structured batch consumers must read `items[]` rather than the
 removed aggregate field. This layout reduces prompt and transport overhead
 without changing workspace, process, or paging semantics.
 
-In this mode, `write`, `edit`, `bash`, `grep`, `glob`, and `ls` are not
+The legacy `write`, `edit`, `bash`, `grep`, `glob`, and `ls` tools are not
 registered. `exec_command` returns a process session ID when a command is still
 running after its yield window. Use `write_stdin` to poll it, send input, resize
 a PTY, or send Ctrl-C. Set `tty: true` only for commands that need a terminal.
+Use `timeoutMs` for a shorter per-command hard deadline; it cannot exceed the
+server's global command runtime limit.
 For multiline Python, SQL, or remote SSH scripts, pass the body through the
 structured `stdin` field instead of nesting shell quotes. Pipe stdin closes by
 default after the initial payload; set `closeStdin: false` only when later
 `write_stdin` calls must add data. PTY sessions cannot use automatic EOF.
-A small command policy blocks `sudo`, forced or recursive `rm`, and
-pipe-to-shell. Normal workspace shell writes are allowed; explicit literal
-targets for common mutations and redirections are rejected if they leave the
-workspace.
+A bounded command policy follows common static nesting and blocks executable
+`sudo`, forced or recursive `rm`, and pipe-to-executing-shell. Parse-only shell
+checks remain available. Normal workspace shell writes are allowed; explicit
+literal targets for common mutations and redirections are rejected if they
+leave the workspace. This is an accident guardrail, not an OS sandbox.
 
 `maxOutputTokens` limits only the current inline process response and defaults
 to 10,000 tokens. Short output is returned in full; long output keeps a
@@ -257,27 +281,9 @@ was reached, meaning those bytes cannot be recovered. Completed output uses its
 own TTL and remains available after the short-lived process session is removed
 or after the backend restarts.
 
-Use `DEVSPACE_TOOL_MODE=full` to expose the dedicated file and shell tools:
-
-- `open_workspace`
-- `close_workspace`
-- `read`
-- `batch_read`
-- `batch_inspect`
-- `load_skill`
-- `write`
-- `edit`
-- `grep`
-- `glob`
-- `ls`
-- `bash`
-- `write_stdin`
-- `read_process_output`
-
-Use `DEVSPACE_TOOL_MODE=minimal` for `open_workspace`, `close_workspace`,
-`read`, `batch_read`, `batch_inspect`, `load_skill`, `write`, `edit`, `bash`,
-`write_stdin`, and `read_process_output` (clients can use the bounded batch
-inspection tool or `bash` with `rg`, `find`, and `ls`).
+Legacy `toolMode`, `DEVSPACE_TOOL_MODE`, and `DEVSPACE_MINIMAL_TOOLS` values are
+ignored. This preserves startup compatibility with old configuration files
+without changing the model-facing tool names between turns.
 
 ## Show Changes
 
@@ -306,16 +312,12 @@ The shell tool is for commands that belong in a terminal:
 
 Behavior is aligned with Codex's unified exec surface:
 
-- default tool mode is `codex` (`exec_command` + `write_stdin`)
+- the command contract is always `exec_command` + `write_stdin`
 - working directory does **not** persist; pass `workingDirectory` when needed and do not rely on `cd`
 - shell env vars / aliases do **not** persist
 - long-running processes return a `sessionId`; poll with `write_stdin`
-- truncated output reports approximate original token count and omitted bytes
-- a small command policy blocks forced/recursive `rm`, `sudo`, and pipe-to-shell
+- truncated output reports omitted bytes and an `outputId` recovery command
+- bounded static checks block forced/recursive `rm`, executable `sudo`, and pipe-to-executing-shell
 - independent commands should be issued as parallel tool calls; dependent ones use `&&`
 - HEREDOC and normal workspace shell writes are allowed
 - do not sleep-poll; use session + `write_stdin` instead
-
-In `full` / `minimal` modes, `bash` defaults to a 120s timeout (max 600) and
-supports `run_in_background`. Shell writes are allowed under the same command
-policy; `apply_patch` or edit/write remain preferable for precise reviewed edits.

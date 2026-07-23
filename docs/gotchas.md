@@ -158,6 +158,11 @@ rejected; discard it and call `open_workspace` again for that project.
 Workspace session metadata is persisted, but clients should still treat
 `open_workspace` as the way to begin a fresh working session.
 
+ChatGPT OAuth clients use stateless MCP POST requests, so an old transport
+session header does not invalidate or consume the workspace. Non-ChatGPT MCP
+hosts remain stateful; an unknown transport session returns a dedicated 404 and
+the server records a redacted `unknown_mcp_session` diagnostic.
+
 ## Workspace Path Rejected
 
 The path must be inside one of the allowed roots configured during setup.
@@ -173,6 +178,23 @@ Then either open a project under an allowed root or rerun setup:
 ```bash
 node dist/cli.js init --force
 ```
+
+## User Instructions Are Missing Or Unexpected
+
+DevSpace does not automatically read `~/.codex/AGENTS.md`. That file often
+contains Codex-specific operating policy which is unnecessary context for a
+ChatGPT web connector. To opt in to one user-level file, set it in the local
+Admin panel or configure:
+
+```bash
+DEVSPACE_USER_INSTRUCTIONS_PATH=~/.devspace/AGENTS.md node dist/cli.js serve
+```
+
+The path must be a readable file. A missing path, directory, or unreadable file
+causes `open_workspace` to fail instead of silently dropping policy. The user
+file and applicable project instructions share the 32 KiB budget. Saved path
+changes require a backend restart; an environment override locks the Admin
+field until the startup environment is changed.
 
 ## Worktree Mode Fails
 

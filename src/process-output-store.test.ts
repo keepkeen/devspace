@@ -24,6 +24,13 @@ import {
 
 const root = mkdtempSync(join(tmpdir(), "devspace-process-output-test-"));
 
+assert.equal(
+  new ProcessOutputNotFoundError().message,
+  "Process output was not found; no output was returned. The outputId may have expired or belong to another " +
+    "workspace or app connection. Stop retrying this outputId; verify command side effects before deciding " +
+    "whether to rerun.",
+);
+
 try {
   testPermissionsAndOwnership(join(root, "permissions"));
   testWriterLock(join(root, "writer-lock"));
@@ -122,6 +129,7 @@ function testPagingReplayAndUtf8(stateDir: string): void {
     assert.equal(first.offset, 0);
     assert.equal(first.nextOffset, 4);
     assert.equal(first.eof, false);
+    assert.equal(first.status, "active");
     assert.deepEqual(store.read("owner", "workspace", outputId, { offset: 0, limit: 2 }), first);
     assert.throws(
       () => store.read("owner", "workspace", outputId, { offset: 2, limit: 2 }),
@@ -316,7 +324,9 @@ function testRestartRecovery(stateDir: string): void {
     const metadata = restoredStore.metadata("owner", "workspace", outputId);
     assert.equal(metadata.status, "unknown");
     assert.equal(metadata.completedAt, 2_000);
-    assert.equal(restoredStore.read("owner", "workspace", outputId, { offset: 0, limit: 100 }).content, "survives restart");
+    const restoredPage = restoredStore.read("owner", "workspace", outputId, { offset: 0, limit: 100 });
+    assert.equal(restoredPage.content, "survives restart");
+    assert.equal(restoredPage.status, "unknown");
     assert.equal(readFileSync(logPath(stateDir, outputId), "utf8"), "survives restart");
     assert.throws(() => restoredStore.append(outputId, "more"), /completed/);
     assert.deepEqual(restoredStore.usageSnapshot(), {

@@ -20,13 +20,13 @@ const app = express();
 app.use(createRuntimeControlPlane({
   ownerToken,
   generation: "runtime-generation",
-  runtimeConfig: { toolMode: "codex", widgets: "changes" },
+  runtimeConfig: { widgets: "changes" },
   allowedRootsRevision: () => "roots-revision-test",
   allowedRootsCleanupPending: () => rootsCleanupPending,
   isClosing: () => false,
   workspaceDatabaseReady: () => true,
   oauthDatabaseReady: () => true,
-  mcpUsage: () => ({ sessions: 2, reservations: 1, limit: 8 }),
+  mcpUsage: () => ({ sessions: 2, reservations: 1, statelessRequests: 1, limit: 8 }),
   processUsage: () => ({ sessions: 3, running: 1, limit: 16 }),
   processOutputUsage: () => ({ outputs: 4, activeOutputs: 1, storedBytes: 1024, droppedBytes: 12, maxStorageBytes: 4096 }),
   workspaceUsage: () => ({ activePersisted: 4, resident: 2, closing: 0, leased: 1, maxResident: 32 }),
@@ -73,12 +73,17 @@ try {
   const body = await diagnosticsResponse.json() as any;
   assert.equal(body.generation, "runtime-generation");
   assert.deepEqual(body.runtimeConfig, {
-    toolMode: "codex",
     widgets: "changes",
     allowedRootsRevision: "roots-revision-test",
     allowedRootsCleanupPending: 0,
   });
-  assert.equal(body.usage.mcpSessions.active, 2);
+  assert.deepEqual(body.usage.mcpSessions, {
+    active: 3,
+    stateful: 2,
+    statelessRequests: 1,
+    reserved: 1,
+    limit: 8,
+  });
   assert.deepEqual(body.usage.processOutput, {
     active: 1024,
     used: 1024,

@@ -17,7 +17,6 @@ const tests = [
   "src/ui/tool-display.test.ts",
   "src/apply-patch.test.ts",
   "src/bash-prompt.test.ts",
-  "src/bash-tool.test.ts",
   "src/batch-tools.test.ts",
   "src/command-policy.test.ts",
   "src/shell-command-scopes.test.ts",
@@ -26,6 +25,8 @@ const tests = [
   "src/process-output-store.test.ts",
   "src/process-sessions.test.ts",
   "src/mcp-sessions.test.ts",
+  "src/mcp-transport-mode.test.ts",
+  "src/chatgpt-flow-e2e.test.ts",
   "src/server-observability.test.ts",
   "src/mcp-context-budget.test.ts",
   "src/server-shutdown.test.ts",
@@ -48,7 +49,14 @@ const tests = [
 
 const tsxCli = resolve("node_modules/tsx/dist/cli.mjs");
 for (const test of tests) {
-  const result = spawnSync(process.execPath, [tsxCli, test], { stdio: "inherit" });
+  const result = spawnSync(process.execPath, [tsxCli, test], {
+    stdio: "inherit",
+    timeout: 180_000,
+  });
+  if (result.error && "code" in result.error && result.error.code === "ETIMEDOUT") {
+    console.error(`Test timed out after 180 seconds: ${test}`);
+    process.exit(1);
+  }
   if (result.error) throw result.error;
   if (result.status !== 0) process.exit(result.status ?? 1);
 }

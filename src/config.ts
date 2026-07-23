@@ -1,5 +1,5 @@
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { expandHomePath } from "./roots.js";
 import type { LoggingConfig, LogFormat, LogLevel } from "./logger.js";
 import type { OAuthConfig } from "./oauth-provider.js";
@@ -12,7 +12,6 @@ import {
   type DevspaceUserConfig,
 } from "./user-config.js";
 
-export type ToolMode = "minimal" | "full" | "codex";
 export type WidgetMode = "off" | "changes" | "full";
 const DEFAULT_OAUTH_ACCESS_TOKEN_TTL_SECONDS = 60 * 60;
 const DEFAULT_OAUTH_REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
@@ -51,7 +50,6 @@ export interface ServerConfig {
   allowedRoots: string[];
   allowedHosts: string[];
   publicBaseUrl: string;
-  toolMode: ToolMode;
   widgets: WidgetMode;
   stateDir: string;
   worktreeRoot: string;
@@ -63,6 +61,7 @@ export interface ServerConfig {
   devspaceAgentsDir: string;
   subagents: boolean;
   agentDir: string;
+  userInstructionsPath: string | null;
   projectDocFallbackFilenames: string[];
   logging: LoggingConfig;
   resources: ResourceLimitsConfig;
@@ -130,25 +129,6 @@ function parseBoolean(value: string | undefined, name: string): boolean {
   if (["1", "true", "yes", "on"].includes(normalized)) return true;
   if (["0", "false", "no", "off"].includes(normalized)) return false;
   throw new Error(`Invalid ${name}: ${value} (expected boolean)`);
-}
-
-function parseToolMode(
-  env: NodeJS.ProcessEnv,
-  configuredMode: ToolMode | undefined,
-): ToolMode {
-  const mode = env.DEVSPACE_TOOL_MODE;
-  if (mode === "minimal" || mode === "full" || mode === "codex") return mode;
-  if (mode) throw new Error(`Invalid DEVSPACE_TOOL_MODE: ${mode}`);
-
-  if (env.DEVSPACE_MINIMAL_TOOLS !== undefined) {
-    return parseBoolean(env.DEVSPACE_MINIMAL_TOOLS, "DEVSPACE_MINIMAL_TOOLS") ? "minimal" : "full";
-  }
-  if (configuredMode) return configuredMode;
-  // Default to the Codex-style unified exec surface (exec_command + write_stdin),
-  // which best fits browser MCP hosts like ChatGPT that have no per-command
-  // approval surface. Set DEVSPACE_TOOL_MODE=full or minimal to use the
-  // dedicated read/write/edit/grep/glob/ls/bash tools instead.
-  return "codex";
 }
 
 function parseLogLevel(value: string | undefined): LogLevel {
@@ -417,7 +397,6 @@ export function loadConfigForAdmin(env: NodeJS.ProcessEnv = process.env): Server
     allowedRoots: parseAllowedRoots(env.DEVSPACE_ALLOWED_ROOTS ?? files.config.allowedRoots),
     allowedHosts: parseAllowedHosts(env.DEVSPACE_ALLOWED_HOSTS, derivedAllowedHosts),
     publicBaseUrl,
-    toolMode: parseToolMode(env, files.config.toolMode),
     widgets: parseWidgetMode(env.DEVSPACE_WIDGETS, files.config.widgets),
     stateDir: resolve(expandHomePath(env.DEVSPACE_STATE_DIR ?? files.config.stateDir ?? defaultStateDir())),
     worktreeRoot: resolve(expandHomePath(env.DEVSPACE_WORKTREE_ROOT ?? files.config.worktreeRoot ?? defaultWorktreeRoot())),
@@ -438,6 +417,9 @@ export function loadConfigForAdmin(env: NodeJS.ProcessEnv = process.env): Server
         ? files.config.subagents === true
         : parseBoolean(env.DEVSPACE_SUBAGENTS, "DEVSPACE_SUBAGENTS"),
     agentDir: resolve(expandHomePath(env.DEVSPACE_AGENT_DIR ?? files.config.agentDir ?? defaultAgentDir())),
+    userInstructionsPath: parseOptionalPath(
+      env.DEVSPACE_USER_INSTRUCTIONS_PATH ?? files.config.userInstructionsPath,
+    ),
     projectDocFallbackFilenames: parseProjectDocFallbackFilenames(
       env.DEVSPACE_PROJECT_DOC_FALLBACK_FILENAMES ??
         files.config.projectDocFallbackFilenames ??
@@ -447,6 +429,16 @@ export function loadConfigForAdmin(env: NodeJS.ProcessEnv = process.env): Server
     resources: parseResourceLimits(env, files.config.resources),
     instructionScan: parseInstructionScan(env),
   };
+}
+
+function parseOptionalPath(value: string | null | undefined): string | null {
+  const path = value?.trim();
+  if (!path) return null;
+  const expanded = expandHomePath(path);
+  if (!isAbsolute(expanded)) {
+    throw new Error("User instructions path must use ~ or an absolute path.");
+  }
+  return resolve(expanded);
 }
 
 function parsePublicBaseUrl(value: string): string {

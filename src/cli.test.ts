@@ -30,7 +30,7 @@ writeFileSync(
 );
 execFileSync(
   "node",
-  ["--import", "tsx", "src/cli.ts", "config", "set", "toolMode", "full"],
+  ["--import", "tsx", "src/cli.ts", "config", "set", "publicBaseUrl", "null"],
   {
     encoding: "utf8",
     env: { ...process.env, DEVSPACE_CONFIG_DIR: configCommandDir },
@@ -39,13 +39,22 @@ execFileSync(
 const updatedConfig = JSON.parse(
   readFileSync(join(configCommandDir, "config.json"), "utf8"),
 ) as { allowedRoots: string[]; publicBaseUrl: string; toolMode: string };
-assert.equal(updatedConfig.toolMode, "full");
+assert.equal(updatedConfig.toolMode, "codex");
 assert.deepEqual(updatedConfig.allowedRoots, [process.cwd()]);
-assert.equal(updatedConfig.publicBaseUrl, "https://devspace.example.com");
+assert.equal(updatedConfig.publicBaseUrl, null);
+const visibleConfig = JSON.parse(execFileSync(
+  "node",
+  ["--import", "tsx", "src/cli.ts", "config", "get"],
+  {
+    encoding: "utf8",
+    env: { ...process.env, DEVSPACE_CONFIG_DIR: configCommandDir },
+  },
+));
+assert.equal("toolMode" in visibleConfig, false);
 assert.throws(
   () => execFileSync(
     "node",
-    ["--import", "tsx", "src/cli.ts", "config", "set", "toolMode", "browser"],
+    ["--import", "tsx", "src/cli.ts", "config", "set", "toolMode", "full"],
     {
       encoding: "utf8",
       env: { ...process.env, DEVSPACE_CONFIG_DIR: configCommandDir },

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "./config.js";
 import { ensureDevspaceDefaultSkills, resolveSubagentsFlag } from "./user-config.js";
@@ -16,12 +16,9 @@ assert.equal(loadConfig(baseEnv).widgets, "full");
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_WIDGETS: "changes" }).widgets, "changes");
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_WIDGETS: "full" }).widgets, "full");
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_WIDGETS: "off" }).widgets, "off");
-assert.equal(loadConfig(baseEnv).toolMode, "codex");
-assert.equal(loadConfig({ ...baseEnv, DEVSPACE_TOOL_MODE: "minimal" }).toolMode, "minimal");
-assert.equal(loadConfig({ ...baseEnv, DEVSPACE_TOOL_MODE: "full" }).toolMode, "full");
-assert.equal(loadConfig({ ...baseEnv, DEVSPACE_TOOL_MODE: "codex" }).toolMode, "codex");
-assert.equal(loadConfig({ ...baseEnv, DEVSPACE_MINIMAL_TOOLS: "0" }).toolMode, "full");
-assert.equal(loadConfig({ ...baseEnv, DEVSPACE_MINIMAL_TOOLS: "1" }).toolMode, "minimal");
+assert.equal("toolMode" in loadConfig(baseEnv), false);
+assert.equal("toolMode" in loadConfig({ ...baseEnv, DEVSPACE_TOOL_MODE: "invalid" }), false);
+assert.equal("toolMode" in loadConfig({ ...baseEnv, DEVSPACE_MINIMAL_TOOLS: "invalid" }), false);
 assert.equal(loadConfig(baseEnv).skillsEnabled, true);
 assert.deepEqual(loadConfig(baseEnv).skillPaths, []);
 assert.deepEqual(loadConfig(baseEnv).disabledSkillPaths, []);
@@ -29,6 +26,22 @@ assert.equal(loadConfig(baseEnv).adminSkillsDir, "/etc/codex/skills");
 assert.equal(loadConfig(baseEnv).devspaceSkillsDir, join(emptyConfigDir, "skills"));
 assert.equal(loadConfig(baseEnv).devspaceAgentsDir, join(emptyConfigDir, "agents"));
 assert.equal(loadConfig(baseEnv).subagents, false);
+assert.equal(loadConfig(baseEnv).userInstructionsPath, null);
+assert.equal(
+  loadConfig({ ...baseEnv, DEVSPACE_USER_INSTRUCTIONS_PATH: "/tmp/devspace-user-instructions.md" })
+    .userInstructionsPath,
+  "/tmp/devspace-user-instructions.md",
+);
+assert.equal(
+  loadConfig({ ...baseEnv, DEVSPACE_USER_INSTRUCTIONS_PATH: "~/devspace-user-instructions.md" })
+    .userInstructionsPath,
+  join(homedir(), "devspace-user-instructions.md"),
+);
+assert.equal(loadConfig({ ...baseEnv, DEVSPACE_USER_INSTRUCTIONS_PATH: "" }).userInstructionsPath, null);
+assert.throws(
+  () => loadConfig({ ...baseEnv, DEVSPACE_USER_INSTRUCTIONS_PATH: "relative/AGENTS.md" }),
+  /must use ~ or an absolute path/,
+);
 assert.deepEqual(loadConfig(baseEnv).projectDocFallbackFilenames, []);
 assert.deepEqual(
   loadConfig({
@@ -88,11 +101,6 @@ assert.throws(
   () => loadConfig({ ...baseEnv, DEVSPACE_WIDGETS: "write-only" }),
   /Invalid DEVSPACE_WIDGETS: write-only/,
 );
-assert.throws(
-  () => loadConfig({ ...baseEnv, DEVSPACE_TOOL_MODE: "invalid" }),
-  /Invalid DEVSPACE_TOOL_MODE: invalid/,
-);
-
 assert.deepEqual(loadConfig(baseEnv).logging, {
   level: "info",
   format: "json",
@@ -324,6 +332,7 @@ writeFileSync(
     subagents: true,
     toolMode: "full",
     widgets: "changes",
+    userInstructionsPath: "/tmp/persisted-devspace-user-instructions.md",
     projectDocFallbackFilenames: ["TEAM_GUIDE.md", ".agents.md"],
     skillPaths: ["workspace-skills"],
     disabledSkillPaths: ["workspace-skills/disabled/SKILL.md"],
@@ -357,8 +366,9 @@ assert.deepEqual(fileConfig.skillPaths, ["workspace-skills"]);
 assert.deepEqual(fileConfig.disabledSkillPaths, ["workspace-skills/disabled/SKILL.md"]);
 assert.equal(fileConfig.adminSkillsDir, "/opt/devspace/admin-skills");
 assert.equal(fileConfig.subagents, true);
-assert.equal(fileConfig.toolMode, "full");
+assert.equal("toolMode" in fileConfig, false);
 assert.equal(fileConfig.widgets, "changes");
+assert.equal(fileConfig.userInstructionsPath, "/tmp/persisted-devspace-user-instructions.md");
 assert.equal(fileConfig.resources.maxMcpSessions, 11);
 assert.equal(fileConfig.resources.maxProcessSessions, 9);
 assert.equal(fileConfig.resources.maxProcessSessionsPerWorkspace, 3);
@@ -369,12 +379,12 @@ assert.equal(fileConfig.resources.maxCommandRuntimeMs, 45_000);
 assert.equal(fileConfig.resources.maxResidentWorkspaces, 22);
 assert.equal(fileConfig.resources.maxManagedWorktrees, 7);
 assert.equal(
-  loadConfig({ DEVSPACE_CONFIG_DIR: configDir, DEVSPACE_TOOL_MODE: "codex" }).toolMode,
-  "codex",
+  "toolMode" in loadConfig({ DEVSPACE_CONFIG_DIR: configDir, DEVSPACE_TOOL_MODE: "codex" }),
+  false,
 );
 assert.equal(
-  loadConfig({ DEVSPACE_CONFIG_DIR: configDir, DEVSPACE_MINIMAL_TOOLS: "1" }).toolMode,
-  "minimal",
+  "toolMode" in loadConfig({ DEVSPACE_CONFIG_DIR: configDir, DEVSPACE_MINIMAL_TOOLS: "1" }),
+  false,
 );
 assert.equal(
   loadConfig({ DEVSPACE_CONFIG_DIR: configDir, DEVSPACE_WIDGETS: "off" }).widgets,
@@ -417,10 +427,7 @@ writeFileSync(
   join(invalidToolModeConfigDir, "auth.json"),
   JSON.stringify({ ownerToken: "persisted-owner-token-long-enough" }),
 );
-assert.throws(
-  () => loadConfig({ DEVSPACE_CONFIG_DIR: invalidToolModeConfigDir }),
-  /Unable to read .*config\.json/,
-);
+assert.equal("toolMode" in loadConfig({ DEVSPACE_CONFIG_DIR: invalidToolModeConfigDir }), false);
 
 const invalidResourceConfigDir = mkdtempSync(join(tmpdir(), "devspace-invalid-resource-test-"));
 writeFileSync(

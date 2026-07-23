@@ -10,6 +10,7 @@ import { DEVSPACE_VERSION } from "./version.js";
 interface McpUsage {
   sessions: number;
   reservations: number;
+  statelessRequests: number;
   limit: number;
 }
 
@@ -63,7 +64,6 @@ export interface RuntimeControlPlaneOptions {
   ownerToken: string;
   generation: string;
   runtimeConfig: {
-    toolMode: "codex" | "full" | "minimal";
     widgets: "full" | "changes" | "off";
   };
   allowedRootsRevision(): string;
@@ -122,7 +122,9 @@ export function createRuntimeControlPlane(options: RuntimeControlPlaneOptions): 
       uptimeSeconds: Math.floor(process.uptime()),
       usage: {
         mcpSessions: {
-          active: mcpUsage.sessions,
+          active: mcpUsage.sessions + mcpUsage.statelessRequests,
+          stateful: mcpUsage.sessions,
+          statelessRequests: mcpUsage.statelessRequests,
           reserved: mcpUsage.reservations,
           limit: finiteLimit(mcpUsage.limit),
         },

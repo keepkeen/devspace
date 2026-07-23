@@ -4,6 +4,11 @@ import { StringDecoder } from "node:string_decoder";
 import { resolveShellCommand, terminateProcessTree } from "./process-platform.js";
 import { ProcessOutputQuotaError, type ProcessOutputStore } from "./process-output-store.js";
 import { tokenizeSegment, unwrapCommandWrappers } from "./command-policy.js";
+import {
+  delegatedCommandPayloads,
+  isShellAnalysisLimitError,
+  splitShellSegments,
+} from "./shell-command-analysis.js";
 
 const DEFAULT_EXEC_YIELD_MS = 10_000;
 const DEFAULT_INTERACTIVE_YIELD_MS = 250;
@@ -183,13 +188,119 @@ function workspaceKey(ownerClientId: string, workspaceId: string): string {
   return `${ownerClientId}\u0000${workspaceId}`;
 }
 
-export function isInteractiveShellCommand(command: string): boolean {
-  const words = unwrapCommandWrappers(tokenizeSegment(command.trim()));
+export function isInteractiveShellCommand(command: string, depth = 0): boolean {
+  if (depth > 8) return true;
+  try {
+    for (const segment of splitShellSegments(command)) {
+      const tokens = tokenizeSegment(segment);
+      if (directShellReadsStdin(tokens)) return true;
+      for (const payload of delegatedCommandPayloads(tokens)) {
+        if (isInteractiveShellCommand(payload, depth + 1)) return true;
+      }
+    }
+    return false;
+  } catch (error) {
+    if (isShellAnalysisLimitError(error)) return true;
+    throw error;
+  }
+}
+
+function directShellReadsStdin(tokens: string[]): boolean {
+  const words = unwrapCommandWrappers(tokens);
   const executable = words.shift()?.split("/").at(-1);
   if (!executable || !["sh", "bash", "zsh", "dash", "ksh", "fish"].includes(executable)) {
     return false;
   }
-  return words.every((word) => word === "--" || /^--?[A-Za-z][A-Za-z-]*$/u.test(word));
+
+  let readsStdin = false;
+  for (let index = 0; index < words.length; index += 1) {
+    const word = words[index]!;
+    if (word === "--" || (executable === "zsh" && word === "-b")) {
+      return readsStdin || index + 1 === words.length;
+    }
+    if (word === "-") {
+      readsStdin = true;
+      continue;
+    }
+    if (!word.startsWith("-") && !word.startsWith("+")) return readsStdin;
+
+    const option = shellInvocationOption(executable, word);
+    if (option === "command") {
+      // A missing command operand is malformed and therefore ambiguous. Treat
+      // it as shell input so any supplied stdin still receives shell checks.
+      return words[index + 1] === undefined;
+    }
+    if (option === "command-inline") return false;
+    if (option === "stdin") {
+      readsStdin = true;
+      continue;
+    }
+    if (option === "value") {
+      if (words[index + 1] === undefined) return true;
+      index += 1;
+      continue;
+    }
+    if (option === "flag") continue;
+
+    // Unknown invocation options may consume the following word. Fail closed
+    // instead of mistaking that operand for a script file.
+    return true;
+  }
+  return true;
+}
+
+type ShellInvocationOption = "command" | "command-inline" | "stdin" | "value" | "flag" | "unknown";
+
+function shellInvocationOption(shell: string, option: string): ShellInvocationOption {
+  if (option.startsWith("--command=")) return "command-inline";
+  if (option === "-c" || option === "--command") return "command";
+  if (option === "-s" || option === "--stdin") return "stdin";
+
+  if (shell === "fish") {
+    if (["-C", "--init-command", "-d", "--debug", "-D", "--debug-output", "--features", "--profile", "--profile-startup"].includes(option)) {
+      return "value";
+    }
+    if (/^--(?:init-command|debug|debug-output|features|profile|profile-startup)=/u.test(option)) {
+      return "flag";
+    }
+    if (["-i", "-l", "-N", "-n", "-P", "--interactive", "--login", "--no-config", "--no-execute", "--private", "--version", "--help"].includes(option)) {
+      return "flag";
+    }
+    return "unknown";
+  }
+
+  if (option === "-o" || option === "+o" || (shell === "bash" && (option === "-O" || option === "+O"))) {
+    return "value";
+  }
+  if (shell === "bash" && ["--init-file", "--rcfile"].includes(option)) return "value";
+  if (shell === "bash" && /^--(?:init-file|rcfile)=/u.test(option)) return "flag";
+  if (shell === "ksh" && option === "-R") return "value";
+
+  if (option.startsWith("--")) {
+    if (shell === "zsh") return "flag";
+    if ([
+      "--debug", "--debugger", "--dump-po-strings", "--dump-strings", "--help", "--login",
+      "--noediting", "--noprofile", "--norc", "--posix", "--pretty-print", "--protected",
+      "--restricted", "--verbose", "--version", "--wordexp",
+    ].includes(option)) return "flag";
+    return "unknown";
+  }
+
+  if (/^-[^-]+/u.test(option)) {
+    const flags = option.slice(1);
+    if (flags.includes("c")) return "command";
+    if (flags.includes("s")) return "stdin";
+    const knownFlags = shell === "bash"
+      ? /^[abefhiklmnprtuvxBCHPD]+$/u
+      : shell === "zsh"
+        ? /^[dfilnrsuvx]+$/u
+        : shell === "ksh"
+          ? /^[abefhiklmnprstuvxBCEG]+$/u
+          : /^[abCefhimnuvx]+$/u;
+    return knownFlags.test(flags) ? "flag" : "unknown";
+  }
+  if (/^\+[^+]+/u.test(option)) return "flag";
+  return "unknown";
 }
 
 function processEnvironment(input?: {
@@ -393,6 +504,7 @@ export class ProcessSessionManager {
     if (workspaceSessions >= this.maxSessionsPerWorkspace) {
       throw new Error(`Process session limit reached for this workspace (${this.maxSessionsPerWorkspace}).`);
     }
+    const runtimeLimitMs = this.resolveRuntimeLimitMs(input.runtimeLimitMs);
     assertProcessInputSize(input.stdin);
     const closeStdin = input.closeStdin ?? input.stdin !== undefined;
     if (input.tty && closeStdin) {
@@ -404,7 +516,7 @@ export class ProcessSessionManager {
     try {
       if (input.tty && process.platform !== "win32") await this.startPty(session, input);
       else this.startPipe(session, input);
-      this.startRuntimeTimer(session, input.runtimeLimitMs);
+      this.startRuntimeTimer(session, runtimeLimitMs);
       if (input.stdin) session.process?.write(input.stdin);
       if (closeStdin) this.closeProcessStdin(session);
     } catch (error) {
@@ -875,10 +987,20 @@ export class ProcessSessionManager {
     this.sessions.delete(sessionId);
   }
 
-  private startRuntimeTimer(session: ProcessSession, requestedRuntimeMs: number | undefined): void {
-    const runtimeMs = requestedRuntimeMs === undefined
-      ? this.maxRuntimeMs
-      : Math.min(boundedInteger(requestedRuntimeMs, this.maxRuntimeMs, this.maxRuntimeMs), this.maxRuntimeMs);
+  private resolveRuntimeLimitMs(requestedRuntimeMs: number | undefined): number {
+    if (requestedRuntimeMs === undefined) return this.maxRuntimeMs;
+    if (!Number.isInteger(requestedRuntimeMs) || requestedRuntimeMs < 1) {
+      throw new Error("Command timeoutMs must be a positive integer.");
+    }
+    if (requestedRuntimeMs > this.maxRuntimeMs) {
+      throw new Error(
+        `Command timeoutMs ${requestedRuntimeMs} exceeds the global maximum ${this.maxRuntimeMs}ms.`,
+      );
+    }
+    return requestedRuntimeMs;
+  }
+
+  private startRuntimeTimer(session: ProcessSession, runtimeMs: number): void {
     session.runtimeTimer = setTimeout(() => {
       if (!session.running) return;
       session.timedOut = true;
@@ -953,8 +1075,8 @@ export class ProcessSessionManager {
 
 function unknownProcessSessionError(sessionId: number): Error {
   return new Error(
-    `Unknown process session: ${sessionId}. This sessionId cannot be polled again. ` +
-    "Stop calling write_stdin for it, inspect any earlier outputId with read_process_output, " +
-    "then rerun the original command from the beginning.",
+    `Unknown process session: ${sessionId}. This is a process sessionId for write_stdin, not an MCP session; ` +
+    "it cannot be polled again. Stop calling write_stdin. If an earlier response returned an outputId, " +
+    "read it with read_process_output, then verify command side effects before deciding whether to rerun.",
   );
 }

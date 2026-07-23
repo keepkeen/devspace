@@ -1,4 +1,3 @@
-export type ToolMode = "codex" | "full" | "minimal";
 export type WidgetMode = "full" | "changes" | "off";
 
 export interface AdminResourceLimits {
@@ -18,8 +17,8 @@ export interface AdminResourceLimits {
 
 export interface AdminConfig {
   allowedRoots: string[];
+  userInstructionsPath: string | null;
   projectDocFallbackFilenames: string[];
-  toolMode: ToolMode;
   widgets: WidgetMode;
   resources: AdminResourceLimits;
 }
@@ -138,13 +137,16 @@ export interface AdminDiagnostics {
   generation?: string;
   uptimeSeconds?: number | null;
   runtimeConfig?: {
-    toolMode: ToolMode;
     widgets: WidgetMode;
     allowedRootsRevision?: string;
     allowedRootsCleanupPending?: number;
   };
   usage?: {
-    mcpSessions?: AdminUsageMetric & { reserved?: number | null };
+    mcpSessions?: AdminUsageMetric & {
+      reserved?: number | null;
+      stateful?: number | null;
+      statelessRequests?: number | null;
+    };
     processSessions?: AdminUsageMetric;
     processOutput?: AdminUsageMetric & { outputs?: number | null; activeOutputs?: number | null; droppedBytes?: number | null };
     workspaces?: AdminUsageMetric & { resident?: number | null; closing?: number | null };

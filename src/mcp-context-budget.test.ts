@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import Database from "better-sqlite3";
 import { loadConfig } from "./config.js";
 import { SqliteOAuthClientsStore, SqliteOAuthStore } from "./oauth-store.js";
 import { createServer } from "./server.js";
@@ -23,21 +26,36 @@ const readNeedle = `CONTEXT_BUDGET_READ_${"r".repeat(256)}`;
 const batchNeedle = `CONTEXT_BUDGET_BATCH_${"b".repeat(256)}`;
 const skillNeedle = `CONTEXT_BUDGET_SKILL_${"s".repeat(256)}`;
 const processNeedle = `CONTEXT_BUDGET_PROCESS_${"p".repeat(256)}`;
+const scopedInstructionNeedle = "CONTEXT_BUDGET_SCOPED_INSTRUCTION";
+const scopedPayloadNeedle = "CONTEXT_BUDGET_SCOPED_PAYLOAD";
 const httpResponses: Array<{ method: string; status: number }> = [];
+const execFileAsync = promisify(execFile);
 
 await Promise.all([
   mkdir(workspaceRoot, { recursive: true }),
   mkdir(configDir, { recursive: true }),
   mkdir(agentDir, { recursive: true }),
   mkdir(worktreeRoot, { recursive: true }),
+  mkdir(join(workspaceRoot, "nested"), { recursive: true }),
+  mkdir(join(workspaceRoot, "read-scope"), { recursive: true }),
   mkdir(join(workspaceRoot, ".agents", "skills", "context-budget"), { recursive: true }),
 ]);
 await writeFile(join(workspaceRoot, "AGENTS.md"), `# Test instructions\n\n${openWorkspaceNeedle}\n`);
+await writeFile(join(workspaceRoot, "nested", "AGENTS.md"), "# Nested instructions\n\nKeep nested commands scoped.\n");
+await writeFile(join(workspaceRoot, "read-scope", "AGENTS.md"), `${scopedInstructionNeedle}\n`);
+await writeFile(join(workspaceRoot, "read-scope", "payload.txt"), `${scopedPayloadNeedle}\n`);
 await writeFile(join(workspaceRoot, "payload.txt"), `${readNeedle}\n`);
 await writeFile(join(workspaceRoot, "batch.txt"), `${batchNeedle}\n`);
 await writeFile(
   join(workspaceRoot, ".agents", "skills", "context-budget", "SKILL.md"),
   `---\nname: context-budget\ndescription: Context budget fixture.\n---\n\n${skillNeedle}\n`,
+);
+await execFileAsync("git", ["init", "-q"], { cwd: workspaceRoot });
+await execFileAsync("git", ["add", "."], { cwd: workspaceRoot });
+await execFileAsync(
+  "git",
+  ["-c", "user.name=DevSpace Test", "-c", "user.email=devspace@example.invalid", "-c", "commit.gpgsign=false", "commit", "-qm", "fixture"],
+  { cwd: workspaceRoot },
 );
 
 const configEnvironment = {
@@ -49,10 +67,11 @@ const configEnvironment = {
   DEVSPACE_WORKTREE_ROOT: worktreeRoot,
   DEVSPACE_AGENT_DIR: agentDir,
   DEVSPACE_OAUTH_OWNER_TOKEN: "context-budget-owner-token-long-enough",
+  DEVSPACE_MAX_COMMAND_RUNTIME_SECONDS: "1",
   DEVSPACE_WIDGETS: "changes",
   DEVSPACE_LOG_LEVEL: "silent",
 };
-const config = loadConfig({ ...configEnvironment, DEVSPACE_TOOL_MODE: "codex" });
+const config = loadConfig(configEnvironment);
 
 seedAccessToken(config, stateDir);
 
@@ -74,6 +93,40 @@ try {
 
   const instructions = client.getInstructions() ?? "";
   const toolsList = await client.listTools();
+  assert.deepEqual(
+    toolsList.tools.map((tool) => tool.name).sort(),
+    [
+      "apply_patch",
+      "batch_inspect",
+      "batch_read",
+      "close_workspace",
+      "exec_command",
+      "load_skill",
+      "open_workspace",
+      "read",
+      "read_process_output",
+      "show_changes",
+      "write_stdin",
+    ],
+    "tools/list must expose only the fixed DevSpace surface",
+  );
+  const toolsByName = new Map(toolsList.tools.map((tool) => [tool.name, tool]));
+  assert.doesNotMatch(toolsByName.get("write_stdin")?.description ?? "", /rerun/i);
+  assert.match(
+    toolsByName.get("read_process_output")?.description ?? "",
+    /retained across process-session loss\/backend restart until TTL\/quota eviction/i,
+  );
+  assert.ok((toolsByName.get("open_workspace")?.description?.length ?? Infinity) < 140);
+  assert.match(toolsByName.get("load_skill")?.description ?? "", /before work.*after recovery/i);
+  assert.ok((toolsByName.get("load_skill")?.description?.length ?? Infinity) < 70);
+  const readProcessOutputSchema = JSON.stringify(toolsByName.get("read_process_output")?.outputSchema);
+  assert.match(readProcessOutputSchema, /unknown/);
+  assert.match(readProcessOutputSchema, /active/);
+  assert.match(readProcessOutputSchema, /completed/);
+  assert.ok(
+    utf8Bytes(toolsList) < 14_000,
+    `tools/list must be under 14000 UTF-8 bytes; received ${utf8Bytes(toolsList)} (${toolsList.tools.map((tool) => `${tool.name}=${utf8Bytes(tool)}/${utf8Bytes(tool.inputSchema)}/${utf8Bytes(tool.outputSchema)}`).join(", ")})`,
+  );
   const resourcesList = await client.listResources();
   const openWorkspace = await client.callTool({
     name: "open_workspace",
@@ -83,10 +136,53 @@ try {
     (openWorkspace.structuredContent as { workspaceId?: unknown } | undefined)?.workspaceId ?? "",
   );
   assert.ok(workspaceId, "open_workspace must return a structured workspaceId");
+  const instructionRevision = String(
+    (openWorkspace.structuredContent as { instructionRevision?: unknown } | undefined)
+      ?.instructionRevision ?? "",
+  );
+  assert.ok(instructionRevision, "open_workspace must return an instructionRevision");
+  const repeatedOpenWorkspace = await client.callTool({
+    name: "open_workspace",
+    arguments: { path: workspaceRoot, knownInstructionRevision: instructionRevision },
+  });
+  assert.equal(
+    (repeatedOpenWorkspace.structuredContent as { workspaceId?: unknown } | undefined)?.workspaceId,
+    workspaceId,
+    "reopening the same path must reuse its workspace",
+  );
+  assert.equal(
+    (repeatedOpenWorkspace.structuredContent as { instructionsIncluded?: unknown } | undefined)
+      ?.instructionsIncluded,
+    false,
+  );
+  assert.deepEqual(
+    (repeatedOpenWorkspace.structuredContent as { agentsFiles?: unknown } | undefined)?.agentsFiles,
+    [],
+  );
+  const firstOpenText = toolText(openWorkspace);
+  assert.equal(firstOpenText.match(/nested instructions load/gi)?.length, 1);
+  assert.equal(firstOpenText.match(/Load a matching Skill before work/gi)?.length, 1);
+  const repeatedOpenText = toolText(repeatedOpenWorkspace);
+  assert.doesNotMatch(repeatedOpenText, /nested instructions load|Load a matching Skill before work/i);
   const read = await client.callTool({
     name: "read",
     arguments: { workspaceId, path: "payload.txt" },
   });
+  const scopedRead = await client.callTool({
+    name: "read",
+    arguments: { workspaceId, path: "read-scope/payload.txt" },
+  });
+  assert.notEqual(scopedRead.isError, true);
+  const scopedReadBlocks = textBlocks(scopedRead);
+  assert.match(scopedReadBlocks[0]?.text ?? "", new RegExp(scopedInstructionNeedle));
+  assert.match(scopedReadBlocks.at(-1)?.text ?? "", new RegExp(scopedPayloadNeedle));
+  assert.ok(toolText(scopedRead).indexOf(scopedInstructionNeedle) < toolText(scopedRead).indexOf(scopedPayloadNeedle));
+  assert.doesNotMatch(toolText(scopedRead), /instructionToken=/);
+  const repeatedScopedRead = await client.callTool({
+    name: "read",
+    arguments: { workspaceId, path: "read-scope/payload.txt" },
+  });
+  assert.doesNotMatch(toolText(repeatedScopedRead), new RegExp(scopedInstructionNeedle));
   const staleWorkspaceResponseStart = httpResponses.length;
   const staleWorkspace = await client.callTool({
     name: "read",
@@ -115,6 +211,42 @@ try {
     name: "batch_inspect",
     arguments: { workspaceId, operations: [{ operation: "grep", pattern: batchNeedle, path: "batch.txt" }] },
   });
+  const partialBatchRead = await client.callTool({
+    name: "batch_read",
+    arguments: { workspaceId, files: [{ path: "batch.txt" }, { path: "missing-partial.txt" }] },
+  });
+  assert.notEqual(partialBatchRead.isError, true);
+  assert.match(toolText(partialBatchRead), /partially completed.*1 failed/i);
+  const failedBatchRead = await client.callTool({
+    name: "batch_read",
+    arguments: { workspaceId, files: [{ path: "missing-one.txt" }, { path: "missing-two.txt" }] },
+  });
+  assert.equal(failedBatchRead.isError, true);
+  assert.match(toolText(failedBatchRead), /Batch read failed.*2 failed/i);
+  const partialBatchInspect = await client.callTool({
+    name: "batch_inspect",
+    arguments: {
+      workspaceId,
+      operations: [
+        { operation: "grep", pattern: batchNeedle, path: "batch.txt" },
+        { operation: "ls", path: "missing-partial-dir" },
+      ],
+    },
+  });
+  assert.notEqual(partialBatchInspect.isError, true);
+  assert.match(toolText(partialBatchInspect), /partially completed.*1 failed/i);
+  const failedBatchInspect = await client.callTool({
+    name: "batch_inspect",
+    arguments: {
+      workspaceId,
+      operations: [
+        { operation: "ls", path: "missing-one-dir" },
+        { operation: "ls", path: "missing-two-dir" },
+      ],
+    },
+  });
+  assert.equal(failedBatchInspect.isError, true);
+  assert.match(toolText(failedBatchInspect), /Batch inspection failed.*2 failed/i);
   const advertisedSkill = (openWorkspace.structuredContent as {
     skills?: Array<{ skillId?: unknown; name?: unknown }>;
   } | undefined)?.skills?.find((skill) => skill.name === "context-budget");
@@ -131,12 +263,194 @@ try {
       stdin: `${processNeedle}\n`,
     },
   });
+  const deniedCommand = await client.callTool({
+    name: "exec_command",
+    arguments: { workspaceId, cmd: "sudo true" },
+  });
+  assert.equal(deniedCommand.isError, true);
+  assert.match(toolText(deniedCommand), /^No command was executed\./);
+  assert.match(JSON.stringify(deniedCommand.content), /blocked by command policy/i);
+
+  const timedOutCommand = await client.callTool({
+    name: "exec_command",
+    arguments: {
+      workspaceId,
+      cmd: `${JSON.stringify(process.execPath)} -e "setInterval(() => {}, 1000)"`,
+      timeoutMs: 50,
+      yieldTimeMs: 2_000,
+    },
+  });
+  assert.notEqual(timedOutCommand.isError, true);
+  assert.equal(
+    (timedOutCommand.structuredContent as { timedOut?: unknown } | undefined)?.timedOut,
+    true,
+  );
+  assert.match(JSON.stringify(timedOutCommand.content), /runtime limit/i);
+
+  const activeCommand = await client.callTool({
+    name: "exec_command",
+    arguments: {
+      workspaceId,
+      cmd: `${JSON.stringify(process.execPath)} -e "process.stdout.write('active-status'); setTimeout(() => {}, 500)"`,
+      yieldTimeMs: 100,
+    },
+  });
+  assert.equal(
+    (activeCommand.structuredContent as { running?: unknown } | undefined)?.running,
+    true,
+  );
+  const activeOutputId = (activeCommand.structuredContent as { outputId?: unknown } | undefined)
+    ?.outputId;
+  const activeSessionId = (activeCommand.structuredContent as { sessionId?: unknown } | undefined)
+    ?.sessionId;
+  assert.equal(typeof activeOutputId, "string");
+  assert.equal(typeof activeSessionId, "number");
+  const activeProcessOutput = await client.callTool({
+    name: "read_process_output",
+    arguments: { workspaceId, outputId: activeOutputId, offset: 0 },
+  });
+  assert.equal(
+    (activeProcessOutput.structuredContent as { status?: unknown } | undefined)?.status,
+    "active",
+  );
+  assert.match(toolText(activeProcessOutput), /\(active\).*more output may arrive/s);
+  await client.callTool({
+    name: "write_stdin",
+    arguments: { workspaceId, sessionId: activeSessionId, yieldTimeMs: 1_000 },
+  });
+
+  const overLimitCommand = await client.callTool({
+    name: "exec_command",
+    arguments: { workspaceId, cmd: "echo should-not-run", timeoutMs: 1_001 },
+  });
+  assert.equal(overLimitCommand.isError, true);
+  assert.match(JSON.stringify(overLimitCommand.content), /1000|maximum|too_big/i);
+
+  const outsideWrite = await client.callTool({
+    name: "exec_command",
+    arguments: {
+      workspaceId,
+      cmd: `printf blocked > ${JSON.stringify(join(root, "outside.txt"))}`,
+    },
+  });
+  assert.equal(outsideWrite.isError, true);
+  assert.match(toolText(outsideWrite), /^No command was executed\./);
+  assert.match(JSON.stringify(outsideWrite.content), /outside the workspace/i);
+
+  const nestedGate = await client.callTool({
+    name: "exec_command",
+    arguments: { workspaceId, cmd: "pwd", workingDirectory: "nested" },
+  });
+  assert.equal(nestedGate.isError, true);
+  const nestedGateText = JSON.stringify(nestedGate.content);
+  assert.match(
+    nestedGateText,
+    /No mutation or command was executed because new scoped instructions must be reviewed first/,
+  );
+  const instructionToken = nestedGateText.match(/instructionToken=([A-Za-z0-9_-]+)/)?.[1];
+  assert.ok(instructionToken, "nested instruction gate must return an acknowledgement token");
+  const nestedRetry = await client.callTool({
+    name: "exec_command",
+    arguments: { workspaceId, instructionToken, cmd: "pwd", workingDirectory: "nested" },
+  });
+  assert.notEqual(nestedRetry.isError, true);
+  assert.match(JSON.stringify(nestedRetry.content), /nested/);
+
+  const background = await client.callTool({
+    name: "exec_command",
+    arguments: {
+      workspaceId,
+      cmd: `${JSON.stringify(process.execPath)} -e "setTimeout(() => console.log('background-ok'), 50)"`,
+      yieldTimeMs: 0,
+    },
+  });
+  const backgroundSessionId = (background.structuredContent as { sessionId?: unknown } | undefined)
+    ?.sessionId;
+  assert.equal(typeof backgroundSessionId, "number");
+  const backgroundResult = await client.callTool({
+    name: "write_stdin",
+    arguments: { workspaceId, sessionId: backgroundSessionId, yieldTimeMs: 1_000 },
+  });
+  assert.match(JSON.stringify(backgroundResult.content), /background-ok/);
+  const dirtyWorkspace = await client.callTool({
+    name: "open_workspace",
+    arguments: { path: workspaceRoot, mode: "worktree" },
+  });
+  const dirtyWorkspaceId = String(
+    (dirtyWorkspace.structuredContent as { workspaceId?: unknown } | undefined)?.workspaceId ?? "",
+  );
+  assert.ok(dirtyWorkspaceId);
+  const dirtyWrite = await client.callTool({
+    name: "exec_command",
+    arguments: { workspaceId: dirtyWorkspaceId, cmd: "printf dirty > dirty.txt" },
+  });
+  assert.notEqual(dirtyWrite.isError, true);
+  const dirtyBackground = await client.callTool({
+    name: "exec_command",
+    arguments: {
+      workspaceId: dirtyWorkspaceId,
+      cmd: `${JSON.stringify(process.execPath)} -e "setInterval(() => {}, 1000)"`,
+      yieldTimeMs: 0,
+    },
+  });
+  assert.equal(
+    typeof (dirtyBackground.structuredContent as { sessionId?: unknown } | undefined)?.sessionId,
+    "number",
+  );
+  const dirtyClose = await client.callTool({
+    name: "close_workspace",
+    arguments: { workspaceId: dirtyWorkspaceId },
+  });
+  assert.equal(dirtyClose.isError, true);
+  assert.deepEqual(dirtyClose.structuredContent, {
+    closed: false,
+    processesTerminated: 1,
+    worktreeRemoved: false,
+    reason: "dirty",
+  });
+  assert.match(
+    toolText(dirtyClose),
+    /closed=false\. Processes terminated: 1\. Worktree retained because it is dirty\./,
+  );
+  const retainedRead = await client.callTool({
+    name: "read",
+    arguments: { workspaceId: dirtyWorkspaceId, path: "dirty.txt" },
+  });
+  assert.match(toolText(retainedRead), /dirty/);
   const outputId = (execCommand.structuredContent as { outputId?: unknown } | undefined)?.outputId;
   assert.equal(typeof outputId, "string");
   const readProcessOutput = await client.callTool({
     name: "read_process_output",
     arguments: { workspaceId, outputId, offset: 0 },
   });
+  assert.equal(
+    (readProcessOutput.structuredContent as { status?: unknown } | undefined)?.status,
+    "completed",
+  );
+  assert.match(toolText(readProcessOutput), /\(completed\).*Reached the retained end of output/s);
+
+  const outputDatabase = new Database(join(stateDir, "process-output", "metadata.sqlite"));
+  try {
+    const changed = outputDatabase
+      .prepare("update process_outputs set status = 'unknown' where output_id = ? and status = 'completed'")
+      .run(outputId).changes;
+    assert.equal(changed, 1, "the retained-output fixture must transition to recovered unknown status");
+  } finally {
+    outputDatabase.close();
+  }
+  const unknownProcessOutput = await client.callTool({
+    name: "read_process_output",
+    arguments: { workspaceId, outputId, offset: 0 },
+  });
+  assert.notEqual(unknownProcessOutput.isError, true);
+  assert.equal(
+    (unknownProcessOutput.structuredContent as { status?: unknown } | undefined)?.status,
+    "unknown",
+  );
+  assert.match(
+    toolText(unknownProcessOutput),
+    /\(unknown\).*Process completion is unknown after interruption or backend restart\..*Verify command side effects before deciding whether to rerun\./s,
+  );
 
   const toolCategories = toolsList.tools.reduce(
     (totals, tool) => ({
@@ -169,6 +483,7 @@ try {
       resourceCount: resourcesList.resources.length,
     },
     openWorkspace: responseMeasurements(openWorkspace, openWorkspaceNeedle),
+    repeatedOpenWorkspace: responseMeasurements(repeatedOpenWorkspace, openWorkspaceNeedle),
     read: responseMeasurements(read, readNeedle),
     batchRead: responseMeasurements(batchRead, batchNeedle),
     batchInspect: responseMeasurements(batchInspect, batchNeedle),
@@ -180,23 +495,24 @@ try {
   console.log(`MCP context budget: ${JSON.stringify(measurements)}`);
 
   assert.ok(
-    measurements.initialize.instructionsBytes >= 1_300 &&
-      measurements.initialize.instructionsBytes <= 1_700,
-    `initialize instructions must be 1300-1700 UTF-8 bytes; received ${measurements.initialize.instructionsBytes}`,
+    measurements.initialize.instructionsBytes < 950,
+    `initialize instructions must be under 950 UTF-8 bytes; received ${measurements.initialize.instructionsBytes}`,
   );
-  assert.ok(
-    measurements.toolsList.totalBytes <= 16_000,
-    `tools/list must be at most 16000 UTF-8 bytes; received ${measurements.toolsList.totalBytes}`,
+  assertFirst512Lifecycle(instructions);
+  assert.equal(
+    measurements.openWorkspace.modelVisibleHeavyCopies,
+    1,
+    "open_workspace instructions must appear in exactly one model-visible field",
   );
   assert.equal(
-    measurements.openWorkspace.heavyFieldCopies,
-    1,
-    "open_workspace instructions must appear in exactly one of content, structuredContent, or _meta.card.payload",
+    measurements.repeatedOpenWorkspace.modelVisibleHeavyCopies,
+    0,
+    "matching instructionRevision must omit repeated instruction bodies",
   );
   assert.equal(
-    measurements.read.heavyFieldCopies,
+    measurements.read.modelVisibleHeavyCopies,
     1,
-    "read output must appear in exactly one of content, structuredContent, or _meta.card.payload",
+    "read output must appear in exactly one model-visible field",
   );
   for (const [name, measurement] of Object.entries({
     batchRead: measurements.batchRead,
@@ -206,7 +522,7 @@ try {
     readProcessOutput: measurements.readProcessOutput,
   })) {
     assert.equal(
-      measurement.heavyFieldCopies,
+      measurement.modelVisibleHeavyCopies,
       1,
       `${name} heavy output must appear in exactly one model-visible field`,
     );
@@ -222,29 +538,25 @@ try {
   assert.equal((execCommand._meta as { tool?: unknown } | undefined)?.tool, "exec_command");
   assert.equal((readProcessOutput.structuredContent as { content?: unknown } | undefined)?.content, undefined);
 
-  const fullStateDir = join(root, "state-full");
-  const fullConfig = loadConfig({
+  const legacyModeStateDir = join(root, "state-legacy-mode");
+  const legacyModeConfig = loadConfig({
     ...configEnvironment,
-    DEVSPACE_STATE_DIR: fullStateDir,
+    DEVSPACE_STATE_DIR: legacyModeStateDir,
     DEVSPACE_TOOL_MODE: "full",
   });
-  seedAccessToken(fullConfig, fullStateDir);
-  const fullDiscovery = await measureDiscovery(fullConfig);
-  console.log(`MCP full discovery budget: ${JSON.stringify({ ...fullDiscovery, instructions: undefined })}`);
-  assert.ok(
-    fullDiscovery.instructionsBytes >= 1_300 && fullDiscovery.instructionsBytes <= 1_700,
-    `full initialize instructions must be 1300-1700 UTF-8 bytes; received ${fullDiscovery.instructionsBytes}`,
+  seedAccessToken(legacyModeConfig, legacyModeStateDir);
+  const legacyModeDiscovery = await measureDiscovery(legacyModeConfig);
+  assert.deepEqual(
+    Object.keys(legacyModeDiscovery.perTool).sort(),
+    Object.keys(measurements.toolsList.perTool).sort(),
+    "legacy DEVSPACE_TOOL_MODE must not alter the fixed tool surface",
   );
-  assert.ok(
-    fullDiscovery.toolsListBytes <= 20_000,
-    `full tools/list must be at most 20000 UTF-8 bytes; received ${fullDiscovery.toolsListBytes}`,
-  );
+  assert.equal("bash" in legacyModeDiscovery.perTool, false);
 
   const skillsOffStateDir = join(root, "state-skills-off");
   const skillsOffConfig = loadConfig({
     ...configEnvironment,
     DEVSPACE_STATE_DIR: skillsOffStateDir,
-    DEVSPACE_TOOL_MODE: "codex",
     DEVSPACE_SKILLS: "0",
   });
   seedAccessToken(skillsOffConfig, skillsOffStateDir);
@@ -328,20 +640,55 @@ function responseMeasurements(response: unknown, needle: string) {
   const result = response as {
     content?: unknown;
     structuredContent?: unknown;
-    _meta?: { card?: { payload?: unknown } };
+    _meta?: unknown;
   };
-  const fields = {
+  const modelVisibleFields = {
     content: result.content,
     structuredContent: result.structuredContent,
-    metaPayload: result._meta?.card?.payload,
   };
+  const hiddenMeta = result._meta;
   return {
-    totalBytes: utf8Bytes(response),
-    contentBytes: utf8Bytes(fields.content),
-    structuredContentBytes: utf8Bytes(fields.structuredContent),
-    metaPayloadBytes: utf8Bytes(fields.metaPayload),
-    heavyFieldCopies: Object.values(fields).filter((field) => serialized(field).includes(needle)).length,
+    wireBytes: utf8Bytes(response),
+    modelVisibleBytes:
+      utf8Bytes(modelVisibleFields.content) + utf8Bytes(modelVisibleFields.structuredContent),
+    contentBytes: utf8Bytes(modelVisibleFields.content),
+    structuredContentBytes: utf8Bytes(modelVisibleFields.structuredContent),
+    hiddenMetaBytes: utf8Bytes(hiddenMeta),
+    modelVisibleHeavyCopies: Object.values(modelVisibleFields)
+      .filter((field) => serialized(field).includes(needle)).length,
+    hiddenMetaHeavyCopies: serialized(hiddenMeta).includes(needle) ? 1 : 0,
   };
+}
+
+function textBlocks(response: unknown): Array<{ type: "text"; text: string }> {
+  if (!response || typeof response !== "object" || !("content" in response)) return [];
+  const content = (response as { content?: unknown }).content;
+  if (!Array.isArray(content)) return [];
+  return content.filter(
+    (block): block is { type: "text"; text: string } =>
+      Boolean(block) && typeof block === "object" &&
+      (block as { type?: unknown }).type === "text" &&
+      typeof (block as { text?: unknown }).text === "string",
+  );
+}
+
+function toolText(response: unknown): string {
+  return textBlocks(response)
+    .map((block) => block.text)
+    .join("\n");
+}
+
+function assertFirst512Lifecycle(instructions: string): void {
+  const first512 = instructions.slice(0, 512);
+  assert.match(first512, /open_workspace with the exact path once/);
+  assert.match(first512, /reuse workspaceId across turns\/transports/);
+  assert.match(first512, /If unknown.*reopen that exact path.*replace ID/s);
+  assert.match(first512, /close_workspace only when asked/);
+  assert.match(first512, /Follow all returned instructions/);
+  assert.match(first512, /Read\/open instructions need no retry/);
+  assert.match(first512, /blocked mutation\/command returns instructionToken/);
+  assert.match(first512, /Batch 2–8 independent known targets/);
+  assert.doesNotMatch(first512, /reconnect|MCP session is rejected/);
 }
 
 function utf8Bytes(value: unknown): number {
