@@ -118,15 +118,30 @@ try {
     /retained across process-session loss\/backend restart until TTL\/quota eviction/i,
   );
   assert.ok((toolsByName.get("open_workspace")?.description?.length ?? Infinity) < 140);
-  assert.match(toolsByName.get("load_skill")?.description ?? "", /before work.*after recovery/i);
-  assert.ok((toolsByName.get("load_skill")?.description?.length ?? Infinity) < 70);
+  assert.match(toolsByName.get("load_skill")?.description ?? "", /exact unique name.*catalog-omitted.*recovery/i);
+  assert.ok((toolsByName.get("load_skill")?.description?.length ?? Infinity) < 150);
   const readProcessOutputSchema = JSON.stringify(toolsByName.get("read_process_output")?.outputSchema);
   assert.match(readProcessOutputSchema, /unknown/);
   assert.match(readProcessOutputSchema, /active/);
-  assert.match(readProcessOutputSchema, /completed/);
+  assert.doesNotMatch(readProcessOutputSchema, /completed|storedBytes|totalBytes|outputId/);
+  for (const name of ["read", "load_skill", "close_workspace", "apply_patch", "show_changes"]) {
+    assert.equal(toolsByName.get(name)?.outputSchema, undefined, `${name} should not advertise a redundant output schema`);
+  }
+  for (const name of [
+    "read",
+    "load_skill",
+    "batch_read",
+    "batch_inspect",
+    "apply_patch",
+    "exec_command",
+    "write_stdin",
+    "read_process_output",
+  ]) {
+    assert.equal(toolsByName.get(name)?._meta, undefined, `${name} should omit empty widget metadata`);
+  }
   assert.ok(
-    utf8Bytes(toolsList) < 14_000,
-    `tools/list must be under 14000 UTF-8 bytes; received ${utf8Bytes(toolsList)} (${toolsList.tools.map((tool) => `${tool.name}=${utf8Bytes(tool)}/${utf8Bytes(tool.inputSchema)}/${utf8Bytes(tool.outputSchema)}`).join(", ")})`,
+    utf8Bytes(toolsList) < 11_500,
+    `tools/list must be under 11500 UTF-8 bytes; received ${utf8Bytes(toolsList)} (${toolsList.tools.map((tool) => `${tool.name}=${utf8Bytes(tool)}/${utf8Bytes(tool.inputSchema)}/${utf8Bytes(tool.outputSchema)}`).join(", ")})`,
   );
   const resourcesList = await client.listResources();
   const openWorkspace = await client.callTool({
@@ -142,9 +157,17 @@ try {
       ?.instructionRevision ?? "",
   );
   assert.ok(instructionRevision, "open_workspace must return an instructionRevision");
+  const skillRevision = String(
+    (openWorkspace.structuredContent as { skillRevision?: unknown } | undefined)?.skillRevision ?? "",
+  );
+  assert.ok(skillRevision, "open_workspace must return a skillRevision");
   const repeatedOpenWorkspace = await client.callTool({
     name: "open_workspace",
-    arguments: { path: workspaceRoot, knownInstructionRevision: instructionRevision },
+    arguments: {
+      path: workspaceRoot,
+      knownInstructionRevision: instructionRevision,
+      knownSkillRevision: skillRevision,
+    },
   });
   assert.equal(
     (repeatedOpenWorkspace.structuredContent as { workspaceId?: unknown } | undefined)?.workspaceId,
@@ -160,11 +183,61 @@ try {
     (repeatedOpenWorkspace.structuredContent as { agentsFiles?: unknown } | undefined)?.agentsFiles,
     [],
   );
+  assert.equal(
+    (repeatedOpenWorkspace.structuredContent as { skillsIncluded?: unknown } | undefined)?.skillsIncluded,
+    false,
+  );
+  assert.deepEqual(
+    (repeatedOpenWorkspace.structuredContent as { skills?: unknown } | undefined)?.skills,
+    [],
+  );
+  const instructionsOnlySuppressed = await client.callTool({
+    name: "open_workspace",
+    arguments: { path: workspaceRoot, knownInstructionRevision: instructionRevision },
+  });
+  assert.equal(
+    (instructionsOnlySuppressed.structuredContent as { instructionsIncluded?: unknown } | undefined)
+      ?.instructionsIncluded,
+    false,
+  );
+  assert.equal(
+    (instructionsOnlySuppressed.structuredContent as { skillsIncluded?: unknown } | undefined)?.skillsIncluded,
+    true,
+  );
+  const skillsOnlySuppressed = await client.callTool({
+    name: "open_workspace",
+    arguments: { path: workspaceRoot, knownSkillRevision: skillRevision },
+  });
+  assert.equal(
+    (skillsOnlySuppressed.structuredContent as { instructionsIncluded?: unknown } | undefined)
+      ?.instructionsIncluded,
+    true,
+  );
+  assert.equal(
+    (skillsOnlySuppressed.structuredContent as { skillsIncluded?: unknown } | undefined)?.skillsIncluded,
+    false,
+  );
   const firstOpenText = toolText(openWorkspace);
   assert.equal(firstOpenText.match(/nested instructions load/gi)?.length, 1);
-  assert.equal(firstOpenText.match(/Load a matching Skill before work/gi)?.length, 1);
+  assert.equal(firstOpenText.match(/Load an applicable returned Skill before work/gi)?.length, 1);
+  assert.doesNotMatch(firstOpenText, new RegExp(workspaceId));
+  assert.doesNotMatch(firstOpenText, new RegExp(workspaceRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   const repeatedOpenText = toolText(repeatedOpenWorkspace);
-  assert.doesNotMatch(repeatedOpenText, /nested instructions load|Load a matching Skill before work/i);
+  assert.equal(repeatedOpenText, "Workspace context unchanged.");
+  const deniedWorkspaceOpen = await client.callTool({
+    name: "open_workspace",
+    arguments: { path: configDir },
+  });
+  assert.equal(deniedWorkspaceOpen.isError, true);
+  assert.match(toolText(deniedWorkspaceOpen), /^path_not_allowed:/);
+  assert.doesNotMatch(toolText(deniedWorkspaceOpen), new RegExp(configDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  const failedWorkspaceOpen = await client.callTool({
+    name: "open_workspace",
+    arguments: { path: join(workspaceRoot, "payload.txt") },
+  });
+  assert.equal(failedWorkspaceOpen.isError, true);
+  assert.match(toolText(failedWorkspaceOpen), /^tool_failed:/);
+  assert.doesNotMatch(toolText(failedWorkspaceOpen), /payload\.txt/);
   const read = await client.callTool({
     name: "read",
     arguments: { workspaceId, path: "payload.txt" },
@@ -198,8 +271,9 @@ try {
     staleWorkspaceContent[0]?.type === "text" && typeof staleWorkspaceContent[0].text === "string"
       ? staleWorkspaceContent[0].text
       : "",
-    /Unknown workspaceId: ws_stale_context_budget\..*open_workspace with the original exact project path.*replace the old ID/i,
+    /^unknown_workspace: Call open_workspace.*replace workspaceId.*retry once/i,
   );
+  assert.doesNotMatch(toolText(staleWorkspace), /ws_stale_context_budget/);
   assert.ok(
     staleWorkspaceResponses.some(({ method, status }) => method === "POST" && status === 200),
     "stale workspace tool errors must remain successful HTTP exchanges",
@@ -217,13 +291,14 @@ try {
     arguments: { workspaceId, files: [{ path: "batch.txt" }, { path: "missing-partial.txt" }] },
   });
   assert.notEqual(partialBatchRead.isError, true);
-  assert.match(toolText(partialBatchRead), /partially completed.*1 failed/i);
+  assert.match(toolText(partialBatchRead), /partial: 1 failed/i);
   const failedBatchRead = await client.callTool({
     name: "batch_read",
     arguments: { workspaceId, files: [{ path: "missing-one.txt" }, { path: "missing-two.txt" }] },
   });
   assert.equal(failedBatchRead.isError, true);
-  assert.match(toolText(failedBatchRead), /Batch read failed.*2 failed/i);
+  assert.match(toolText(failedBatchRead), /Batch read failed/i);
+  assert.doesNotMatch(JSON.stringify(failedBatchRead.structuredContent), new RegExp(root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   const partialBatchInspect = await client.callTool({
     name: "batch_inspect",
     arguments: {
@@ -235,7 +310,7 @@ try {
     },
   });
   assert.notEqual(partialBatchInspect.isError, true);
-  assert.match(toolText(partialBatchInspect), /partially completed.*1 failed/i);
+  assert.match(toolText(partialBatchInspect), /partial: 1 failed/i);
   const failedBatchInspect = await client.callTool({
     name: "batch_inspect",
     arguments: {
@@ -247,11 +322,13 @@ try {
     },
   });
   assert.equal(failedBatchInspect.isError, true);
-  assert.match(toolText(failedBatchInspect), /Batch inspection failed.*2 failed/i);
+  assert.match(toolText(failedBatchInspect), /Batch inspection failed/i);
   const advertisedSkill = (openWorkspace.structuredContent as {
-    skills?: Array<{ skillId?: unknown; name?: unknown }>;
+    skills?: Array<Record<string, unknown> & { skillId?: unknown; name?: unknown }>;
   } | undefined)?.skills?.find((skill) => skill.name === "context-budget");
   assert.ok(advertisedSkill?.skillId);
+  assert.deepEqual(Object.keys(advertisedSkill).sort(), ["description", "name", "skillId"]);
+  assert.doesNotMatch(JSON.stringify(advertisedSkill), new RegExp(root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   const loadSkill = await client.callTool({
     name: "load_skill",
     arguments: { workspaceId, skillId: advertisedSkill.skillId },
@@ -264,6 +341,7 @@ try {
       stdin: `${processNeedle}\n`,
     },
   });
+  assert.deepEqual(execCommand.structuredContent, {});
   const deniedCommand = await client.callTool({
     name: "exec_command",
     arguments: { workspaceId, cmd: "sudo true" },
@@ -298,7 +376,7 @@ try {
   });
   assert.equal(
     (activeCommand.structuredContent as { running?: unknown } | undefined)?.running,
-    true,
+    undefined,
   );
   const activeOutputId = (activeCommand.structuredContent as { outputId?: unknown } | undefined)
     ?.outputId;
@@ -306,6 +384,10 @@ try {
     ?.sessionId;
   assert.equal(typeof activeOutputId, "string");
   assert.equal(typeof activeSessionId, "number");
+  assert.deepEqual(
+    Object.keys((activeCommand.structuredContent ?? {}) as Record<string, unknown>).sort(),
+    ["outputId", "sessionId"],
+  );
   const activeProcessOutput = await client.callTool({
     name: "read_process_output",
     arguments: { workspaceId, outputId: activeOutputId, offset: 0 },
@@ -314,11 +396,34 @@ try {
     (activeProcessOutput.structuredContent as { status?: unknown } | undefined)?.status,
     "active",
   );
-  assert.match(toolText(activeProcessOutput), /\(active\).*more output may arrive/s);
+  assert.deepEqual(
+    Object.keys((activeProcessOutput.structuredContent ?? {}) as Record<string, unknown>).sort(),
+    ["nextOffset", "status"],
+  );
+  assert.match(toolText(activeProcessOutput), /active-status.*current end; poll offset=/s);
   await client.callTool({
     name: "write_stdin",
     arguments: { workspaceId, sessionId: activeSessionId, yieldTimeMs: 1_000 },
   });
+  const unknownProcessSession = await client.callTool({
+    name: "write_stdin",
+    arguments: { workspaceId, sessionId: activeSessionId },
+  });
+  assert.equal(unknownProcessSession.isError, true);
+  assert.match(toolText(unknownProcessSession), /^unknown_process_session:/);
+  assert.doesNotMatch(toolText(unknownProcessSession), new RegExp(String(activeSessionId)));
+  assert.equal(
+    (unknownProcessSession._meta as { error?: { code?: unknown } } | undefined)?.error?.code,
+    "unknown_process_session",
+  );
+
+  const missingProcessOutput = await client.callTool({
+    name: "read_process_output",
+    arguments: { workspaceId, outputId: "output_missing_context_budget", offset: 0 },
+  });
+  assert.equal(missingProcessOutput.isError, true);
+  assert.match(toolText(missingProcessOutput), /^process_output_not_found:/);
+  assert.doesNotMatch(toolText(missingProcessOutput), /output_missing_context_budget/);
 
   const overLimitCommand = await client.callTool({
     name: "exec_command",
@@ -403,6 +508,18 @@ try {
   });
   assert.notEqual(nestedRetry.isError, true);
   assert.match(JSON.stringify(nestedRetry.content), /nested/);
+  const invalidInstructionToken = await client.callTool({
+    name: "exec_command",
+    arguments: {
+      workspaceId,
+      instructionToken: "instructions_missing_context_budget",
+      cmd: "pwd",
+      workingDirectory: "nested",
+    },
+  });
+  assert.equal(invalidInstructionToken.isError, true);
+  assert.match(toolText(invalidInstructionToken), /^instruction_token_invalid:/);
+  assert.doesNotMatch(toolText(invalidInstructionToken), /instructions_missing_context_budget/);
 
   const background = await client.callTool({
     name: "exec_command",
@@ -471,7 +588,8 @@ try {
     arguments: { workspaceId: dirtyWorkspaceId },
   });
   assert.equal(dirtyClose.isError, true);
-  assert.deepEqual(dirtyClose.structuredContent, {
+  assert.equal(dirtyClose.structuredContent, undefined);
+  assert.deepEqual((dirtyClose._meta as { card?: { summary?: unknown } } | undefined)?.card?.summary, {
     closed: false,
     processesTerminated: 1,
     worktreeRemoved: false,
@@ -479,24 +597,22 @@ try {
   });
   assert.match(
     toolText(dirtyClose),
-    /closed=false\. Processes terminated: 1\. Worktree retained because it is dirty\./,
+    /Workspace remains open: dirty worktree retained; 1 process\(es\) terminated\./,
   );
   const retainedRead = await client.callTool({
     name: "read",
     arguments: { workspaceId: dirtyWorkspaceId, path: "dirty.txt" },
   });
   assert.match(toolText(retainedRead), /dirty/);
-  const outputId = (execCommand.structuredContent as { outputId?: unknown } | undefined)?.outputId;
+  const outputId = activeOutputId;
   assert.equal(typeof outputId, "string");
   const readProcessOutput = await client.callTool({
     name: "read_process_output",
     arguments: { workspaceId, outputId, offset: 0 },
   });
-  assert.equal(
-    (readProcessOutput.structuredContent as { status?: unknown } | undefined)?.status,
-    "completed",
-  );
-  assert.match(toolText(readProcessOutput), /\(completed\).*Reached the retained end of output/s);
+  assert.deepEqual(readProcessOutput.structuredContent, { eof: true });
+  assert.match(toolText(readProcessOutput), /active-status/);
+  assert.doesNotMatch(toolText(readProcessOutput), /completed|retained end|outputId/);
 
   const outputDatabase = new Database(join(stateDir, "process-output", "metadata.sqlite"));
   try {
@@ -516,9 +632,10 @@ try {
     (unknownProcessOutput.structuredContent as { status?: unknown } | undefined)?.status,
     "unknown",
   );
+  assert.deepEqual(unknownProcessOutput.structuredContent, { eof: true, status: "unknown" });
   assert.match(
     toolText(unknownProcessOutput),
-    /\(unknown\).*Process completion is unknown after interruption or backend restart\..*Verify command side effects before deciding whether to rerun\./s,
+    /completion unknown; verify side effects before rerun/i,
   );
 
   const toolCategories = toolsList.tools.reduce(
@@ -558,14 +675,14 @@ try {
     batchInspect: responseMeasurements(batchInspect, batchNeedle),
     loadSkill: responseMeasurements(loadSkill, skillNeedle),
     execCommand: responseMeasurements(execCommand, processNeedle),
-    readProcessOutput: responseMeasurements(readProcessOutput, processNeedle),
+    readProcessOutput: responseMeasurements(readProcessOutput, "active-status"),
   };
 
   console.log(`MCP context budget: ${JSON.stringify(measurements)}`);
 
   assert.ok(
-    measurements.initialize.instructionsBytes < 950,
-    `initialize instructions must be under 950 UTF-8 bytes; received ${measurements.initialize.instructionsBytes}`,
+    measurements.initialize.instructionsBytes < 850,
+    `initialize instructions must be under 850 UTF-8 bytes; received ${measurements.initialize.instructionsBytes}`,
   );
   assertFirst512Lifecycle(instructions);
   assert.equal(
@@ -600,8 +717,17 @@ try {
     const structured = batchResult.structuredContent as { result?: unknown; items?: unknown } | undefined;
     assert.equal(structured?.result, undefined);
     assert.ok(Array.isArray(structured?.items));
+    for (const item of structured.items as Array<Record<string, unknown>>) {
+      assert.deepEqual(
+        Object.keys(item).sort(),
+        item.truncated === true ? ["ok", "result", "truncated"] : ["ok", "result"],
+      );
+    }
   }
-  assert.equal((loadSkill.structuredContent as { content?: unknown } | undefined)?.content, undefined);
+  assert.equal(measurements.batchRead.hiddenMetaHeavyCopies, 0);
+  assert.equal(measurements.batchInspect.hiddenMetaHeavyCopies, 0);
+  assert.equal(read.structuredContent, undefined);
+  assert.equal(loadSkill.structuredContent, undefined);
   assert.equal((loadSkill._meta as { tool?: unknown } | undefined)?.tool, "load_skill");
   assert.equal((execCommand.structuredContent as { result?: unknown } | undefined)?.result, undefined);
   assert.equal((execCommand._meta as { tool?: unknown } | undefined)?.tool, "exec_command");
@@ -632,6 +758,18 @@ try {
   const skillsOffDiscovery = await measureDiscovery(skillsOffConfig);
   assert.equal("load_skill" in skillsOffDiscovery.perTool, false);
   assert.doesNotMatch(skillsOffDiscovery.instructions, /load_skill|matching skill|explicit-only/);
+
+  const widgetsOffStateDir = join(root, "state-widgets-off");
+  const widgetsOffConfig = loadConfig({
+    ...configEnvironment,
+    DEVSPACE_STATE_DIR: widgetsOffStateDir,
+    DEVSPACE_WIDGETS: "off",
+  });
+  seedAccessToken(widgetsOffConfig, widgetsOffStateDir);
+  const widgetsOffDiscovery = await measureDiscovery(widgetsOffConfig);
+  assert.equal(widgetsOffDiscovery.resourceCount, 0);
+  assert.equal(widgetsOffDiscovery.resourcesListBytes, utf8Bytes({ resources: [] }));
+  assert.ok(widgetsOffDiscovery.toolsListBytes < measurements.toolsList.totalBytes);
 } finally {
   await client?.close().catch(() => undefined);
   await closeHttpServer(httpServer);
@@ -645,6 +783,8 @@ async function measureDiscovery(testConfig: ReturnType<typeof loadConfig>): Prom
   toolsListBytes: number;
   toolCount: number;
   perTool: Record<string, number>;
+  resourcesListBytes: number;
+  resourceCount: number;
 }> {
   const testRunning = createServer(testConfig);
   const testHttpServer = createHttpServer(testRunning.app);
@@ -656,6 +796,12 @@ async function measureDiscovery(testConfig: ReturnType<typeof loadConfig>): Prom
       requestInit: { headers: { authorization: `Bearer ${accessToken}` } },
     }));
     const tools = await testClient.listTools();
+    let resources: { resources: unknown[] } = { resources: [] };
+    try {
+      resources = await testClient.listResources();
+    } catch (error) {
+      assert.equal((error as { code?: unknown }).code, -32601);
+    }
     const instructions = testClient.getInstructions() ?? "";
     return {
       instructions,
@@ -663,6 +809,8 @@ async function measureDiscovery(testConfig: ReturnType<typeof loadConfig>): Prom
       toolsListBytes: utf8Bytes(tools),
       toolCount: tools.tools.length,
       perTool: Object.fromEntries(tools.tools.map((tool) => [tool.name, utf8Bytes(tool)])),
+      resourcesListBytes: utf8Bytes(resources),
+      resourceCount: resources.resources.length,
     };
   } finally {
     await testClient?.close().catch(() => undefined);
@@ -749,13 +897,13 @@ function toolText(response: unknown): string {
 
 function assertFirst512Lifecycle(instructions: string): void {
   const first512 = instructions.slice(0, 512);
-  assert.match(first512, /open_workspace with the exact path once/);
+  assert.match(first512, /open_workspace once for the exact path/);
   assert.match(first512, /reuse workspaceId across turns\/transports/);
-  assert.match(first512, /If unknown.*reopen that exact path.*replace ID/s);
+  assert.match(first512, /unknown_workspace.*reopen the path.*replace ID/s);
   assert.match(first512, /close_workspace only when asked/);
-  assert.match(first512, /Follow all returned instructions/);
-  assert.match(first512, /Read\/open instructions need no retry/);
-  assert.match(first512, /blocked mutation\/command returns instructionToken/);
+  assert.match(first512, /Follow returned instructions/);
+  assert.match(first512, /Read\/open needs no retry/);
+  assert.match(first512, /blocked mutation\/command.*instructionToken/);
   assert.match(first512, /Batch 2–8 independent known targets/);
   assert.doesNotMatch(first512, /reconnect|MCP session is rejected/);
 }

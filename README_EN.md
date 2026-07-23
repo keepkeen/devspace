@@ -307,11 +307,15 @@ instruction chain is limited to 32 KiB, and interactive `write_stdin` input is
 gated when a running process may enter a newly instructed directory. Each
 `open_workspace` result includes a `sha256-v1:` `instructionRevision` over the
 ordered initial path/content pairs so clients can recognize an unchanged chain.
+The Skill catalog has an independent `skillRevision`; pass
+`knownSkillRevision` only while the prior catalog is still retained, and an
+unchanged catalog will not be sent again.
 
 DevSpace also advertises matching local Skills. ChatGPT web has no Codex
 `$skill` or `/skills` picker, so the model calls `load_skill` to load one
 complete `SKILL.md`. Supporting files remain unavailable until that succeeds.
-Duplicate names are preserved and distinguished by `skillId`, path, and scope.
+Duplicate names are preserved and distinguished by `skillId`, a privacy-safe
+logical path, and scope.
 See the detailed
 [ChatGPT coding workflow](./docs/chatgpt-coding-workflow.md).
 
@@ -335,11 +339,11 @@ the next file depends on the result of the previous search.
 
 DevSpace keeps each large model-visible payload in one place so the same file
 or command output does not consume context in both `content` and
-`structuredContent`. Single reads, Skill loads, and process tools put body text
-in `content`, while structured results retain only follow-up state and handles.
-Batch tools instead keep per-item bodies in `structuredContent.items[]`; their
-text `content` is only a completion summary and there is no concatenated
-aggregate `result`. `_meta` is optional ChatGPT component data and can be
+`structuredContent`. Reads and Skill loads put body text only in `content`;
+process structures emit only actionable handles or exceptional state. Batch
+tools keep ordered `ok/result` entries in `structuredContent.items[]` without
+echoing paths or operations, and there is no aggregate `result`. `_meta` is
+optional ChatGPT component data and can be
 ignored by ordinary MCP clients. Clients that consumed the old duplicate
 fields must follow these result locations; see the
 [ChatGPT coding workflow](./docs/chatgpt-coding-workflow.md) for the full contract.
@@ -428,11 +432,11 @@ The comparison is against upstream commit
 | Real resource limits | Global and per-client limits cover MCP sessions, workspaces, processes, worktrees, output, and command runtime. Hung commands receive `SIGTERM` and then `SIGKILL` after a grace period. |
 | Client isolation | OAuth ownership is enforced for MCP sessions, workspaces, processes, and stored state. One client cannot reuse another client's IDs. |
 | Project instructions | User instructions are explicit and revisioned, root instructions load immediately, empty files are skipped, the chain is capped at 32 KiB, and nested instructions gate mutations, commands, and interactive process input. |
-| Local Skills | Skills come from repository ancestors within an approved root plus user, Admin, and DevSpace bundled scopes; duplicate names remain visible, the catalog is capped at 8,000 characters, and ChatGPT web loads a selected Skill through `load_skill`. |
-| Safer shell workflow | High-risk command patterns are blocked and inline output stays bounded; background/PTY sessions can be polled or interrupted, while durable output is replayable by opaque `outputId` through `read_process_output`. |
+| Local Skills | Skills come from repository ancestors within an approved root plus user, Admin, and DevSpace bundled scopes; duplicate names remain visible, the catalog is capped at 8,000 UTF-8 bytes, and ChatGPT web loads a selected Skill through `load_skill`. |
+| Safer shell workflow | High-risk command patterns are blocked and inline output stays bounded; background/PTY sessions can be polled or interrupted, while available durable output is replayable by opaque `outputId` through `read_process_output`. |
 | Admin panel | A localhost-only React panel manages roots and limits, detects concurrent config edits with revision/ETag checks, verifies restarts, and exposes sanitized diagnostics. |
 | OAuth hardening | Approval pages cannot be framed, expired records are cleaned up, the owner can revoke every client and token in one action, and tokens are stored as hashes. |
-| Observable behavior | Structured request/tool logs, hashed client identities, readiness generations, resource usage, recent sanitized failures, and downloadable diagnostics. |
+| Observable behavior | Structured request/tool logs use `connectionRef` for OAuth registrations and `workspaceActivityRef` for different project activities under one connection, alongside readiness generations, resource usage, sanitized failures, and downloadable diagnostics. |
 | Tested distribution | Node 24/26 CI, macOS/Linux/Windows process tests, real browser tests, `npm pack`, installed-package CLI startup, and SQLite native-module checks. |
 
 ## Security

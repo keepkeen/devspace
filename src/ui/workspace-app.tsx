@@ -15,6 +15,7 @@ import {
   isWriteTool,
   toolResultCard,
   toolResultText,
+  workspacePayloadText,
   type AnyToolResultCard,
   type HostContext,
   type ToolResultCard,
@@ -438,39 +439,6 @@ function setPayloadLoading(container: HTMLElement, loading: boolean): void {
 
   const button = header instanceof HTMLButtonElement ? header : null;
   if (button) button.setAttribute("aria-busy", String(loading));
-}
-
-function workspacePayloadText(card: AnyToolResultCard): string {
-  const agentsFiles = card.agentsFiles ?? [];
-  const availableAgentsFiles = card.availableAgentsFiles ?? [];
-  const skills = card.skills ?? [];
-  const lines = [
-    card.workspaceId ? `Workspace: ${card.workspaceId}` : undefined,
-    card.root ? `Root: ${card.root}` : undefined,
-    skills.length > 0
-      ? `Skills: ${skills.map((skill) => skill.name ?? skill.path ?? "unnamed").join(", ")}`
-      : "Skills: none",
-    availableAgentsFiles.length > 0
-      ? `Nested instructions: ${availableAgentsFiles.map((file) => file.path ?? "unknown").join(", ")}`
-      : undefined,
-    agentsFiles.length > 0
-      ? `\n${formatAgentsFilesForPayload(agentsFiles)}`
-      : "\nAGENTS.md: none loaded",
-  ].filter((line): line is string => typeof line === "string");
-
-  return lines.join("\n");
-}
-
-function formatAgentsFilesForPayload(
-  agentsFiles: NonNullable<AnyToolResultCard["agentsFiles"]>,
-): string {
-  return agentsFiles
-    .map((file) => {
-      const path = file.path ?? "AGENTS.md";
-      const content = file.content?.trim();
-      return content ? `${path}\n\n${content}` : `${path}\n\nNo content loaded.`;
-    })
-    .join("\n\n");
 }
 
 function getCardDisplay(card: AnyToolResultCard): ToolDisplay {

@@ -56,6 +56,8 @@ export interface ToolResultCard<TTool extends ToolName = DisplayToolName> {
     path?: string;
   }>;
   skillDiagnostics?: unknown[];
+  instructionsIncluded?: boolean;
+  skillsIncluded?: boolean;
   instruction?: string;
   content?: ToolContent[];
   items?: BatchResultItem[];
@@ -184,6 +186,43 @@ export function toolResultText(card: AnyToolResultCard): string {
   return contentText(card.content) || payloadText(card.payload);
 }
 
+export function workspacePayloadText(card: AnyToolResultCard): string {
+  const agentsFiles = card.agentsFiles ?? [];
+  const availableAgentsFiles = card.availableAgentsFiles ?? [];
+  const skills = card.skills ?? [];
+  const lines = [
+    card.workspaceId ? `Workspace: ${card.workspaceId}` : undefined,
+    card.root ? `Root: ${card.root}` : undefined,
+    card.skillsIncluded === false
+      ? "Skills: unchanged (not repeated)"
+      : skills.length > 0
+        ? `Skills: ${skills.map((skill) => skill.name ?? skill.path ?? "unnamed").join(", ")}`
+        : "Skills: none",
+    availableAgentsFiles.length > 0
+      ? `Nested instructions: ${availableAgentsFiles.map((file) => file.path ?? "unknown").join(", ")}`
+      : undefined,
+    card.instructionsIncluded === false
+      ? "\nProject instructions: unchanged (not repeated)"
+      : agentsFiles.length > 0
+        ? `\n${formatAgentsFilesForPayload(agentsFiles)}`
+        : "\nAGENTS.md: none loaded",
+  ].filter((line): line is string => typeof line === "string");
+
+  return lines.join("\n");
+}
+
+function formatAgentsFilesForPayload(
+  agentsFiles: NonNullable<AnyToolResultCard["agentsFiles"]>,
+): string {
+  return agentsFiles
+    .map((file) => {
+      const path = file.path ?? "AGENTS.md";
+      const content = file.content?.trim();
+      return content ? `${path}\n\n${content}` : `${path}\n\nNo content loaded.`;
+    })
+    .join("\n\n");
+}
+
 export function toolResultCard(result: CallToolResult): AnyToolResultCard | undefined {
   const meta = objectRecord(result._meta);
   const tool = meta?.tool;
@@ -197,12 +236,22 @@ export function toolResultCard(result: CallToolResult): AnyToolResultCard | unde
     ? normalizeContent(metaPayload?.content)
     : [];
   const payload = uiOnlyPayload(metaPayload);
+  const structuredItems = Array.isArray(structuredContent.items)
+    ? structuredContent.items
+    : undefined;
+  const metadataItems = Array.isArray(metaCard.batchItems)
+    ? metaCard.batchItems
+    : undefined;
+  const items = structuredItems?.map((item, index) => ({
+    ...(objectRecord(metadataItems?.[index]) ?? {}),
+    ...(objectRecord(item) ?? {}),
+  })) as BatchResultItem[] | undefined;
   const files = Array.isArray(structuredContent.files)
     ? structuredContent.files
     : Array.isArray(metaCard.files)
       ? metaCard.files
       : undefined;
-  const { payload: _legacyPayload, ...cardMetadata } = metaCard;
+  const { payload: _legacyPayload, batchItems: _batchItems, ...cardMetadata } = metaCard;
 
   return {
     ...cardMetadata,
@@ -213,6 +262,7 @@ export function toolResultCard(result: CallToolResult): AnyToolResultCard | unde
       : {}),
     ...(payload ? { payload } : {}),
     ...(files ? { files } : {}),
+    ...(items ? { items } : {}),
   } as AnyToolResultCard;
 }
 

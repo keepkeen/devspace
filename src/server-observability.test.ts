@@ -5,24 +5,31 @@ import { resolve } from "node:path";
 import {
   OPEN_WORKSPACE_ANNOTATIONS,
   SHOW_CHANGES_ANNOTATIONS,
-  MAX_SKILL_CATALOG_CHARACTERS,
+  MAX_SKILL_CATALOG_BYTES,
   buildWorkspaceSkillCatalog,
   combineBatchItemsWithInstructions,
   containsBatchedToolCall,
   commandInstructionScopePaths,
   jsonRpcRequestId,
+  isExpectedPiToolError,
   processInputInstructionScopePaths,
   processInputPolicyViolation,
+  processModelState,
   processResult,
   recoverableWorkspaceError,
   toolSurface,
+  toolCallWorkspaceId,
   readinessSnapshot,
   workspaceOperationId,
   workspaceAppAssetPaths,
 } from "./server.js";
 import type { Skill } from "./skills.js";
 import { UnknownWorkspaceError } from "./workspaces.js";
-import { isLoopbackProxyPeer } from "./logger.js";
+import {
+  connectionRef,
+  isLoopbackProxyPeer,
+  workspaceActivityRef,
+} from "./logger.js";
 
 assert.equal(isLoopbackProxyPeer("127.0.0.1"), true);
 assert.equal(isLoopbackProxyPeer("127.12.34.56"), true);
@@ -30,6 +37,28 @@ assert.equal(isLoopbackProxyPeer("::1"), true);
 assert.equal(isLoopbackProxyPeer("::ffff:127.0.0.1"), true);
 assert.equal(isLoopbackProxyPeer("10.0.0.1"), false);
 assert.equal(isLoopbackProxyPeer("::ffff:10.0.0.1"), false);
+assert.equal(connectionRef("oauth-client-a"), connectionRef("oauth-client-a"));
+assert.notEqual(connectionRef("oauth-client-a"), connectionRef("oauth-client-b"));
+assert.match(connectionRef("oauth-client-a") ?? "", /^conn_[a-f0-9]{12}$/u);
+assert.equal(
+  workspaceActivityRef("oauth-client-a", "ws_project_a"),
+  workspaceActivityRef("oauth-client-a", "ws_project_a"),
+);
+assert.notEqual(
+  workspaceActivityRef("oauth-client-a", "ws_project_a"),
+  workspaceActivityRef("oauth-client-a", "ws_project_b"),
+);
+assert.notEqual(
+  workspaceActivityRef("oauth-client-a", "ws_project_a"),
+  workspaceActivityRef("oauth-client-b", "ws_project_a"),
+);
+assert.match(workspaceActivityRef("oauth-client-a", "ws_project_a") ?? "", /^act_[a-f0-9]{12}$/u);
+assert.equal(workspaceActivityRef(undefined, "ws_project_a"), undefined);
+assert.equal(workspaceActivityRef("oauth-client-a", undefined), undefined);
+assert.equal(isExpectedPiToolError(Object.assign(new Error("missing"), { code: "ENOENT" })), true);
+assert.equal(isExpectedPiToolError(Object.assign(new Error("not a directory"), { code: "ENOTDIR" })), true);
+assert.equal(isExpectedPiToolError(Object.assign(new Error("storage failure"), { code: "EIO" })), false);
+assert.equal(isExpectedPiToolError(new Error("unknown adapter failure")), false);
 
 const catalogSkills: Skill[] = Array.from({ length: 80 }, (_, index) => ({
   skillId: `skill_${String(index).padStart(64, "0")}`,
@@ -52,14 +81,26 @@ const catalogSkills: Skill[] = Array.from({ length: 80 }, (_, index) => ({
   },
 }));
 const boundedCatalog = buildWorkspaceSkillCatalog(catalogSkills);
-assert.ok(boundedCatalog.characters <= MAX_SKILL_CATALOG_CHARACTERS);
-assert.equal(JSON.stringify(boundedCatalog.skills).length, boundedCatalog.characters);
+assert.ok(boundedCatalog.bytes <= MAX_SKILL_CATALOG_BYTES);
+assert.equal(Buffer.byteLength(JSON.stringify(boundedCatalog.skills), "utf8"), boundedCatalog.bytes);
 assert.equal(boundedCatalog.totalSkills, catalogSkills.length);
 assert.ok(boundedCatalog.omittedSkills > 0);
 assert.equal(boundedCatalog.truncated, true);
 assert.equal(boundedCatalog.skills[0]?.name, "duplicate");
 assert.equal(boundedCatalog.skills[1]?.name, "duplicate");
-assert.equal(boundedCatalog.skills[1]?.allowImplicitInvocation, false);
+assert.equal(boundedCatalog.skills[1]?.explicitOnly, true);
+assert.equal(boundedCatalog.skills[1]?.scope, "user");
+assert.doesNotMatch(JSON.stringify(boundedCatalog.skills), /\/tmp\/catalog/);
+
+const multibyteCatalog = buildWorkspaceSkillCatalog(
+  catalogSkills.map((skill) => ({ ...skill, description: `中文😀${skill.description}` })),
+  1_024,
+);
+assert.ok(multibyteCatalog.bytes <= 1_024);
+assert.equal(
+  Buffer.byteLength(JSON.stringify(multibyteCatalog.skills), "utf8"),
+  multibyteCatalog.bytes,
+);
 
 const recoverableProcessResult = processResult({
   output: "head\ntail\n",
@@ -77,9 +118,8 @@ const recoverableProcessResult = processResult({
   stdinClosed: true,
 });
 assert.match(recoverableProcessResult, /read_process_output/);
-assert.match(recoverableProcessResult, /outputId=output-test-id/);
-assert.equal(recoverableProcessResult.match(/inline output truncated/g)?.length, 1);
-assert.equal(recoverableProcessResult.match(/recover with read_process_output/g)?.length, 1);
+assert.doesNotMatch(recoverableProcessResult, /outputId=output-test-id/);
+assert.equal(recoverableProcessResult.match(/truncated/g)?.length, 1);
 assert.equal(recoverableProcessResult.match(/^\[/gm)?.length, 1);
 assert.match(processResult({
   output: "tail",
@@ -109,7 +149,59 @@ assert.match(processResult({
   droppedBytes: 0,
   timedOut: false,
   stdinClosed: true,
-}), /Stdin is closed; poll only/);
+}), /Stdin is closed/);
+const sanitizedStorageFailure = processResult({
+  output: "command stdout",
+  outputTruncated: false,
+  running: false,
+  exitCode: 0,
+  wallTimeMs: 100,
+  originalTokenCount: 2,
+  outputOmittedBytes: 0,
+  totalOutputBytes: 14,
+  storedOutputBytes: 0,
+  droppedBytes: 0,
+  outputStorageError: "SQLITE_CANTOPEN /Users/example/.devspace/private.sqlite",
+  timedOut: false,
+  stdinClosed: true,
+});
+assert.equal(sanitizedStorageFailure.match(/command stdout/g)?.length, 1);
+assert.equal(sanitizedStorageFailure.match(/durable output unavailable/g)?.length, 1);
+assert.doesNotMatch(sanitizedStorageFailure, /SQLITE|\/Users\/example|private\.sqlite/);
+
+const failedStorageState = processModelState({
+  output: "head\ntail",
+  outputTruncated: true,
+  running: false,
+  exitCode: 0,
+  wallTimeMs: 100,
+  originalTokenCount: 50_000,
+  outputOmittedBytes: 100_000,
+  outputId: "unrecoverable-output",
+  totalOutputBytes: 200_000,
+  storedOutputBytes: 0,
+  droppedBytes: 0,
+  outputStorageError: "unavailable",
+  timedOut: false,
+  stdinClosed: true,
+});
+assert.equal("outputId" in failedStorageState, false);
+assert.doesNotMatch(processResult({
+  output: "head\ntail",
+  outputTruncated: true,
+  running: false,
+  exitCode: 0,
+  wallTimeMs: 100,
+  originalTokenCount: 50_000,
+  outputOmittedBytes: 100_000,
+  outputId: "unrecoverable-output",
+  totalOutputBytes: 200_000,
+  storedOutputBytes: 0,
+  droppedBytes: 0,
+  outputStorageError: "unavailable",
+  timedOut: false,
+  stdinClosed: true,
+}), /read_process_output|unrecoverable-output/);
 
 const shellWorkspaceRoot = mkdtempSync(resolve(tmpdir(), "devspace-shell-scopes-"));
 mkdirSync(resolve(shellWorkspaceRoot, "nested"));
@@ -350,16 +442,12 @@ const dynamicInteractiveInputScopes = processInputInstructionScopePaths(
 assert.ok(dynamicInteractiveInputScopes && "error" in dynamicInteractiveInputScopes);
 
 assert.deepEqual(OPEN_WORKSPACE_ANNOTATIONS, {
-  readOnlyHint: false,
   destructiveHint: false,
-  idempotentHint: false,
   openWorldHint: false,
 });
 
 assert.deepEqual(SHOW_CHANGES_ANNOTATIONS, {
-  readOnlyHint: false,
   destructiveHint: false,
-  idempotentHint: false,
   openWorldHint: false,
 });
 
@@ -414,17 +502,26 @@ assert.equal(workspaceOperationId({
   method: "tools/call",
   params: { name: "close_workspace", arguments: { workspaceId: "ws_test" } },
 }), undefined);
+assert.equal(toolCallWorkspaceId({
+  method: "tools/call",
+  params: { name: "close_workspace", arguments: { workspaceId: "ws_test" } },
+}), "ws_test");
+assert.equal(toolCallWorkspaceId({
+  method: "tools/call",
+  params: { name: "open_workspace", arguments: { path: "/tmp/project" } },
+}), undefined);
+assert.equal(toolCallWorkspaceId([{ method: "tools/call" }]), undefined);
 assert.equal(workspaceOperationId([{ method: "tools/call" }]), undefined);
 assert.equal(jsonRpcRequestId({ jsonrpc: "2.0", id: 42 }), 42);
 assert.equal(jsonRpcRequestId({ jsonrpc: "2.0", id: "call-1" }), "call-1");
 assert.equal(jsonRpcRequestId([{ jsonrpc: "2.0", id: 42 }]), null);
 assert.match(
   recoverableWorkspaceError(new UnknownWorkspaceError("ws_stale")) ?? "",
-  /call open_workspace with the original exact project path/,
+  /^unknown_workspace: Call open_workspace/,
 );
-assert.match(
+assert.doesNotMatch(
   recoverableWorkspaceError(new UnknownWorkspaceError("ws_stale")) ?? "",
-  /replace the old ID.*retry the failed tool call once/,
+  /ws_stale/,
 );
 assert.equal(recoverableWorkspaceError(new Error("database failure")), undefined);
 

@@ -37,11 +37,11 @@ Do not call `close_workspace` as a normal end-of-turn or end-of-conversation
 step. Call it only after the user explicitly asks to close or release the
 workspace.
 
-When the initial instruction chain is already present in the conversation,
-pass its returned `instructionRevision` as `knownInstructionRevision` on a
-recovery call. DevSpace then returns the same current revision without copying
-unchanged instruction bodies. A new conversation should omit that argument so
-it receives the full applicable instructions.
+When retained context is still present in the conversation, pass
+`instructionRevision` as `knownInstructionRevision` and `skillRevision` as
+`knownSkillRevision`. DevSpace omits only the corresponding unchanged
+instruction or Skill context. A new conversation must omit revisions for any
+context it did not retain.
 
 ## Checkout Mode
 
@@ -113,6 +113,11 @@ clients can recognize an unchanged chain across later turns without treating a
 repeated copy as new policy. A changed path or changed content produces a new
 revision.
 
+It also returns an independent `skillRevision`. The revision covers the full
+discovered Skill set, including content and invocation-policy hashes, even when
+the catalog budget omits entries. A matching `knownSkillRevision` returns
+`skillsIncluded=false` and an empty `skills` array.
+
 Shell calls also inspect literal `cd` and `pushd` targets before execution.
 Dynamic targets such as `cd "$TARGET"`, `cd $(command)`, or `cd ~/path` are
 rejected because their instruction scope cannot be established safely; pass a
@@ -176,10 +181,12 @@ before use.
 
 Legacy project paths such as `.pi/skills` can be added through `DEVSPACE_SKILL_PATHS` when needed.
 
-`open_workspace` returns a deterministic Skill catalog capped at 8,000
+`open_workspace` returns a deterministic Skill catalog capped at 8,000 UTF-8 bytes
 serialized characters and reports how many entries were omitted. Descriptions
-are shortened before whole entries are omitted. An exact user-provided Skill
-name can still be passed to `load_skill` even if its catalog entry was omitted.
+are shortened before whole same-name groups are omitted. Common entries contain
+only selection data; duplicate names additionally receive a privacy-safe
+logical path and scope. An exact user-provided Skill name can still be passed
+to `load_skill` even if its catalog entry was omitted.
 
 For ChatGPT web, the model should call `load_skill` with the advertised
 `skillId` before following a Skill. The tool atomically reads the complete
@@ -228,21 +235,22 @@ Large model-visible text has one canonical location. DevSpace does not mirror
 file contents, Skill manifests, or process output between MCP `content` and
 `structuredContent`:
 
-- `read` and `load_skill` return their body in text `content`; structured data
-  contains only compact identifiers, status, and other follow-up metadata.
+- `read` and `load_skill` return their body only in text `content`.
 - `batch_read` and `batch_inspect` return a short text completion summary and
-  keep each independent result in `structuredContent.items[]`. There is no
-  concatenated aggregate `structuredContent.result`.
+  keep ordered results in `structuredContent.items[]` as `ok`, `result`, and
+  exceptional `truncated=true`. Request order identifies each item, so paths
+  and operations are not echoed. There is no aggregate `result`.
 - `exec_command` and `write_stdin` return the current inline output in
-  text `content`. Their structured data contains process state such as
-  `sessionId`, `running`, `exitCode`, timing/truncation metrics, and `outputId`,
-  but no copy of the inline output.
+  text `content`. Structured data contains only actionable or exceptional
+  fields: active `sessionId`, recoverable `outputId`, nonzero `exitCode`,
+  `signal`, and `timedOut=true`.
 - `read_process_output` returns the requested UTF-8 page in text `content` and
-  keeps only paging metadata in `structuredContent`: `outputId`, `offset`,
-  `nextOffset`, `eof`, `status`, `totalBytes`, `storedBytes`, and
-  `droppedBytes`. `status=unknown` means the backend recovered output from an
-  interrupted process and cannot prove completion; verify side effects before
-  deciding whether to rerun.
+  keeps only `nextOffset`, terminal `eof=true`, and exceptional/nonterminal
+  `status` in `structuredContent`. Absence of `status` means completed;
+  `status=unknown` means completion cannot be proved, so verify side effects
+  before rerunning.
+- `close_workspace`, `apply_patch`, and `show_changes` return one concise text
+  result. Their detailed presentation data is UI-only `_meta`.
 
 `_meta` is reserved for optional widget presentation and is not a source of
 model-visible state or body text. Widgets read the top-level result instead of
@@ -269,15 +277,16 @@ leave the workspace. This is an accident guardrail, not an OS sandbox.
 
 `maxOutputTokens` limits only the current inline process response and defaults
 to 10,000 tokens. Short output is returned in full; long output keeps a
-head/tail summary inside a 1 MiB UTF-8 in-memory content cap. Every process that
-produces output also returns an opaque `outputId` whose retained UTF-8 bytes can
-be replayed with `read_process_output(workspaceId, outputId, offset, limit)`.
+head/tail summary inside a 1 MiB UTF-8 in-memory content cap. When durable
+storage is available, an active process or truncated inline result returns an
+opaque `outputId` whose retained UTF-8 bytes can be replayed with
+`read_process_output(workspaceId, outputId, offset, limit)`.
 The page body is in text `content`; structured paging metadata deliberately
 does not repeat it. Use the returned `nextOffset` for the next page. Output
 ownership is checked against both the OAuth client and workspace; no local log
 path is exposed.
-`droppedBytes` is nonzero only when the per-output or total durable disk quota
-was reached, meaning those bytes cannot be recovered. Completed output uses its
+An exceptional text warning reports bytes that exceeded the final durable disk
+quota and cannot be recovered. Completed output uses its
 own TTL and remains available after the short-lived process session is removed
 or after the backend restarts.
 
@@ -316,7 +325,8 @@ Behavior is aligned with Codex's unified exec surface:
 - working directory does **not** persist; pass `workingDirectory` when needed and do not rely on `cd`
 - shell env vars / aliases do **not** persist
 - long-running processes return a `sessionId`; poll with `write_stdin`
-- truncated output reports omitted bytes and an `outputId` recovery command
+- truncated output reports omitted bytes and, when durable storage is available,
+  an `outputId` recovery command
 - bounded static checks block forced/recursive `rm`, executable `sudo`, and pipe-to-executing-shell
 - independent commands should be issued as parallel tool calls; dependent ones use `&&`
 - HEREDOC and normal workspace shell writes are allowed

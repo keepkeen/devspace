@@ -1,6 +1,7 @@
 export const BATCH_MAX_ITEMS = 8;
 export const BATCH_READ_DEFAULT_LINES = 400;
 export const BATCH_READ_MAX_LINES = 2_000;
+export const BATCH_ERROR_MAX_CHARACTERS = 1_000;
 export const BATCH_ITEM_MAX_CHARACTERS = 16_000;
 export const BATCH_TOTAL_MAX_CHARACTERS = 48_000;
 
@@ -24,6 +25,10 @@ export interface BatchResult {
   truncated: boolean;
 }
 
+export interface BatchOptions<T extends BatchWorkItem> {
+  onError?: (error: unknown, item: T, index: number) => void;
+}
+
 export function limitBatchText(
   text: string,
   maxCharacters = BATCH_TOTAL_MAX_CHARACTERS,
@@ -38,6 +43,7 @@ export function limitBatchText(
 export async function runBoundedBatch<T extends BatchWorkItem>(
   items: T[],
   execute: (item: T, index: number) => Promise<{ ok: boolean; result: string }>,
+  options: BatchOptions<T> = {},
 ): Promise<BatchResult> {
   if (items.length === 0 || items.length > BATCH_MAX_ITEMS) {
     throw new Error(`Batch must contain between 1 and ${BATCH_MAX_ITEMS} items.`);
@@ -60,7 +66,10 @@ export async function runBoundedBatch<T extends BatchWorkItem>(
 
     try {
       const response = await execute(item, index);
-      const limited = limitText(response.result, BATCH_ITEM_MAX_CHARACTERS);
+      const limited = limitText(
+        response.result,
+        response.ok ? BATCH_ITEM_MAX_CHARACTERS : BATCH_ERROR_MAX_CHARACTERS,
+      );
       return {
         index,
         operation: item.operation,
@@ -70,9 +79,10 @@ export async function runBoundedBatch<T extends BatchWorkItem>(
         truncated: limited.truncated,
       };
     } catch (error) {
+      options.onError?.(error, item, index);
       const limited = limitText(
-        error instanceof Error ? error.message : String(error),
-        BATCH_ITEM_MAX_CHARACTERS,
+        publicBatchError(error),
+        BATCH_ERROR_MAX_CHARACTERS,
       );
       return {
         index,
@@ -104,6 +114,13 @@ export async function runBoundedBatch<T extends BatchWorkItem>(
     result: formatted.text,
     truncated: formatted.truncated || aggregateTruncated || results.some((item) => item.truncated),
   };
+}
+
+function publicBatchError(error: unknown): string {
+  if (error && typeof error === "object" && "code" in error && typeof error.code === "string") {
+    return `${error.code}: Batch item failed.`;
+  }
+  return "Batch item failed.";
 }
 
 function formatBatchItem(item: BatchItemResult): string {

@@ -295,11 +295,13 @@ worktree，否则不建议两个账号同时写入同一个项目。
 指令链合计最多 32 KiB；后台进程后续通过 `write_stdin` 进入新目录时也会先经过
 同一套指令确认。`open_workspace` 返回基于初始指令路径和内容生成的
 `sha256-v1:` `instructionRevision`，便于客户端识别未变化的指令链，避免重复污染上下文。
+Skill 目录使用独立的 `skillRevision`；只有模型仍保留旧目录时才传
+`knownSkillRevision`，目录未变化便不会重复返回。
 
 DevSpace 也会告诉 ChatGPT 当前可用的本地 Skill。ChatGPT 网页端没有 Codex 的
 `$skill`/`/skills` 界面，因此模型通过 `load_skill` 完整加载对应 `SKILL.md`；
 加载成功后才允许读取支持文件并执行工作流。同名 Skill 不会被覆盖，模型使用
-`skillId`、路径和作用域区分。详细规则见
+`skillId`、隐私安全的逻辑路径和作用域区分。详细规则见
 [ChatGPT 编码工作流](./docs/chatgpt-coding-workflow.md)。
 
 ### 固定工具协议
@@ -319,10 +321,10 @@ DevSpace 只提供一套稳定的 Codex 风格工具：`read`、`batch_read`、
 仍应按顺序检查，而不是强行批量处理。
 
 DevSpace 对较大的工具结果只保留一份模型可见正文，避免同一文件或命令输出在
-`content` 和 `structuredContent` 中重复占用上下文。单项读取、Skill 加载和
-进程输出把正文放在文本 `content` 中，结构化结果只保留后续调用所需的状态与
-句柄；批量工具则把各项正文保留在 `structuredContent.items[]`，文本 `content`
-只返回完成摘要，不再提供拼接后的聚合 `result`。`_meta` 只承载可选的
+`content` 和 `structuredContent` 中重复占用上下文。单项读取和 Skill 加载只在
+`content` 返回正文；进程结构化结果只在需要时返回 `sessionId`、`outputId` 或异常
+状态；批量工具按请求顺序在 `structuredContent.items[]` 保留 `ok/result`，不再
+回显路径、操作或拼接后的聚合 `result`。`_meta` 只承载可选的
 ChatGPT 组件信息，普通 MCP 客户端可以忽略。依赖旧重复字段的客户端需要按上述
 归属读取结果；详细契约见[ChatGPT 编码工作流](./docs/chatgpt-coding-workflow.md)。
 单个 `SKILL.md` 的加载上限为 64 KiB。
@@ -405,11 +407,11 @@ DEVSPACE_LAUNCHD_SERVICE_LABEL=com.waishnav.devspace node dist/cli.js admin
 | 真正的资源限制 | 全局和单客户端配额覆盖 MCP 会话、workspace、进程、worktree、输出和命令时间。超时命令先接收 `SIGTERM`，宽限期后仍未退出则使用 `SIGKILL`。 |
 | 客户端身份隔离 | MCP 会话、workspace、进程和持久化状态都校验 OAuth 所有权，一个客户端不能复用另一个客户端的 ID。 |
 | 项目指令 | 用户级说明显式启用且带修订号；根目录指令立即加载；空文件跳过；全链限制为 32 KiB；嵌套 `AGENTS.md`/`CLAUDE.md` 按路径懒加载，写入、命令及交互式 `write_stdin` 跨目录前都要确认新指令。 |
-| 本地 Skill | 在已批准根目录内从项目祖先发现 Skill，并支持用户、Admin 和 DevSpace bundled 来源；保留同名项并显示来源；8,000 字符目录预算避免挤占上下文；`load_skill` 为 ChatGPT 网页端提供可审计的显式加载。 |
-| 更安全的命令流程 | 阻止高风险命令模式，限制内联输出大小，并支持轮询或中断后台/PTY 进程；完整输出以受限 `outputId` 持久化，可用 `read_process_output` 分页恢复。 |
+| 本地 Skill | 在已批准根目录内从项目祖先发现 Skill，并支持用户、Admin 和 DevSpace bundled 来源；保留同名项并显示来源；8,000 UTF-8 字节目录预算避免挤占上下文；`load_skill` 为 ChatGPT 网页端提供可审计的显式加载。 |
+| 更安全的命令流程 | 阻止高风险命令模式，限制内联输出大小，并支持轮询或中断后台/PTY 进程；持久存储可用时，完整输出以受限 `outputId` 保存，可用 `read_process_output` 分页恢复。 |
 | 管理面板 | localhost React 面板可管理目录和配额，通过 revision/ETag 防止覆盖并发配置，验证重启结果并提供脱敏诊断。 |
 | OAuth 加固 | 授权页面禁止 iframe 嵌套，自动清理过期记录，Owner 可一键撤销全部客户端和 Token，Token 以哈希形式存储。 |
-| 可观测性 | 结构化请求/工具日志、客户端哈希、进程代次、资源使用率、近期脱敏失败和可下载诊断报告。 |
+| 可观测性 | 结构化请求/工具日志通过 `connectionRef` 区分 OAuth 连接，通过 `workspaceActivityRef` 区分同一连接下的不同项目活动，并提供进程代次、资源使用率、近期脱敏失败和可下载诊断报告。 |
 | 完整发布测试 | Node 24/26 CI、macOS/Linux/Windows 进程测试、真实浏览器测试、`npm pack`、安装后 CLI 启动和 SQLite 原生模块检查。 |
 
 ## 安全边界

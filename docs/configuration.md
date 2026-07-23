@@ -165,6 +165,9 @@ cannot consume unbounded memory while being classified as empty.
 `open_workspace` computes a stable `sha256-v1:` `instructionRevision` from the
 ordered initial instruction paths and contents. A client can use it to detect
 an unchanged initial chain and avoid retaining duplicate instruction bodies.
+It independently computes `skillRevision` over the full discovered Skill set;
+clients may pass `knownSkillRevision` only while retaining the corresponding
+catalog so unchanged Skill entries can be omitted safely.
 
 Configure fallbacks in `~/.devspace/config.json`:
 
@@ -304,7 +307,7 @@ Each manifest requires non-empty string `name` and `description` frontmatter.
 Duplicate names are retained and distinguished by stable ID, path, source, and
 scope. Optional `agents/openai.yaml` is supported; set
 `policy.allow_implicit_invocation: false` to require an explicit user request.
-The `open_workspace` Skill catalog is limited to 8,000 serialized characters.
+The `open_workspace` Skill catalog is limited to 8,000 serialized UTF-8 bytes.
 ChatGPT web loads a selected manifest of at most 64 KiB with `load_skill`; only
 a complete, successful load opens access to that Skill's support files.
 
@@ -337,9 +340,23 @@ Set `DEVSPACE_LOG_SHELL_COMMANDS=1` only when you intentionally want command
 previews in logs.
 
 `GET /healthz` is a liveness check. `GET /readyz` returns `503` while shutting
-down or when either SQLite store cannot answer a readiness probe. Structured
-request and tool logs include request IDs and short OAuth client identifier hashes, but
-never access tokens or full client identifiers.
+down or when either SQLite store cannot answer a readiness probe.
+
+Structured request and tool logs use three correlation levels:
+
+- `requestId` identifies one HTTP/MCP request.
+- `connectionRef` (`conn_…`) identifies one OAuth client registration across
+  access-token refreshes and server restarts.
+- `workspaceActivityRef` (`act_…`) identifies one connection + `workspaceId`
+  activity, so conversations working on different projects can be separated.
+
+`clientIdHash` remains as a compatibility alias for existing log consumers.
+Neither reference is a verified ChatGPT account or conversation ID: ChatGPT's
+remote MCP contract does not provide those claims to DevSpace. A removed and
+re-added connection receives a new `connectionRef`; two conversations using the
+same registration and same reused workspace remain intentionally
+indistinguishable. Logs never contain access tokens, Authorization headers, or
+full OAuth client identifiers.
 
 ## Env-Only Example
 

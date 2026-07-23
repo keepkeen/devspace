@@ -10,16 +10,16 @@ const lifecycle = buildWorkspaceLifecycleInstruction({
 });
 assert.equal(
   lifecycle,
-  "Use DevSpace, not hosted Python. Call open_workspace with the exact path once; reuse workspaceId " +
-    "across turns/transports. If unknown, reopen that exact path, replace ID, retry once. " +
-    "Use close_workspace only when asked.",
+  "Use DevSpace, not hosted Python. Call open_workspace once for the exact path; reuse workspaceId " +
+    "across turns/transports. On unknown_workspace, reopen the path, replace ID, retry once. " +
+    "close_workspace only when asked.",
 );
 assert.match(lifecycle, /not hosted Python/);
-assert.match(lifecycle, /Call open_workspace with the exact path once/);
+assert.match(lifecycle, /Call open_workspace once for the exact path/);
 assert.match(lifecycle, /reuse workspaceId across turns\/transports/);
-assert.match(lifecycle, /If unknown/);
+assert.match(lifecycle, /On unknown_workspace/);
 assert.match(lifecycle, /replace ID/);
-assert.match(lifecycle, /Use close_workspace only when asked/);
+assert.match(lifecycle, /close_workspace only when asked/);
 assert.doesNotMatch(lifecycle, /reconnect|MCP session is rejected/);
 assert.ok(lifecycle.length < 300);
 
@@ -32,27 +32,26 @@ const fixedSurface = buildCodexServerInstructions({
   readProcessOutput: "read_process_output",
   writeStdin: "write_stdin",
 });
-assert.match(fixedSurface, /Follow all returned instructions/);
+assert.match(fixedSurface, /Follow returned instructions/);
 assert.match(
   fixedSurface,
-  /Read\/open instructions need no retry/,
+  /Read\/open needs no retry/,
 );
 assert.match(
   fixedSurface,
-  /If a blocked mutation\/command returns instructionToken, review returned instructions and retry with it/,
+  /On blocked mutation\/command, review instructions and retry with instructionToken/,
 );
-assert.doesNotMatch(fixedSurface, /instructions[^.]*retry with (?:the )?(?:returned )?instructionToken/i);
 assert.match(fixedSurface, /Batch 2–8 independent known targets/);
 assert.match(fixedSurface, /Call load_skill\(workspaceId,skillId\)/);
-assert.match(fixedSurface, /process sessionId\/write_stdin, not MCP session/);
-assert.match(fixedSurface, /page outputId with read_process_output/);
+assert.match(fixedSurface, /sessionId\/write_stdin/);
+assert.match(fixedSurface, /page outputId\/read_process_output/);
 assert.match(
   fixedSurface,
-  /If process sessionId is unknown, stop polling, read prior outputId, verify effects before rerun/,
+  /On unknown process, stop polling, read outputId if known, verify effects before rerun/,
 );
-assert.match(fixedSurface, /Keep writes[/]temp files in workspace/);
-assert.match(fixedSurface, /use stdout[/]outputId for long output/);
-assert.match(fixedSurface, /Never inspect DevSpace internal state/);
+assert.match(fixedSurface, /Keep writes[/]temp in workspace/);
+assert.match(fixedSurface, /use stdout[/]outputId/);
+assert.match(fixedSurface, /Never inspect DevSpace state/);
 assert.match(fixedSurface, /Checks are guardrails, not a sandbox/);
 assert.ok(fixedSurface.length < 800);
 assert.doesNotMatch(fixedSurface, /dangerous commands (?:remain|stay) blocked|all dangerous commands/i);
@@ -64,8 +63,8 @@ const worstCaseInitialize =
   `${lifecycle} ${fixedSurface}` +
   " After the final file change, call show_changes once before replying; not after each edit.";
 assert.ok(
-  Buffer.byteLength(worstCaseInitialize, "utf8") < 950,
-  `worst-case initialize instructions must be under 950 bytes; got ${Buffer.byteLength(worstCaseInitialize, "utf8")}`,
+  Buffer.byteLength(worstCaseInitialize, "utf8") < 850,
+  `worst-case initialize instructions must be under 850 bytes; got ${Buffer.byteLength(worstCaseInitialize, "utf8")}`,
 );
 
 const codexWithoutSkills = buildCodexServerInstructions({

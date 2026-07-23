@@ -163,6 +163,14 @@ session header does not invalidate or consume the workspace. Non-ChatGPT MCP
 hosts remain stateful; an unknown transport session returns a dedicated 404 and
 the server records a redacted `unknown_mcp_session` diagnostic.
 
+For log correlation, `connectionRef` identifies the OAuth registration rather
+than a verified ChatGPT account. `workspaceActivityRef` identifies that
+registration plus the workspace handle, which separates the common case of one
+account running conversations against different projects. ChatGPT does not
+currently provide DevSpace a documented thread/conversation ID, so two
+conversations using the same connection and reused workspace cannot be labeled
+as separate threads without adding an explicit client handshake.
+
 ## Workspace Path Rejected
 
 The path must be inside one of the allowed roots configured during setup.
@@ -263,9 +271,9 @@ Legacy project paths such as `.pi/skills` can be added through `DEVSPACE_SKILL_P
 If a Skill appears in `open_workspace`, ChatGPT web should call `load_skill`
 with its `skillId` before reading other files inside the Skill directory.
 Duplicate names require the ID. Skills marked
-`allowImplicitInvocation=false` remain available only for explicit user
+`explicitOnly=true` remain available only for explicit user
 requests. Check `DEVSPACE_DISABLED_SKILL_PATHS` when an expected Skill is
-missing; the catalog also reports entries omitted by its 8,000-character
+missing; the catalog also reports entries omitted by its 8,000-byte UTF-8
 budget.
 
 ## Review Card Does Not Appear
@@ -284,13 +292,14 @@ metadata and only show text results.
 
 `batch_read` and `batch_inspect` intentionally keep their independent payloads
 in `structuredContent.items[]`. Text `content` contains only a short completion
-summary, and the former concatenated `structuredContent.result` is not emitted.
+summary; request order maps each compact `ok/result` item back to its input,
+and paths/operations plus the former aggregate `result` are not emitted.
 Update clients or adapters that only display text content, or use single-item
 tools when structured results are unavailable.
 
 Other heavy results also have one canonical model-visible location: single
-read, Skill, and process bodies are in text `content`, while process state and
-output paging fields remain structured. Do not fall back to
+read, Skill, and process bodies are in text `content`, while only actionable
+process handles and paging fields remain structured. Do not fall back to
 `_meta.card.payload.content`; `_meta` is optional widget presentation and may be
 absent. For durable output, display the page from `read_process_output` text
 `content` and continue with structured `nextOffset` until `eof` is true.

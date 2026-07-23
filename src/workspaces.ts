@@ -91,6 +91,7 @@ export interface WorkspaceContext {
   workspace: Workspace;
   agentsFiles: LoadedAgentsFile[];
   instructionRevision: string;
+  skillRevision: string;
   availableAgentsFiles: AvailableAgentsFile[];
   instructionScan: InstructionScanResult;
   reused: boolean;
@@ -139,16 +140,17 @@ export class UnknownWorkspaceError extends Error {
   readonly code = "unknown_workspace";
 
   constructor(readonly workspaceId: string) {
-    super(
-      `Unknown workspaceId: ${workspaceId}. It may have expired or no longer belong to this app connection. ` +
-      "Discard it and call open_workspace with the original exact project path. If this conversation still " +
-      "has that revision's complete agentsFiles, pass its instructionRevision as knownInstructionRevision; " +
-      "otherwise omit knownInstructionRevision so the instructions are returned again; replace the old ID and " +
-      "retry the failed tool call once. If a skill applies, call load_skill with " +
-      "{workspaceId: newWorkspaceId, skillId: currentSkillId} " +
-      "using the reopened skills catalog before reading support files.",
-    );
+    super("The workspace is no longer available.");
     this.name = "UnknownWorkspaceError";
+  }
+}
+
+export class InstructionTokenError extends Error {
+  readonly code = "instruction_token_invalid";
+
+  constructor() {
+    super("The instruction token is no longer valid.");
+    this.name = "InstructionTokenError";
   }
 }
 
@@ -395,6 +397,7 @@ export class WorkspaceRegistry {
       return {
         ...readPath,
         absolutePath: assertAllowedPath(canonicalPath, canonicalRoots),
+        readRoots: canonicalRoots,
       };
     } catch (error) {
       if (isMissingPathError(error)) return readPath;
@@ -559,16 +562,16 @@ export class WorkspaceRegistry {
 
   async acknowledgeInstructions(workspace: Workspace, token: string): Promise<void> {
     const pending = workspace.pendingInstructionAcknowledgements.get(token);
-    if (!pending) throw new Error("Unknown or expired instructionToken. Retry the tool without it to load current instructions.");
+    if (!pending) throw new InstructionTokenError();
     if (Date.now() - pending.createdAt > INSTRUCTION_ACKNOWLEDGEMENT_TTL_MS) {
       workspace.pendingInstructionAcknowledgements.delete(token);
-      throw new Error("Expired instructionToken. Retry the tool without it to load current instructions.");
+      throw new InstructionTokenError();
     }
     for (const file of pending.files) {
       const current = await this.readCachedInstruction(file.path);
       if (current.fingerprint !== file.fingerprint) {
         workspace.pendingInstructionAcknowledgements.delete(token);
-        throw new Error("Applicable project instructions changed. Retry the tool without instructionToken.");
+        throw new InstructionTokenError();
       }
     }
     await this.assertCurrentInstructionChainsWithinBudget(workspace, pending.files);
@@ -929,6 +932,7 @@ export class WorkspaceRegistry {
       workspace,
       agentsFiles,
       instructionRevision: computeInstructionRevision(agentsFiles),
+      skillRevision: computeSkillRevision(realpathSync(workspace.root), workspace.skills),
       availableAgentsFiles,
       instructionScan,
       reused,
@@ -1313,6 +1317,28 @@ function computeInstructionRevision(files: LoadedAgentsFile[]): string {
     hash.update(content);
   }
   return `sha256-v1:${hash.digest("base64url")}`;
+}
+
+function computeSkillRevision(canonicalWorkspaceRoot: string, skills: readonly Skill[]): string {
+  const hash = createHash("sha256");
+  hash.update("devspace-skills-v1\0", "utf8");
+  updateRevisionHash(hash, canonicalWorkspaceRoot);
+  for (const skill of skills) {
+    updateRevisionHash(hash, skill.skillId);
+    updateRevisionHash(hash, skill.manifestHash);
+    updateRevisionHash(hash, skill.openAiMetadataHash ?? "");
+    updateRevisionHash(hash, skill.allowImplicitInvocation ? "implicit" : "explicit");
+    updateRevisionHash(hash, skill.source);
+    updateRevisionHash(hash, skill.scope);
+    updateRevisionHash(hash, skill.sourceRoot);
+  }
+  return `sha256-v1:${hash.digest("base64url")}`;
+}
+
+function updateRevisionHash(hash: ReturnType<typeof createHash>, value: string): void {
+  const bytes = Buffer.from(value, "utf8");
+  hash.update(`${bytes.byteLength}:`, "utf8");
+  hash.update(bytes);
 }
 
 function assertInstructionFitsBudget(

@@ -6,7 +6,10 @@ import { join } from "node:path";
 import type { Response } from "express";
 import { InvalidGrantError, InvalidTokenError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import { databasePath, openDatabase } from "./db/client.js";
-import { SingleUserOAuthProvider } from "./oauth-provider.js";
+import {
+  SingleUserOAuthProvider,
+  type OAuthAuditEvent,
+} from "./oauth-provider.js";
 import { SqliteOAuthClientsStore, SqliteOAuthStore } from "./oauth-store.js";
 
 const root = await mkdtemp(join(tmpdir(), "devspace-oauth-test-"));
@@ -28,14 +31,70 @@ try {
   testRedirectSchemeValidation(join(root, "redirect-schemes"));
   await testAuthorizationResponseHardening(join(root, "approval-headers"));
   await testAuthorizationThrottling(join(root, "approval-throttling"));
+  await testAuditFailuresAreBestEffort(join(root, "audit-failures"));
   await testProviderRestartRotationAndRevocation(join(root, "provider"));
   await testOwnerCredentialChangeAndRevokeAll(join(root, "owner-change"));
 } finally {
   await rm(root, { recursive: true, force: true });
 }
 
+async function testAuditFailuresAreBestEffort(stateDir: string): Promise<void> {
+  const provider = new SingleUserOAuthProvider(
+    oauthConfig,
+    mcpUrl,
+    stateDir,
+    () => { throw new Error("audit sink unavailable"); },
+  );
+  try {
+    const client = await provider.clientsStore.registerClient?.({
+      redirect_uris: [redirectUri],
+      client_name: "ChatGPT",
+    });
+    assert.ok(client, "audit failure must not fail persisted client registration");
+
+    const approval = fakeAuthorizationResponse("POST", { owner_token: oauthConfig.ownerToken });
+    await provider.authorize(client, {
+      redirectUri,
+      codeChallenge: "challenge",
+      scopes: ["devspace"],
+      resource: mcpUrl,
+    }, approval.response);
+    assert.equal((approval.response as unknown as { statusCode: number }).statusCode, 302);
+
+    const code = "audit-code";
+    provider["codes"].set(code, {
+      clientId: client.client_id,
+      params: {
+        redirectUri,
+        codeChallenge: "challenge",
+        scopes: ["devspace"],
+        resource: mcpUrl,
+      },
+      expiresAtMs: Date.now() + 60_000,
+    });
+    const issued = await provider.exchangeAuthorizationCode(client, code, undefined, redirectUri, mcpUrl);
+    assert.ok(issued.refresh_token);
+    const refreshed = await provider.exchangeRefreshToken(
+      client,
+      issued.refresh_token,
+      ["devspace"],
+      mcpUrl,
+    );
+    assert.ok(refreshed.access_token);
+    assert.ok(refreshed.refresh_token);
+  } finally {
+    provider.close();
+  }
+}
+
 async function testAuthorizationThrottling(stateDir: string): Promise<void> {
-  const provider = new SingleUserOAuthProvider(oauthConfig, mcpUrl, stateDir);
+  const auditEvents: OAuthAuditEvent[] = [];
+  const provider = new SingleUserOAuthProvider(
+    oauthConfig,
+    mcpUrl,
+    stateDir,
+    (event) => auditEvents.push(event),
+  );
   const client = await provider.clientsStore.registerClient?.({
     redirect_uris: [redirectUri],
     client_name: "ChatGPT",
@@ -66,6 +125,11 @@ async function testAuthorizationThrottling(stateDir: string): Promise<void> {
     await provider.authorize(client, params, throttledFailure.response);
     assert.equal((throttledFailure.response as unknown as { statusCode: number }).statusCode, 429);
     assert.match(throttledFailure.headers.get("retry-after") ?? "", /^\d+$/u);
+    assert.equal(auditEvents.filter(({ event }) => event === "oauth_client_registered").length, 1);
+    assert.equal(auditEvents.filter(({ event }) => event === "oauth_authorization_failed").length, 10);
+    assert.equal(auditEvents.filter(({ event }) => event === "oauth_authorization_succeeded").length, 1);
+    assert.equal(auditEvents.filter(({ event }) => event === "oauth_authorization_rate_limited").length, 1);
+    assert.ok(auditEvents.every(({ clientId }) => clientId === client.client_id));
   } finally {
     provider.close();
   }

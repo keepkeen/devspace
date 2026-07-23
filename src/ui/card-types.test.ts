@@ -7,6 +7,7 @@ import {
   isToolName,
   toolResultCard,
   toolResultText,
+  workspacePayloadText,
 } from "./card-types.js";
 
 for (const tool of ["apply_patch", "exec_command", "write_stdin"]) {
@@ -62,13 +63,21 @@ const batchCard = toolResultCard({
   content: [{ type: "text", text: "Read 2 files." }],
   structuredContent: {
     items: [
-      { index: 0, path: "a.ts", ok: true, result: "alpha" },
-      { index: 1, path: "b.ts", ok: false, result: "not found" },
+      { ok: true, result: "alpha" },
+      { ok: false, result: "not found" },
     ],
-    truncated: false,
     instructions: "Follow nested instructions.",
   },
-  _meta: { tool: "batch_read", card: { summary: { items: 2 } } },
+  _meta: {
+    tool: "batch_read",
+    card: {
+      summary: { items: 2 },
+      batchItems: [
+        { index: 0, operation: "read", path: "a.ts" },
+        { index: 1, operation: "read", path: "b.ts" },
+      ],
+    },
+  },
 });
 assert.ok(batchCard);
 assert.equal(
@@ -78,13 +87,11 @@ assert.equal(
 
 const processCard = toolResultCard({
   content: [{ type: "text", text: "test output\n[process exited with code 0]" }],
-  structuredContent: {
-    running: false,
-    exitCode: 0,
-    outputId: "output-1",
-    storedOutputBytes: 11,
+  structuredContent: {},
+  _meta: {
+    tool: "exec_command",
+    card: { outputId: "output-1", summary: { command: "npm test", exitCode: 0 } },
   },
-  _meta: { tool: "exec_command", card: { summary: { command: "npm test" } } },
 });
 assert.ok(processCard);
 assert.equal(toolResultText(processCard), "test output\n[process exited with code 0]");
@@ -92,10 +99,12 @@ assert.equal(processCard.outputId, "output-1");
 
 const patchCard = toolResultCard({
   content: [{ type: "text", text: "Applied patch." }],
-  structuredContent: { files: [{ path: "a.ts", operation: "update" }] },
   _meta: {
     tool: "apply_patch",
-    card: { payload: { patch: "diff --git a/a.ts b/a.ts", content: [] } },
+    card: {
+      files: [{ path: "a.ts", operation: "update" }],
+      payload: { patch: "diff --git a/a.ts b/a.ts", content: [] },
+    },
   },
 });
 assert.ok(patchCard);
@@ -104,7 +113,6 @@ assert.equal(patchCard.payload?.content, undefined);
 
 const reviewCard = toolResultCard({
   content: [{ type: "text", text: "Changed 2 files." }],
-  structuredContent: { files: 2, additions: 3, removals: 1 },
   _meta: {
     tool: "show_changes",
     card: {
@@ -128,8 +136,39 @@ assert.equal(toolResultText(skillCard), "loaded");
 
 const closeCard = toolResultCard({
   content: [{ type: "text", text: "Workspace closed." }],
-  structuredContent: { closed: true, processesTerminated: 0 },
-  _meta: { tool: "close_workspace" },
+  _meta: {
+    tool: "close_workspace",
+    card: { summary: { closed: true, processesTerminated: 0 } },
+  },
 });
 assert.ok(closeCard);
 assert.equal(toolResultText(closeCard), "Workspace closed.");
+
+const retainedOutputCard = toolResultCard({
+  content: [{ type: "text", text: "page body" }],
+  structuredContent: { nextOffset: 9, status: "active" },
+  _meta: {
+    tool: "read_process_output",
+    card: { outputId: "output-2", storedBytes: 20, totalBytes: 20 },
+  },
+});
+assert.ok(retainedOutputCard);
+assert.equal(retainedOutputCard.outputId, "output-2");
+assert.equal(retainedOutputCard.storedBytes, 20);
+assert.equal(retainedOutputCard.nextOffset, 9);
+
+const repeatedWorkspaceCard = toolResultCard({
+  content: [{ type: "text", text: "Workspace context unchanged." }],
+  structuredContent: {
+    workspaceId: "workspace-1",
+    instructionsIncluded: false,
+    agentsFiles: [],
+    skillsIncluded: false,
+    skills: [],
+  },
+  _meta: { tool: "open_workspace", card: { root: "/tmp/project" } },
+});
+assert.ok(repeatedWorkspaceCard);
+assert.match(workspacePayloadText(repeatedWorkspaceCard), /Skills: unchanged \(not repeated\)/);
+assert.match(workspacePayloadText(repeatedWorkspaceCard), /Project instructions: unchanged \(not repeated\)/);
+assert.doesNotMatch(workspacePayloadText(repeatedWorkspaceCard), /Skills: none|AGENTS\.md: none loaded/);

@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { loadConfig } from "./config.js";
+import { connectionRef, workspaceActivityRef } from "./logger.js";
 import { createServer } from "./server.js";
 
 // This is a server-side simulation of ChatGPT's OAuth/MCP protocol behavior.
@@ -19,6 +20,18 @@ const resource = `${publicBaseUrl}/mcp`;
 const ownerPassword = "chatgpt-flow-e2e-owner-password-long-enough";
 const clients = new Set<Client>();
 let active: Awaited<ReturnType<typeof startServer>> | undefined;
+const capturedLogs: string[] = [];
+const originalConsole = {
+  log: console.log,
+  warn: console.warn,
+  error: console.error,
+};
+const captureLog = (...values: unknown[]): void => {
+  capturedLogs.push(values.map(String).join(" "));
+};
+console.log = captureLog;
+console.warn = captureLog;
+console.error = captureLog;
 
 try {
   await mkdir(workspaceRoot, { recursive: true });
@@ -34,7 +47,8 @@ try {
     DEVSPACE_SKILLS: "0",
     DEVSPACE_SUBAGENTS: "0",
     DEVSPACE_WIDGETS: "off",
-    DEVSPACE_LOG_LEVEL: "silent",
+    DEVSPACE_LOG_LEVEL: "info",
+    DEVSPACE_LOG_FORMAT: "json",
     DEVSPACE_MAX_MCP_SESSIONS: "8",
     DEVSPACE_MAX_MCP_SESSIONS_PER_CLIENT: "4",
     DEVSPACE_MAX_PROCESS_SESSIONS: "8",
@@ -49,6 +63,11 @@ try {
     registerAndAuthorize(active.origin, metadata, "client-b"),
   ]);
   assert.notEqual(oauthA.clientId, oauthB.clientId);
+  const originalAccessTokenA = oauthA.accessToken;
+  const originalRefreshTokenA = oauthA.refreshToken;
+  const refreshedA = await refreshTokens(active.origin, oauthA);
+  oauthA.accessToken = refreshedA.accessToken;
+  oauthA.refreshToken = refreshedA.refreshToken;
 
   const firstRound = await connectClient("same-conversation-round-one", oauthA.accessToken, active.origin);
   const opened = await firstRound.callTool({
@@ -64,7 +83,7 @@ try {
       arguments: { workspaceId: workspaceA, cmd: "printf 'safe-run\\n' >> safe-runs.txt" },
     });
     assertToolSucceeded(executed);
-    assert.match(JSON.stringify(executed.content), /Process exited with code 0/);
+    assert.match(JSON.stringify(executed.content), /Process exited \(code 0\)/);
   }
   const repeatedExecution = await firstRound.callTool({
     name: "read",
@@ -153,8 +172,8 @@ try {
       arguments: { workspaceId: concurrentWorkspaceA, path: "payload.txt" },
     }),
   ]);
-  assertToolRejected(aReadsB, /Unknown workspaceId/);
-  assertToolRejected(bReadsA, /Unknown workspaceId/);
+  assertToolRejected(aReadsB, /unknown_workspace/);
+  assertToolRejected(bReadsA, /unknown_workspace/);
 
   const node = JSON.stringify(process.execPath);
   const [backgroundA, backgroundB] = await Promise.all([
@@ -191,8 +210,8 @@ try {
       arguments: { workspaceId: workspaceB, sessionId: sessionA, yieldTimeMs: 0 },
     }),
   ]);
-  assertToolRejected(aPollsB, /Unknown process session/);
-  assertToolRejected(bPollsA, /Unknown process session/);
+  assertToolRejected(aPollsB, /unknown_process_session/);
+  assertToolRejected(bPollsA, /unknown_process_session/);
 
   const [finishedA, finishedB] = await Promise.all([
     concurrentA.callTool({
@@ -212,12 +231,108 @@ try {
 
   assert.equal(await readFile(join(workspaceRoot, "safe-runs.txt"), "utf8"), "safe-run\nsafe-run\n");
   assert.equal(await readFile(join(workspaceRoot, "conversation.txt"), "utf8"), "round-two\nnew-session\n");
+
+  const quietServer = await startServer(loadConfig({
+    DEVSPACE_CONFIG_DIR: join(root, "quiet-config"),
+    DEVSPACE_STATE_DIR: join(root, "quiet-state"),
+    DEVSPACE_ALLOWED_ROOTS: workspaceRoot,
+    DEVSPACE_ALLOWED_HOSTS: "*",
+    DEVSPACE_PUBLIC_BASE_URL: publicBaseUrl,
+    DEVSPACE_OAUTH_OWNER_TOKEN: ownerPassword,
+    DEVSPACE_SKILLS: "0",
+    DEVSPACE_SUBAGENTS: "0",
+    DEVSPACE_WIDGETS: "off",
+    DEVSPACE_LOG_LEVEL: "info",
+    DEVSPACE_LOG_FORMAT: "json",
+    DEVSPACE_LOG_TOOL_CALLS: "0",
+    PORT: "1",
+  }));
+  let quietCredentials: OAuthCredentials | undefined;
+  let quietWorkspaceId: string | undefined;
+  try {
+    const quietMetadata = await discoverOAuth(quietServer.origin);
+    quietCredentials = await registerAndAuthorize(quietServer.origin, quietMetadata, "quiet-client");
+    const quietClient = await connectClient("quiet-tool-logs", quietCredentials.accessToken, quietServer.origin);
+    const quietOpen = await quietClient.callTool({
+      name: "open_workspace",
+      arguments: { path: workspaceRoot },
+    });
+    assertToolSucceeded(quietOpen);
+    quietWorkspaceId = workspaceId(quietOpen);
+    await closeClient(quietClient);
+  } finally {
+    await quietServer.close();
+  }
+
+  const logText = capturedLogs.join("\n");
+  const connectionA = connectionRef(oauthA.clientId);
+  const connectionB = connectionRef(oauthB.clientId);
+  const activityA = workspaceActivityRef(oauthA.clientId, workspaceA);
+  const activityB = workspaceActivityRef(oauthB.clientId, workspaceB);
+  const quietConnection = connectionRef(quietCredentials?.clientId);
+  const quietActivity = workspaceActivityRef(quietCredentials?.clientId, quietWorkspaceId);
+  assert.ok(connectionA && connectionB && activityA && activityB && quietCredentials && quietConnection && quietActivity);
+  assert.notEqual(connectionA, connectionB);
+  assert.notEqual(activityA, activityB);
+  assert.match(logText, new RegExp(`"connectionRef":"${connectionA}"`));
+  assert.match(logText, new RegExp(`"connectionRef":"${connectionB}"`));
+  assert.match(logText, new RegExp(`"workspaceActivityRef":"${activityA}"`));
+  assert.match(logText, new RegExp(`"workspaceActivityRef":"${activityB}"`));
+  assert.match(logText, new RegExp(`"event":"oauth_client_registered"[^\n]*"connectionRef":"${connectionA}"`));
+  assert.match(logText, new RegExp(`"event":"oauth_authorization_succeeded"[^\n]*"connectionRef":"${connectionA}"`));
+  assert.match(logText, new RegExp(`"event":"oauth_token_issued"[^\n]*"connectionRef":"${connectionA}"`));
+  assert.match(logText, new RegExp(`"event":"oauth_token_refreshed"[^\n]*"connectionRef":"${connectionA}"`));
+  const parsedLogs = capturedLogs.flatMap((line): Array<Record<string, unknown>> => {
+    try {
+      const value = JSON.parse(line) as unknown;
+      return value && typeof value === "object" && !Array.isArray(value)
+        ? [value as Record<string, unknown>]
+        : [];
+    } catch {
+      return [];
+    }
+  });
+  assert.ok(parsedLogs.some((entry) =>
+    entry.event === "tool_call" &&
+    entry.connectionRef === connectionA &&
+    entry.workspaceActivityRef === activityA &&
+    entry.workspaceId === workspaceA
+  ));
+  assert.ok(parsedLogs.some((entry) =>
+    entry.event === "http_request" &&
+    entry.connectionRef === connectionA &&
+    entry.workspaceActivityRef === activityA &&
+    entry.path === "/mcp"
+  ));
+  assert.equal(parsedLogs.some((entry) =>
+    entry.event === "tool_call" && entry.connectionRef === quietConnection
+  ), false);
+  assert.ok(parsedLogs.some((entry) =>
+    entry.event === "http_request" &&
+    entry.connectionRef === quietConnection &&
+    entry.workspaceActivityRef === quietActivity &&
+    entry.path === "/mcp"
+  ));
+  assert.doesNotMatch(logText, new RegExp(oauthA.clientId.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")));
+  assert.doesNotMatch(logText, new RegExp(oauthB.clientId.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")));
+  assert.doesNotMatch(logText, new RegExp(oauthA.accessToken.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")));
+  assert.doesNotMatch(logText, new RegExp(oauthB.accessToken.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")));
+  assert.doesNotMatch(logText, new RegExp(originalAccessTokenA.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")));
+  assert.doesNotMatch(logText, new RegExp(originalRefreshTokenA.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")));
+  assert.doesNotMatch(logText, new RegExp(oauthA.refreshToken.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")));
+  assert.doesNotMatch(logText, new RegExp(oauthB.refreshToken.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")));
+  assert.doesNotMatch(logText, new RegExp(quietCredentials.accessToken.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")));
+  assert.doesNotMatch(logText, new RegExp(quietCredentials.refreshToken.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")));
+  assert.doesNotMatch(logText, new RegExp(ownerPassword.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")));
 } finally {
   const cleanup = await Promise.allSettled([
     ...Array.from(clients, (client) => client.close()),
     ...(active ? [active.close()] : []),
   ]);
   await rm(root, { recursive: true, force: true });
+  console.log = originalConsole.log;
+  console.warn = originalConsole.warn;
+  console.error = originalConsole.error;
   const failedCleanup = cleanup.find((result) => result.status === "rejected");
   if (failedCleanup?.status === "rejected") throw failedCleanup.reason;
 }
@@ -232,6 +347,7 @@ interface OAuthMetadata {
 interface OAuthCredentials {
   clientId: string;
   accessToken: string;
+  refreshToken: string;
 }
 
 async function discoverOAuth(origin: URL): Promise<OAuthMetadata> {
@@ -333,10 +449,42 @@ async function registerAndAuthorize(
     }),
   });
   assert.equal(tokenResponse.status, 200);
-  const tokens = await tokenResponse.json() as { access_token?: unknown; token_type?: unknown };
+  const tokens = await tokenResponse.json() as {
+    access_token?: unknown;
+    refresh_token?: unknown;
+    token_type?: unknown;
+  };
   assert.equal(typeof tokens.access_token, "string");
+  assert.equal(typeof tokens.refresh_token, "string");
   assert.equal(String(tokens.token_type).toLowerCase(), "bearer");
-  return { clientId, accessToken: String(tokens.access_token) };
+  return {
+    clientId,
+    accessToken: String(tokens.access_token),
+    refreshToken: String(tokens.refresh_token),
+  };
+}
+
+async function refreshTokens(origin: URL, credentials: OAuthCredentials): Promise<OAuthCredentials> {
+  const response = await fetch(new URL("/token", origin), {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "refresh_token",
+      client_id: credentials.clientId,
+      refresh_token: credentials.refreshToken,
+      scope: "devspace",
+      resource,
+    }),
+  });
+  assert.equal(response.status, 200);
+  const tokens = await response.json() as { access_token?: unknown; refresh_token?: unknown };
+  assert.equal(typeof tokens.access_token, "string");
+  assert.equal(typeof tokens.refresh_token, "string");
+  return {
+    clientId: credentials.clientId,
+    accessToken: String(tokens.access_token),
+    refreshToken: String(tokens.refresh_token),
+  };
 }
 
 async function connectClient(

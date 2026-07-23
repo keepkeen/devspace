@@ -90,6 +90,15 @@ export interface ProcessSnapshot {
   stdinClosed: boolean;
 }
 
+export class UnknownProcessSessionError extends Error {
+  readonly code = "unknown_process_session";
+
+  constructor() {
+    super("The process session is no longer available.");
+    this.name = "UnknownProcessSessionError";
+  }
+}
+
 export interface ProcessInstructionContext {
   cwd: string;
   scopePaths: string[];
@@ -149,6 +158,10 @@ export interface ProcessSessionManagerOptions {
   maxRuntimeMs?: number;
   terminationGraceMs?: number;
   outputStore?: ProcessOutputStore;
+  onOutputStorageError?: (
+    error: unknown,
+    context: { ownerClientId: string; workspaceId: string; outputId?: string },
+  ) => void;
 }
 
 export interface ProcessSessionUsageSnapshot {
@@ -468,6 +481,7 @@ export class ProcessSessionManager {
   private readonly maxRuntimeMs: number;
   private readonly terminationGraceMs: number;
   private readonly outputStore?: ProcessOutputStore;
+  private readonly onOutputStorageError?: ProcessSessionManagerOptions["onOutputStorageError"];
   private nextSessionId = 1;
   private shuttingDown = false;
   private shutdownPromise?: Promise<void>;
@@ -482,6 +496,7 @@ export class ProcessSessionManager {
     this.maxRuntimeMs = options.maxRuntimeMs ?? 60 * 60 * 1_000;
     this.terminationGraceMs = options.terminationGraceMs ?? 5_000;
     this.outputStore = options.outputStore;
+    this.onOutputStorageError = options.onOutputStorageError;
   }
 
   async start(input: StartCommandInput): Promise<ProcessSnapshot> {
@@ -884,8 +899,12 @@ export class ProcessSessionManager {
         session.durableQuotaReached = true;
         session.quotaDroppedBytes += outputBytes;
       } else {
-        session.outputStorageError = error instanceof Error ? error.message : String(error);
-        session.buffer.append(`\nDurable process output failed: ${session.outputStorageError}\n`);
+        session.outputStorageError = "unavailable";
+        this.onOutputStorageError?.(error, {
+          ownerClientId: session.ownerClientId,
+          workspaceId: session.workspaceId,
+          outputId: session.outputId,
+        });
       }
     }
   }
@@ -1073,10 +1092,6 @@ export class ProcessSessionManager {
   }
 }
 
-function unknownProcessSessionError(sessionId: number): Error {
-  return new Error(
-    `Unknown process session: ${sessionId}. This is a process sessionId for write_stdin, not an MCP session; ` +
-    "it cannot be polled again. Stop calling write_stdin. If an earlier response returned an outputId, " +
-    "read it with read_process_output, then verify command side effects before deciding whether to rerun.",
-  );
+function unknownProcessSessionError(_sessionId: number): Error {
+  return new UnknownProcessSessionError();
 }

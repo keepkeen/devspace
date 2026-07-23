@@ -26,10 +26,9 @@ const root = mkdtempSync(join(tmpdir(), "devspace-process-output-test-"));
 
 assert.equal(
   new ProcessOutputNotFoundError().message,
-  "Process output was not found; no output was returned. The outputId may have expired or belong to another " +
-    "workspace or app connection. Stop retrying this outputId; verify command side effects before deciding " +
-    "whether to rerun.",
+  "The retained process output is no longer available.",
 );
+assert.equal(new ProcessOutputNotFoundError().code, "process_output_not_found");
 
 try {
   testPermissionsAndOwnership(join(root, "permissions"));

@@ -87,6 +87,32 @@ export function identifierHash(identifier: string | undefined): string | undefin
     : undefined;
 }
 
+/** Stable, privacy-safe reference for one OAuth client registration. */
+export function connectionRef(clientId: string | undefined): string | undefined {
+  const hash = identifierHash(clientId);
+  return hash ? `conn_${hash}` : undefined;
+}
+
+/**
+ * Stable reference for work performed through one OAuth registration and
+ * workspace handle. This is an operational activity key, not a ChatGPT thread
+ * or account claim.
+ */
+export function workspaceActivityRef(
+  clientId: string | undefined,
+  workspaceId: string | undefined,
+): string | undefined {
+  if (!clientId || !workspaceId) return undefined;
+  const hash = createHash("sha256")
+    .update("devspace:workspace-activity:v1\0")
+    .update(clientId)
+    .update("\0")
+    .update(workspaceId)
+    .digest("hex")
+    .slice(0, 12);
+  return `act_${hash}`;
+}
+
 export function errorFields(error: unknown): Record<string, unknown> {
   if (!(error instanceof Error)) return { error: String(error) };
   return {

@@ -269,10 +269,8 @@ await assert.rejects(
   async () => manager.instructionContext("client-b", "workspace-a", backgroundSessionId),
   (error: unknown) =>
     error instanceof Error &&
-    error.message ===
-      `Unknown process session: ${backgroundSessionId}. This is a process sessionId for write_stdin, not an ` +
-        "MCP session; it cannot be polled again. Stop calling write_stdin. If an earlier response returned an " +
-        "outputId, read it with read_process_output, then verify command side effects before deciding whether to rerun.",
+    error.message === "The process session is no longer available." &&
+    "code" in error && error.code === "unknown_process_session",
 );
 
 await assert.rejects(
@@ -282,7 +280,7 @@ await assert.rejects(
     sessionId: background.sessionId,
     yieldTimeMs: 1,
   }),
-  /Unknown process session/,
+  /no longer available/,
 );
 
 await manager.write({
@@ -544,7 +542,7 @@ try {
       sessionId: firstQuotaSession.sessionId,
       yieldTimeMs: 1,
     }),
-    /Unknown process session/,
+    /no longer available/,
   );
 
   const secondQuotaSession = await quotaManager.start({
@@ -838,4 +836,42 @@ try {
 } finally {
   reopenedDurableStore.close();
   await rm(durableRoot, { recursive: true, force: true });
+}
+
+const storageFailureRoot = await mkdtemp(join(tmpdir(), "devspace-process-session-storage-failure-"));
+const storageFailureStore = new ProcessOutputStore({
+  stateDir: storageFailureRoot,
+  maxFileBytes: 120_000,
+  maxStorageBytes: 500_000,
+  completedTtlMs: 60_000,
+});
+const rawStorageError = `SQLITE_CANTOPEN: cannot open ${join(storageFailureRoot, "process-output.sqlite")}`;
+let reportedStorageError: unknown;
+storageFailureStore.append = () => {
+  throw new Error(rawStorageError);
+};
+const storageFailureManager = new ProcessSessionManager({
+  outputStore: storageFailureStore,
+  onOutputStorageError: (error) => {
+    reportedStorageError = error;
+  },
+});
+try {
+  const snapshot = await storageFailureManager.start({
+    ownerClientId,
+    workspaceId: "storage-failure",
+    cwd: process.cwd(),
+    command: `${node} -e "process.stdout.write('model-visible-stdout')"`,
+    yieldTimeMs: 2_000,
+  });
+  assert.equal(snapshot.output.match(/model-visible-stdout/gu)?.length, 1);
+  assert.equal(snapshot.outputStorageError, "unavailable");
+  assert.equal(reportedStorageError instanceof Error ? reportedStorageError.message : "", rawStorageError);
+  assert.equal(snapshot.output.includes(rawStorageError), false);
+  assert.equal(snapshot.output.includes(storageFailureRoot), false);
+  assert.doesNotMatch(snapshot.output, /Durable process output failed/u);
+} finally {
+  await storageFailureManager.shutdown();
+  storageFailureStore.close();
+  await rm(storageFailureRoot, { recursive: true, force: true });
 }

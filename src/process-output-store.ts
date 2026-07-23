@@ -81,12 +81,10 @@ export interface ProcessOutputUsageSnapshot {
 }
 
 export class ProcessOutputNotFoundError extends Error {
+  readonly code = "process_output_not_found";
+
   constructor() {
-    super(
-      "Process output was not found; no output was returned. The outputId may have expired or belong to " +
-      "another workspace or app connection. Stop retrying this outputId; verify command side effects before " +
-      "deciding whether to rerun.",
-    );
+    super("The retained process output is no longer available.");
     this.name = "ProcessOutputNotFoundError";
   }
 }

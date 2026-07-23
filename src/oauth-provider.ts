@@ -26,6 +26,19 @@ export interface OAuthConfig {
   allowedRedirectHosts: string[];
 }
 
+export type OAuthAuditEventName =
+  | "oauth_client_registered"
+  | "oauth_authorization_succeeded"
+  | "oauth_authorization_failed"
+  | "oauth_authorization_rate_limited"
+  | "oauth_token_issued"
+  | "oauth_token_refreshed";
+
+export interface OAuthAuditEvent {
+  event: OAuthAuditEventName;
+  clientId: string;
+}
+
 interface AuthorizationCodeRecord {
   clientId: string;
   params: AuthorizationParams;
@@ -147,11 +160,16 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     private readonly config: OAuthConfig,
     resourceServerUrl: URL,
     stateDir: string,
+    private readonly onAuditEvent?: (event: OAuthAuditEvent) => void,
   ) {
     this.resourceServerUrl = resourceUrlFromServerUrl(resourceServerUrl);
     this.oauthStore = new SqliteOAuthStore(stateDir);
     this.ownerCredentialChanged = this.oauthStore.reconcileOwnerCredential(config.ownerToken);
-    this.clientsStore = new SqliteOAuthClientsStore(this.oauthStore, config.allowedRedirectHosts);
+    this.clientsStore = new SqliteOAuthClientsStore(
+      this.oauthStore,
+      config.allowedRedirectHosts,
+      (clientId) => this.emitAudit("oauth_client_registered", clientId),
+    );
   }
 
   async authorize(
@@ -190,6 +208,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
       this.authorizationFailures.shift();
     }
     if (!tokenMatches && this.authorizationFailures.length >= MAX_AUTH_FAILURES_PER_WINDOW) {
+      this.emitAudit("oauth_authorization_rate_limited", client.client_id);
       const retryAfterSeconds = Math.max(
         1,
         Math.ceil((this.authorizationFailures[0]! + AUTH_FAILURE_WINDOW_MS - now) / 1_000),
@@ -209,6 +228,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     }
     if (!tokenMatches) {
       this.authorizationFailures.push(now);
+      this.emitAudit("oauth_authorization_failed", client.client_id);
       res.status(401).setHeader("Content-Type", "text/html; charset=utf-8");
       res.send(
         formHtml({
@@ -222,6 +242,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
       return;
     }
     this.authorizationFailures.length = 0;
+    this.emitAudit("oauth_authorization_succeeded", client.client_id);
 
     const code = `code-${randomUUID()}`;
     this.codes.set(code, {
@@ -260,7 +281,9 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     }
 
     this.codes.delete(authorizationCode);
-    return this.issueTokens(client.client_id, record.params.scopes ?? this.config.scopes, record.params.resource);
+    const tokens = this.issueTokens(client.client_id, record.params.scopes ?? this.config.scopes, record.params.resource);
+    this.emitAudit("oauth_token_issued", client.client_id);
+    return tokens;
   }
 
   async exchangeRefreshToken(
@@ -283,12 +306,14 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
       throw new AccessDeniedError("Refresh token cannot grant requested scopes");
     }
 
-    return this.issueTokens(
+    const tokens = this.issueTokens(
       client.client_id,
       requestedScopes,
       resource ?? (record.resource ? new URL(record.resource) : undefined),
       refreshTokenHash,
     );
+    this.emitAudit("oauth_token_refreshed", client.client_id);
+    return tokens;
   }
 
   async verifyAccessToken(token: string): Promise<AuthInfo> {
@@ -395,6 +420,14 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
       refresh_token: refreshToken,
       scope: scopes.join(" "),
     };
+  }
+
+  private emitAudit(event: OAuthAuditEventName, clientId: string): void {
+    try {
+      this.onAuditEvent?.({ event, clientId });
+    } catch {
+      // Observability must never change committed OAuth state or client results.
+    }
   }
 }
 

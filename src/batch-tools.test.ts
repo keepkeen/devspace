@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import {
+  BATCH_ERROR_MAX_CHARACTERS,
   BATCH_ITEM_MAX_CHARACTERS,
   BATCH_MAX_ITEMS,
   BATCH_TOTAL_MAX_CHARACTERS,
@@ -31,7 +32,7 @@ const partialFailure = await runBoundedBatch(
 );
 assert.equal(partialFailure.items[0]?.ok, true);
 assert.equal(partialFailure.items[1]?.ok, false);
-assert.match(partialFailure.items[1]?.result ?? "", /unreadable/);
+assert.equal(partialFailure.items[1]?.result, "Batch item failed.");
 assert.match(partialFailure.items[2]?.result ?? "", /Duplicate batch item skipped/);
 
 const oversized = await runBoundedBatch(
@@ -43,12 +44,25 @@ assert.ok(oversized.items.every((item) => item.result.length <= BATCH_ITEM_MAX_C
 assert.ok(oversized.items.reduce((sum, item) => sum + item.result.length, 0) <= BATCH_TOTAL_MAX_CHARACTERS);
 assert.ok(oversized.result.length <= BATCH_TOTAL_MAX_CHARACTERS);
 
+let capturedBatchError: unknown;
 const oversizedError = await runBoundedBatch(
   [{ operation: "read", path: "bad" }],
-  async () => { throw new Error("x".repeat(BATCH_ITEM_MAX_CHARACTERS + 100)); },
+  async () => { throw Object.assign(new Error(`/Users/private/${"x".repeat(BATCH_ITEM_MAX_CHARACTERS + 100)}`), { code: "EIO" }); },
+  { onError: (error) => { capturedBatchError = error; } },
 );
-assert.equal(oversizedError.items[0]?.truncated, true);
-assert.ok((oversizedError.items[0]?.result.length ?? Infinity) <= BATCH_ITEM_MAX_CHARACTERS);
+assert.equal(oversizedError.items[0]?.truncated, false);
+assert.ok(BATCH_ERROR_MAX_CHARACTERS < BATCH_ITEM_MAX_CHARACTERS);
+assert.ok((oversizedError.items[0]?.result.length ?? Infinity) <= BATCH_ERROR_MAX_CHARACTERS);
+assert.equal(oversizedError.items[0]?.result, "EIO: Batch item failed.");
+assert.doesNotMatch(oversizedError.items[0]?.result ?? "", /Users|private/);
+assert.match(capturedBatchError instanceof Error ? capturedBatchError.message : "", /Users\/private/);
+
+const oversizedReturnedError = await runBoundedBatch(
+  [{ operation: "read", path: "bad" }],
+  async () => ({ ok: false, result: "x".repeat(BATCH_ERROR_MAX_CHARACTERS + 100) }),
+);
+assert.equal(oversizedReturnedError.items[0]?.truncated, true);
+assert.ok((oversizedReturnedError.items[0]?.result.length ?? Infinity) <= BATCH_ERROR_MAX_CHARACTERS);
 
 await assert.rejects(
   runBoundedBatch([], async () => ({ ok: true, result: "" })),

@@ -294,6 +294,7 @@ export class SqliteOAuthClientsStore implements OAuthRegisteredClientsStore {
   constructor(
     private readonly store: SqliteOAuthStore,
     private readonly allowedRedirectHosts: string[],
+    private readonly onClientRegistered?: (clientId: string) => void,
   ) {}
 
   getClient(clientId: string): OAuthClientInformationFull | undefined {
@@ -303,7 +304,9 @@ export class SqliteOAuthClientsStore implements OAuthRegisteredClientsStore {
   registerClient(
     client: Omit<OAuthClientInformationFull, "client_id" | "client_id_issued_at">,
   ): OAuthClientInformationFull {
-    return this.store.registerClient(client, this.allowedRedirectHosts);
+    const registered = this.store.registerClient(client, this.allowedRedirectHosts);
+    this.onClientRegistered?.(registered.client_id);
+    return registered;
   }
 }
 
