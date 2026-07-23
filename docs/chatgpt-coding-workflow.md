@@ -195,6 +195,12 @@ also accepted when it identifies one Skill; duplicate names require `skillId`.
 This is DevSpace's explicit replacement for Codex's `$skill` and `/skills`
 surfaces. Direct and batch reads cannot bypass `load_skill`; activation and
 manifest access go through it so the discovery-time hash can be checked.
+After loading, `load_skill` returns a virtual root such as
+`skill://<skillId>/`. The model can read `references/`, `scripts/`, and other
+support files with paths such as
+`skill://<skillId>/references/example.md`, without receiving the host's
+absolute Skill directory. Traversal, encoded separators, and symlink escapes
+remain blocked.
 
 Skill paths may be outside the workspace. DevSpace only permits reading:
 

@@ -314,8 +314,10 @@ unchanged catalog will not be sent again.
 DevSpace also advertises matching local Skills. ChatGPT web has no Codex
 `$skill` or `/skills` picker, so the model calls `load_skill` to load one
 complete `SKILL.md`. Supporting files remain unavailable until that succeeds.
-Duplicate names are preserved and distinguished by `skillId`, a privacy-safe
-logical path, and scope.
+It can then read references, scripts, and other support files through paths
+such as `skill://<skillId>/references/example.md` without receiving the host's
+absolute Skill path. Duplicate names are preserved and distinguished by
+`skillId`, a privacy-safe logical path, and scope.
 See the detailed
 [ChatGPT coding workflow](./docs/chatgpt-coding-workflow.md).
 

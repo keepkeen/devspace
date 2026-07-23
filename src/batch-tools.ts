@@ -117,6 +117,16 @@ export async function runBoundedBatch<T extends BatchWorkItem>(
 }
 
 function publicBatchError(error: unknown): string {
+  if (
+    error &&
+    typeof error === "object" &&
+    "code" in error &&
+    typeof error.code === "string" &&
+    "publicText" in error &&
+    typeof error.publicText === "string"
+  ) {
+    return `${error.code}: ${error.publicText}`;
+  }
   if (error && typeof error === "object" && "code" in error && typeof error.code === "string") {
     return `${error.code}: Batch item failed.`;
   }

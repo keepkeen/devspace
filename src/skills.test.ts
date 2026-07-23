@@ -13,6 +13,7 @@ import {
   resolveSkillPath,
   resolveSkillReadPath,
   SKILL_DISCOVERY_LIMITS,
+  skillUriRoot,
 } from "./skills.js";
 
 const root = await realpath(await mkdtemp(join(tmpdir(), "devspace-skills-test-")));
@@ -162,6 +163,26 @@ try {
     resolveSkillReadPath(loaded.skills, activated, referencePath)?.isSkillFile,
     false,
   );
+  assert.equal(
+    resolveSkillReadPath(
+      loaded.skills,
+      activated,
+      `${skillUriRoot(workspaceSkill.skillId)}references.md`,
+      workspaceRoot,
+    )?.absolutePath,
+    referencePath,
+  );
+  for (const invalidPath of ["../outside.txt", "%2e%2e/outside.txt", "references%2Fsecret.md"]) {
+    assert.throws(
+      () => resolveSkillReadPath(
+        loaded.skills,
+        activated,
+        `${skillUriRoot(workspaceSkill.skillId)}${invalidPath}`,
+        workspaceRoot,
+      ),
+      (error: unknown) => error instanceof Error && "code" in error && error.code === "skill_path_invalid",
+    );
+  }
   const userSkill = loaded.skills.find((skill) => skill.name === "user");
   assert.ok(userSkill);
   const externalReferencePath = join(userSkill.baseDir, "external-reference.md");

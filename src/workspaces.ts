@@ -154,6 +154,16 @@ export class InstructionTokenError extends Error {
   }
 }
 
+export class SkillNotLoadedError extends Error {
+  readonly code = "skill_not_loaded";
+  readonly publicText = "Call load_skill for this workspace, then retry.";
+
+  constructor() {
+    super("A Skill must be loaded before its files can be read.");
+    this.name = "SkillNotLoadedError";
+  }
+}
+
 interface WorkspaceLifecycleState {
   ownerClientId: string;
   phase: "open" | "closing";
@@ -353,13 +363,8 @@ export class WorkspaceRegistry {
       workspace.root,
     );
     if (skillRead) {
-      if (
-        skillRead.isSkillFile &&
-        !workspace.activatedSkillDirs.has(resolve(skillRead.skill.baseDir))
-      ) {
-        throw new Error(
-          `Advertised Skill manifests must be loaded with load_skill so their discovery hash can be verified. Use skillId=${skillRead.skill.skillId}.`,
-        );
+      if (!workspace.activatedSkillDirs.has(resolve(skillRead.skill.baseDir))) {
+        throw new SkillNotLoadedError();
       }
       return {
         absolutePath: skillRead.absolutePath,
@@ -375,9 +380,7 @@ export class WorkspaceRegistry {
       !workspace.activatedSkillDirs.has(resolve(skill.baseDir))
     );
     if (lockedSkill) {
-      throw new Error(
-        `Skill support files are unavailable until load_skill activates skillId=${lockedSkill.skillId}.`,
-      );
+      throw new SkillNotLoadedError();
     }
 
     try {

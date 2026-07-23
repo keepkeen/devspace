@@ -14,6 +14,7 @@ import {
   isExpectedPiToolError,
   processInputInstructionScopePaths,
   processInputPolicyViolation,
+  processCallSucceeded,
   processModelState,
   processResult,
   recoverableWorkspaceError,
@@ -121,6 +122,25 @@ assert.match(recoverableProcessResult, /read_process_output/);
 assert.doesNotMatch(recoverableProcessResult, /outputId=output-test-id/);
 assert.equal(recoverableProcessResult.match(/truncated/g)?.length, 1);
 assert.equal(recoverableProcessResult.match(/^\[/gm)?.length, 1);
+const failedProcessSnapshot = {
+  output: "ModuleNotFoundError: No module named 'numpy'",
+  outputTruncated: false,
+  running: false,
+  exitCode: 1,
+  wallTimeMs: 100,
+  originalTokenCount: 8,
+  outputOmittedBytes: 0,
+  totalOutputBytes: 44,
+  storedOutputBytes: 44,
+  droppedBytes: 0,
+  timedOut: false,
+  stdinClosed: true,
+};
+assert.match(processResult(failedProcessSnapshot), /Process exited \(code 1\)/);
+assert.doesNotMatch(processResult(failedProcessSnapshot), /partial effects|side effects/i);
+assert.equal(processCallSucceeded(failedProcessSnapshot), false);
+assert.equal(processCallSucceeded({ ...failedProcessSnapshot, running: true, exitCode: undefined }), true);
+assert.equal(processCallSucceeded({ ...failedProcessSnapshot, exitCode: 0 }), true);
 assert.match(processResult({
   output: "tail",
   outputTruncated: false,

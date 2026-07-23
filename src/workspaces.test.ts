@@ -411,16 +411,18 @@ try {
   const promptedSkillPath = formatPathForPrompt(workspaceSkill.filePath);
   assert.throws(
     () => registry.resolveReadPath(workspace, promptedSkillPath),
-    /must be loaded with load_skill.*skillId=/i,
+    (error: unknown) =>
+      error instanceof Error &&
+      "code" in error &&
+      error.code === "skill_not_loaded" &&
+      "publicText" in error &&
+      error.publicText === "Call load_skill for this workspace, then retry.",
   );
   const workspaceSkillReference = join(workspaceSkill.baseDir, "reference.md");
+  const workspaceSkillUri = `skill://${workspaceSkill.skillId}/reference.md`;
   assert.throws(
-    () => registry.resolveReadPath(workspace, workspaceSkillReference),
-    /load_skill activates skillId=/i,
-  );
-  assert.throws(
-    () => registry.resolveReadPath(workspace, workspaceSkillReference),
-    /load_skill activates skillId=/i,
+    () => registry.resolveReadPath(workspace, workspaceSkillUri),
+    /must be loaded before its files can be read/i,
   );
   const loadedWorkspaceSkill = await registry.loadSkill(
     ownerClientId,
@@ -437,6 +439,22 @@ try {
     registry.resolveReadPath(skillActivatedWorkspace, workspaceSkillReference).absolutePath,
     workspaceSkillReference,
   );
+  assert.equal(
+    registry.resolveReadPath(skillActivatedWorkspace, workspaceSkillUri).absolutePath,
+    workspaceSkillReference,
+  );
+  const skillLeak = join(workspaceSkill.baseDir, "leak.txt");
+  await writeFile(join(outsideRoot, "secret.txt"), "outside secret\n");
+  await symlink(join(outsideRoot, "secret.txt"), skillLeak);
+  assert.throws(
+    () => registry.confineReadPath(
+      registry.resolveReadPath(
+        skillActivatedWorkspace,
+        `skill://${workspaceSkill.skillId}/leak.txt`,
+      ),
+    ),
+    /outside allowed roots/,
+  );
   const mutableSkill = skillActivatedWorkspace.skills.find((skill) => skill.name === "mutable-skill");
   assert(mutableSkill);
   await writeFile(
@@ -449,7 +467,7 @@ try {
   );
   assert.throws(
     () => registry.resolveReadPath(skillActivatedWorkspace, mutableSkill.filePath),
-    /must be loaded with load_skill/i,
+    /must be loaded before its files can be read/i,
   );
   const mutableMetadataSkill = skillActivatedWorkspace.skills.find(
     (skill) => skill.name === "mutable-metadata-skill",
@@ -465,7 +483,7 @@ try {
   );
   assert.throws(
     () => registry.resolveReadPath(skillActivatedWorkspace, join(mutableMetadataSkill.baseDir, "reference.md")),
-    /load_skill activates skillId=/i,
+    /must be loaded before its files can be read/i,
   );
 
   const priorityDirectory = join(root, "instruction-priority");

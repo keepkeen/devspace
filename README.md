@@ -301,7 +301,9 @@ Skill 目录使用独立的 `skillRevision`；只有模型仍保留旧目录时�
 DevSpace 也会告诉 ChatGPT 当前可用的本地 Skill。ChatGPT 网页端没有 Codex 的
 `$skill`/`/skills` 界面，因此模型通过 `load_skill` 完整加载对应 `SKILL.md`；
 加载成功后才允许读取支持文件并执行工作流。同名 Skill 不会被覆盖，模型使用
-`skillId`、隐私安全的逻辑路径和作用域区分。详细规则见
+`skillId`、隐私安全的逻辑路径和作用域区分。加载后可通过
+`skill://<skillId>/references/example.md` 读取 reference、script 等支持文件，
+无需向模型暴露本机 Skill 绝对路径。详细规则见
 [ChatGPT 编码工作流](./docs/chatgpt-coding-workflow.md)。
 
 ### 固定工具协议

@@ -25,6 +25,7 @@ const openWorkspaceNeedle = `CONTEXT_BUDGET_OPEN_WORKSPACE_${"o".repeat(256)}`;
 const readNeedle = `CONTEXT_BUDGET_READ_${"r".repeat(256)}`;
 const batchNeedle = `CONTEXT_BUDGET_BATCH_${"b".repeat(256)}`;
 const skillNeedle = `CONTEXT_BUDGET_SKILL_${"s".repeat(256)}`;
+const skillReferenceNeedle = `CONTEXT_BUDGET_SKILL_REFERENCE_${"f".repeat(128)}`;
 const processNeedle = `CONTEXT_BUDGET_PROCESS_${"p".repeat(256)}`;
 const scopedInstructionNeedle = "CONTEXT_BUDGET_SCOPED_INSTRUCTION";
 const scopedPayloadNeedle = "CONTEXT_BUDGET_SCOPED_PAYLOAD";
@@ -38,7 +39,7 @@ await Promise.all([
   mkdir(worktreeRoot, { recursive: true }),
   mkdir(join(workspaceRoot, "nested"), { recursive: true }),
   mkdir(join(workspaceRoot, "read-scope"), { recursive: true }),
-  mkdir(join(workspaceRoot, ".agents", "skills", "context-budget"), { recursive: true }),
+  mkdir(join(workspaceRoot, ".agents", "skills", "context-budget", "references"), { recursive: true }),
 ]);
 await writeFile(join(workspaceRoot, "AGENTS.md"), `# Test instructions\n\n${openWorkspaceNeedle}\n`);
 await writeFile(join(workspaceRoot, "nested", "AGENTS.md"), "# Nested instructions\n\nKeep nested commands scoped.\n");
@@ -50,6 +51,10 @@ await writeFile(join(configDir, "internal.txt"), "private DevSpace state\n");
 await writeFile(
   join(workspaceRoot, ".agents", "skills", "context-budget", "SKILL.md"),
   `---\nname: context-budget\ndescription: Context budget fixture.\n---\n\n${skillNeedle}\n`,
+);
+await writeFile(
+  join(workspaceRoot, ".agents", "skills", "context-budget", "references", "example.md"),
+  `${skillReferenceNeedle}\n`,
 );
 await execFileAsync("git", ["init", "-q"], { cwd: workspaceRoot });
 await execFileAsync("git", ["add", "."], { cwd: workspaceRoot });
@@ -152,6 +157,33 @@ try {
     (openWorkspace.structuredContent as { workspaceId?: unknown } | undefined)?.workspaceId ?? "",
   );
   assert.ok(workspaceId, "open_workspace must return a structured workspaceId");
+  const advertisedSkill = (openWorkspace.structuredContent as {
+    skills?: Array<Record<string, unknown> & { skillId?: unknown; name?: unknown }>;
+  } | undefined)?.skills?.find((skill) => skill.name === "context-budget");
+  assert.ok(advertisedSkill?.skillId);
+  const unloadedSkillRead = await client.callTool({
+    name: "read",
+    arguments: { workspaceId, path: ".agents/skills/context-budget/SKILL.md" },
+  });
+  assert.equal(unloadedSkillRead.isError, true);
+  assert.equal(
+    toolText(unloadedSkillRead),
+    "skill_not_loaded: Call load_skill for this workspace, then retry.",
+  );
+  const unloadedSkillBatchRead = await client.callTool({
+    name: "batch_read",
+    arguments: {
+      workspaceId,
+      files: [{ path: ".agents/skills/context-budget/SKILL.md" }],
+    },
+  });
+  assert.equal(unloadedSkillBatchRead.isError, true);
+  assert.equal(
+    (unloadedSkillBatchRead.structuredContent as {
+      items?: Array<{ result?: unknown }>;
+    } | undefined)?.items?.[0]?.result,
+    "skill_not_loaded: Call load_skill for this workspace, then retry.",
+  );
   const instructionRevision = String(
     (openWorkspace.structuredContent as { instructionRevision?: unknown } | undefined)
       ?.instructionRevision ?? "",
@@ -323,16 +355,36 @@ try {
   });
   assert.equal(failedBatchInspect.isError, true);
   assert.match(toolText(failedBatchInspect), /Batch inspection failed/i);
-  const advertisedSkill = (openWorkspace.structuredContent as {
-    skills?: Array<Record<string, unknown> & { skillId?: unknown; name?: unknown }>;
-  } | undefined)?.skills?.find((skill) => skill.name === "context-budget");
-  assert.ok(advertisedSkill?.skillId);
   assert.deepEqual(Object.keys(advertisedSkill).sort(), ["description", "name", "skillId"]);
   assert.doesNotMatch(JSON.stringify(advertisedSkill), new RegExp(root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   const loadSkill = await client.callTool({
     name: "load_skill",
     arguments: { workspaceId, skillId: advertisedSkill.skillId },
   });
+  assert.match(toolText(loadSkill), new RegExp(`skill://${advertisedSkill.skillId}/<relative-path>`));
+  const skillReferenceRead = await client.callTool({
+    name: "read",
+    arguments: {
+      workspaceId,
+      path: `skill://${advertisedSkill.skillId}/references/example.md`,
+    },
+  });
+  assert.notEqual(skillReferenceRead.isError, true);
+  assert.match(toolText(skillReferenceRead), new RegExp(skillReferenceNeedle));
+  const skillReferenceBatchRead = await client.callTool({
+    name: "batch_read",
+    arguments: {
+      workspaceId,
+      files: [{ path: `skill://${advertisedSkill.skillId}/references/example.md` }],
+    },
+  });
+  assert.notEqual(skillReferenceBatchRead.isError, true);
+  assert.match(
+    String((skillReferenceBatchRead.structuredContent as {
+      items?: Array<{ result?: unknown }>;
+    } | undefined)?.items?.[0]?.result ?? ""),
+    new RegExp(skillReferenceNeedle),
+  );
   const execCommand = await client.callTool({
     name: "exec_command",
     arguments: {
@@ -342,6 +394,17 @@ try {
     },
   });
   assert.deepEqual(execCommand.structuredContent, {});
+  const heredocShellInput = await client.callTool({
+    name: "exec_command",
+    arguments: {
+      workspaceId,
+      cmd: "bash",
+      stdin: "cat <<'EOF'\ncd \"$TARGET\"\nEOF\n",
+    },
+  });
+  assert.notEqual(heredocShellInput.isError, true);
+  assert.match(toolText(heredocShellInput), /cd "\$TARGET"/);
+  assert.match(toolText(heredocShellInput), /Process exited \(code 0\)/);
   const deniedCommand = await client.callTool({
     name: "exec_command",
     arguments: { workspaceId, cmd: "sudo true" },

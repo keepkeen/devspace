@@ -15,11 +15,17 @@ assert.deepEqual(splitCommandSegments("build 2>&1"), ["build 2>&1"]);
 assert.deepEqual(splitCommandSegments('echo "a && b" && true'), ['echo "a && b"', "true"]);
 assert.deepEqual(splitCommandSegments("echo 'a | b' | cat"), ["echo 'a | b'", "cat"]);
 assert.deepEqual(splitCommandSegments("(cd src && ls) && pwd"), ["cd src", "ls", "pwd"]);
+assert.deepEqual(splitCommandSegments("echo ok # && rm -rf nested"), ["echo ok"]);
+assert.deepEqual(
+  splitCommandSegments("echo ok # ignored && rm -rf nested\nprintf done"),
+  ["echo ok", "printf done"],
+);
 
 assert.deepEqual(tokenizeSegment("git status"), ["git", "status"]);
 assert.deepEqual(tokenizeSegment('echo "hello world"'), ["echo", "hello world"]);
 assert.deepEqual(tokenizeSegment("rm -rf /tmp/x"), ["rm", "-rf", "/tmp/x"]);
 assert.deepEqual(tokenizeSegment("echo foo\\ bar baz"), ["echo", "foo bar", "baz"]);
+assert.deepEqual(tokenizeSegment(String.raw`echo "\q"`), ["echo", String.raw`\q`]);
 
 assert.equal(classifyCommand("git status").decision, "allow");
 assert.equal(classifyCommand("npm test").decision, "allow");
@@ -27,6 +33,8 @@ assert.equal(classifyCommand("ls -la").decision, "allow");
 assert.equal(classifyCommand("echo hello").decision, "allow");
 assert.equal(classifyCommand("ls missing 2>/dev/null || true").decision, "allow");
 assert.equal(classifyCommand("build 2>&1").decision, "allow");
+assert.equal(classifyCommand("echo ok # && rm -rf nested").decision, "allow");
+assert.equal(classifyCommand("echo ok # ignored\nrm -rf nested").decision, "deny");
 
 for (const command of [
   "touch nested/file.ts",

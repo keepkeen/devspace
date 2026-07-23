@@ -57,6 +57,21 @@ assert.equal(oversizedError.items[0]?.result, "EIO: Batch item failed.");
 assert.doesNotMatch(oversizedError.items[0]?.result ?? "", /Users|private/);
 assert.match(capturedBatchError instanceof Error ? capturedBatchError.message : "", /Users\/private/);
 
+const publicRecoveryError = await runBoundedBatch(
+  [{ operation: "read", path: "SKILL.md" }],
+  async () => {
+    throw Object.assign(new Error("private diagnostic"), {
+      code: "skill_not_loaded",
+      publicText: "Call load_skill for this workspace, then retry.",
+    });
+  },
+);
+assert.equal(
+  publicRecoveryError.items[0]?.result,
+  "skill_not_loaded: Call load_skill for this workspace, then retry.",
+);
+assert.doesNotMatch(publicRecoveryError.items[0]?.result ?? "", /private diagnostic/);
+
 const oversizedReturnedError = await runBoundedBatch(
   [{ operation: "read", path: "bad" }],
   async () => ({ ok: false, result: "x".repeat(BATCH_ERROR_MAX_CHARACTERS + 100) }),

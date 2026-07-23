@@ -80,11 +80,12 @@ import {
 } from "./process-output-store.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
-import type { Skill } from "./skills.js";
+import { skillUriRoot, SkillUriError, type Skill } from "./skills.js";
 import { createWorkspaceStore } from "./workspace-store.js";
 import {
   formatAgentsPath,
   InstructionTokenError,
+  SkillNotLoadedError,
   UnknownWorkspaceError,
   WorkspaceRegistry,
   type Workspace,
@@ -163,6 +164,18 @@ function publicToolError(error: unknown, toolName: string): PublicToolError | un
     return {
       code: error.code,
       text: "instruction_token_invalid: Retry the same tool without instructionToken to receive current instructions.",
+    };
+  }
+  if (error instanceof SkillNotLoadedError) {
+    return {
+      code: error.code,
+      text: `${error.code}: ${error.publicText}`,
+    };
+  }
+  if (error instanceof SkillUriError) {
+    return {
+      code: error.code,
+      text: `${error.code}: ${error.publicText}`,
     };
   }
   if (error instanceof AccessDeniedError) {
@@ -1252,6 +1265,14 @@ export function processResult(snapshot: ProcessSnapshot): string {
     : `${status}${truncationNote}${durableNote}`;
 }
 
+export function processCallSucceeded(snapshot: ProcessSnapshot): boolean {
+  return snapshot.running || (
+    snapshot.exitCode === 0 &&
+    snapshot.signal === undefined &&
+    !snapshot.timedOut
+  );
+}
+
 export function processModelState(snapshot: ProcessSnapshot) {
   return {
     ...(snapshot.running && snapshot.sessionId !== undefined
@@ -1618,34 +1639,44 @@ function registerProcessTools(
             isError: true,
           };
         }
-        const initialInputScopes = processInputInstructionScopePaths(
-          workspace.root,
-          stdin,
-          {
-            cwd,
-            scopePaths: commandScopes.paths,
-            inputMode: "shell",
-            pendingInput: "",
-            inputRevision: 0,
-          },
-          { flushPending: true },
-        );
-        if (initialInputScopes) {
-          if ("error" in initialInputScopes) return initialInputScopes.error;
-          const inputPolicyViolation = processInputPolicyViolation(initialInputScopes.preparedInput, {
-            cwd,
-            workspaceRoot: workspace.root,
-            protectedRoots: protectedShellRoots(config),
-            allowedProtectedSubtrees: allowedProtectedShellSubtrees(workspace),
-          });
-          if (inputPolicyViolation) {
-            return { content: [textBlock(inputPolicyViolation)], isError: true };
-          }
-          instructionScopePaths = [...new Set([
-            ...instructionScopePaths,
-            ...initialInputScopes.paths,
-          ])];
+        const initialInputAnalysis = analyzeShellCommandScopes(stdin, cwd, workspace.root);
+        if (initialInputAnalysis.unresolvedCwds.length > 0) {
+          const unresolved = initialInputAnalysis.unresolvedCwds
+            .map((entry) => `${entry.fragment} (${entry.reason})`)
+            .join(", ");
+          return {
+            content: [textBlock(
+              "No command was executed because a directory change in the supplied shell script could not be checked against scoped project instructions. " +
+              "Use workingDirectory or a literal cd/pushd path, then retry. " +
+              `Unresolved directory change: ${unresolved}`,
+            )],
+            isError: true,
+          };
         }
+        const initialInputPaths = [
+          workingDirectory ?? ".",
+          ...initialInputAnalysis.staticCwds,
+        ];
+        const preparedInput: PreparedProcessInput = {
+          expectedRevision: 0,
+          pendingInput: "",
+          charsToWrite: stdin,
+          nextCwd: cwd,
+          instructionScopePaths: initialInputPaths,
+        };
+        const inputPolicyViolation = processInputPolicyViolation(preparedInput, {
+          cwd,
+          workspaceRoot: workspace.root,
+          protectedRoots: protectedShellRoots(config),
+          allowedProtectedSubtrees: allowedProtectedShellSubtrees(workspace),
+        });
+        if (inputPolicyViolation) {
+          return { content: [textBlock(inputPolicyViolation)], isError: true };
+        }
+        instructionScopePaths = [...new Set([
+          ...instructionScopePaths,
+          ...initialInputPaths,
+        ])];
       }
       const instructionGate = await applicableMutationGate(
         workspaces,
@@ -1754,7 +1785,7 @@ function registerProcessTools(
         command: cmd,
         commandLength: cmd.length,
         stdinBytes: stdin === undefined ? 0 : Buffer.byteLength(stdin, "utf8"),
-        success: true,
+        success: processCallSucceeded(snapshot),
         durationMs: Math.round(performance.now() - startedAt),
       });
 
@@ -2037,7 +2068,7 @@ function createMcpServer(
     {
       title: "Load skill",
       description:
-        "Load an advertised skillId, or an exact unique name including a catalog-omitted Skill; reload after workspace recovery.",
+        "Load an advertised skillId or exact unique name, including catalog-omitted Skills; reload after recovery; returns its skill:// root.",
       inputSchema: {
         workspaceId: z.string(),
         skillId: z
@@ -2095,7 +2126,7 @@ function createMcpServer(
       });
       return {
         content: [textBlock(
-          `Loaded skill ${loaded.skill.name}.\n\n${loaded.content}`,
+          `Loaded skill ${loaded.skill.name}. Read support files under ${skillUriRoot(loaded.skill.skillId)}<relative-path>.\n\n${loaded.content}`,
         )],
       };
       },
@@ -2202,9 +2233,9 @@ function createMcpServer(
       title: "Read file",
       description:
         [
-          "Read one file.",
+          "Read one workspace file.",
           config.skillsEnabled
-            ? "Loaded Skill files are also readable."
+            ? "Use skill://<skillId>/... for loaded Skill support files."
             : "",
         ]
           .filter(Boolean)

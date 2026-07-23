@@ -74,6 +74,16 @@ export interface SkillDiagnostic {
   path?: string;
 }
 
+export class SkillUriError extends Error {
+  constructor(
+    readonly code: "skill_path_invalid" | "skill_not_found",
+    readonly publicText: string,
+  ) {
+    super(publicText);
+    this.name = "SkillUriError";
+  }
+}
+
 export interface LoadedSkills {
   skills: Skill[];
   diagnostics: SkillDiagnostic[];
@@ -592,12 +602,82 @@ export function resolveSkillInputPath(inputPath: string, workspaceRoot: string):
   return resolve(workspaceRoot, expandHomePath(inputPath));
 }
 
+export function skillUriRoot(skillId: string): string {
+  return `skill://${skillId}/`;
+}
+
+function parseSkillUri(inputPath: string): { skillId: string; relativePath: string } | undefined {
+  if (!inputPath.startsWith("skill:")) return undefined;
+  if (!inputPath.startsWith("skill://")) {
+    throw new SkillUriError(
+      "skill_path_invalid",
+      "Use skill://<skillId>/<relative-path>.",
+    );
+  }
+
+  const remainder = inputPath.slice("skill://".length);
+  const separatorIndex = remainder.indexOf("/");
+  const skillId = separatorIndex < 0 ? "" : remainder.slice(0, separatorIndex);
+  const rawPath = separatorIndex < 0 ? "" : remainder.slice(separatorIndex + 1);
+  if (!skillId || !rawPath || /[/?#%\\\0]/u.test(skillId) || /[?#\\\0]/u.test(rawPath)) {
+    throw new SkillUriError(
+      "skill_path_invalid",
+      "Use skill://<skillId>/<relative-path> without query, fragment, or backslash components.",
+    );
+  }
+
+  const decodedSegments = rawPath.split("/").map((segment) => {
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(segment);
+    } catch {
+      throw new SkillUriError("skill_path_invalid", "The Skill path contains invalid percent encoding.");
+    }
+    if (
+      !decoded ||
+      decoded === "." ||
+      decoded === ".." ||
+      decoded.includes("/") ||
+      decoded.includes("\\") ||
+      decoded.includes("\0")
+    ) {
+      throw new SkillUriError(
+        "skill_path_invalid",
+        "Skill paths cannot contain empty, dot, traversal, or encoded separator components.",
+      );
+    }
+    return decoded;
+  });
+
+  return { skillId, relativePath: join(...decodedSegments) };
+}
+
 export function resolveSkillReadPath(
   skills: Skill[],
   activatedSkillDirs: Set<string>,
   inputPath: string,
   workspaceRoot?: string,
 ): SkillReadResolution | undefined {
+  const skillUri = parseSkillUri(inputPath);
+  if (skillUri) {
+    const skill = skills.find((candidate) => candidate.skillId === skillUri.skillId);
+    if (!skill) {
+      throw new SkillUriError(
+        "skill_not_found",
+        "The Skill is not available in this workspace; reopen the workspace and use its current skillId.",
+      );
+    }
+    const absolutePath = resolve(skill.baseDir, skillUri.relativePath);
+    if (!isPathInsideRoot(absolutePath, skill.baseDir)) {
+      throw new SkillUriError("skill_path_invalid", "The Skill path escapes its Skill directory.");
+    }
+    return {
+      absolutePath,
+      skill,
+      isSkillFile: absolutePath === resolve(skill.filePath),
+    };
+  }
+
   const expandedPath = expandHomePath(inputPath);
   if (!isAbsolute(expandedPath) && !workspaceRoot) return undefined;
   const absolutePath = isAbsolute(expandedPath)

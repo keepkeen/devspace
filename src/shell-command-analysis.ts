@@ -85,7 +85,12 @@ export function tokenizeShellSegment(segment: string): string[] {
     const character = segment[index]!;
     if (quote) {
       if (character === "\\" && quote === '"' && index + 1 < segment.length) {
-        current += segment[index + 1];
+        const escaped = segment[index + 1]!;
+        if (escaped === "\n") {
+          index += 2;
+          continue;
+        }
+        current += '$`"\\'.includes(escaped) ? escaped : `\\${escaped}`;
         index += 2;
         continue;
       }
@@ -172,6 +177,12 @@ export function splitShellSegments(command: string): string[] {
       if (character === "(") substitutionDepth += 1;
       else if (character === ")") substitutionDepth -= 1;
       index += 1;
+      continue;
+    }
+    if (character === "#" && isShellCommentStart(command, index)) {
+      while (index < command.length && command[index] !== "\n" && command[index] !== "\r") {
+        index += 1;
+      }
       continue;
     }
     if (character === "\n" || character === "\r") {
