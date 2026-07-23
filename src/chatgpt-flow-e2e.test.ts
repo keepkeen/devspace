@@ -91,7 +91,7 @@ try {
   const invalidReceiptRead = await firstRound.callTool({
     name: "read",
     arguments: {
-      receipt: `wctx2.${"A".repeat(43)}`,
+      receipt: `wctx3.${"A".repeat(43)}`,
       path: "payload.txt",
     },
   });
@@ -309,7 +309,7 @@ try {
   });
   assertToolSucceeded(reopened);
   assert.equal(workspaceId(reopened), workspaceA);
-  assert.match(String((reopened.structuredContent as { receipt?: unknown } | undefined)?.receipt), /^wctx2\./);
+  assert.match(String((reopened.structuredContent as { receipt?: unknown } | undefined)?.receipt), /^wctx3\./);
   const newSessionRead = await newSession.callTool({
     name: "read",
     arguments: { workspaceId: workspaceA, path: "conversation.txt" },

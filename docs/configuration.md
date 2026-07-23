@@ -237,7 +237,7 @@ DevSpace exposes one Codex-style surface: `open_workspace`, `list_workspaces`,
 ignored so an old configuration file can still start without changing the
 model-facing protocol.
 
-Every Workspace-scoped call requires the current v2 context `receipt`. The
+Every Workspace-scoped call requires the current v3 context `receipt`. The
 receipt binds the OAuth owner, Workspace ID and generation, both context
 revisions at issuance, and server process generation. The unified registration
 layer validates ownership, integrity, and generation before the tool handler

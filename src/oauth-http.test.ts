@@ -120,7 +120,7 @@ try {
     (openedWorkspace.structuredContent as { receipt?: unknown } | undefined)?.receipt ?? "",
   );
   assert.ok(workspaceId);
-  assert.match(receipt, /^wctx2\./);
+  assert.match(receipt, /^wctx3\./);
   const backgroundProcess = await mcpClient.callTool({
     name: "exec_command",
     arguments: {

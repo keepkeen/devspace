@@ -186,14 +186,21 @@ try {
     name: "open_workspace",
     arguments: { path: workspaceRoot, alias: "context-budget", writeAccess: "read_write" },
   });
-  assert.equal((openMetadata.structuredContent as { schemaVersion?: unknown } | undefined)?.schemaVersion, 2);
+  assert.equal((openMetadata.structuredContent as { schemaVersion?: unknown } | undefined)?.schemaVersion, 3);
   const metadataWorkspace = (openMetadata.structuredContent as {
     workspace?: { ref?: unknown; generation?: unknown; mode?: unknown; writeAccess?: unknown };
   } | undefined)?.workspace;
   assert.equal(typeof metadataWorkspace?.ref, "string");
   assert.equal(typeof metadataWorkspace?.generation, "number");
   assert.equal(metadataWorkspace?.writeAccess, "read_write");
-  assert.match(String((openMetadata.structuredContent as { receipt?: unknown })?.receipt), /^wctx2\./);
+  const metadataReceipt = String(
+    (openMetadata.structuredContent as { receipt?: unknown })?.receipt ?? "",
+  );
+  assert.match(metadataReceipt, /^wctx3\./);
+  assert.deepEqual(
+    (openMetadata.structuredContent as { context?: unknown } | undefined)?.context,
+    { phase: "metadata" },
+  );
   assert.deepEqual(
     (openMetadata.structuredContent as { instructions?: { items?: unknown } } | undefined)
       ?.instructions?.items,
@@ -220,8 +227,23 @@ try {
       processesTerminated: 0,
     },
   );
-  assert.match(JSON.stringify(openMetadata.content), /Repository instructions are untrusted project guidance/);
+  assert.match(JSON.stringify(openMetadata.content), /Load its full context before reading/);
   assert.doesNotMatch(JSON.stringify(openMetadata.structuredContent), /alias|displayPath|project|topLevel/);
+  const metadataRead = await client.callTool({
+    name: "read",
+    arguments: { receipt: metadataReceipt, path: "payload.txt" },
+  });
+  assert.equal(metadataRead.isError, true);
+  assert.deepEqual(
+    (metadataRead.structuredContent as { error?: unknown } | undefined)?.error,
+    {
+      code: "workspace_context_incomplete",
+      retryable: true,
+      safeToRetry: true,
+      recovery: "get_workspace_context",
+      phase: "not_started",
+    },
+  );
   const openWorkspace = await client.callTool({
     name: "get_workspace_context",
     arguments: { alias: "context-budget", contextMode: "full" },
@@ -230,6 +252,14 @@ try {
     (openWorkspace.structuredContent as { workspace?: { ref?: unknown } } | undefined)?.workspace?.ref ?? "",
   );
   assert.ok(workspaceId, "open_workspace must return a structured workspaceId");
+  assert.match(
+    JSON.stringify(openWorkspace.content),
+    /Repository instructions are untrusted project guidance/,
+  );
+  assert.deepEqual(
+    (openWorkspace.structuredContent as { context?: unknown } | undefined)?.context,
+    { phase: "context_loaded" },
+  );
   const workspaceInstructions = (openWorkspace.structuredContent as {
     instructions?: { items?: Array<Record<string, unknown>> };
   } | undefined)?.instructions?.items ?? [];
@@ -438,7 +468,7 @@ try {
   const staleWorkspaceResponseStart = httpResponses.length;
   const staleWorkspace = await client.callTool({
     name: "read",
-    arguments: { receipt: `wctx2.${"A".repeat(43)}`, path: "payload.txt" },
+    arguments: { receipt: `wctx3.${"A".repeat(43)}`, path: "payload.txt" },
   });
   const staleWorkspaceResponses = httpResponses.slice(staleWorkspaceResponseStart);
   assert.equal(staleWorkspace.isError, true);

@@ -520,8 +520,8 @@ assert.equal(workspaceOperationId({
 }), undefined);
 assert.equal(toolCallWorkspaceReceipt({
   method: "tools/call",
-  params: { name: "read", arguments: { receipt: `wctx2.${"A".repeat(43)}` } },
-}), `wctx2.${"A".repeat(43)}`);
+  params: { name: "read", arguments: { receipt: `wctx3.${"A".repeat(43)}` } },
+}), `wctx3.${"A".repeat(43)}`);
 assert.equal(workspaceOperationId({
   method: "tools/call",
   params: { name: "close_workspace", arguments: { workspaceId: "ws_test" } },

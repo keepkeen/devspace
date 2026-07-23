@@ -22,7 +22,7 @@ Skill bodies. Before work, pass that receipt to `get_workspace_context`:
 
 ```json
 {
-  "receipt": "wctx2.…",
+  "receipt": "wctx3.…",
   "contextMode": "full"
 }
 ```
@@ -89,7 +89,7 @@ is the authoritative context:
   },
   "instructions": { "revision": "sha256-v1:…", "complete": true, "included": true, "items": [] },
   "skills": { "revision": "sha256-v1:…", "count": 3, "included": true, "items": [] },
-  "receipt": "wctx2.…"
+  "receipt": "wctx3.…"
 }
 ```
 

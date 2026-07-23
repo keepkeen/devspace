@@ -636,12 +636,18 @@ const registerAppTool: typeof registerSdkAppTool = ((...args: unknown[]) => {
 }) as typeof registerSdkAppTool;
 
 type WorkspaceToolLease = "shared" | "exclusive";
+type WorkspaceContextRequirement = "metadata" | "context_loaded";
 const workspaceToolLeases = new Map<string, WorkspaceToolLease>();
+const workspaceToolContextRequirements = new Map<string, WorkspaceContextRequirement>();
 
-function workspaceToolRegistrar(lease: WorkspaceToolLease): typeof registerSdkAppTool {
+function workspaceToolRegistrar(
+  lease: WorkspaceToolLease,
+  requirement: WorkspaceContextRequirement,
+): typeof registerSdkAppTool {
   return ((...args: unknown[]) => {
     const toolName = typeof args[1] === "string" ? args[1] : "unknown";
     workspaceToolLeases.set(toolName, lease);
+    workspaceToolContextRequirements.set(toolName, requirement);
     const definition = args[2];
     if (definition && typeof definition === "object" && !Array.isArray(definition)) {
       const record = definition as Record<string, unknown>;
@@ -654,7 +660,7 @@ function workspaceToolRegistrar(lease: WorkspaceToolLease): typeof registerSdkAp
         ...toolInput
       } = input;
       record.inputSchema = {
-        receipt: z.string().regex(/^wctx2\.[A-Za-z0-9_-]{43}$/u),
+        receipt: z.string().regex(/^wctx3\.[A-Za-z0-9_-]{43}$/u),
         ...toolInput,
       };
     }
@@ -684,8 +690,9 @@ function workspaceToolRegistrar(lease: WorkspaceToolLease): typeof registerSdkAp
   }) as typeof registerSdkAppTool;
 }
 
-const registerWorkspaceTool = workspaceToolRegistrar("shared");
-const registerExclusiveWorkspaceTool = workspaceToolRegistrar("exclusive");
+const registerWorkspaceTool = workspaceToolRegistrar("shared", "context_loaded");
+const registerContextWorkspaceTool = workspaceToolRegistrar("shared", "metadata");
+const registerExclusiveWorkspaceTool = workspaceToolRegistrar("exclusive", "metadata");
 // MCP clients can reconnect without closing the previous transport. Bound stale
 // session retention so abandoned MCP servers do not accumulate for the life of the process.
 const WORKSPACE_APP_URI = "ui://devspace/workspace-app.html";
@@ -1045,6 +1052,7 @@ function renderWorkspaceContext(
   const serialized = serializeWorkspaceContext({
     ownerClientId: workspace.ownerClientId,
     workspaceId: workspace.id,
+    phase: contextMode === "metadata" ? "metadata" : "context_loaded",
     workspace: {
       ref: workspace.id,
       generation: workspace.stateGeneration,
@@ -1142,6 +1150,8 @@ function sendCallToolErrorResult(
             code === "stale_workspace_generation" ||
             code === "workspace_context_required"
           ? "resume_workspace"
+          : code === "workspace_context_incomplete"
+            ? "get_workspace_context"
           : "open_workspace",
       })
     : undefined;
@@ -1187,6 +1197,18 @@ export function workspaceToolLease(body: unknown): WorkspaceToolLease | undefine
   }
   const name = (request.params as { name?: unknown }).name;
   return typeof name === "string" ? workspaceToolLeases.get(name) : undefined;
+}
+
+export function workspaceToolContextRequirement(
+  body: unknown,
+): WorkspaceContextRequirement | undefined {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return undefined;
+  const request = body as { method?: unknown; params?: unknown };
+  if (request.method !== "tools/call" || !request.params || typeof request.params !== "object") {
+    return undefined;
+  }
+  const name = (request.params as { name?: unknown }).name;
+  return typeof name === "string" ? workspaceToolContextRequirements.get(name) : undefined;
 }
 
 export function toolCallWorkspaceReceipt(body: unknown): string | undefined {
@@ -2752,7 +2774,7 @@ function createMcpServer(
       use: "resuming by alias after a new chat or restart.",
       avoid: "reopening the host path.",
       requires: "a listed alias.",
-      returns: "v2 context and fresh receipt.",
+      returns: "v3 context and fresh receipt.",
     }),
     inputSchema: resumeInputSchema,
     ...toolWidgetDescriptorMeta(config, "workspace"),
@@ -2771,13 +2793,13 @@ function createMcpServer(
     );
   });
 
-  registerWorkspaceTool(server, toolNames.getWorkspaceContext, {
+  registerContextWorkspaceTool(server, toolNames.getWorkspaceContext, {
     title: "Get workspace context",
     description: toolDescription({
       use: "reloading an active workspace's context.",
       avoid: "ordinary file reads.",
       requires: "a valid receipt.",
-      returns: "v2 context and fresh receipt.",
+      returns: "v3 context and fresh receipt.",
     }),
     inputSchema: { ...workspaceHandleInputSchema, ...contextOptionsInputSchema },
     ...toolWidgetDescriptorMeta(config, "workspace"),
@@ -4446,6 +4468,7 @@ export function createServer(configInput?: ServerConfig): RunningServer {
       }
 
       const lease = workspaceToolLease(req.body);
+      const contextRequirement = workspaceToolContextRequirement(req.body);
       const receipt = lease ? toolCallWorkspaceReceipt(req.body) : undefined;
       const workspaceBinding = receipt ? contextReceipts.resolve(receipt) : undefined;
       if (lease && (!workspaceBinding || workspaceBinding.ownerClientId !== ownerClientId)) {
@@ -4454,6 +4477,18 @@ export function createServer(configInput?: ServerConfig): RunningServer {
           "workspace_context_required: Call list_workspaces, then resume_workspace with contextMode=\"full\" to obtain a fresh receipt.",
           jsonRpcRequestId(req.body),
           "workspace_context_required",
+        );
+        return;
+      }
+      if (
+        workspaceBinding?.phase === "metadata" &&
+        contextRequirement === "context_loaded"
+      ) {
+        sendCallToolErrorResult(
+          res,
+          "workspace_context_incomplete: Call get_workspace_context with this receipt and contextMode=\"full\", then retry once with the returned receipt.",
+          jsonRpcRequestId(req.body),
+          "workspace_context_incomplete",
         );
         return;
       }

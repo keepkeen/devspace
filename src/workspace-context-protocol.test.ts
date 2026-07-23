@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import {
   WORKSPACE_CONTEXT_SCHEMA_VERSION,
   WORKSPACE_CONTEXT_TEXT,
+  WORKSPACE_METADATA_TEXT,
   createWorkspaceContextReceiptManager,
   serializeWorkspaceContext,
   type WorkspaceContextProtocolInput,
@@ -17,10 +18,11 @@ const binding: WorkspaceContextReceiptBinding = {
   generation: 7,
   instructionRevision: "instruction-revision-a",
   skillRevision: "skill-revision-a",
+  phase: "context_loaded",
 };
 
 const receipt = receipts.issue(binding);
-assert.match(receipt, /^wctx2\.[A-Za-z0-9_-]{43}$/);
+assert.match(receipt, /^wctx3\.[A-Za-z0-9_-]{43}$/);
 assert.equal(receipts.verify(receipt, binding), true);
 const resolved = receipts.resolve(receipt);
 assert.deepEqual(resolved, binding);
@@ -40,6 +42,7 @@ for (const changed of [
   { ...binding, generation: binding.generation + 1 },
   { ...binding, instructionRevision: "instruction-revision-b" },
   { ...binding, skillRevision: "skill-revision-b" },
+  { ...binding, phase: "metadata" as const },
 ]) {
   assert.equal(receipts.verify(receipt, changed), false);
 }
@@ -57,7 +60,7 @@ assert.equal(
 );
 const alteredReceipt = `${receipt.slice(0, -1)}${receipt.endsWith("A") ? "B" : "A"}`;
 assert.equal(receipts.verify(alteredReceipt, binding), false);
-assert.equal(receipts.verify("wctx2.not-a-receipt", binding), false);
+assert.equal(receipts.verify("wctx3.not-a-receipt", binding), false);
 assert.equal(receipts.verify("x".repeat(10_000), binding), false);
 assert.equal(receipts.verify(receipt, { ...binding, ownerClientId: "x".repeat(1_025) }), false);
 assert.doesNotMatch(receipt, /owner|workspace|instruction|skill|secret/);
@@ -102,6 +105,7 @@ assert.equal(expiringReceipts.resolve(expiringReceipt), undefined, "receipt expi
 const input: WorkspaceContextProtocolInput = {
   ownerClientId: binding.ownerClientId,
   workspaceId: binding.workspaceId,
+  phase: "context_loaded",
   workspace: {
     ref: binding.workspaceId,
     generation: binding.generation,
@@ -137,6 +141,7 @@ assert.deepEqual(serialized, {
   content: [{ type: "text", text: WORKSPACE_CONTEXT_TEXT }],
   structuredContent: {
     schemaVersion: WORKSPACE_CONTEXT_SCHEMA_VERSION,
+    context: { phase: "context_loaded" },
     workspace: input.workspace,
     instructions: {
       revision: input.instructions.revision,
@@ -159,6 +164,7 @@ assert.equal(
 );
 assert.deepEqual(Object.keys(serialized.structuredContent), [
   "schemaVersion",
+  "context",
   "workspace",
   "instructions",
   "skills",
@@ -185,6 +191,24 @@ assert.deepEqual(exceptional.structuredContent.diagnostics, {
 assert.equal(exceptional.content.length, 1);
 assert.equal(exceptional.content[0].text, WORKSPACE_CONTEXT_TEXT);
 
+const metadata = serializeWorkspaceContext({
+  ...input,
+  phase: "metadata",
+  instructions: {
+    ...input.instructions,
+    included: false,
+    items: [],
+  },
+  skills: {
+    ...input.skills,
+    included: false,
+    items: [],
+  },
+}, receipts);
+assert.equal(metadata.content[0].text, WORKSPACE_METADATA_TEXT);
+assert.deepEqual(metadata.structuredContent.context, { phase: "metadata" });
+assert.deepEqual(receipts.resolve(metadata.structuredContent.receipt)?.phase, "metadata");
+
 assert.throws(
   () => serializeWorkspaceContext({
     ...input,
@@ -198,6 +222,10 @@ assert.throws(
     skills: { ...input.skills, count: 0 },
   }, receipts),
   /skills\.count cannot be smaller/,
+);
+assert.throws(
+  () => serializeWorkspaceContext({ ...input, phase: "metadata" }, receipts),
+  /metadata context cannot include/,
 );
 
 console.log("workspace context protocol tests passed");

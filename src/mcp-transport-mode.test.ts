@@ -84,7 +84,7 @@ try {
   let receipt = String(
     (opened.structuredContent as { receipt?: unknown } | undefined)?.receipt ?? "",
   );
-  assert.match(receipt, /^wctx2\./);
+  assert.match(receipt, /^wctx3\./);
   const instructionRevision = String(
     (opened.structuredContent as { instructions?: { revision?: unknown } } | undefined)?.instructions?.revision ?? "",
   );
@@ -158,7 +158,7 @@ try {
   } | undefined;
   assert.ok((freshStructured?.instructions?.items?.length ?? 0) > 0);
   receipt = String(freshStructured?.receipt ?? "");
-  assert.match(receipt, /^wctx2\./);
+  assert.match(receipt, /^wctx3\./);
   const resumedMutationWithoutReload = await secondChatGpt.callTool({
     name: "exec_command",
     arguments: { receipt, cmd: "pwd" },
