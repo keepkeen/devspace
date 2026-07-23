@@ -103,6 +103,7 @@ import {
   WorkspaceQuotaError,
   WorkspaceRegistry,
   WorkspaceResumeRequiredError,
+  WorkspaceContextSessionError,
   type ApplicableAgentsFile,
   type WorkspaceContext,
   type WorkspaceSummary,
@@ -241,6 +242,16 @@ function publicToolError(error: unknown, toolName: string): PublicToolError | un
       code: error.code,
       text: "workspace_resume_required: Call list_workspaces, then resume_workspace with contextMode=\"full\".",
       recovery: "resume_workspace",
+    };
+  }
+  if (error instanceof WorkspaceContextSessionError) {
+    return {
+      code: error.code,
+      text: "workspace_context_required: Call get_workspace_context with the current receipt, or resume_workspace after reconnecting.",
+      retryable: true,
+      safeToRetry: true,
+      recovery: "get_workspace_context",
+      phase: "not_started",
     };
   }
   if (error instanceof StaleWorkspaceGenerationError) {
@@ -1029,6 +1040,8 @@ function renderWorkspaceContext(
   contextMode: WorkspaceContextMode,
   knownInstructionRevision: string | undefined,
   knownSkillRevision: string | undefined,
+  contextSessionId: string,
+  instructionsAcknowledged: boolean,
   receipts: WorkspaceContextReceiptManager,
 ) {
   const {
@@ -1052,6 +1065,7 @@ function renderWorkspaceContext(
   const serialized = serializeWorkspaceContext({
     ownerClientId: workspace.ownerClientId,
     workspaceId: workspace.id,
+    contextSessionId,
     phase: contextMode === "metadata" ? "metadata" : "context_loaded",
     workspace: {
       ref: workspace.id,
@@ -1063,6 +1077,7 @@ function renderWorkspaceContext(
       revision: instructionRevision,
       complete: instructionScan.complete,
       included: instructionsIncluded,
+      acknowledged: instructionsAcknowledged,
       items: returnedInstructions,
       ...(instructionScan.reason ? { incompleteReason: instructionScan.reason } : {}),
     },
@@ -1387,23 +1402,33 @@ function sendStaleOAuthClientPage(res: Response, uiLocales: string | undefined):
   res.send(staleOAuthClientHtml(uiLocales));
 }
 
+function currentWorkspaceContextSessionId(): string {
+  const contextSessionId = requestContext.getStore()?.workspaceBinding?.contextSessionId;
+  if (!contextSessionId) throw new WorkspaceContextSessionError();
+  return contextSessionId;
+}
+
 async function applicableMutationGate(
   workspaces: WorkspaceRegistry,
   workspace: Workspace,
   paths: string[],
   instructionToken?: string,
 ): Promise<{ content: ToolContent[]; isError: true } | undefined> {
-  let generation = workspaces.instructionAcknowledgementGeneration(workspace);
+  const contextSessionId = currentWorkspaceContextSessionId();
+  let generation = workspaces.instructionAcknowledgementGeneration(
+    workspace,
+    contextSessionId,
+  );
   if (instructionToken) {
-    await workspaces.acknowledgeInstructions(workspace, instructionToken);
-    generation = workspaces.instructionAcknowledgementGeneration(workspace);
+    await workspaces.acknowledgeInstructions(workspace, contextSessionId, instructionToken);
+    generation = workspaces.instructionAcknowledgementGeneration(workspace, contextSessionId);
   }
   const files = await workspaces.loadApplicableAgentsFiles(
     workspace,
     paths,
-    { requireAcknowledged: true },
+    { contextSessionId, requireAcknowledged: true },
   );
-  if (workspaces.instructionAcknowledgementGeneration(workspace) !== generation) {
+  if (workspaces.instructionAcknowledgementGeneration(workspace, contextSessionId) !== generation) {
     return rejectedToolResult(
       "instruction_state_changed",
       "No mutation or command was executed because applicable instructions were acknowledged by another concurrent call. Retry this tool call.",
@@ -2651,16 +2676,40 @@ function createMcpServer(
       await reviewCheckpoints.initializeWorkspace({ workspaceId: workspace.id, root: workspace.root });
     }
     const summary = workspaces.workspaceSummary(ownerClientId, workspace.alias);
+    const currentBinding = requestContext.getStore()?.workspaceBinding;
+    const contextSessionId = workspaces.createInstructionContext(
+      workspace,
+      tool === toolNames.getWorkspaceContext &&
+          currentBinding?.workspaceId === workspace.id &&
+          currentBinding.generation === workspace.stateGeneration
+        ? currentBinding.contextSessionId
+        : undefined,
+    );
+    const instructionsIncluded = contextMode === "full" || (
+      contextMode === "retained" && knownInstructionRevision !== context.instructionRevision
+    );
+    if (instructionsIncluded) {
+      await workspaces.markAgentsFilesAcknowledged(
+        workspace,
+        contextSessionId,
+        context.agentsFiles,
+      );
+    }
+    const instructionsAcknowledged = contextMode !== "metadata" &&
+      workspaces.instructionsAcknowledged(
+        workspace,
+        contextSessionId,
+        context.agentsFiles,
+      );
     const rendered = renderWorkspaceContext(
       context,
       contextMode,
       knownInstructionRevision,
       knownSkillRevision,
+      contextSessionId,
+      instructionsAcknowledged,
       contextReceipts,
     );
-    if (rendered.summary.instructionsIncluded && context.agentsFiles.length > 0) {
-      await workspaces.markAgentsFilesDelivered(workspace, context.agentsFiles);
-    }
     logToolCall(config, {
       tool,
       workspaceId: workspace.id,
@@ -2782,7 +2831,6 @@ function createMcpServer(
   }, async ({ alias, contextMode, knownInstructionRevision, knownSkillRevision }) => {
     const startedAt = performance.now();
     const context = await workspaces.resumeWorkspace(ownerClientId, alias);
-    workspaces.resetInstructionAcknowledgements(context.workspace);
     return returnWorkspaceContext(
       toolNames.resumeWorkspace,
       context,
@@ -2892,13 +2940,14 @@ function createMcpServer(
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async ({ workspaceId, paths }) => {
     const workspace = workspaces.getWorkspace(ownerClientId, workspaceId);
+    const contextSessionId = currentWorkspaceContextSessionId();
     const files = await workspaces.loadApplicableAgentsFiles(
       workspace,
       paths,
-      { requireAcknowledged: true },
+      { contextSessionId, requireAcknowledged: true },
     );
     const instructionToken = files.length > 0
-      ? await workspaces.createInstructionAcknowledgement(workspace, files)
+      ? await workspaces.createInstructionAcknowledgement(workspace, contextSessionId, files)
       : undefined;
     return {
       content: [textBlock(
@@ -3295,7 +3344,9 @@ function createMcpServer(
       let readPath = workspaces.resolveReadPath(workspace, input.path);
       const newlyLoadedAgentsFiles = readPath.skillRead
         ? []
-        : await workspaces.loadApplicableAgentsFiles(workspace, [input.path]);
+        : await workspaces.loadApplicableAgentsFiles(workspace, [input.path], {
+            contextSessionId: currentWorkspaceContextSessionId(),
+          });
       readPath = workspaces.confineReadPath(readPath);
       const versionBefore = await readFileVersion(readPath.absolutePath);
       const response = await readFileTool(
@@ -3415,6 +3466,7 @@ function createMcpServer(
       const newlyLoadedAgentsFiles = await workspaces.loadApplicableAgentsFiles(
         workspace,
         files.map((file) => file.path),
+        { contextSessionId: currentWorkspaceContextSessionId() },
       );
       const batch = await runBoundedBatch(
         files.map((file) => ({ ...file, operation: "read" })),
@@ -3536,6 +3588,7 @@ function createMcpServer(
       const newlyLoadedAgentsFiles = await workspaces.loadApplicableAgentsFiles(
         workspace,
         normalized.map((operation) => operation.path),
+        { contextSessionId: currentWorkspaceContextSessionId() },
       );
       const batch = await runBoundedBatch(normalized, async (operation) => {
         workspaces.confineWorkspacePath(workspace, operation.path);

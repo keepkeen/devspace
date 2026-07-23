@@ -82,13 +82,23 @@ export interface Workspace {
   skillDiagnostics: LoadedSkills["diagnostics"];
   agentProfiles: LocalAgentProfile[];
   activatedSkillDirs: Set<string>;
+  instructionContexts: Map<string, WorkspaceInstructionContext>;
+  lastUsedAt: number;
+}
+
+export interface WorkspaceInstructionContext {
+  id: string;
+  ownerClientId: string;
+  workspaceId: string;
+  workspaceGeneration: number;
   deliveredInstructionVersions: Map<string, string>;
   acknowledgedInstructionVersions: Map<string, string>;
-  instructionAcknowledgementGeneration: number;
-  pendingInstructionAcknowledgements: Map<string, {
+  acknowledgementGeneration: number;
+  pendingAcknowledgements: Map<string, {
     createdAt: number;
     files: Array<{ path: string; fingerprint: string; content: string }>;
   }>;
+  createdAt: number;
   lastUsedAt: number;
 }
 
@@ -276,6 +286,15 @@ export class StaleWorkspaceGenerationError extends Error {
   }
 }
 
+export class WorkspaceContextSessionError extends Error {
+  readonly code = "workspace_context_required";
+
+  constructor() {
+    super("The workspace context session is no longer available.");
+    this.name = "WorkspaceContextSessionError";
+  }
+}
+
 interface WorkspaceLifecycleState {
   ownerClientId: string;
   phase: "open" | "closing";
@@ -286,8 +305,10 @@ interface WorkspaceLifecycleState {
 
 const MAX_INSTRUCTION_VERSIONS_PER_WORKSPACE = 1_024;
 const MAX_PENDING_INSTRUCTION_ACKNOWLEDGEMENTS = 32;
+const MAX_INSTRUCTION_CONTEXTS_PER_WORKSPACE = 128;
 const MAX_EXPIRED_SESSION_CANDIDATE_SCAN = 1_024;
 const INSTRUCTION_ACKNOWLEDGEMENT_TTL_MS = 10 * 60_000;
+const INSTRUCTION_CONTEXT_TTL_MS = 6 * 60 * 60_000;
 const CLOSED_WORKSPACE_HISTORY_RETENTION_MS = 30 * 24 * 60 * 60_000;
 const MAX_EMPTY_INSTRUCTION_SCAN_BYTES = 1024 * 1024;
 
@@ -723,8 +744,14 @@ export class WorkspaceRegistry {
   async loadApplicableAgentsFiles(
     workspace: Workspace,
     inputPaths: string[],
-    options: { requireAcknowledged?: boolean } = {},
+    options: { contextSessionId?: string; requireAcknowledged?: boolean } = {},
   ): Promise<ApplicableAgentsFile[]> {
+    const instructionContext = options.contextSessionId === undefined
+      ? undefined
+      : this.instructionContext(workspace, options.contextSessionId);
+    if (options.requireAcknowledged && !instructionContext) {
+      throw new WorkspaceContextSessionError();
+    }
     const targetDirectories = new Set<string>();
     for (const inputPath of inputPaths) {
       const absolutePath = this.resolvePath(workspace, inputPath);
@@ -736,13 +763,13 @@ export class WorkspaceRegistry {
     const loadedPaths = new Set<string>();
     let loadedBytes = 0;
     const knownVersions = options.requireAcknowledged
-      ? workspace.acknowledgedInstructionVersions
-      : workspace.deliveredInstructionVersions;
+      ? instructionContext!.acknowledgedInstructionVersions
+      : instructionContext?.deliveredInstructionVersions;
     for (const targetDirectory of [...targetDirectories].sort()) {
       const chain = await this.loadInstructionChain(workspace.root, targetDirectory);
       for (const file of chain) {
         const { path } = file;
-        if (knownVersions.get(path) === file.fingerprint) continue;
+        if (knownVersions?.get(path) === file.fingerprint) continue;
         if (loadedPaths.has(path)) continue;
         const fileBytes = Buffer.byteLength(file.content, "utf8");
         assertInstructionFitsBudget(path, loadedBytes, fileBytes, "instruction response");
@@ -754,10 +781,53 @@ export class WorkspaceRegistry {
     return loaded;
   }
 
+  createInstructionContext(
+    workspace: Workspace,
+    contextSessionId = `wctxs_${randomUUID()}`,
+  ): string {
+    const id = validateInstructionContextSessionId(contextSessionId);
+    const existing = workspace.instructionContexts.get(id);
+    if (existing) {
+      if (
+        existing.ownerClientId !== workspace.ownerClientId ||
+        existing.workspaceId !== workspace.id ||
+        existing.workspaceGeneration !== workspace.stateGeneration
+      ) {
+        throw new WorkspaceContextSessionError();
+      }
+      existing.lastUsedAt = Date.now();
+      workspace.instructionContexts.delete(id);
+      workspace.instructionContexts.set(id, existing);
+      return id;
+    }
+
+    const now = Date.now();
+    workspace.instructionContexts.set(id, {
+      id,
+      ownerClientId: workspace.ownerClientId,
+      workspaceId: workspace.id,
+      workspaceGeneration: workspace.stateGeneration,
+      deliveredInstructionVersions: new Map(),
+      acknowledgedInstructionVersions: new Map(),
+      acknowledgementGeneration: 0,
+      pendingAcknowledgements: new Map(),
+      createdAt: now,
+      lastUsedAt: now,
+    });
+    while (workspace.instructionContexts.size > MAX_INSTRUCTION_CONTEXTS_PER_WORKSPACE) {
+      const oldest = workspace.instructionContexts.keys().next().value;
+      if (!oldest || oldest === id) break;
+      workspace.instructionContexts.delete(oldest);
+    }
+    return id;
+  }
+
   async markAgentsFilesDelivered(
     workspace: Workspace,
+    contextSessionId: string,
     files: ApplicableAgentsFile[],
   ): Promise<void> {
+    const instructionContext = this.instructionContext(workspace, contextSessionId);
     await this.assertCurrentInstructionChainsWithinBudget(workspace, files);
     let deliveredBytes = 0;
     for (const file of files) {
@@ -770,24 +840,82 @@ export class WorkspaceRegistry {
       deliveredBytes += fileBytes;
     }
     for (const file of files) {
-      setBoundedMap(workspace.deliveredInstructionVersions, file.path, file.fingerprint, MAX_INSTRUCTION_VERSIONS_PER_WORKSPACE);
+      setBoundedMap(
+        instructionContext.deliveredInstructionVersions,
+        file.path,
+        file.fingerprint,
+        MAX_INSTRUCTION_VERSIONS_PER_WORKSPACE,
+      );
     }
   }
 
-  instructionAcknowledgementGeneration(workspace: Workspace): number {
-    return workspace.instructionAcknowledgementGeneration;
+  async markAgentsFilesAcknowledged(
+    workspace: Workspace,
+    contextSessionId: string,
+    files: ApplicableAgentsFile[],
+  ): Promise<void> {
+    const instructionContext = this.instructionContext(workspace, contextSessionId);
+    await this.assertCurrentInstructionChainsWithinBudget(workspace, files);
+    let acknowledgementBytes = 0;
+    let changed = false;
+    for (const file of files) {
+      const current = await this.readCachedInstruction(file.path);
+      if (current.fingerprint !== file.fingerprint) {
+        throw new Error("Applicable project instructions changed while acknowledging context. Retry the tool.");
+      }
+      const fileBytes = Buffer.byteLength(file.content, "utf8");
+      assertInstructionFitsBudget(
+        file.path,
+        acknowledgementBytes,
+        fileBytes,
+        "instruction acknowledgement",
+      );
+      acknowledgementBytes += fileBytes;
+      if (instructionContext.acknowledgedInstructionVersions.get(file.path) !== file.fingerprint) {
+        changed = true;
+      }
+    }
+    for (const file of files) {
+      setBoundedMap(
+        instructionContext.deliveredInstructionVersions,
+        file.path,
+        file.fingerprint,
+        MAX_INSTRUCTION_VERSIONS_PER_WORKSPACE,
+      );
+      setBoundedMap(
+        instructionContext.acknowledgedInstructionVersions,
+        file.path,
+        file.fingerprint,
+        MAX_INSTRUCTION_VERSIONS_PER_WORKSPACE,
+      );
+    }
+    if (changed) instructionContext.acknowledgementGeneration += 1;
   }
 
-  resetInstructionAcknowledgements(workspace: Workspace): void {
-    workspace.acknowledgedInstructionVersions.clear();
-    workspace.pendingInstructionAcknowledgements.clear();
-    workspace.instructionAcknowledgementGeneration += 1;
+  instructionsAcknowledged(
+    workspace: Workspace,
+    contextSessionId: string,
+    files: ApplicableAgentsFile[],
+  ): boolean {
+    const instructionContext = this.instructionContext(workspace, contextSessionId);
+    return files.every(
+      (file) => instructionContext.acknowledgedInstructionVersions.get(file.path) === file.fingerprint,
+    );
+  }
+
+  instructionAcknowledgementGeneration(
+    workspace: Workspace,
+    contextSessionId: string,
+  ): number {
+    return this.instructionContext(workspace, contextSessionId).acknowledgementGeneration;
   }
 
   async createInstructionAcknowledgement(
     workspace: Workspace,
+    contextSessionId: string,
     files: ApplicableAgentsFile[],
   ): Promise<string> {
+    const instructionContext = this.instructionContext(workspace, contextSessionId);
     await this.assertCurrentInstructionChainsWithinBudget(workspace, files);
     const token = `instructions_${randomUUID()}`;
     const versionedFiles = [];
@@ -802,39 +930,74 @@ export class WorkspaceRegistry {
       acknowledgementBytes += fileBytes;
       versionedFiles.push({ path: file.path, fingerprint: file.fingerprint, content: file.content });
     }
-    workspace.pendingInstructionAcknowledgements.set(token, {
+    instructionContext.pendingAcknowledgements.set(token, {
       createdAt: Date.now(),
       files: versionedFiles,
     });
-    while (workspace.pendingInstructionAcknowledgements.size > MAX_PENDING_INSTRUCTION_ACKNOWLEDGEMENTS) {
-      const oldest = workspace.pendingInstructionAcknowledgements.keys().next().value;
+    while (instructionContext.pendingAcknowledgements.size > MAX_PENDING_INSTRUCTION_ACKNOWLEDGEMENTS) {
+      const oldest = instructionContext.pendingAcknowledgements.keys().next().value;
       if (!oldest) break;
-      workspace.pendingInstructionAcknowledgements.delete(oldest);
+      instructionContext.pendingAcknowledgements.delete(oldest);
     }
     return token;
   }
 
-  async acknowledgeInstructions(workspace: Workspace, token: string): Promise<void> {
-    const pending = workspace.pendingInstructionAcknowledgements.get(token);
+  async acknowledgeInstructions(
+    workspace: Workspace,
+    contextSessionId: string,
+    token: string,
+  ): Promise<void> {
+    const instructionContext = this.instructionContext(workspace, contextSessionId);
+    const pending = instructionContext.pendingAcknowledgements.get(token);
     if (!pending) throw new InstructionTokenError();
     if (Date.now() - pending.createdAt > INSTRUCTION_ACKNOWLEDGEMENT_TTL_MS) {
-      workspace.pendingInstructionAcknowledgements.delete(token);
+      instructionContext.pendingAcknowledgements.delete(token);
       throw new InstructionTokenError();
     }
     for (const file of pending.files) {
       const current = await this.readCachedInstruction(file.path);
       if (current.fingerprint !== file.fingerprint) {
-        workspace.pendingInstructionAcknowledgements.delete(token);
+        instructionContext.pendingAcknowledgements.delete(token);
         throw new InstructionTokenError();
       }
     }
     await this.assertCurrentInstructionChainsWithinBudget(workspace, pending.files);
     for (const file of pending.files) {
-      setBoundedMap(workspace.deliveredInstructionVersions, file.path, file.fingerprint, MAX_INSTRUCTION_VERSIONS_PER_WORKSPACE);
-      setBoundedMap(workspace.acknowledgedInstructionVersions, file.path, file.fingerprint, MAX_INSTRUCTION_VERSIONS_PER_WORKSPACE);
+      setBoundedMap(
+        instructionContext.deliveredInstructionVersions,
+        file.path,
+        file.fingerprint,
+        MAX_INSTRUCTION_VERSIONS_PER_WORKSPACE,
+      );
+      setBoundedMap(
+        instructionContext.acknowledgedInstructionVersions,
+        file.path,
+        file.fingerprint,
+        MAX_INSTRUCTION_VERSIONS_PER_WORKSPACE,
+      );
     }
-    workspace.pendingInstructionAcknowledgements.delete(token);
-    workspace.instructionAcknowledgementGeneration += 1;
+    instructionContext.pendingAcknowledgements.delete(token);
+    instructionContext.acknowledgementGeneration += 1;
+  }
+
+  private instructionContext(
+    workspace: Workspace,
+    contextSessionId: string,
+  ): WorkspaceInstructionContext {
+    const id = validateInstructionContextSessionId(contextSessionId);
+    const instructionContext = workspace.instructionContexts.get(id);
+    if (
+      !instructionContext ||
+      instructionContext.ownerClientId !== workspace.ownerClientId ||
+      instructionContext.workspaceId !== workspace.id ||
+      instructionContext.workspaceGeneration !== workspace.stateGeneration
+    ) {
+      throw new WorkspaceContextSessionError();
+    }
+    instructionContext.lastUsedAt = Date.now();
+    workspace.instructionContexts.delete(id);
+    workspace.instructionContexts.set(id, instructionContext);
+    return instructionContext;
   }
 
   resolveWorkingDirectory(workspace: Workspace, workingDirectory: string | undefined): string {
@@ -954,13 +1117,26 @@ export class WorkspaceRegistry {
   } {
     let expiredInstructionTokens = 0;
     for (const workspace of this.workspaces.values()) {
-      for (const [token, pending] of workspace.pendingInstructionAcknowledgements) {
-        if (now - pending.createdAt <= INSTRUCTION_ACKNOWLEDGEMENT_TTL_MS) continue;
-        workspace.pendingInstructionAcknowledgements.delete(token);
-        expiredInstructionTokens += 1;
+      for (const [contextSessionId, instructionContext] of workspace.instructionContexts) {
+        if (now - instructionContext.lastUsedAt > INSTRUCTION_CONTEXT_TTL_MS) {
+          expiredInstructionTokens += instructionContext.pendingAcknowledgements.size;
+          workspace.instructionContexts.delete(contextSessionId);
+          continue;
+        }
+        for (const [token, pending] of instructionContext.pendingAcknowledgements) {
+          if (now - pending.createdAt <= INSTRUCTION_ACKNOWLEDGEMENT_TTL_MS) continue;
+          instructionContext.pendingAcknowledgements.delete(token);
+          expiredInstructionTokens += 1;
+        }
+        trimMap(
+          instructionContext.deliveredInstructionVersions,
+          MAX_INSTRUCTION_VERSIONS_PER_WORKSPACE,
+        );
+        trimMap(
+          instructionContext.acknowledgedInstructionVersions,
+          MAX_INSTRUCTION_VERSIONS_PER_WORKSPACE,
+        );
       }
-      trimMap(workspace.deliveredInstructionVersions, MAX_INSTRUCTION_VERSIONS_PER_WORKSPACE);
-      trimMap(workspace.acknowledgedInstructionVersions, MAX_INSTRUCTION_VERSIONS_PER_WORKSPACE);
     }
     this.trimInstructionCaches();
     this.evictResidentWorkspaces();
@@ -1283,10 +1459,7 @@ export class WorkspaceRegistry {
       ...this.loadSkillsForWorkspace(input.root),
       agentProfiles: await loadLocalAgentProfiles(this.config, input.root),
       activatedSkillDirs: new Set(),
-      deliveredInstructionVersions: new Map(),
-      acknowledgedInstructionVersions: new Map(),
-      instructionAcknowledgementGeneration: 0,
-      pendingInstructionAcknowledgements: new Map(),
+      instructionContexts: new Map(),
       lastUsedAt: Date.now(),
     };
     let reused = Boolean(residentCheckoutId);
@@ -1457,10 +1630,7 @@ export class WorkspaceRegistry {
         ...this.loadSkillsForWorkspace(root),
         agentProfiles: await loadLocalAgentProfiles(this.config, root),
         activatedSkillDirs: new Set(),
-        deliveredInstructionVersions: new Map(),
-        acknowledgedInstructionVersions: new Map(),
-        instructionAcknowledgementGeneration: 0,
-        pendingInstructionAcknowledgements: new Map(),
+        instructionContexts: new Map(),
         lastUsedAt: Date.now(),
       };
       const context = await this.contextForWorkspace(workspace, true);
@@ -1858,6 +2028,13 @@ function validateWorkspaceAlias(alias: string): string {
     throw new Error("Workspace alias must be 1-64 letters, digits, dots, underscores, or hyphens.");
   }
   return normalized;
+}
+
+function validateInstructionContextSessionId(contextSessionId: string): string {
+  if (!/^wctxs_[A-Za-z0-9-]{1,128}$/u.test(contextSessionId)) {
+    throw new WorkspaceContextSessionError();
+  }
+  return contextSessionId;
 }
 
 function formatWorkspaceDisplayPath(path: string | undefined): string {

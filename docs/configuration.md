@@ -183,10 +183,14 @@ the default metadata response from `open_workspace` contains no instruction or
 Skill bodies. It does contain a short-lived context receipt used by later tools.
 
 Full context represents instructions as structured `instructions.items[]`
-records. Read/search tools only advertise `scopedInstructionsAvailable=true`;
-they never append instruction Markdown to file or search output. Call
-`load_workspace_instructions` with intended mutation paths to receive the
-applicable records and one-time token.
+records and returns `instructions.acknowledged=true` after binding the root
+chain to the receipt's private context session. The root chain therefore does
+not need to be sent a second time before the first root-scoped mutation.
+Read/search tools only advertise `scopedInstructionsAvailable=true`; they never
+append instruction Markdown to file or search output. Call
+`load_workspace_instructions` for newly entered nested mutation paths to receive
+only the additional records and a one-time token. The token is valid only for
+the context session that requested it.
 
 Configure fallbacks in `~/.devspace/config.json`:
 
@@ -238,10 +242,14 @@ ignored so an old configuration file can still start without changing the
 model-facing protocol.
 
 Every Workspace-scoped call requires the current v3 context `receipt`. The
-receipt binds the OAuth owner, Workspace ID and generation, both context
-revisions at issuance, and server process generation. The unified registration
-layer validates ownership, integrity, and generation before the tool handler
-starts. A successful OAuth authorization
+receipt binds the OAuth connection, Workspace ID and generation, a private
+context session, context phase, both context revisions at issuance, and server
+process generation. A metadata receipt may only call `get_workspace_context`,
+`close_workspace`, or `revoke_workspace`; read, inspection, process, and mutation
+tools require a context-loaded receipt. The unified registration layer validates
+ownership, integrity, phase, and generation before the tool handler starts.
+Each context session owns its instruction acknowledgements, so resuming a new
+conversation cannot clear another valid receipt's state. A successful OAuth authorization
 advances active generations; a restart invalidates receipts without deleting
 resumable aliases.
 

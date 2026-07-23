@@ -170,7 +170,8 @@ try {
   assert.equal(reused, false);
   assert.match(instructionRevision, /^sha256-v1:[A-Za-z0-9_-]{43}$/);
   assert.match(skillRevision, /^sha256-v1:[A-Za-z0-9_-]{43}$/);
-  await registry.markAgentsFilesDelivered(workspace, agentsFiles);
+  const instructionContextId = registry.createInstructionContext(workspace);
+  await registry.markAgentsFilesDelivered(workspace, instructionContextId, agentsFiles);
   const sequentialCheckout = await registry.openWorkspace(ownerClientId, root);
   assert.equal(sequentialCheckout.reused, true);
   assert.equal(sequentialCheckout.instructionRevision, instructionRevision);
@@ -632,6 +633,7 @@ try {
   const priorityInstructions = await registry.loadApplicableAgentsFiles(
     workspace,
     ["instruction-priority/file.txt"],
+    { contextSessionId: instructionContextId },
   );
   assert.deepEqual(
     priorityInstructions.map((file) => ({ path: file.path, content: file.content })),
@@ -644,6 +646,7 @@ try {
   const priorityFallbackInstructions = await registry.loadApplicableAgentsFiles(
     workspace,
     ["instruction-priority/file.txt"],
+    { contextSessionId: instructionContextId },
   );
   assert.deepEqual(
     priorityFallbackInstructions.map((file) => ({ path: file.path, content: file.content })),
@@ -670,6 +673,9 @@ try {
   });
   const fallbackRegistry = new WorkspaceRegistry(fallbackConfig);
   const fallbackOpen = await fallbackRegistry.openWorkspace(ownerClientId, fallbackProject);
+  const fallbackInstructionContextId = fallbackRegistry.createInstructionContext(
+    fallbackOpen.workspace,
+  );
   assert.deepEqual(
     fallbackOpen.agentsFiles
       .filter((file) => file.path.startsWith(canonicalFallbackProject))
@@ -679,10 +685,15 @@ try {
       content: "root override instructions\n",
     }],
   );
-  await fallbackRegistry.markAgentsFilesDelivered(fallbackOpen.workspace, fallbackOpen.agentsFiles);
+  await fallbackRegistry.markAgentsFilesDelivered(
+    fallbackOpen.workspace,
+    fallbackInstructionContextId,
+    fallbackOpen.agentsFiles,
+  );
   const nestedFallback = await fallbackRegistry.loadApplicableAgentsFiles(
     fallbackOpen.workspace,
     ["nested/file.txt"],
+    { contextSessionId: fallbackInstructionContextId },
   );
   assert.deepEqual(
     nestedFallback.map((file) => ({ path: file.path, content: file.content })),
@@ -787,101 +798,174 @@ try {
   await writeFile(join(nestedBudgetProject, "AGENTS.md"), nestedRootContent);
   await writeFile(join(nestedBudgetProject, "nested", "AGENTS.md"), nestedContent);
   const nestedBudgetOpen = await budgetRegistry.openWorkspace(ownerClientId, nestedBudgetProject);
+  const nestedBudgetContextId = budgetRegistry.createInstructionContext(
+    nestedBudgetOpen.workspace,
+  );
   await budgetRegistry.markAgentsFilesDelivered(
     nestedBudgetOpen.workspace,
+    nestedBudgetContextId,
     nestedBudgetOpen.agentsFiles,
   );
   const exactNestedInstructions = await budgetRegistry.loadApplicableAgentsFiles(
     nestedBudgetOpen.workspace,
     ["nested/file.txt"],
+    { contextSessionId: nestedBudgetContextId },
   );
   assert.deepEqual(exactNestedInstructions.map((file) => file.content), [nestedContent]);
-  await budgetRegistry.markAgentsFilesDelivered(nestedBudgetOpen.workspace, exactNestedInstructions);
+  await budgetRegistry.markAgentsFilesDelivered(
+    nestedBudgetOpen.workspace,
+    nestedBudgetContextId,
+    exactNestedInstructions,
+  );
   const exactNestedAcknowledgement = await budgetRegistry.loadApplicableAgentsFiles(
     nestedBudgetOpen.workspace,
     ["nested/file.txt"],
-    { requireAcknowledged: true },
+    { contextSessionId: nestedBudgetContextId, requireAcknowledged: true },
   );
   const exactNestedToken = await budgetRegistry.createInstructionAcknowledgement(
     nestedBudgetOpen.workspace,
+    nestedBudgetContextId,
     exactNestedAcknowledgement,
   );
-  await budgetRegistry.acknowledgeInstructions(nestedBudgetOpen.workspace, exactNestedToken);
+  await budgetRegistry.acknowledgeInstructions(
+    nestedBudgetOpen.workspace,
+    nestedBudgetContextId,
+    exactNestedToken,
+  );
   await writeFile(join(nestedBudgetProject, "nested", "AGENTS.md"), `${nestedContent}x`);
   await assert.rejects(
-    budgetRegistry.loadApplicableAgentsFiles(nestedBudgetOpen.workspace, ["nested/file.txt"]),
+    budgetRegistry.loadApplicableAgentsFiles(
+      nestedBudgetOpen.workspace,
+      ["nested/file.txt"],
+      { contextSessionId: nestedBudgetContextId },
+    ),
     new RegExp(`instruction chain exceeds the ${MAX_PROJECT_INSTRUCTION_BYTES}-byte UTF-8 limit`),
   );
   await assert.rejects(
     budgetRegistry.loadApplicableAgentsFiles(
       nestedBudgetOpen.workspace,
       ["nested/file.txt"],
-      { requireAcknowledged: true },
+      { contextSessionId: nestedBudgetContextId, requireAcknowledged: true },
     ),
     /nested[/\\]AGENTS\.md requires .*total 32769 bytes/,
   );
 
-  const nestedInstructions = await registry.loadApplicableAgentsFiles(workspace, ["nested/file.txt"]);
+  const nestedInstructions = await registry.loadApplicableAgentsFiles(
+    workspace,
+    ["nested/file.txt"],
+    { contextSessionId: instructionContextId },
+  );
   assert.deepEqual(nestedInstructions.map(({ path, content }) => ({ path, content })), [{
     path: join(canonicalRoot, "nested", "AGENTS.md"),
     content: "nested instructions\n",
   }]);
-  await registry.markAgentsFilesDelivered(workspace, nestedInstructions);
-  assert.deepEqual(await registry.loadApplicableAgentsFiles(workspace, ["nested/file.txt"]), []);
+  await registry.markAgentsFilesDelivered(workspace, instructionContextId, nestedInstructions);
+  assert.deepEqual(
+    await registry.loadApplicableAgentsFiles(
+      workspace,
+      ["nested/file.txt"],
+      { contextSessionId: instructionContextId },
+    ),
+    [],
+  );
   await writeFile(join(root, "nested", "AGENTS.md"), "updated nested instructions\n");
-  const updatedNestedInstructions = await registry.loadApplicableAgentsFiles(workspace, ["nested/file.txt"]);
+  const updatedNestedInstructions = await registry.loadApplicableAgentsFiles(
+    workspace,
+    ["nested/file.txt"],
+    { contextSessionId: instructionContextId },
+  );
   assert.deepEqual(
     updatedNestedInstructions.map((file) => file.content),
     ["updated nested instructions\n"],
   );
-  await registry.markAgentsFilesDelivered(workspace, updatedNestedInstructions);
+  await registry.markAgentsFilesDelivered(
+    workspace,
+    instructionContextId,
+    updatedNestedInstructions,
+  );
   const mutationInstructions = await registry.loadApplicableAgentsFiles(
     workspace,
     ["nested/file.txt"],
-    { requireAcknowledged: true },
+    { contextSessionId: instructionContextId, requireAcknowledged: true },
   );
   assert.equal(mutationInstructions.length, 3);
-  const generationBeforeAcknowledgement = registry.instructionAcknowledgementGeneration(workspace);
-  const instructionToken = await registry.createInstructionAcknowledgement(workspace, mutationInstructions);
-  await registry.acknowledgeInstructions(workspace, instructionToken);
-  assert.equal(registry.instructionAcknowledgementGeneration(workspace), generationBeforeAcknowledgement + 1);
+  const generationBeforeAcknowledgement = registry.instructionAcknowledgementGeneration(
+    workspace,
+    instructionContextId,
+  );
+  const instructionToken = await registry.createInstructionAcknowledgement(
+    workspace,
+    instructionContextId,
+    mutationInstructions,
+  );
+  await registry.acknowledgeInstructions(workspace, instructionContextId, instructionToken);
+  assert.equal(
+    registry.instructionAcknowledgementGeneration(workspace, instructionContextId),
+    generationBeforeAcknowledgement + 1,
+  );
   assert.deepEqual(
-    await registry.loadApplicableAgentsFiles(workspace, ["nested/file.txt"], { requireAcknowledged: true }),
+    await registry.loadApplicableAgentsFiles(
+      workspace,
+      ["nested/file.txt"],
+      { contextSessionId: instructionContextId, requireAcknowledged: true },
+    ),
     [],
   );
   await assert.rejects(
-    registry.acknowledgeInstructions(workspace, instructionToken),
+    registry.acknowledgeInstructions(workspace, instructionContextId, instructionToken),
     /instruction token is no longer valid/,
   );
   const currentWorkspace = registry.getWorkspace(ownerClientId, workspace.id);
-  const expiringToken = await registry.createInstructionAcknowledgement(currentWorkspace, []);
-  currentWorkspace.pendingInstructionAcknowledgements.get(expiringToken)!.createdAt = 0;
+  const expiringToken = await registry.createInstructionAcknowledgement(
+    currentWorkspace,
+    instructionContextId,
+    [],
+  );
+  currentWorkspace.instructionContexts
+    .get(instructionContextId)!
+    .pendingAcknowledgements
+    .get(expiringToken)!.createdAt = 0;
   assert.deepEqual(registry.cleanupLifecycleState(), {
     expiredInstructionTokens: 1,
     deletedClosedWorkspaceSessions: 0,
   });
   await assert.rejects(
-    registry.acknowledgeInstructions(currentWorkspace, expiringToken),
+    registry.acknowledgeInstructions(currentWorkspace, instructionContextId, expiringToken),
     /instruction token is no longer valid/,
   );
 
   const lateInstructionDir = join(root, "late-instructions");
   await mkdir(lateInstructionDir);
-  assert.deepEqual(await registry.loadApplicableAgentsFiles(workspace, ["late-instructions/new.txt"]), []);
+  assert.deepEqual(
+    await registry.loadApplicableAgentsFiles(
+      workspace,
+      ["late-instructions/new.txt"],
+      { contextSessionId: instructionContextId },
+    ),
+    [],
+  );
   await writeFile(join(lateInstructionDir, "AGENTS.md"), "late instructions\n");
-  const lateInstructions = await registry.loadApplicableAgentsFiles(workspace, ["late-instructions/new.txt"]);
+  const lateInstructions = await registry.loadApplicableAgentsFiles(
+    workspace,
+    ["late-instructions/new.txt"],
+    { contextSessionId: instructionContextId },
+  );
   assert.deepEqual(lateInstructions.map(({ path, content }) => ({ path, content })), [
     { path: join(canonicalRoot, "late-instructions", "AGENTS.md"), content: "late instructions\n" },
   ]);
-  await registry.markAgentsFilesDelivered(workspace, lateInstructions);
+  await registry.markAgentsFilesDelivered(workspace, instructionContextId, lateInstructions);
   const lateMutationInstructions = await registry.loadApplicableAgentsFiles(
     workspace,
     ["late-instructions/new.txt"],
-    { requireAcknowledged: true },
+    { contextSessionId: instructionContextId, requireAcknowledged: true },
   );
   await writeFile(join(lateInstructionDir, "AGENTS.md"), "changed before token\n");
   await assert.rejects(
-    registry.createInstructionAcknowledgement(workspace, lateMutationInstructions),
+    registry.createInstructionAcknowledgement(
+      workspace,
+      instructionContextId,
+      lateMutationInstructions,
+    ),
     /changed while preparing instructionToken/,
   );
   assert.throws(() => registry.getWorkspace("client-b", workspace.id), /workspace is no longer available/);
@@ -909,7 +993,11 @@ try {
     await writeFile(join(canonicalScope, "deep", "AGENTS.md"), "canonical deep instructions\n");
     await writeFile(join(canonicalScope, "deep", "file.txt"), "inside\n");
     await symlink(join(canonicalScope, "deep"), join(root, "scope-link"));
-    const symlinkInstructions = await registry.loadApplicableAgentsFiles(workspace, ["scope-link/file.txt"]);
+    const symlinkInstructions = await registry.loadApplicableAgentsFiles(
+      workspace,
+      ["scope-link/file.txt"],
+      { contextSessionId: instructionContextId },
+    );
     assert.deepEqual(
       symlinkInstructions.map(({ path, content }) => ({ path, content })),
       [

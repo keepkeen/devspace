@@ -39,7 +39,12 @@ const chatGptToken = "chatgpt-stateless-access-token";
 const statefulToken = "stateful-access-token";
 const clients: Client[] = [];
 await mkdir(workspaceRoot, { recursive: true });
+await mkdir(join(workspaceRoot, "nested"), { recursive: true });
 await writeFile(join(workspaceRoot, "AGENTS.md"), "# Transport test instructions\n\nKeep this fixture read-only.\n");
+await writeFile(
+  join(workspaceRoot, "nested", "AGENTS.md"),
+  "# Nested transport instructions\n\nAcknowledge this context before entering nested.\n",
+);
 await writeFile(join(workspaceRoot, "payload.txt"), "transport-mode-ok\n");
 
 const config = loadConfig({
@@ -84,6 +89,7 @@ try {
   let receipt = String(
     (opened.structuredContent as { receipt?: unknown } | undefined)?.receipt ?? "",
   );
+  const firstContextReceipt = receipt;
   assert.match(receipt, /^wctx3\./);
   const instructionRevision = String(
     (opened.structuredContent as { instructions?: { revision?: unknown } } | undefined)?.instructions?.revision ?? "",
@@ -123,11 +129,20 @@ try {
   const instructionToken = String(
     (loadedInstructions.structuredContent as { instructionToken?: unknown } | undefined)?.instructionToken ?? "",
   );
-  assert.ok(instructionToken);
+  assert.equal(instructionToken, "");
+  const nestedInstructions = await firstChatGpt.callTool({
+    name: "load_workspace_instructions",
+    arguments: { receipt, paths: ["nested"] },
+  });
+  const firstContextNestedToken = String(
+    (nestedInstructions.structuredContent as { instructionToken?: unknown } | undefined)
+      ?.instructionToken ?? "",
+  );
+  assert.match(firstContextNestedToken, /^instructions_/);
 
   const heldCommand = firstChatGpt.callTool({
     name: "exec_command",
-    arguments: { receipt, instructionToken, cmd: "sleep 0.25", yieldTimeMs: 1_000 },
+    arguments: { receipt, cmd: "sleep 0.25", yieldTimeMs: 1_000 },
   });
   await delay(50);
   const overCapacity = await rawMcpPost(origin, chatGptToken, "concurrent-chatgpt-session");
@@ -163,11 +178,41 @@ try {
     name: "exec_command",
     arguments: { receipt, cmd: "pwd" },
   });
-  assert.equal(
-    (resumedMutationWithoutReload.structuredContent as { error?: { code?: unknown } } | undefined)
-      ?.error?.code,
-    "instructions_required",
+  assert.notEqual(resumedMutationWithoutReload.isError, true);
+  const originalContextStillAcknowledged = await secondChatGpt.callTool({
+    name: "exec_command",
+    arguments: { receipt: firstContextReceipt, cmd: "pwd" },
+  });
+  assert.notEqual(
+    originalContextStillAcknowledged.isError,
+    true,
+    "resuming a new context must not clear acknowledgement state owned by an older receipt",
   );
+  const crossContextInstructionToken = await secondChatGpt.callTool({
+    name: "exec_command",
+    arguments: {
+      receipt,
+      instructionToken: firstContextNestedToken,
+      cmd: "pwd",
+      workingDirectory: "nested",
+    },
+  });
+  assert.equal(
+    (crossContextInstructionToken.structuredContent as {
+      error?: { code?: unknown };
+    } | undefined)?.error?.code,
+    "instruction_token_invalid",
+  );
+  const originalContextConsumesItsToken = await secondChatGpt.callTool({
+    name: "exec_command",
+    arguments: {
+      receipt: firstContextReceipt,
+      instructionToken: firstContextNestedToken,
+      cmd: "pwd",
+      workingDirectory: "nested",
+    },
+  });
+  assert.notEqual(originalContextConsumesItsToken.isError, true);
   const reusedRead = await secondChatGpt.callTool({
     name: "read",
     arguments: { receipt, path: "payload.txt" },

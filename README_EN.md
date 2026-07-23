@@ -270,20 +270,26 @@ run the smallest relevant verification, and summarize the changed files.
 The expected workflow is:
 
 1. ChatGPT calls `open_workspace` with the path and alias. The default response
-   is metadata-only, so instructions and Skills are not injected yet.
-2. It calls `get_workspace_context(alias, full)` for the `workspaceId`, project
-   instructions, and Skill catalog. Only explicit `contextMode: "retained"`
-   permits revision-based body suppression.
-3. ChatGPT reuses that `workspaceId` for reads, searches, edits, and commands.
+   is metadata-only, so instructions and Skills are not injected yet. The
+   metadata receipt can only load context or close/revoke the Workspace; it
+   cannot read, inspect, execute, or modify local files.
+2. It passes that receipt to `get_workspace_context` with
+   `contextMode: "full"` to receive the v3 structured instructions, Skill
+   catalog, and a refreshed context-loaded receipt. Only explicit
+   `contextMode: "retained"` permits revision-based body suppression.
+3. ChatGPT passes the current receipt to reads, searches, edits, and commands.
+   The receipt binds the OAuth connection, Workspace and generation, context
+   phase, a private context session, and both context revisions.
 4. Each ChatGPT tool call may use a fresh stateless HTTP transport. Continuity
-   comes from `workspaceId`, so reconnects and stale MCP session headers do not
-   interrupt the workspace. The same authorized client can reopen and reuse the
-   same workspace in later conversations. A new conversation calls
+   comes from the persisted Workspace record, so reconnects and stale MCP
+   session headers do not interrupt the workspace. The same authorized client
+   can reopen and reuse the same workspace in later conversations. A new
+   conversation calls
    `list_workspaces`, then `resume_workspace(alias, full)`, without resending an
    absolute host path.
    If the ChatGPT app is deleted, refreshed, or re-authorized as a new OAuth
-   client, discard any rejected old `workspaceId` and call `open_workspace`
-   again immediately.
+   client, rejected old receipts and aliases belong to the earlier connection;
+   call `open_workspace` again.
 5. `close_workspace` is used only when you explicitly ask to release it.
    Unused workspaces may also expire after the configured idle period.
 
@@ -307,14 +313,20 @@ use separate Git worktrees.
 ### `AGENTS.md` and Skills
 
 The initial `open_workspace` call returns metadata by default. After
-`get_workspace_context(alias, full)`, DevSpace returns structured
-`workspaceInstructions[]` records with source, scope, relative path, revision,
-trust, and content. One user-level file may be explicitly
+`get_workspace_context(receipt, full)`, DevSpace returns structured
+`instructions.items[]` records with source, scope, relative path, hash, trust,
+and content. One user-level file may be explicitly
 selected in the Admin panel or with `DEVSPACE_USER_INSTRUCTIONS_PATH`. DevSpace does not
 implicitly read `~/.codex/AGENTS.md`; `DEVSPACE_AGENT_DIR` is only a Skill
-compatibility root. Reads only advertise `scopedInstructionsAvailable=true`.
-Before a mutation or command, ChatGPT calls `load_workspace_instructions` for
-the intended paths and receives structured instructions plus a one-time token.
+compatibility root. The root chain returned by full context is acknowledged for
+that receipt's private context session, so it is not sent a second time before
+the first root-scoped mutation. Reads only advertise
+`scopedInstructionsAvailable=true`. Before entering a newly instructed nested
+scope for a mutation or command, ChatGPT calls `load_workspace_instructions`
+for the intended paths and receives only the additional structured instructions
+plus a one-time token. The token can only be consumed by the context session
+that requested it. Resuming a new conversation creates independent
+acknowledgement state and does not clear an older valid receipt's state.
 Whitespace-only files are skipped, the combined user/root/nested
 instruction chain is limited to 32 KiB, and interactive `write_stdin` input is
 gated when a running process may enter a newly instructed directory. Each
@@ -364,9 +376,12 @@ from a command that never started.
 `get_operation_status(operationId)` checks retained state without executing or
 repeating the stored result body.
 
-Every Workspace-scoped tool requires both `workspaceId` and
-`workspaceGeneration`. Restarts, OAuth reauthorization, allowed-root changes, and close/reopen cycles
-stale old handles. `read` returns `contentHash` and exact string `mtimeNs`;
+Every Workspace-scoped tool requires the current v3 `receipt`. The unified
+registration layer validates ownership, generation, context phase, and private
+context-session binding before the handler starts. Metadata receipts can only
+promote context or close/revoke the Workspace. Restarts, OAuth
+reauthorization, allowed-root changes, and close/reopen cycles stale old
+receipts. `read` returns `contentHash` and exact string `mtimeNs`;
 `apply_patch.ifMatch` checks one or more paths before the first write.
 
 Equivalent managed-worktree opens reuse the same active worktree for one OAuth
@@ -408,8 +423,8 @@ end without closing the local workspace; DevSpace's workspace state is stored
 in SQLite and is not tied to one HTTP connection.
 
 If the server restarts, ChatGPT may open a fresh MCP transport. Existing
-checkout workspaces remain available, but an old ID requires hydration before
-direct use: call `list_workspaces`, then `resume_workspace(alias, full)`.
+checkout workspaces remain available, but old receipts are invalid: call
+`list_workspaces`, then `resume_workspace(alias, full)` for a fresh receipt.
 
 <details>
 <summary><strong>Shadowrocket or another TUN proxy</strong></summary>
@@ -477,6 +492,7 @@ The comparison is against upstream commit
 | Safer lifecycle | Workspace operation leases, exclusive close, request draining, process termination, and cleanup rules prevent resources from being closed while still in use. |
 | Real resource limits | Global and per-client limits cover MCP sessions, workspaces, processes, worktrees, output, and command runtime. Hung commands receive `SIGTERM` and then `SIGKILL` after a grace period. |
 | Client isolation | OAuth ownership is enforced for MCP sessions, workspaces, processes, and stored state. One client cannot reuse another client's IDs. |
+| Compact context protocol | v3 receipts separate metadata from context-loaded capabilities and isolate instruction acknowledgements in private context sessions, avoiding repeated root instructions and cross-conversation state resets. |
 | Project instructions | Instructions are structured with source, scope, and revision; reads advertise availability only, mutations explicitly load and acknowledge them, empty files are skipped, and the chain is capped at 32 KiB. |
 | Local Skills | Skills come from repository ancestors within an approved root plus user, Admin, and DevSpace bundled scopes; duplicate names remain visible, the catalog is capped at 8,000 UTF-8 bytes, and ChatGPT web loads a selected Skill through `load_skill`. |
 | Safer shell workflow | High-risk command patterns are blocked and inline output stays bounded; background/PTY sessions can be polled or interrupted, while available durable output is replayable by opaque `outputId` through `read_process_output`. |

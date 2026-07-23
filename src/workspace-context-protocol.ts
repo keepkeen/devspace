@@ -22,6 +22,7 @@ const MAX_RECEIPT_TTL_MS = 24 * 60 * 60 * 1_000;
 export interface WorkspaceContextReceiptBinding {
   ownerClientId: string;
   workspaceId: string;
+  contextSessionId: string;
   generation: number;
   instructionRevision: string;
   skillRevision: string;
@@ -69,6 +70,7 @@ export interface WorkspaceContextSkillItem {
 export interface WorkspaceContextProtocolInput {
   ownerClientId: string;
   workspaceId: string;
+  contextSessionId: string;
   phase: WorkspaceContextPhase;
   workspace: {
     ref: string;
@@ -80,6 +82,7 @@ export interface WorkspaceContextProtocolInput {
     revision: string;
     complete: boolean;
     included: boolean;
+    acknowledged: boolean;
     items: readonly WorkspaceContextInstructionItem[];
     incompleteReason?: string;
   };
@@ -103,7 +106,10 @@ export interface WorkspaceContextProtocolResult {
     schemaVersion: typeof WORKSPACE_CONTEXT_SCHEMA_VERSION;
     context: { phase: WorkspaceContextPhase };
     workspace: WorkspaceContextProtocolInput["workspace"];
-    instructions: Pick<WorkspaceContextProtocolInput["instructions"], "revision" | "complete" | "included" | "items">;
+    instructions: Pick<
+      WorkspaceContextProtocolInput["instructions"],
+      "revision" | "complete" | "included" | "acknowledged" | "items"
+    >;
     skills: Pick<WorkspaceContextProtocolInput["skills"], "revision" | "count" | "included" | "items">;
     receipt: string;
     diagnostics?: WorkspaceContextDiagnostics;
@@ -138,6 +144,7 @@ export function createWorkspaceContextReceiptManager(options: {
     updateFramed(hmac, processGeneration);
     updateFramed(hmac, binding.ownerClientId);
     updateFramed(hmac, binding.workspaceId);
+    updateFramed(hmac, binding.contextSessionId);
     updateFramed(hmac, String(binding.generation));
     updateFramed(hmac, binding.instructionRevision);
     updateFramed(hmac, binding.skillRevision);
@@ -203,6 +210,7 @@ export function serializeWorkspaceContext(
     throw new Error("workspace.ref must match workspaceId.");
   }
   assertContextPhase(input.phase);
+  assertBoundedString("contextSessionId", input.contextSessionId);
   assertPositiveSafeInteger("workspace.generation", input.workspace.generation);
   assertNonNegativeSafeInteger("skills.count", input.skills.count);
   assertNonNegativeSafeInteger("skills.warningCount", input.skills.warningCount ?? 0);
@@ -218,6 +226,9 @@ export function serializeWorkspaceContext(
       input.skills.included || input.skills.items.length > 0)
   ) {
     throw new Error("metadata context cannot include instructions or Skills.");
+  }
+  if (input.phase === "metadata" && input.instructions.acknowledged) {
+    throw new Error("metadata context cannot acknowledge instructions.");
   }
 
   const omitted = input.skills.count - input.skills.items.length;
@@ -238,6 +249,7 @@ export function serializeWorkspaceContext(
   const receipt = receipts.issue({
     ownerClientId: input.ownerClientId,
     workspaceId: input.workspaceId,
+    contextSessionId: input.contextSessionId,
     generation: input.workspace.generation,
     instructionRevision: input.instructions.revision,
     skillRevision: input.skills.revision,
@@ -257,6 +269,7 @@ export function serializeWorkspaceContext(
         revision: input.instructions.revision,
         complete: input.instructions.complete,
         included: input.instructions.included,
+        acknowledged: input.instructions.acknowledged,
         items: input.instructions.items,
       },
       skills: {
@@ -284,6 +297,7 @@ function validateKey(key: Uint8Array): Buffer {
 function assertReceiptBinding(binding: WorkspaceContextReceiptBinding): void {
   assertBoundedString("ownerClientId", binding.ownerClientId);
   assertBoundedString("workspaceId", binding.workspaceId);
+  assertBoundedString("contextSessionId", binding.contextSessionId);
   assertPositiveSafeInteger("generation", binding.generation);
   assertBoundedString("instructionRevision", binding.instructionRevision);
   assertBoundedString("skillRevision", binding.skillRevision);

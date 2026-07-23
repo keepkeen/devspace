@@ -212,6 +212,12 @@ try {
     false,
   );
   assert.equal(
+    (openMetadata.structuredContent as {
+      instructions?: { acknowledged?: unknown };
+    } | undefined)?.instructions?.acknowledged,
+    false,
+  );
+  assert.equal(
     (openMetadata.structuredContent as { skills?: { included?: unknown } } | undefined)
       ?.skills?.included,
     false,
@@ -266,6 +272,12 @@ try {
   assert.equal(
     (openWorkspace.structuredContent as { instructions?: { included?: unknown } } | undefined)
       ?.instructions?.included,
+    true,
+  );
+  assert.equal(
+    (openWorkspace.structuredContent as {
+      instructions?: { acknowledged?: unknown };
+    } | undefined)?.instructions?.acknowledged,
     true,
   );
   const rootInstruction = workspaceInstructions.find((instruction) => instruction.path === "AGENTS.md");
@@ -620,15 +632,21 @@ try {
     name: "load_workspace_instructions",
     arguments: { workspaceId, paths: ["."] },
   });
-  const rootInstructionToken = String(
-    (rootInstructionLoad.structuredContent as { instructionToken?: unknown } | undefined)?.instructionToken ?? "",
+  assert.equal(
+    (rootInstructionLoad.structuredContent as { instructionToken?: unknown } | undefined)
+      ?.instructionToken,
+    undefined,
   );
-  assert.match(rootInstructionToken, /^instructions_/);
+  assert.deepEqual(
+    (rootInstructionLoad.structuredContent as {
+      instructions?: { items?: unknown[] };
+    } | undefined)?.instructions?.items,
+    [],
+  );
   const execCommand = await client.callTool({
     name: "exec_command",
     arguments: {
       workspaceId,
-      instructionToken: rootInstructionToken,
       cmd: `${JSON.stringify(process.execPath)} -e "process.stdin.pipe(process.stdout)"`,
       stdin: `${processNeedle}\n`,
     },
@@ -1036,13 +1054,14 @@ try {
     name: "load_workspace_instructions",
     arguments: { workspaceId: dirtyWorkspaceId, paths: ["."] },
   });
-  const dirtyInstructionToken = String(
-    (dirtyInstructionLoad.structuredContent as { instructionToken?: unknown } | undefined)?.instructionToken ?? "",
+  assert.equal(
+    (dirtyInstructionLoad.structuredContent as { instructionToken?: unknown } | undefined)
+      ?.instructionToken,
+    undefined,
   );
-  assert.match(dirtyInstructionToken, /^instructions_/);
   const dirtyPwd = await client.callTool({
     name: "exec_command",
-    arguments: { workspaceId: dirtyWorkspaceId, instructionToken: dirtyInstructionToken, cmd: "pwd" },
+    arguments: { workspaceId: dirtyWorkspaceId, cmd: "pwd" },
   });
   const dirtyWorkspaceRoot = toolText(dirtyPwd).split("\n")[0]?.trim() ?? "";
   assert.ok(dirtyWorkspaceRoot);

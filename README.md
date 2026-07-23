@@ -265,12 +265,14 @@ OpenAI 目前把自定义 MCP 集成称为 **developer-mode app（开发者模�
 正常的调用流程是：
 
 1. ChatGPT 用本地项目路径和别名调用 `open_workspace`。默认只返回 metadata，
-   不把项目指令或 Skill 目录立即塞入上下文，同时返回短期 `receipt`。
-2. 模型用这个 `receipt` 调用 `get_workspace_context`，取得 v2 结构化项目指令、
+   不把项目指令或 Skill 目录立即塞入上下文，同时返回短期 `receipt`。metadata
+   receipt 只能继续加载上下文或关闭/撤销 Workspace，不能直接读取、搜索、执行或修改文件。
+2. 模型用这个 `receipt` 调用 `get_workspace_context`，取得 v3 结构化项目指令、
    Skill 目录和刷新后的 `receipt`。只有显式的 `contextMode: "retained"` 才会按
    revision 跳过正文。
 3. 后续读取、搜索、编辑和命令调用只传当前 `receipt`。它已经绑定 OAuth 客户端、
-   Workspace、代次及两类上下文修订号，模型不需要在每次调用里重复绝对路径或内部 ID。
+   Workspace、代次、上下文阶段、私有 context session 及两类上下文修订号，模型不需要
+   在每次调用里重复绝对路径或内部 ID。
 4. ChatGPT 的每次工具调用都可以使用新的无状态 HTTP 传输；真正需要复用的是
    Workspace 的持久化记录，不是 MCP transport session。传输重连或旧 MCP session
    header 不会中断 workspace。
@@ -304,9 +306,12 @@ worktree，否则不建议两个账号同时写入同一个项目。
 仓库指令明确标记为 `repository_untrusted`，不能覆盖用户要求或 DevSpace 安全策略。
 需要用户级指令时，可在管理面板或
 `DEVSPACE_USER_INSTRUCTIONS_PATH` 中显式指定一个文件；默认不会读取
-`~/.codex/AGENTS.md`，`DEVSPACE_AGENT_DIR` 只用于兼容 Skill。读取嵌套目录时只返回
-`scopedInstructionsAvailable=true`；准备修改或执行前，模型调用
-`load_workspace_instructions` 获取该作用域的结构化指令和一次性确认 Token。
+`~/.codex/AGENTS.md`，`DEVSPACE_AGENT_DIR` 只用于兼容 Skill。full context 返回的根级
+指令会直接绑定并确认到该 receipt 的私有 context session，第一次在根目录修改或执行前
+不必再次发送。读取嵌套目录时只返回 `scopedInstructionsAvailable=true`；准备进入新的
+嵌套指令作用域修改或执行前，模型调用 `load_workspace_instructions` 获取增量结构化指令和
+一次性确认 Token。Token 只能由签发它的 context session 使用；新对话恢复 Workspace
+不会清除旧有效 receipt 的确认状态。
 纯空白指令文件会跳过，用户、根目录和嵌套
 指令链合计最多 32 KiB；后台进程后续通过 `write_stdin` 进入新目录时也会先经过
 同一套指令确认。完整上下文返回基于初始指令路径和内容生成的
@@ -350,8 +355,10 @@ DevSpace 只提供一套稳定的 Codex 风格工具：`read`、`batch_read`、
 不会在 24 小时后重新变成一次新操作。
 
 所有 Workspace 工具都要求当前上下文 `receipt`；统一注册层会在工具执行前解析它并校验
-OAuth 所有权与 Workspace 代次。receipt 还绑定签发时的两类上下文修订号，供恢复和缓存
-去重使用；项目内文件变化仍由指令门禁、Skill 重载和文件版本锁分别检查。服务重启、OAuth 重新授权、授权根变更和
+OAuth 所有权、Workspace 代次、context phase 与私有 context session。metadata receipt
+只能升级上下文或执行关闭/撤销；读取、搜索、进程和修改工具必须使用 context-loaded receipt。
+receipt 还绑定签发时的两类上下文修订号，供恢复和缓存去重使用；项目内文件变化仍由指令
+门禁、Skill 重载和文件版本锁分别检查。服务重启、OAuth 重新授权、授权根变更和
 关闭/重新打开会使旧 receipt 失效，此时用 alias 恢复并获取新的 receipt。`read` 返回
 `contentHash` 和精确字符串形式的
 `mtimeNs`；`apply_patch.ifMatch` 可在写入前检查一个或多个路径，防止不同对话静默覆盖。
@@ -458,7 +465,7 @@ DEVSPACE_LAUNCHD_SERVICE_LABEL=com.waishnav.devspace node dist/cli.js admin
 | 完整生命周期 | workspace 操作租约、独占关闭、请求排空、进程终止和统一清理，避免资源仍在使用时被提前关闭。 |
 | 真正的资源限制 | 全局和单客户端配额覆盖 MCP 会话、workspace、进程、worktree、输出和命令时间。超时命令先接收 `SIGTERM`，宽限期后仍未退出则使用 `SIGKILL`。 |
 | 客户端身份隔离 | MCP 会话、workspace、进程和持久化状态都校验 OAuth 所有权，一个客户端不能复用另一个客户端的 ID。 |
-| 紧凑上下文协议 | v2 上下文只返回 Workspace 摘要、结构化指令、Skill 目录和短期 receipt；后续工具统一校验 receipt，避免反复注入路径和恢复说明。 |
+| 紧凑上下文协议 | v3 上下文按 metadata/context-loaded phase 签发短期 receipt，并把指令确认隔离到私有 context session；根指令不重复发送，新对话也不会清除旧 receipt 的确认状态。 |
 | 可核验副作用 | 写入、命令、进程、变更展示和 Workspace 生命周期工具统一返回机器可读 effects，并明确区分精确观测与 Shell 无法完整跟踪的副作用。 |
 | 可靠撤销 | 撤销全部 OAuth 客户端时先阻止新调用并排空进行中的调用，再用持久化任务回收进程、输出、review 和干净 worktree；脏 worktree 留作可审计记录。 |
 | 项目指令 | 指令以带来源、作用域和修订号的结构化记录返回；只读工具只提示可用性，修改前通过 `load_workspace_instructions` 显式加载并确认；空文件跳过，全链限制为 32 KiB。 |

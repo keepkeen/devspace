@@ -16,9 +16,11 @@ connection-scoped alias:
 }
 ```
 
-`open_workspace` defaults to `contextMode: "metadata"`. It returns a compact v2
+`open_workspace` defaults to `contextMode: "metadata"`. It returns a compact v3
 context and a receipt with a six-hour maximum lifetime, without instruction or
-Skill bodies. Before work, pass that receipt to `get_workspace_context`:
+Skill bodies. A metadata receipt can only refresh context or close/revoke the
+Workspace; it cannot read, inspect, execute, or modify local files. Before work,
+pass it to `get_workspace_context`:
 
 ```json
 {
@@ -29,9 +31,9 @@ Skill bodies. Before work, pass that receipt to `get_workspace_context`:
 
 The result contains structured instruction and Skill sections plus a refreshed
 receipt. Pass the current receipt to later Workspace-scoped tools. It binds the
-OAuth owner, Workspace identity and generation, instruction revision, Skill
-revision, and current server process; callers do not repeat host paths or
-internal IDs.
+OAuth connection, Workspace identity and generation, a private context session,
+instruction revision, Skill revision, context phase, and current server process;
+callers do not repeat host paths or internal IDs.
 
 In a new conversation, do not resend or guess the host path. Call
 `list_workspaces`, select the intended alias, then call:
@@ -75,19 +77,26 @@ After a backend restart, an old receipt fails with
 advances the Workspace generation and reloads agent profiles, Skills, root
 instructions, and durable review checkpoints before issuing the new receipt.
 
-The normal text result is intentionally one sentence. The v2 structured result
+The normal text result is intentionally one sentence. The v3 structured result
 is the authoritative context:
 
 ```json
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
+  "context": { "phase": "context_loaded" },
   "workspace": {
     "ref": "ws_…",
     "generation": 5,
     "mode": "worktree",
     "writeAccess": "read_write"
   },
-  "instructions": { "revision": "sha256-v1:…", "complete": true, "included": true, "items": [] },
+  "instructions": {
+    "revision": "sha256-v1:…",
+    "complete": true,
+    "included": true,
+    "acknowledged": true,
+    "items": []
+  },
   "skills": { "revision": "sha256-v1:…", "count": 3, "included": true, "items": [] },
   "receipt": "wctx3.…"
 }
@@ -172,14 +181,19 @@ the first matching project-root instruction in this priority order:
 - `CLAUDE.MD`
 - configured project document fallback filenames
 
-Nested instruction files are discovered lazily by path. Read and inspection
-tools do not inject their bodies; they return only
-`scopedInstructionsAvailable=true`. Before modifying or executing in that
-scope, call `load_workspace_instructions` with the intended paths. It returns
-only structured instruction items—source, trust, scope, path, hash, and
-content—plus a one-time `instructionToken`. Pass that token
-to the intended mutation. Instruction Markdown is never concatenated with a
-server-authored prompt or error message.
+The root chain returned by full context is acknowledged for that receipt's
+private context session. It does not need to be loaded a second time before the
+first root-scoped mutation. Nested instruction files are discovered lazily by
+path. Read and inspection tools do not inject their bodies; they return only
+`scopedInstructionsAvailable=true`. Before modifying or executing in a newly
+instructed scope, call `load_workspace_instructions` with the intended paths.
+It returns only the new structured instruction items—source, trust, scope, path,
+hash, and content—plus a one-time `instructionToken`. Pass that token to the
+intended mutation. Tokens are bound to the receipt's context session and cannot
+be consumed by another conversation or receipt. Resuming a new conversation
+creates an independent context session and does not erase acknowledgement state
+owned by an older valid receipt. Instruction Markdown is never concatenated
+with a server-authored prompt or error message.
 
 Whitespace-only instruction files are ignored so the next filename in priority
 order can apply. DevSpace does not implicitly import `~/.codex/AGENTS.md`;
@@ -343,10 +357,13 @@ prose:
 ```
 
 All Workspace-scoped tools require a current `receipt`. A single registration
-wrapper resolves it and checks ownership and generation before the handler
-starts. The receipt carries the context revisions of the delivered snapshot;
-instruction gates, Skill reload checks, and file versions handle later project
-changes without forcing a new receipt after every edit. Cold hydration, allowed-root changes,
+wrapper resolves it and checks ownership, generation, context phase, and the
+private context-session binding before the handler starts. Metadata receipts
+are limited to context promotion and lifecycle operations. Full/retained
+receipts carry the context revisions of the delivered snapshot and their own
+instruction acknowledgement state; instruction gates, Skill reload checks, and
+file versions handle later project changes without forcing a new receipt after
+every edit. Cold hydration, allowed-root changes,
 credential-epoch changes, close/reopen transitions, and server restart make an
 old receipt unusable.
 

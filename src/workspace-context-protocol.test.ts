@@ -15,6 +15,7 @@ const receipts = createWorkspaceContextReceiptManager({ key, processGeneration }
 const binding: WorkspaceContextReceiptBinding = {
   ownerClientId: "owner-secret-17",
   workspaceId: "workspace-opaque-ref",
+  contextSessionId: "wctxs_context-session-a",
   generation: 7,
   instructionRevision: "instruction-revision-a",
   skillRevision: "skill-revision-a",
@@ -39,6 +40,7 @@ assert.equal(equivalentManager.resolve(receipt), undefined, "only locally issued
 for (const changed of [
   { ...binding, ownerClientId: "different-owner" },
   { ...binding, workspaceId: "different-workspace" },
+  { ...binding, contextSessionId: "wctxs_context-session-b" },
   { ...binding, generation: binding.generation + 1 },
   { ...binding, instructionRevision: "instruction-revision-b" },
   { ...binding, skillRevision: "skill-revision-b" },
@@ -105,6 +107,7 @@ assert.equal(expiringReceipts.resolve(expiringReceipt), undefined, "receipt expi
 const input: WorkspaceContextProtocolInput = {
   ownerClientId: binding.ownerClientId,
   workspaceId: binding.workspaceId,
+  contextSessionId: binding.contextSessionId,
   phase: "context_loaded",
   workspace: {
     ref: binding.workspaceId,
@@ -116,6 +119,7 @@ const input: WorkspaceContextProtocolInput = {
     revision: binding.instructionRevision,
     complete: true,
     included: true,
+    acknowledged: true,
     items: [{
       source: "repository",
       trust: "repository_untrusted",
@@ -147,6 +151,7 @@ assert.deepEqual(serialized, {
       revision: input.instructions.revision,
       complete: true,
       included: true,
+      acknowledged: true,
       items: input.instructions.items,
     },
     skills: {
@@ -197,6 +202,7 @@ const metadata = serializeWorkspaceContext({
   instructions: {
     ...input.instructions,
     included: false,
+    acknowledged: false,
     items: [],
   },
   skills: {
