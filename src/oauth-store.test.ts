@@ -11,6 +11,7 @@ import {
   type OAuthAuditEvent,
 } from "./oauth-provider.js";
 import { SqliteOAuthClientsStore, SqliteOAuthStore } from "./oauth-store.js";
+import { SqliteWorkspaceStore } from "./workspace-store.js";
 
 const root = await mkdtemp(join(tmpdir(), "devspace-oauth-test-"));
 const oauthConfig = {
@@ -28,6 +29,8 @@ try {
   testPersistenceAndTokenHashing(join(root, "persistence"));
   testExpiredTokenCleanup(join(root, "expiration"));
   testTransactionalTokenRotation(join(root, "rotation"));
+  testDurableWorkspaceRevocationCleanup(join(root, "workspace-revocation"));
+  testOrphanedWorkspaceReconciliation(join(root, "workspace-orphans"));
   testRedirectSchemeValidation(join(root, "redirect-schemes"));
   await testAuthorizationResponseHardening(join(root, "approval-headers"));
   await testAuthorizationThrottling(join(root, "approval-throttling"));
@@ -159,6 +162,7 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
       { version: 7, name: "workspace-resume-idempotency" },
       { version: 8, name: "workspace-generation-operation-identity" },
       { version: 9, name: "workspace-worktree-source-state" },
+      { version: 10, name: "oauth-revocation-cleanup" },
     ]);
   } finally {
     database.close();
@@ -243,6 +247,7 @@ function testExpiredTokenCleanup(stateDir: string): void {
     clients: 1,
     accessTokens: 1,
     refreshTokens: 1,
+    workspaceCleanupJobs: 0,
     expiredAccessTokens: 1,
     expiredRefreshTokens: 1,
   });
@@ -277,6 +282,170 @@ function testRedirectSchemeValidation(stateDir: string): void {
     assert.doesNotThrow(() => clients.registerClient({ redirect_uris: ["http://127.0.0.1:8765/callback"] }));
   } finally {
     store.close();
+  }
+}
+
+function testDurableWorkspaceRevocationCleanup(stateDir: string): void {
+  const oauth = new SqliteOAuthStore(stateDir);
+  const client = new SqliteOAuthClientsStore(oauth, oauthConfig.allowedRedirectHosts).registerClient({
+    redirect_uris: [redirectUri],
+  });
+  const workspaces = new SqliteWorkspaceStore(stateDir);
+  const checkout = workspaces.createSession({
+    id: "revoked-checkout",
+    ownerClientId: client.client_id,
+    root: "/workspace/revoked-checkout",
+  });
+  workspaces.createSession({
+    id: "revoked-worktree",
+    ownerClientId: client.client_id,
+    root: "/workspace/revoked-worktree",
+    mode: "worktree",
+    sourceRoot: "/workspace/source",
+    baseRef: "main",
+    baseSha: "abc123",
+    managed: true,
+  });
+  const closed = workspaces.createSession({
+    id: "closed-workspace",
+    ownerClientId: client.client_id,
+    root: "/workspace/closed",
+  });
+  assert.equal(workspaces.closeSession(closed.id, client.client_id), true);
+
+  assert.deepEqual(oauth.revokeAll(), {
+    clients: 1,
+    accessTokens: 0,
+    refreshTokens: 0,
+    workspaceCleanupJobs: 3,
+  });
+  assert.equal(workspaces.getSession(checkout.id, client.client_id), undefined);
+  const database = openDatabase(stateDir);
+  try {
+    assert.deepEqual(
+      database.sqlite.prepare(
+        "select id, status from workspace_sessions order by id",
+      ).all(),
+      [
+        { id: "closed-workspace", status: "revoked" },
+        { id: "revoked-checkout", status: "revoked" },
+        { id: "revoked-worktree", status: "revoked" },
+      ],
+    );
+  } finally {
+    database.close();
+  }
+  oauth.close();
+  workspaces.close();
+
+  const restarted = new SqliteWorkspaceStore(stateDir);
+  try {
+    const jobs = restarted.listRevocationCleanupJobs();
+    assert.deepEqual(jobs.map(({ workspaceId, status }) => ({ workspaceId, status }))
+      .sort((left, right) => left.workspaceId.localeCompare(right.workspaceId)), [
+      { workspaceId: "closed-workspace", status: "pending" },
+      { workspaceId: "revoked-checkout", status: "pending" },
+      { workspaceId: "revoked-worktree", status: "pending" },
+    ]);
+    const worktreeJob = jobs.find(({ workspaceId }) => workspaceId === "revoked-worktree")!;
+    const firstClaim = restarted.claimRevocationCleanupJob(worktreeJob.id, { now: 1_000, leaseMs: 100 });
+    assert.equal(firstClaim?.attempts, 1);
+    assert.equal(restarted.claimRevocationCleanupJob(worktreeJob.id, { now: 1_050, leaseMs: 100 }), undefined);
+    const reclaimed = restarted.claimRevocationCleanupJob(worktreeJob.id, { now: 1_101, leaseMs: 100 });
+    assert.equal(reclaimed?.attempts, 2);
+    assert.notEqual(reclaimed?.claimToken, firstClaim?.claimToken);
+    assert.equal(restarted.finalizeRevocationCleanupJob({
+      id: worktreeJob.id,
+      claimToken: firstClaim!.claimToken!,
+      retainedDirtyWorktreeReason: "stale worker must not finalize",
+      now: 1_102,
+    }), false);
+    assert.equal(restarted.failRevocationCleanupJob({
+      id: worktreeJob.id,
+      claimToken: reclaimed!.claimToken!,
+      error: "temporary cleanup failure",
+      now: 1_103,
+    }), true);
+    const finalClaim = restarted.claimRevocationCleanupJob(worktreeJob.id, { now: 1_104 });
+    assert.equal(finalClaim?.attempts, 3);
+    assert.equal(restarted.finalizeRevocationCleanupJob({
+      id: worktreeJob.id,
+      claimToken: finalClaim!.claimToken!,
+      retainedDirtyWorktreeReason: "worktree has uncommitted changes",
+      now: 1_105,
+    }), true);
+    assert.equal(restarted.finalizeRevocationCleanupJob({
+      id: worktreeJob.id,
+      claimToken: finalClaim!.claimToken!,
+      retainedDirtyWorktreeReason: "worktree has uncommitted changes",
+      now: 1_105,
+    }), true);
+
+    const checkoutJob = restarted.listRevocationCleanupJobs().find(
+      ({ workspaceId }) => workspaceId === "revoked-checkout",
+    )!;
+    const checkoutClaim = restarted.claimRevocationCleanupJob(checkoutJob.id, { now: 1_105 });
+    assert.equal(restarted.finalizeRevocationCleanupJob({
+      id: checkoutJob.id,
+      claimToken: checkoutClaim!.claimToken!,
+      now: 1_106,
+    }), true);
+    const closedJob = restarted.listRevocationCleanupJobs().find(
+      ({ workspaceId }) => workspaceId === "closed-workspace",
+    )!;
+    const closedClaim = restarted.claimRevocationCleanupJob(closedJob.id, { now: 1_106 });
+    assert.equal(restarted.finalizeRevocationCleanupJob({
+      id: closedJob.id,
+      claimToken: closedClaim!.claimToken!,
+      now: 1_107,
+    }), true);
+    assert.deepEqual(restarted.listRevocationCleanupJobs(), []);
+    assert.deepEqual(restarted.listRevocationDirtyWorktreeArtifacts().map((artifact) => ({
+      workspaceId: artifact.workspaceId,
+      reason: artifact.reason,
+    })), [{
+      workspaceId: "revoked-worktree",
+      reason: "worktree has uncommitted changes",
+    }]);
+    assert.deepEqual(restarted.cleanupRevocationHistory("9999-01-01T00:00:00.000Z", 1), {
+      jobs: 1,
+      workspaceSessions: 1,
+    });
+    assert.deepEqual(restarted.cleanupRevocationHistory("9999-01-01T00:00:00.000Z", 10), {
+      jobs: 2,
+      workspaceSessions: 2,
+    });
+    assert.equal(restarted.listRevocationDirtyWorktreeArtifacts().length, 1);
+  } finally {
+    restarted.close();
+  }
+}
+
+function testOrphanedWorkspaceReconciliation(stateDir: string): void {
+  const workspaces = new SqliteWorkspaceStore(stateDir);
+  workspaces.createSession({
+    id: "orphaned-workspace",
+    ownerClientId: "devspace-missing-oauth-client",
+    root: "/workspace/orphaned",
+  });
+  workspaces.close();
+
+  const oauth = new SqliteOAuthStore(stateDir);
+  try {
+    assert.equal(oauth.queueOrphanedWorkspaceCleanup(), 1);
+    assert.equal(oauth.queueOrphanedWorkspaceCleanup(), 0, "reconciliation is idempotent");
+  } finally {
+    oauth.close();
+  }
+  const restored = new SqliteWorkspaceStore(stateDir);
+  try {
+    assert.deepEqual(
+      restored.listRevocationCleanupJobs().map(({ workspaceId, status }) => ({ workspaceId, status })),
+      [{ workspaceId: "orphaned-workspace", status: "pending" }],
+    );
+    assert.equal(restored.getSession("orphaned-workspace", "devspace-missing-oauth-client"), undefined);
+  } finally {
+    restored.close();
   }
 }
 
@@ -444,10 +613,16 @@ async function testOwnerCredentialChangeAndRevokeAll(stateDir: string): Promise<
     clients: 1,
     accessTokens: 1,
     refreshTokens: 1,
+    workspaceCleanupJobs: 0,
     expiredAccessTokens: 0,
     expiredRefreshTokens: 0,
   });
-  assert.deepEqual(firstProvider.revokeAll(), { clients: 1, accessTokens: 1, refreshTokens: 1 });
+  assert.deepEqual(firstProvider.revokeAll(), {
+    clients: 1,
+    accessTokens: 1,
+    refreshTokens: 1,
+    workspaceCleanupJobs: 0,
+  });
   assert.equal(await firstProvider.clientsStore.getClient?.(client.client_id), undefined);
   await assert.rejects(firstProvider.verifyAccessToken(tokens.access_token), InvalidTokenError);
 
@@ -484,6 +659,7 @@ async function testOwnerCredentialChangeAndRevokeAll(stateDir: string): Promise<
       clients: 1,
       accessTokens: 0,
       refreshTokens: 0,
+      workspaceCleanupJobs: 0,
       expiredAccessTokens: 0,
       expiredRefreshTokens: 0,
     });

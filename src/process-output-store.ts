@@ -474,6 +474,49 @@ export class ProcessOutputStore {
     return { deleted, bytesReclaimed };
   }
 
+  retireWorkspace(ownerClientId: string, workspaceId: string): ProcessOutputCleanupResult {
+    this.assertOpenAndStorageDirectory();
+    const owner = boundedNonEmptyString(ownerClientId, "ownerClientId");
+    const workspace = boundedNonEmptyString(workspaceId, "workspaceId");
+    this.recoverPendingDeletions();
+    const now = this.currentTime();
+    const retireActive = this.database.transaction(() => {
+      const result = this.database.prepare(`
+        update process_outputs
+        set status = 'unknown', updated_at = ?, completed_at = ?
+        where owner_client_id = ? and workspace_id = ? and status = 'active'
+      `).run(now, now, owner, workspace);
+      if (result.changes > 0) {
+        this.database.prepare(`
+          update process_output_usage
+          set active_outputs = active_outputs - ?, completed_outputs = completed_outputs + ?
+          where id = 1
+        `).run(result.changes, result.changes);
+      }
+    });
+    retireActive.immediate();
+
+    const rows = this.database.prepare(`
+      select *
+      from process_outputs
+      where owner_client_id = ? and workspace_id = ?
+      order by output_id
+    `).all(owner, workspace) as ProcessOutputRow[];
+    let deleted = 0;
+    let bytesReclaimed = 0;
+    for (const row of rows) {
+      this.assertFile(row);
+      this.database
+        .prepare("insert or ignore into process_output_deletions (output_id) values (?)")
+        .run(row.output_id);
+      unlinkSync(this.filePath(row.output_id));
+      this.finalizeDeletion(row);
+      deleted += 1;
+      bytesReclaimed += row.stored_bytes;
+    }
+    return { deleted, bytesReclaimed };
+  }
+
   usageSnapshot(): ProcessOutputUsageSnapshot {
     this.assertOpenAndStorageDirectory();
     const usage = this.getUsageRow();

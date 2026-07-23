@@ -26,7 +26,6 @@ import {
   preparePatch,
 } from "./apply-patch.js";
 import { readFileVersion, type FileVersion } from "./file-version.js";
-import { inspectProjectOrientation, type ProjectOrientation } from "./project-orientation.js";
 import { loadConfig, type ServerConfig, type WidgetMode } from "./config.js";
 import {
   logEvent,
@@ -49,7 +48,7 @@ import {
   validateShellWriteTargets,
 } from "./shell-write-targets.js";
 import { analyzeShellCommandScopes } from "./shell-command-scopes.js";
-import { executableChain, unwrapShellWrappers } from "./shell-command-analysis.js";
+import { executableChain, isShellProgram, unwrapShellWrappers } from "./shell-command-analysis.js";
 import {
   BATCH_MAX_ITEMS,
   BATCH_READ_DEFAULT_LINES,
@@ -124,6 +123,23 @@ import {
   getLocalAgentProviderAvailabilitySnapshot,
   type LocalAgentProviderAvailability,
 } from "./local-agent-availability.js";
+import {
+  createWorkspaceContextReceiptManager,
+  serializeWorkspaceContext,
+  type WorkspaceContextInstructionItem,
+  type WorkspaceContextReceiptBinding,
+  type WorkspaceContextReceiptManager,
+} from "./workspace-context-protocol.js";
+import {
+  createApplyPatchEffects,
+  createProcessInteractEffects,
+  createProcessStartEffects,
+  createReviewEffects,
+  createWorkspaceCloseEffects,
+  createWorkspaceOpenEffects,
+  createWorkspaceRevokeEffects,
+  type ToolEffects,
+} from "./tool-effects.js";
 
 const SHELL_COMMAND_MAX_CHARACTERS = 100_000;
 
@@ -138,6 +154,7 @@ const requestContext = new AsyncLocalStorage<{
   clientId: string;
   requestId?: string;
   correlation: RequestCorrelationState;
+  workspaceBinding?: WorkspaceContextReceiptBinding;
 }>();
 const toolHandlerBarriers = new WeakMap<McpServer, ActiveRequestBarrier>();
 const toolErrorReporters = new WeakMap<McpServer, (tool: string, error: unknown) => void>();
@@ -148,7 +165,7 @@ interface PublicToolError {
   retryable?: boolean;
   safeToRetry?: boolean;
   recovery?: string;
-  phase?: "not_started" | "outcome_unknown";
+  phase?: "not_started" | "executed" | "outcome_unknown";
 }
 
 class PublicActionError extends Error {
@@ -550,7 +567,28 @@ const registerAppTool: typeof registerSdkAppTool = ((...args: unknown[]) => {
             ? meta.error as Record<string, unknown>
             : {};
           const code = typeof existingError.code === "string" ? existingError.code : "tool_rejected";
-          const error = structuredToolError({ code, text: "" });
+          const retryable = typeof existingError.retryable === "boolean"
+            ? existingError.retryable
+            : undefined;
+          const safeToRetry = typeof existingError.safeToRetry === "boolean"
+            ? existingError.safeToRetry
+            : undefined;
+          const recovery = typeof existingError.recovery === "string"
+            ? existingError.recovery
+            : undefined;
+          const phase = existingError.phase === "not_started" ||
+              existingError.phase === "executed" ||
+              existingError.phase === "outcome_unknown"
+            ? existingError.phase
+            : undefined;
+          const error = structuredToolError({
+            code,
+            text: "",
+            ...(retryable === undefined ? {} : { retryable }),
+            ...(safeToRetry === undefined ? {} : { safeToRetry }),
+            ...(recovery === undefined ? {} : { recovery }),
+            ...(phase === undefined ? {} : { phase }),
+          });
           const structured = record.structuredContent && typeof record.structuredContent === "object" && !Array.isArray(record.structuredContent)
             ? record.structuredContent as Record<string, unknown>
             : {};
@@ -596,6 +634,58 @@ const registerAppTool: typeof registerSdkAppTool = ((...args: unknown[]) => {
   }
   return (registerSdkAppTool as (...parameters: unknown[]) => unknown)(...args);
 }) as typeof registerSdkAppTool;
+
+type WorkspaceToolLease = "shared" | "exclusive";
+const workspaceToolLeases = new Map<string, WorkspaceToolLease>();
+
+function workspaceToolRegistrar(lease: WorkspaceToolLease): typeof registerSdkAppTool {
+  return ((...args: unknown[]) => {
+    const toolName = typeof args[1] === "string" ? args[1] : "unknown";
+    workspaceToolLeases.set(toolName, lease);
+    const definition = args[2];
+    if (definition && typeof definition === "object" && !Array.isArray(definition)) {
+      const record = definition as Record<string, unknown>;
+      const input = record.inputSchema && typeof record.inputSchema === "object" && !Array.isArray(record.inputSchema)
+        ? record.inputSchema as Record<string, unknown>
+        : {};
+      const {
+        workspaceId: _workspaceId,
+        workspaceGeneration: _workspaceGeneration,
+        ...toolInput
+      } = input;
+      record.inputSchema = {
+        receipt: z.string().regex(/^wctx2\.[A-Za-z0-9_-]{43}$/u),
+        ...toolInput,
+      };
+    }
+    const handlerIndex = args.length - 1;
+    const handler = args[handlerIndex];
+    if (typeof handler === "function") {
+      args[handlerIndex] = (...handlerArgs: unknown[]) => {
+        const binding = requestContext.getStore()?.workspaceBinding;
+        if (!binding) {
+          throw new PublicActionError(
+            "workspace_context_required",
+            "Call resume_workspace or get_workspace_context to obtain a fresh receipt, then retry once.",
+            { retryable: true, safeToRetry: true, recovery: "resume_workspace", phase: "not_started" },
+          );
+        }
+        const input = handlerArgs[0] && typeof handlerArgs[0] === "object" && !Array.isArray(handlerArgs[0])
+          ? handlerArgs[0] as Record<string, unknown>
+          : {};
+        return handler({
+          ...input,
+          workspaceId: binding.workspaceId,
+          workspaceGeneration: binding.generation,
+        }, ...handlerArgs.slice(1));
+      };
+    }
+    return (registerAppTool as (...parameters: unknown[]) => unknown)(...args);
+  }) as typeof registerSdkAppTool;
+}
+
+const registerWorkspaceTool = workspaceToolRegistrar("shared");
+const registerExclusiveWorkspaceTool = workspaceToolRegistrar("exclusive");
 // MCP clients can reconnect without closing the previous transport. Bound stale
 // session retention so abandoned MCP servers do not accumulate for the life of the process.
 const WORKSPACE_APP_URI = "ui://devspace/workspace-app.html";
@@ -714,6 +804,15 @@ const toolNames = {
   execCommand: "exec_command",
 } as const;
 
+function toolDescription(parts: {
+  use: string;
+  avoid: string;
+  requires: string;
+  returns: string;
+}): string {
+  return `Use when ${parts.use} Avoid ${parts.avoid} Needs ${parts.requires} Returns ${parts.returns}`;
+}
+
 export function toolSurface(config: Pick<ServerConfig, "widgets" | "skillsEnabled">): string[] {
   const tools: string[] = [
     toolNames.openWorkspace,
@@ -798,30 +897,22 @@ export interface WorkspaceSkillCatalog {
   bytes: number;
 }
 
-interface WorkspaceInstructionRecord {
-  source: "user" | "repository";
-  scope: string;
-  relativePath: string;
-  revision: string;
-  trust: "project";
-  content: string;
-}
-
 function workspaceInstructionRecord(
   file: Pick<ApplicableAgentsFile, "path" | "content">,
   workspaceRoot: string,
-): WorkspaceInstructionRecord {
+): WorkspaceContextInstructionItem {
   const repositoryInstruction = isPathInsideRoot(file.path, workspaceRoot);
-  const relativePath = repositoryInstruction
+  const path = repositoryInstruction
     ? formatAgentsPath(file.path, workspaceRoot)
     : "user-instructions";
-  const relativeScope = repositoryInstruction ? dirname(relativePath) : ".";
+  const relativeScope = repositoryInstruction ? dirname(path) : ".";
   return {
-    source: repositoryInstruction ? "repository" : "user",
+    ...(repositoryInstruction
+      ? { source: "repository" as const, trust: "repository_untrusted" as const }
+      : { source: "user" as const, trust: "user_trusted" as const }),
     scope: relativeScope === "." ? "." : relativeScope.split(sep).join("/"),
-    relativePath,
-    revision: `sha256-v1:${createHash("sha256").update(file.content).digest("hex")}`,
-    trust: "project",
+    path,
+    hash: `sha256-v1:${createHash("sha256").update(file.content).digest("hex")}`,
     content: file.content,
   };
 }
@@ -928,11 +1019,10 @@ function decodeSkillCursor(cursor: string): SkillCursorPayload {
 
 function renderWorkspaceContext(
   context: WorkspaceContext,
-  summary: WorkspaceSummary,
-  project: ProjectOrientation | undefined,
   contextMode: WorkspaceContextMode,
   knownInstructionRevision: string | undefined,
   knownSkillRevision: string | undefined,
+  receipts: WorkspaceContextReceiptManager,
 ) {
   const {
     workspace,
@@ -952,54 +1042,33 @@ function renderWorkspaceContext(
   const loadedInstructions = agentsFiles.map((file) => workspaceInstructionRecord(file, workspace.root));
   const returnedInstructions = instructionsIncluded ? loadedInstructions : [];
   const visibleSkills = skillsIncluded ? skillCatalog.skills : [];
-  const text = [
-    contextMode === "metadata"
-      ? "Workspace metadata returned; call get_workspace_context with contextMode=\"full\" before work."
-      : undefined,
-    !instructionScan.complete
-      ? `Warning: nested instruction scan was incomplete (${instructionScan.reason ?? "unknown"}).`
-      : undefined,
-    skillsIncluded && visibleSkills.length > 0
-      ? "Load an applicable returned Skill before work; explicit-only Skills require a user request."
-      : undefined,
-    skillsIncluded && skillCatalog.omittedSkills > 0
-      ? `Skill catalog budget reached: ${skillCatalog.omittedSkills} of ${skillCatalog.totalSkills} omitted.`
-      : undefined,
-    workspace.skillDiagnostics.length > 0
-      ? `Skill discovery warnings: ${workspace.skillDiagnostics.length}.`
-      : undefined,
-  ].filter(Boolean).join("\n") || (project?.empty
-    ? reused ? "Workspace resumed; project is empty." : "Workspace opened; project is empty."
-    : reused ? "Workspace context unchanged." : "Workspace opened.");
-
-  return {
-    content: [textBlock(text)],
-    structuredContent: {
-      ok: true,
-      alias: summary.alias,
-      displayPath: summary.displayPath,
-      ...(contextMode === "metadata" ? {} : { workspaceId: workspace.id }),
-      reused,
+  const serialized = serializeWorkspaceContext({
+    ownerClientId: workspace.ownerClientId,
+    workspaceId: workspace.id,
+    workspace: {
+      ref: workspace.id,
+      generation: workspace.stateGeneration,
       mode: workspace.mode,
       writeAccess: workspace.writeAccess,
-      workspaceGeneration: workspace.stateGeneration,
-      hydrationStatus: "ready" as const,
-      ...(project
-        ? { project: {
-            ...project,
-            ...(workspace.worktree ? { dirtySource: workspace.worktree.dirtySource } : {}),
-          } }
-        : {}),
-      contextMode,
-      instructionRevision,
-      instructionsIncluded,
-      workspaceInstructions: returnedInstructions,
-      skillRevision,
-      skillsIncluded,
-      skillCount: skillCatalog.totalSkills,
-      skills: visibleSkills,
-      skillsOmitted: skillCatalog.omittedSkills,
     },
+    instructions: {
+      revision: instructionRevision,
+      complete: instructionScan.complete,
+      included: instructionsIncluded,
+      items: returnedInstructions,
+      ...(instructionScan.reason ? { incompleteReason: instructionScan.reason } : {}),
+    },
+    skills: {
+      revision: skillRevision,
+      count: skillCatalog.totalSkills,
+      included: skillsIncluded,
+      items: visibleSkills,
+      warningCount: workspace.skillDiagnostics.length,
+    },
+  }, receipts);
+
+  return {
+    ...serialized,
     summary: {
       workspaceInstructions: returnedInstructions.length,
       instructionsIncluded,
@@ -1007,6 +1076,8 @@ function renderWorkspaceContext(
       skillsIncluded,
       skillDiagnostics: workspace.skillDiagnostics.length,
       instructionScanComplete: instructionScan.complete,
+      contextMode,
+      reused,
     },
   };
 }
@@ -1067,7 +1138,9 @@ function sendCallToolErrorResult(
     ? structuredToolError({
         code,
         text: message,
-        recovery: code === "workspace_resume_required" || code === "stale_workspace_generation"
+        recovery: code === "workspace_resume_required" ||
+            code === "stale_workspace_generation" ||
+            code === "workspace_context_required"
           ? "resume_workspace"
           : "open_workspace",
       })
@@ -1103,21 +1176,29 @@ export function recoverableWorkspaceError(error: unknown): string | undefined {
 }
 
 export function workspaceOperationId(body: unknown): string | undefined {
+  return workspaceToolLease(body) === "shared" ? toolCallWorkspaceId(body) : undefined;
+}
+
+export function workspaceToolLease(body: unknown): WorkspaceToolLease | undefined {
   if (!body || typeof body !== "object" || Array.isArray(body)) return undefined;
   const request = body as { method?: unknown; params?: unknown };
   if (request.method !== "tools/call" || !request.params || typeof request.params !== "object") {
     return undefined;
   }
-  const params = request.params as { name?: unknown };
-  if (
-    params.name === toolNames.openWorkspace ||
-    params.name === toolNames.listWorkspaces ||
-    params.name === toolNames.resumeWorkspace ||
-    params.name === toolNames.getWorkspaceContext ||
-    params.name === toolNames.closeWorkspace ||
-    params.name === toolNames.revokeWorkspace
-  ) return undefined;
-  return toolCallWorkspaceId(body);
+  const name = (request.params as { name?: unknown }).name;
+  return typeof name === "string" ? workspaceToolLeases.get(name) : undefined;
+}
+
+export function toolCallWorkspaceReceipt(body: unknown): string | undefined {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return undefined;
+  const request = body as { method?: unknown; params?: unknown };
+  if (request.method !== "tools/call" || !request.params || typeof request.params !== "object") {
+    return undefined;
+  }
+  const args = (request.params as { arguments?: unknown }).arguments;
+  if (!args || typeof args !== "object" || Array.isArray(args)) return undefined;
+  const receipt = (args as { receipt?: unknown }).receipt;
+  return typeof receipt === "string" && receipt.length > 0 ? receipt : undefined;
 }
 
 export function workspaceOperationGeneration(body: unknown): number | undefined {
@@ -1368,11 +1449,25 @@ function directCommandScopePaths(
   if (executable === "rm" && effectiveArgs.some((argument) => /^-[^-]*[rf]/u.test(argument) || argument === "--recursive" || argument === "--force")) {
     return { error: rejectedToolResult("command_blocked", "No command was executed. Forced or recursive rm is blocked.") };
   }
-  if (["bash", "sh", "zsh", "dash", "ksh"].includes(executable) && effectiveArgs.some((argument) => argument === "-c" || /^-[^-]*c/u.test(argument))) {
+  let delegated = effective;
+  let launchesShell = false;
+  for (let depth = 0; depth < 8; depth += 1) {
+    const delegatedExecutable = basename(delegated[0] ?? "").toLowerCase();
+    if (isShellProgram(delegated[0])) {
+      launchesShell = true;
+      break;
+    }
+    if (!["busybox", "toybox"].includes(delegatedExecutable)) break;
+    const appletIndex = delegated.slice(1).findIndex((argument) => !argument.startsWith("-"));
+    if (appletIndex < 0) break;
+    delegated = unwrapShellWrappers(delegated.slice(appletIndex + 1));
+    if (delegated.length === 0) break;
+  }
+  if (launchesShell) {
     return {
       error: rejectedToolResult(
         "explicit_shell_required",
-        "No command was executed. Use shell=true with command for shell -c syntax.",
+        "No command was executed. Interactive shell programs are not accepted as direct argv; use shell=true with command so each input can be checked.",
       ),
     };
   }
@@ -1824,6 +1919,7 @@ function processOutputSchema(extra: z.ZodRawShape = {}) {
     exitCode: z.number().int().optional(),
     signal: z.string().optional(),
     timedOut: z.literal(true).optional(),
+    effects: z.unknown().optional(),
     ...extra,
   };
 }
@@ -1833,11 +1929,15 @@ function processToolResponse(
   workspaceId: string,
   snapshot: ProcessSnapshot,
   summary: Record<string, unknown>,
+  effects?: ToolEffects,
 ) {
   const result = processResult(snapshot);
   const content = [textBlock(result)];
   const outputSummary = textSummary(snapshot.output ? [textBlock(snapshot.output)] : []);
-  const structuredContent = processModelState(snapshot);
+  const structuredContent = {
+    ...processModelState(snapshot),
+    ...(effects ? { effects } : {}),
+  };
   const recoverableOutputId = snapshot.outputStorageError ? undefined : snapshot.outputId;
   return {
     content,
@@ -1875,12 +1975,17 @@ function registerWriteStdinTool(
   pendingMutationOperations: Map<string, PendingMutationOperation>,
   ownerClientId: string,
 ): void {
-  registerAppTool(
+  registerWorkspaceTool(
     server,
     toolNames.writeStdin,
     {
       title: "Write to process",
-      description: "Poll or write a live process; omit chars to poll; PTY stdin cannot close.",
+      description: toolDescription({
+        use: "polling or interacting with a live process.",
+        avoid: "starting a replacement command.",
+        requires: "receipt and sessionId.",
+        returns: "process state and input effects.",
+      }),
       inputSchema: {
         ...workspaceHandleInputSchema,
         operationId: z.string().min(1).max(128).optional(),
@@ -1977,15 +2082,27 @@ function registerWriteStdinTool(
           success: true,
           durationMs: Math.round(performance.now() - startedAt),
         });
+        const submittedChars = inputScopes && "paths" in inputScopes
+          ? inputScopes.preparedInput.charsToWrite
+          : chars ?? "";
         return processToolResponse(toolNames.writeStdin as "write_stdin", workspaceId, snapshot, {
           sessionId,
-          charactersWritten: inputScopes && "paths" in inputScopes
-            ? inputScopes.preparedInput.charsToWrite.length
-            : chars?.length ?? 0,
+          charactersWritten: submittedChars.length,
           running: snapshot.running,
           exitCode: snapshot.exitCode,
           wallTimeMs: snapshot.wallTimeMs,
-        });
+        }, mutatesProcess ? createProcessInteractEffects({
+          observedAt: new Date().toISOString(),
+          submitted: {
+            stdinBytes: Buffer.byteLength(submittedChars, "utf8"),
+            closeStdin: closeStdin === true,
+            interrupt: submittedChars.includes("\x03"),
+            ...((columns !== undefined || rows !== undefined)
+              ? { resize: { columns, rows } }
+              : {}),
+          },
+          snapshot,
+        }) : undefined);
       };
       if (!operationId || !mutatesProcess) return execute();
       return runMutationOperation({
@@ -2008,13 +2125,17 @@ function registerReadProcessOutputTool(
   processOutputStore: ProcessOutputStore,
   ownerClientId: string,
 ): void {
-  registerAppTool(
+  registerWorkspaceTool(
     server,
     toolNames.readProcessOutput,
     {
       title: "Read process output",
-      description:
-        "Page outputId to eof; retained across process-session loss/backend restart until TTL/quota eviction.",
+      description: toolDescription({
+        use: "paging retained output to EOF.",
+        avoid: "polling a live session.",
+        requires: "receipt and outputId.",
+        returns: "one page plus nextOffset/eof.",
+      }),
       inputSchema: {
         ...workspaceHandleInputSchema,
         outputId: z.string(),
@@ -2102,12 +2223,17 @@ function registerProcessTools(
   pendingMutationOperations: Map<string, PendingMutationOperation>,
   ownerClientId: string,
 ): void {
-  registerAppTool(
+  registerWorkspaceTool(
     server,
     "exec_command",
     {
       title: "Execute command",
-      description: "Prefer program+args for direct execution. Use shell=true+command only for shell syntax; legacy cmd remains accepted.",
+      description: toolDescription({
+        use: "running a workspace command; prefer program+args.",
+        avoid: "shell mode without shell syntax.",
+        requires: "writable receipt; operationId for retry.",
+        returns: "process state and effect limits.",
+      }),
       inputSchema: {
         ...workspaceHandleInputSchema,
         operationId: z.string().min(1).max(128).optional(),
@@ -2369,7 +2495,19 @@ function registerProcessTools(
           running: snapshot.running,
           exitCode: snapshot.exitCode,
           wallTimeMs: snapshot.wallTimeMs,
-        });
+        }, createProcessStartEffects({
+          observedAt: new Date().toISOString(),
+          submitted: {
+            stdinBytes: stdin === undefined ? 0 : Buffer.byteLength(stdin, "utf8"),
+            closeStdin: stdin === undefined ? closeStdin === true : closeStdin !== false,
+            interrupt: false,
+            ...((columns !== undefined || rows !== undefined)
+              ? { resize: { columns, rows } }
+              : {}),
+          },
+          snapshot,
+          networkAllowed: true,
+        }));
       };
       if (!operationId) return execute();
       return runMutationOperation({
@@ -2406,6 +2544,7 @@ function createMcpServer(
   localAgentProviders: LocalAgentProviderAvailability[],
   runtimeDiagnostics: RuntimeDiagnostics,
   activeToolHandlers: ActiveRequestBarrier,
+  contextReceipts: WorkspaceContextReceiptManager,
 ): McpServer {
   const server = new McpServer(
     DEVSPACE_SERVER_INFO,
@@ -2490,18 +2629,14 @@ function createMcpServer(
       await reviewCheckpoints.initializeWorkspace({ workspaceId: workspace.id, root: workspace.root });
     }
     const summary = workspaces.workspaceSummary(ownerClientId, workspace.alias);
-    const project = tool === toolNames.openWorkspace || contextMode === "full"
-      ? await inspectProjectOrientation(workspace.root)
-      : undefined;
     const rendered = renderWorkspaceContext(
       context,
-      summary,
-      project,
       contextMode,
       knownInstructionRevision,
       knownSkillRevision,
+      contextReceipts,
     );
-    if (rendered.structuredContent.instructionsIncluded && context.agentsFiles.length > 0) {
+    if (rendered.summary.instructionsIncluded && context.agentsFiles.length > 0) {
       await workspaces.markAgentsFilesDelivered(workspace, context.agentsFiles);
     }
     logToolCall(config, {
@@ -2529,13 +2664,29 @@ function createMcpServer(
           summary: { mode: workspace.mode, writeAccess: workspace.writeAccess, ...rendered.summary },
         },
       },
-      structuredContent: rendered.structuredContent,
+      structuredContent: {
+        ...rendered.structuredContent,
+        ...(tool === toolNames.openWorkspace
+          ? {
+              effects: createWorkspaceOpenEffects({
+                observedAt: new Date().toISOString(),
+                reused: context.reused,
+                managedWorktree: workspace.worktree?.managed === true,
+              }),
+            }
+          : {}),
+      },
     };
   };
 
   registerAppTool(server, toolNames.listWorkspaces, {
     title: "List workspaces",
-    description: "List resumable workspace aliases for this connection; host paths stay hidden.",
+    description: toolDescription({
+      use: "finding resumable workspace aliases.",
+      avoid: "filesystem discovery.",
+      requires: "an authorized connection.",
+      returns: "aliases, modes, generations, and state.",
+    }),
     inputSchema: {},
     ...toolWidgetDescriptorMeta(config, "workspace"),
     annotations: { readOnlyHint: true, openWorldHint: false },
@@ -2552,7 +2703,12 @@ function createMcpServer(
 
   registerAppTool(server, toolNames.getOperationStatus, {
     title: "Get operation status",
-    description: "Check a prior mutation operationId without rerunning it or returning its stored body.",
+    description: toolDescription({
+      use: "checking a prior mutation operationId.",
+      avoid: "treating a missing result as no effects.",
+      requires: "the original operationId.",
+      returns: "durable state without rerunning.",
+    }),
     inputSchema: {
       operationId: z.string().min(1).max(128),
     },
@@ -2580,46 +2736,77 @@ function createMcpServer(
     };
   });
 
-  const resumeInputSchema = {
-    alias: z.string().min(1).max(64),
+  const contextOptionsInputSchema = {
     contextMode: workspaceContextModeSchema.optional(),
     knownInstructionRevision: z.string().max(128).optional(),
     knownSkillRevision: z.string().max(128).optional(),
   };
+  const resumeInputSchema = {
+    alias: z.string().min(1).max(64),
+    ...contextOptionsInputSchema,
+  };
 
-  for (const [name, title] of [
-    [toolNames.resumeWorkspace, "Resume workspace"],
-    [toolNames.getWorkspaceContext, "Get workspace context"],
-  ] as const) {
-    registerAppTool(server, name, {
-      title,
-      description: name === toolNames.resumeWorkspace
-        ? "Resume by alias; full context is the safe default after a new conversation or restart."
-        : "Reload instructions and Skill catalog by alias; retained mode alone honors revision hints.",
-      inputSchema: resumeInputSchema,
-      ...toolWidgetDescriptorMeta(config, "workspace"),
-      annotations: { readOnlyHint: true, openWorldHint: false },
-    }, async ({ alias, contextMode, knownInstructionRevision, knownSkillRevision }) => {
-      const startedAt = performance.now();
-      const effectiveContextMode = contextMode ?? "full";
-      const context = await workspaces.resumeWorkspace(ownerClientId, alias);
-      if (name === toolNames.resumeWorkspace) {
-        workspaces.resetInstructionAcknowledgements(context.workspace);
-      }
-      return returnWorkspaceContext(
-        name,
-        context,
-        effectiveContextMode,
-        knownInstructionRevision,
-        knownSkillRevision,
-        startedAt,
-      );
-    });
-  }
+  registerAppTool(server, toolNames.resumeWorkspace, {
+    title: "Resume workspace",
+    description: toolDescription({
+      use: "resuming by alias after a new chat or restart.",
+      avoid: "reopening the host path.",
+      requires: "a listed alias.",
+      returns: "v2 context and fresh receipt.",
+    }),
+    inputSchema: resumeInputSchema,
+    ...toolWidgetDescriptorMeta(config, "workspace"),
+    annotations: { readOnlyHint: true, openWorldHint: false },
+  }, async ({ alias, contextMode, knownInstructionRevision, knownSkillRevision }) => {
+    const startedAt = performance.now();
+    const context = await workspaces.resumeWorkspace(ownerClientId, alias);
+    workspaces.resetInstructionAcknowledgements(context.workspace);
+    return returnWorkspaceContext(
+      toolNames.resumeWorkspace,
+      context,
+      contextMode ?? "full",
+      knownInstructionRevision,
+      knownSkillRevision,
+      startedAt,
+    );
+  });
+
+  registerWorkspaceTool(server, toolNames.getWorkspaceContext, {
+    title: "Get workspace context",
+    description: toolDescription({
+      use: "reloading an active workspace's context.",
+      avoid: "ordinary file reads.",
+      requires: "a valid receipt.",
+      returns: "v2 context and fresh receipt.",
+    }),
+    inputSchema: { ...workspaceHandleInputSchema, ...contextOptionsInputSchema },
+    ...toolWidgetDescriptorMeta(config, "workspace"),
+    annotations: { readOnlyHint: true, openWorldHint: false },
+  }, async ({ workspaceId, workspaceGeneration, contextMode, knownInstructionRevision, knownSkillRevision }) => {
+    const startedAt = performance.now();
+    const context = await workspaces.getWorkspaceContext(
+      ownerClientId,
+      workspaceId,
+      workspaceGeneration,
+    );
+    return returnWorkspaceContext(
+      toolNames.getWorkspaceContext,
+      context,
+      contextMode ?? "full",
+      knownInstructionRevision,
+      knownSkillRevision,
+      startedAt,
+    );
+  });
 
   registerAppTool(server, toolNames.openWorkspace, {
     title: "Open workspace",
-    description: "Open approved project; metadata default. Use full, or retained + knownInstructionRevision/knownSkillRevision, to skip unchanged context.",
+    description: toolDescription({
+      use: "opening an approved project; metadata-only by default.",
+      avoid: "reopening a resumable alias.",
+      requires: "a user-approved path.",
+      returns: "receipt; then call get_workspace_context for full context.",
+    }),
     inputSchema: {
       path: z.string(),
       alias: z.string().min(1).max(64).optional(),
@@ -2667,9 +2854,14 @@ function createMcpServer(
     );
   });
 
-  registerAppTool(server, toolNames.loadWorkspaceInstructions, {
+  registerWorkspaceTool(server, toolNames.loadWorkspaceInstructions, {
     title: "Load workspace instructions",
-    description: "Load structured project instructions for paths immediately before modifying or executing in that scope.",
+    description: toolDescription({
+      use: "loading scoped instructions before mutation.",
+      avoid: "unrelated directories.",
+      requires: "receipt and intended paths.",
+      returns: "instruction items and one-use token.",
+    }),
     inputSchema: {
       ...workspaceHandleInputSchema,
       paths: z.array(z.string().min(1).max(1_024)).min(1).max(16),
@@ -2689,21 +2881,28 @@ function createMcpServer(
     return {
       content: [textBlock(
         files.length > 0
-          ? `Loaded ${files.length} scoped instruction file(s). Use the returned instructionToken only for the intended mutation.`
-          : "No unacknowledged instructions apply to those paths.",
+          ? "Workspace instructions loaded."
+          : "No new workspace instructions apply.",
       )],
       structuredContent: {
-        ok: true,
-        workspaceInstructions: files.map((file) => workspaceInstructionRecord(file, workspace.root)),
+        schemaVersion: 2,
+        instructions: {
+          items: files.map((file) => workspaceInstructionRecord(file, workspace.root)),
+        },
         ...(instructionToken ? { instructionToken } : {}),
       },
     };
   });
 
   if (enabledTools.has(toolNames.listSkills)) {
-    registerAppTool(server, toolNames.listSkills, {
+    registerWorkspaceTool(server, toolNames.listSkills, {
       title: "List skills",
-      description: "Search and page the current workspace Skill catalog without loading a manifest.",
+      description: toolDescription({
+        use: "searching or paging Skills.",
+        avoid: "reading manifests directly.",
+        requires: "a receipt.",
+        returns: "matching metadata and next cursor.",
+      }),
       inputSchema: {
         ...workspaceHandleInputSchema,
         query: z.string().max(200).optional(),
@@ -2754,13 +2953,17 @@ function createMcpServer(
   }
 
   if (enabledTools.has(toolNames.loadSkill)) {
-    registerAppTool(
+    registerWorkspaceTool(
       server,
       toolNames.loadSkill,
     {
       title: "Load skill",
-      description:
-        "Load an advertised skillId or exact unique name, including catalog-omitted Skills; reload after recovery; returns its skill:// root.",
+      description: toolDescription({
+        use: "loading one advertised Skill.",
+        avoid: "ambiguous names.",
+        requires: "receipt and skillId or unique name.",
+        returns: "manifest text and skill:// root.",
+      }),
       inputSchema: {
         ...workspaceHandleInputSchema,
         skillId: z
@@ -2817,13 +3020,17 @@ function createMcpServer(
     );
   }
 
-  registerAppTool(
+  registerExclusiveWorkspaceTool(
     server,
     "close_workspace",
     {
       title: "Close workspace",
-      description:
-        "Close only on user request; dirty worktrees are retained.",
+      description: toolDescription({
+        use: "closing on explicit user request.",
+        avoid: "end-of-turn cleanup.",
+        requires: "a receipt.",
+        returns: "close effects; dirty worktrees stay open.",
+      }),
       inputSchema: {
         ...workspaceHandleInputSchema,
       },
@@ -2897,9 +3104,27 @@ function createMcpServer(
             : `Workspace closed; ${processesTerminated} process(es) terminated.` +
               (worktreeRemoved ? " Clean managed worktree removed." : ""),
         )],
+        structuredContent: {
+          ok: !worktreeRetainedReason,
+          effects: createWorkspaceCloseEffects({
+            observedAt: new Date().toISOString(),
+            closed,
+            managedWorktree: workspace.worktree?.managed === true,
+            worktreeRemoved,
+            processesTerminated,
+          }),
+        },
         _meta: {
           tool: "close_workspace",
-          ...(worktreeRetainedReason ? { error: { code: "workspace_dirty" } } : {}),
+          ...(worktreeRetainedReason ? {
+            error: {
+              code: "workspace_dirty",
+              retryable: false,
+              safeToRetry: true,
+              recovery: "show_changes",
+              phase: "executed",
+            },
+          } : {}),
           card: {
             workspaceId,
             summary: {
@@ -2915,9 +3140,14 @@ function createMcpServer(
     },
   );
 
-  registerAppTool(server, toolNames.revokeWorkspace, {
+  registerExclusiveWorkspaceTool(server, toolNames.revokeWorkspace, {
     title: "Revoke workspace",
-    description: "Permanently revoke this connection's workspace handle; it cannot be resumed.",
+    description: toolDescription({
+      use: "permanently revoking a workspace.",
+      avoid: "temporary inactivity.",
+      requires: "receipt and explicit user intent.",
+      returns: "revoke effects; dirty worktrees stay.",
+    }),
     inputSchema: workspaceHandleInputSchema,
     ...toolWidgetDescriptorMeta(config, "workspace"),
     annotations: { destructiveHint: true, idempotentHint: true, openWorldHint: false },
@@ -2929,15 +3159,70 @@ function createMcpServer(
     );
     try {
       const processesTerminated = await processSessions.terminateWorkspace(ownerClientId, workspaceId);
+      const workspace = closeLease.workspace;
+      let worktreeRemoved = false;
+      if (workspace.worktree?.managed) {
+        const removal = await removeManagedWorktree({
+          sourceRoot: workspace.sourceRoot!,
+          worktreePath: workspace.root,
+          config,
+        });
+        if (removal.reason === "dirty") {
+          closeLease.abort();
+          return {
+            content: [textBlock(
+              `Workspace was not revoked because its managed worktree has uncommitted changes; ${processesTerminated} process(es) were terminated. Review or clean the worktree, then retry.`,
+            )],
+            isError: true as const,
+            structuredContent: {
+              ok: false,
+              processesTerminated,
+              worktreeRetained: true,
+              effects: createWorkspaceRevokeEffects({
+                observedAt: new Date().toISOString(),
+                revoked: false,
+                managedWorktree: true,
+                worktreeRemoved: false,
+                processesTerminated,
+              }),
+            },
+            _meta: {
+              error: {
+                code: "workspace_dirty",
+                retryable: false,
+                safeToRetry: true,
+                recovery: "show_changes",
+                phase: processesTerminated > 0 ? "executed" : "not_started",
+              },
+            },
+          };
+        }
+        worktreeRemoved = removal.removed || removal.reason === "missing";
+      }
       await reviewCheckpoints.cleanupWorkspace({ workspaceId }).catch((error) => {
         runtimeDiagnostics.recordFailure("review_cleanup_failed", error);
       });
-      if (!closeLease.commit({ revoke: true })) {
+      if (!closeLease.commit(workspace.worktree?.managed ? { delete: true } : { revoke: true })) {
         throw new UnknownWorkspaceError(workspaceId);
       }
       return {
-        content: [textBlock("Workspace access revoked for this connection.")],
-        structuredContent: { ok: true, processesTerminated },
+        content: [textBlock(
+          worktreeRemoved
+            ? "Workspace access revoked and its clean managed worktree removed."
+            : "Workspace access revoked for this connection.",
+        )],
+        structuredContent: {
+          ok: true,
+          processesTerminated,
+          worktreeRemoved,
+          effects: createWorkspaceRevokeEffects({
+            observedAt: new Date().toISOString(),
+            revoked: true,
+            managedWorktree: workspace.worktree?.managed === true,
+            worktreeRemoved,
+            processesTerminated,
+          }),
+        },
       };
     } catch (error) {
       closeLease.abort();
@@ -2947,20 +3232,17 @@ function createMcpServer(
     }
   });
 
-  registerAppTool(
+  registerWorkspaceTool(
     server,
     toolNames.read,
     {
       title: "Read file",
-      description:
-        [
-          "Read one workspace file.",
-          config.skillsEnabled
-            ? "Use skill://<skillId>/... for loaded Skill support files."
-            : "",
-        ]
-          .filter(Boolean)
-          .join(" "),
+      description: toolDescription({
+        use: "reading one known workspace file.",
+        avoid: "discovery; use batch_inspect.",
+        requires: "receipt and known path.",
+        returns: "content and version hash.",
+      }),
       inputSchema: {
         ...workspaceHandleInputSchema,
         path: z.string(),
@@ -3064,13 +3346,17 @@ function createMcpServer(
     },
   );
 
-  registerAppTool(
+  registerWorkspaceTool(
     server,
     toolNames.batchRead,
     {
       title: "Batch read files",
-      description:
-        `Batch up to ${BATCH_MAX_ITEMS} known files.`,
+      description: toolDescription({
+        use: `reading up to ${BATCH_MAX_ITEMS} known files.`,
+        avoid: "search or directory discovery.",
+        requires: "receipt and file paths.",
+        returns: "ref-keyed items and partial status.",
+      }),
       inputSchema: {
         ...workspaceHandleInputSchema,
         files: z
@@ -3168,13 +3454,17 @@ function createMcpServer(
     },
   );
 
-  registerAppTool(
+  registerWorkspaceTool(
     server,
     toolNames.batchInspect,
     {
       title: "Batch inspect workspace",
-      description:
-        `Batch up to ${BATCH_MAX_ITEMS} known grep, glob, or ls operations.`,
+      description: toolDescription({
+        use: `combining up to ${BATCH_MAX_ITEMS} grep, glob, or list operations.`,
+        avoid: "reading known files.",
+        requires: "a receipt.",
+        returns: "ref-keyed items and partial status.",
+      }),
       inputSchema: {
         ...workspaceHandleInputSchema,
         operations: z
@@ -3283,12 +3573,17 @@ function createMcpServer(
   );
 
   if (enabledTools.has(toolNames.applyPatch)) {
-    registerAppTool(
+    registerWorkspaceTool(
       server,
       "apply_patch",
       {
         title: "Apply patch",
-        description: "Apply a `*** Begin Patch` Codex patch using workspace-relative paths.",
+        description: toolDescription({
+          use: "applying one workspace-relative patch.",
+          avoid: "blind overwrite after a read.",
+          requires: "writable receipt; operationId and ifMatch for retry.",
+          returns: "file effects with observed versions.",
+        }),
         inputSchema: {
           ...workspaceHandleInputSchema,
           operationId: z.string().min(1).max(128).optional(),
@@ -3354,6 +3649,10 @@ function createMcpServer(
           });
           return {
             content,
+            structuredContent: {
+              ok: true,
+              effects: createApplyPatchEffects(new Date().toISOString(), applied.files),
+            },
             _meta: {
               tool: "apply_patch",
               card: {
@@ -3384,12 +3683,17 @@ function createMcpServer(
   }
 
   if (enabledTools.has("show_changes")) {
-    registerAppTool(
+    registerWorkspaceTool(
       server,
       "show_changes",
       {
         title: "Show changes",
-        description: "Show changes since workspace open or the last show_changes call, then advance the review checkpoint.",
+        description: toolDescription({
+          use: "reviewing changes since the checkpoint.",
+          avoid: "ordinary file discovery.",
+          requires: "a writable receipt.",
+          returns: "diff metadata and checkpoint effects.",
+        }),
         inputSchema: {
           ...workspaceHandleInputSchema,
         },
@@ -3420,6 +3724,14 @@ function createMcpServer(
 
         return {
           content,
+          structuredContent: {
+            ok: true,
+            effects: createReviewEffects({
+              observedAt: new Date().toISOString(),
+              since: "last_shown",
+              advanced: true,
+            }),
+          },
           _meta: {
             tool: "show_changes",
             card: {
@@ -3457,6 +3769,7 @@ export function createServer(configInput?: ServerConfig): RunningServer {
   const managesRuntimeConfig = configInput === undefined;
   const config = configInput ?? loadConfig();
   const processGeneration = randomUUID();
+  const contextReceipts = createWorkspaceContextReceiptManager({ processGeneration });
   const runtimeDiagnostics = new RuntimeDiagnostics();
   const activeMcpRequests = new ActiveRequestBarrier();
   const activeToolHandlers = new ActiveRequestBarrier();
@@ -3679,6 +3992,66 @@ export function createServer(configInput?: ServerConfig): RunningServer {
     }
   };
 
+  let revocationCleanupTail: Promise<void> = Promise.resolve();
+  const drainRevocationCleanupJobs = (): Promise<void> => {
+    const operation = revocationCleanupTail.then(async () => {
+      const listJobs = workspaceStore.listRevocationCleanupJobs?.bind(workspaceStore);
+      const claimJob = workspaceStore.claimRevocationCleanupJob?.bind(workspaceStore);
+      const finalizeJob = workspaceStore.finalizeRevocationCleanupJob?.bind(workspaceStore);
+      const failJob = workspaceStore.failRevocationCleanupJob?.bind(workspaceStore);
+      if (!listJobs || !claimJob || !finalizeJob || !failJob) return;
+      for (const pending of listJobs(100)) {
+        const job = claimJob(pending.id);
+        if (!job?.claimToken) continue;
+        processSessions.blockWorkspace(job.ownerClientId, job.workspaceId);
+        workspaces.evictRevokedWorkspace(job.ownerClientId, job.workspaceId, job.workspaceRoot);
+        try {
+          await processSessions.terminateWorkspace(job.ownerClientId, job.workspaceId);
+          processOutputStore.retireWorkspace(job.ownerClientId, job.workspaceId);
+          await reviewCheckpoints.cleanupWorkspace({
+            workspaceId: job.workspaceId,
+            root: job.workspaceRoot,
+          });
+          let retainedDirtyWorktreeReason: string | undefined;
+          if (job.managed) {
+            if (!job.sourceRoot) throw new Error("Managed worktree revocation job has no source root.");
+            const removal = await removeManagedWorktree({
+              sourceRoot: job.sourceRoot,
+              worktreePath: job.workspaceRoot,
+              config,
+            });
+            if (removal.reason === "dirty") retainedDirtyWorktreeReason = "dirty";
+          }
+          if (!finalizeJob({
+            id: job.id,
+            claimToken: job.claimToken,
+            ...(retainedDirtyWorktreeReason ? { retainedDirtyWorktreeReason } : {}),
+          })) {
+            throw new Error("Revocation cleanup claim changed before completion.");
+          }
+          processSessions.reopenWorkspace(job.ownerClientId, job.workspaceId);
+        } catch (error) {
+          failJob({
+            id: job.id,
+            claimToken: job.claimToken,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          runtimeDiagnostics.recordFailure("oauth_revocation_cleanup_failed", error);
+          logEvent(config.logging, "error", "oauth_revocation_cleanup_failed", {
+            workspaceId: job.workspaceId,
+            ...correlationLogFields(job.ownerClientId, job.workspaceId),
+            ...errorFields(error),
+          });
+        }
+      }
+    });
+    revocationCleanupTail = operation.then(() => undefined, () => undefined);
+    return operation;
+  };
+
+  oauthProvider.queueOrphanedWorkspaceCleanup();
+  void drainRevocationCleanupJobs();
+
   let cleanupRunning = false;
   let cleanupPromise: Promise<void> | undefined;
   const sessionCleanupTimer = setInterval(() => {
@@ -3704,6 +4077,11 @@ export function createServer(configInput?: ServerConfig): RunningServer {
       localAgentStore.cleanup();
       processOutputStore.cleanupExpired();
       mutationOperations.cleanupExpired();
+      await drainRevocationCleanupJobs();
+      workspaceStore.cleanupRevocationHistory?.(
+        new Date(Date.now() - 30 * 24 * 60 * 60 * 1_000).toISOString(),
+        100,
+      );
       await cleanupDetachedAgentPromptArtifacts();
     })().catch((error) => {
       runtimeDiagnostics.recordFailure("resource_cleanup_failed", error);
@@ -3826,12 +4204,16 @@ export function createServer(configInput?: ServerConfig): RunningServer {
     workspaceUsage: () => workspaces.usageSnapshot(),
     oauthUsage: () => oauthProvider.diagnosticSnapshot(),
     reloadAllowedRoots,
+    beforeGlobalRevocation: async () => {
+      const closeResults = await transports.closeActive();
+      logSessionCloseResults("global_revocation", closeResults);
+      await activeToolHandlers.waitForIdle();
+    },
     revokeAll: () => oauthProvider.revokeAll(),
     runtimeDiagnostics,
     onGlobalRevocation: async (revoked) => {
       logEvent(config.logging, "warn", "oauth_global_revocation", { ...revoked });
-      const closeResults = await transports.closeActive();
-      logSessionCloseResults("global_revocation", closeResults);
+      await drainRevocationCleanupJobs();
     },
   }));
 
@@ -3963,6 +4345,7 @@ export function createServer(configInput?: ServerConfig): RunningServer {
           localAgentProviders,
           runtimeDiagnostics,
           activeToolHandlers,
+          contextReceipts,
         );
         await statelessServer.connect(transport);
       } else if (sessionId) {
@@ -4049,6 +4432,7 @@ export function createServer(configInput?: ServerConfig): RunningServer {
           localAgentProviders,
           runtimeDiagnostics,
           activeToolHandlers,
+          contextReceipts,
         );
         await server.connect(transport);
       } else {
@@ -4061,18 +4445,34 @@ export function createServer(configInput?: ServerConfig): RunningServer {
         return;
       }
 
-      const workspaceId = workspaceOperationId(req.body);
+      const lease = workspaceToolLease(req.body);
+      const receipt = lease ? toolCallWorkspaceReceipt(req.body) : undefined;
+      const workspaceBinding = receipt ? contextReceipts.resolve(receipt) : undefined;
+      if (lease && (!workspaceBinding || workspaceBinding.ownerClientId !== ownerClientId)) {
+        sendCallToolErrorResult(
+          res,
+          "workspace_context_required: Call list_workspaces, then resume_workspace with contextMode=\"full\" to obtain a fresh receipt.",
+          jsonRpcRequestId(req.body),
+          "workspace_context_required",
+        );
+        return;
+      }
+      if (workspaceBinding) {
+        correlation.workspaceId = workspaceBinding.workspaceId;
+        correlation.workspaceActivityRef = workspaceActivityRef(
+          ownerClientId,
+          workspaceBinding.workspaceId,
+        );
+      }
       const handleRequest = () => requestContext.run(
-        { clientId: ownerClientId, requestId, correlation },
+        { clientId: ownerClientId, requestId, correlation, workspaceBinding },
         () => transport.handleRequest(req, res, req.body),
       );
-      if (workspaceId) {
-        const workspaceGeneration = workspaceOperationGeneration(req.body);
-        if (workspaceGeneration === undefined) throw new StaleWorkspaceGenerationError();
+      if (lease === "shared" && workspaceBinding) {
         await workspaces.withWorkspaceOperation(
           ownerClientId,
-          workspaceId,
-          workspaceGeneration,
+          workspaceBinding.workspaceId,
+          workspaceBinding.generation,
           handleRequest,
         );
       } else {

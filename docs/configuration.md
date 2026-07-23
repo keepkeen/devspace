@@ -114,7 +114,12 @@ Changing the Owner password and restarting DevSpace revokes all access and refre
 tokens, but preserves public OAuth client registrations so ChatGPT and other MCP
 clients can reauthorize without recreating their connector. The local Admin panel's
 "revoke all" action deliberately removes both clients and tokens when a complete
-reset is required.
+reset is required. Before revocation, new tool calls are blocked and in-flight
+calls are drained. Active Workspace cleanup is persisted as durable jobs, so
+process/output/review cleanup resumes after a crash or restart. Clean managed
+worktrees are removed; dirty worktrees are retained as auditable artifacts
+instead of being deleted. Removed OAuth clients therefore cannot leave active
+orphan Workspace authority.
 
 ## Resource Lifecycle and Limits
 
@@ -174,10 +179,10 @@ from the ordered initial instruction paths and contents. It independently
 computes `skillRevision` over the full discovered Skill set. Revision hints are
 honored only when the caller explicitly selects `contextMode: "retained"` and
 still retains the corresponding bodies. `contextMode: "full"` ignores hints;
-the default metadata response from `open_workspace` contains neither an
-operational `workspaceId` nor instruction or Skill bodies.
+the default metadata response from `open_workspace` contains no instruction or
+Skill bodies. It does contain a short-lived context receipt used by later tools.
 
-Full context represents instructions as structured `workspaceInstructions[]`
+Full context represents instructions as structured `instructions.items[]`
 records. Read/search tools only advertise `scopedInstructionsAvailable=true`;
 they never append instruction Markdown to file or search output. Call
 `load_workspace_instructions` with intended mutation paths to receive the
@@ -232,13 +237,18 @@ DevSpace exposes one Codex-style surface: `open_workspace`, `list_workspaces`,
 ignored so an old configuration file can still start without changing the
 model-facing protocol.
 
-Every Workspace-scoped call requires the current `workspaceId` and
-`workspaceGeneration`. Stale generations fail before the tool starts. A successful
-OAuth authorization advances all active generations owned by that client.
+Every Workspace-scoped call requires the current v2 context `receipt`. The
+receipt binds the OAuth owner, Workspace ID and generation, both context
+revisions at issuance, and server process generation. The unified registration
+layer validates ownership, integrity, and generation before the tool handler
+starts. A successful OAuth authorization
+advances active generations; a restart invalidates receipts without deleting
+resumable aliases.
 
 Commands run without a PTY by default. Prefer `program` plus `args` for direct
 execution; argument boundaries reach `spawn`/PTY unchanged. Use `shell: true`
-plus `command` only for shell syntax. Legacy `cmd` remains accepted. Set `tty: true` on
+plus `command` for shell syntax and interactive shells; direct argv shells are
+rejected so `write_stdin` cannot bypass command checks. Legacy `cmd` remains accepted. Set `tty: true` on
 `exec_command` for interactive terminal programs. PTY support uses the optional
 `node-pty` dependency; `write_stdin` can send input, poll output, and resize PTY
 sessions.
@@ -287,7 +297,9 @@ outcome is never executed automatically. Structured errors expose `code`,
 exits instead report `commandExecuted: true`, `status: "exited"`, and the exit
 code.
 `get_operation_status` returns state and result availability without returning
-the stored body. Reads expose `contentHash` and decimal-string `mtimeNs`;
+the stored body. Expired replay bodies are cleared while their operation-ID
+tombstones remain until Workspace deletion, so an old ID cannot execute again.
+Reads expose `contentHash` and decimal-string `mtimeNs`;
 `apply_patch.ifMatch` validates all supplied path versions before its first
 write.
 

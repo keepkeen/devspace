@@ -155,6 +155,56 @@ export const oauthOwnerCredential = sqliteTable(
   },
 );
 
+export const oauthRevocationCleanupJobs = sqliteTable(
+  "oauth_revocation_cleanup_jobs",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    ownerClientId: text("owner_client_id").notNull(),
+    workspaceId: text("workspace_id").notNull(),
+    workspaceRoot: text("workspace_root").notNull(),
+    workspaceMode: text("workspace_mode", { enum: ["checkout", "worktree"] }).notNull(),
+    sourceRoot: text("source_root"),
+    managed: text("managed").notNull(),
+    dirtySource: text("dirty_source").notNull(),
+    status: text("status", { enum: ["pending", "claimed", "failed", "completed"] })
+      .notNull()
+      .default("pending"),
+    claimToken: text("claim_token"),
+    leaseExpiresAt: text("lease_expires_at"),
+    attempts: integer("attempts").notNull().default(0),
+    lastError: text("last_error"),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+    completedAt: text("completed_at"),
+  },
+  (table) => [
+    uniqueIndex("oauth_revocation_cleanup_jobs_owner_workspace_uq")
+      .on(table.ownerClientId, table.workspaceId),
+    index("oauth_revocation_cleanup_jobs_status_idx")
+      .on(table.status, table.leaseExpiresAt, table.createdAt, table.id),
+    index("oauth_revocation_cleanup_jobs_completed_idx")
+      .on(table.completedAt, table.id)
+      .where(sql`${table.status} = 'completed'`),
+  ],
+);
+
+export const oauthRevocationDirtyWorktreeArtifacts = sqliteTable(
+  "oauth_revocation_dirty_worktree_artifacts",
+  {
+    jobId: integer("job_id").primaryKey(),
+    ownerClientId: text("owner_client_id").notNull(),
+    workspaceId: text("workspace_id").notNull(),
+    workspaceRoot: text("workspace_root").notNull(),
+    sourceRoot: text("source_root"),
+    reason: text("reason").notNull(),
+    recordedAt: text("recorded_at").notNull(),
+  },
+  (table) => [
+    index("oauth_revocation_dirty_worktree_artifacts_recorded_idx")
+      .on(table.recordedAt, table.jobId),
+  ],
+);
+
 export const localAgentSessions = sqliteTable(
   "local_agent_sessions",
   {
@@ -187,3 +237,6 @@ export type LoadedAgentFileRow = typeof loadedAgentFiles.$inferSelect;
 export type NewLoadedAgentFileRow = typeof loadedAgentFiles.$inferInsert;
 export type LocalAgentSessionRow = typeof localAgentSessions.$inferSelect;
 export type NewLocalAgentSessionRow = typeof localAgentSessions.$inferInsert;
+export type OAuthRevocationCleanupJobRow = typeof oauthRevocationCleanupJobs.$inferSelect;
+export type OAuthRevocationDirtyWorktreeArtifactRow =
+  typeof oauthRevocationDirtyWorktreeArtifacts.$inferSelect;

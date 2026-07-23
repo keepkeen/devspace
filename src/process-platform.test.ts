@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import {
+  isProcessTreeAlive,
   resolveProcessCommand,
   resolveShellCommand,
   terminateProcessTree,
@@ -105,5 +106,37 @@ terminateProcessTree(
   },
 );
 assert.deepEqual(fallbackCalls, ["child:SIGTERM"]);
+
+const aliveCalls: string[] = [];
+assert.equal(
+  isProcessTreeAlive(
+    { pid: 45, kill: () => true },
+    true,
+    {
+      platform: "linux",
+      killGroup: (pid, signal) => aliveCalls.push(`group:${pid}:${signal}`),
+      killWindowsTree: () => false,
+    },
+  ),
+  true,
+);
+assert.deepEqual(aliveCalls, ["group:45:0"]);
+
+assert.equal(
+  isProcessTreeAlive(
+    { pid: 46, kill: () => true },
+    true,
+    {
+      platform: "darwin",
+      killGroup: () => {
+        const error = new Error("missing") as NodeJS.ErrnoException;
+        error.code = "ESRCH";
+        throw error;
+      },
+      killWindowsTree: () => false,
+    },
+  ),
+  false,
+);
 
 console.log("process-platform tests passed");

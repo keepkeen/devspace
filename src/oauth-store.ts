@@ -29,6 +29,7 @@ export interface OAuthRevocationCounts {
   clients: number;
   accessTokens: number;
   refreshTokens: number;
+  workspaceCleanupJobs: number;
 }
 
 export interface OAuthDiagnosticSnapshot extends OAuthRevocationCounts {
@@ -227,6 +228,44 @@ export class SqliteOAuthStore {
   revokeAll(): OAuthRevocationCounts {
     const revoke = this.database.sqlite.transaction(() => {
       const counts = this.diagnosticSnapshot();
+      const now = new Date().toISOString();
+      const workspaceCleanupJobs = this.database.sqlite.prepare(`
+        insert into oauth_revocation_cleanup_jobs (
+          owner_client_id, workspace_id, workspace_root, workspace_mode,
+          source_root, managed, dirty_source, status, claim_token,
+          lease_expires_at, attempts, last_error, created_at, updated_at,
+          completed_at
+        )
+        select
+          workspace.owner_client_id,
+          workspace.id,
+          workspace.root,
+          workspace.mode,
+          workspace.source_root,
+          workspace.managed,
+          workspace.dirty_source,
+          'pending',
+          null,
+          null,
+          0,
+          null,
+          @now,
+          @now,
+          null
+        from workspace_sessions as workspace
+        inner join oauth_clients as client
+          on client.client_id = workspace.owner_client_id
+        where workspace.status in ('active', 'closed')
+        on conflict(owner_client_id, workspace_id) do nothing
+      `).run({ now }).changes;
+      this.database.sqlite.prepare(`
+        update workspace_sessions
+        set status = 'revoked',
+            state_generation = state_generation + 1,
+            last_used_at = @now
+        where status in ('active', 'closed')
+          and owner_client_id in (select client_id from oauth_clients)
+      `).run({ now });
       this.database.sqlite.prepare("delete from oauth_access_tokens").run();
       this.database.sqlite.prepare("delete from oauth_refresh_tokens").run();
       this.database.sqlite.prepare("delete from oauth_clients").run();
@@ -234,9 +273,58 @@ export class SqliteOAuthStore {
         clients: counts.clients,
         accessTokens: counts.accessTokens,
         refreshTokens: counts.refreshTokens,
+        workspaceCleanupJobs,
       };
     });
     return revoke.immediate();
+  }
+
+  queueOrphanedWorkspaceCleanup(): number {
+    const reconcile = this.database.sqlite.transaction(() => {
+      const now = new Date().toISOString();
+      const queued = this.database.sqlite.prepare(`
+        insert into oauth_revocation_cleanup_jobs (
+          owner_client_id, workspace_id, workspace_root, workspace_mode,
+          source_root, managed, dirty_source, status, claim_token,
+          lease_expires_at, attempts, last_error, created_at, updated_at,
+          completed_at
+        )
+        select
+          workspace.owner_client_id,
+          workspace.id,
+          workspace.root,
+          workspace.mode,
+          workspace.source_root,
+          workspace.managed,
+          workspace.dirty_source,
+          'pending',
+          null,
+          null,
+          0,
+          null,
+          @now,
+          @now,
+          null
+        from workspace_sessions as workspace
+        left join oauth_clients as client
+          on client.client_id = workspace.owner_client_id
+        where workspace.status in ('active', 'closed')
+          and workspace.owner_client_id like 'devspace-%'
+          and client.client_id is null
+        on conflict(owner_client_id, workspace_id) do nothing
+      `).run({ now }).changes;
+      this.database.sqlite.prepare(`
+        update workspace_sessions
+        set status = 'revoked',
+            state_generation = state_generation + 1,
+            last_used_at = @now
+        where status in ('active', 'closed')
+          and owner_client_id like 'devspace-%'
+          and owner_client_id not in (select client_id from oauth_clients)
+      `).run({ now });
+      return queued;
+    });
+    return reconcile.immediate();
   }
 
   diagnosticSnapshot(nowSeconds = Math.floor(Date.now() / 1000)): OAuthDiagnosticSnapshot {
@@ -245,6 +333,7 @@ export class SqliteOAuthStore {
         (select count(*) from oauth_clients) as clients,
         (select count(*) from oauth_access_tokens) as accessTokens,
         (select count(*) from oauth_refresh_tokens) as refreshTokens,
+        (select count(*) from oauth_revocation_cleanup_jobs where status != 'completed') as workspaceCleanupJobs,
         (select count(*) from oauth_access_tokens where expires_at < @nowSeconds) as expiredAccessTokens,
         (select count(*) from oauth_refresh_tokens where expires_at < @nowSeconds) as expiredRefreshTokens
     `).get({ nowSeconds }) as OAuthDiagnosticSnapshot;

@@ -169,6 +169,7 @@ try {
     });
     assert.equal(downgraded.id, "ws-a");
     assert.equal(downgraded.writeAccess, "read_only");
+    assert.equal(downgraded.stateGeneration, 2);
 
     const preservedDowngrade = first.createOrReuseCheckoutSession({
       id: "ws-a-preserved",
@@ -179,6 +180,68 @@ try {
       maxActiveSessionsPerClient: 1,
     });
     assert.equal(preservedDowngrade.writeAccess, "read_only");
+    assert.equal(preservedDowngrade.stateGeneration, 2);
+
+    const upgraded = first.createOrReuseCheckoutSession({
+      id: "ws-a-upgrade",
+      ownerClientId: "client-a",
+      root: "/workspace/a",
+      canonicalRoot: "/workspace/a",
+      writeAccess: "read_write",
+      replaceWriteAccess: true,
+      maxActiveSessionsPerClient: 1,
+    });
+    assert.equal(upgraded.writeAccess, "read_write");
+    assert.equal(upgraded.stateGeneration, 3);
+
+    const aliasGuarded = first.createOrReuseCheckoutSession({
+      id: "ws-alias-guarded",
+      ownerClientId: "client-alias-guarded",
+      alias: "stable-alias",
+      root: "/workspace/alias-guarded",
+      canonicalRoot: "/workspace/alias-guarded",
+      writeAccess: "read_only",
+    });
+    assert.equal(first.closeSession(aliasGuarded.id, aliasGuarded.ownerClientId), true);
+    const rejectedAliasReuse = second.createOrReuseCheckoutSession({
+      id: "ws-alias-guarded-reuse",
+      ownerClientId: aliasGuarded.ownerClientId,
+      alias: "conflicting-alias",
+      root: aliasGuarded.root,
+      canonicalRoot: aliasGuarded.root,
+      writeAccess: "read_write",
+      replaceWriteAccess: true,
+    });
+    assert.equal(rejectedAliasReuse.status, "closed");
+    assert.equal(rejectedAliasReuse.alias, "stable-alias");
+    assert.equal(rejectedAliasReuse.writeAccess, "read_only");
+    assert.equal(rejectedAliasReuse.stateGeneration, 2);
+    assert.equal(first.countActiveSessions(aliasGuarded.ownerClientId), 0);
+
+    first.createSession({
+      id: "ws-quota-active",
+      ownerClientId: aliasGuarded.ownerClientId,
+      alias: "quota-active",
+      root: "/workspace/quota-active",
+    });
+    assert.throws(
+      () => second.createOrReuseCheckoutSession({
+        id: "ws-alias-guarded-reactivate",
+        ownerClientId: aliasGuarded.ownerClientId,
+        alias: "stable-alias",
+        root: aliasGuarded.root,
+        canonicalRoot: aliasGuarded.root,
+        maxActiveSessionsPerClient: 1,
+      }),
+      /limit reached for this OAuth client/,
+    );
+    assert.equal(first.countActiveSessions(aliasGuarded.ownerClientId), 1);
+    assert.throws(
+      () => first.reactivateClosedSession(aliasGuarded.id, aliasGuarded.ownerClientId, 1),
+      /limit reached for this OAuth client/,
+    );
+    assert.equal(first.deleteSession("ws-quota-active", aliasGuarded.ownerClientId), true);
+    assert.equal(first.deleteSession(aliasGuarded.id, aliasGuarded.ownerClientId), true);
 
     assert.throws(
       () => second.createSession({

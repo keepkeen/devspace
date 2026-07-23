@@ -18,6 +18,8 @@ const tests = [
   "src/ui/patch-display.test.ts",
   "src/ui/tool-display.test.ts",
   "src/apply-patch.test.ts",
+  "src/tool-effects.test.ts",
+  "src/workspace-context-protocol.test.ts",
   "src/pi-tools.test.ts",
   "src/bash-prompt.test.ts",
   "src/batch-tools.test.ts",

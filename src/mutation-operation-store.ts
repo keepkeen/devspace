@@ -67,7 +67,9 @@ const MAX_REQUEST_HASH_LENGTH = 512;
 /**
  * Durable idempotency records for mutating tool calls. The store persists only
  * caller-supplied identity fields, a request digest, and the bounded result; it
- * never accepts or stores the request body itself.
+ * never accepts or stores the request body itself. Result bodies expire, but
+ * the operation identity remains a tombstone until its workspace is deleted so
+ * an old operationId can never silently become a new mutation.
  */
 export class MutationOperationStore {
   private readonly database: DatabaseHandle;
@@ -118,8 +120,10 @@ export class MutationOperationStore {
     const reserveOperation = this.database.sqlite.transaction((): MutationOperationReservation => {
       this.database.sqlite
         .prepare(
-          `delete from mutation_operations
-           where owner_client_id = ? and operation_id = ? and expires_at <= ?`,
+          `update mutation_operations
+           set result_json = null
+           where owner_client_id = ? and operation_id = ? and expires_at <= ?
+             and result_json is not null`,
         )
         .run(normalizedKey.ownerClientId, normalizedKey.operationId, nowTimestamp);
 
@@ -277,8 +281,10 @@ export class MutationOperationStore {
       MAX_KEY_PART_LENGTH,
     );
     this.database.sqlite.prepare(`
-      delete from mutation_operations
+      update mutation_operations
+      set result_json = null
       where owner_client_id = ? and operation_id = ? and expires_at <= ?
+        and result_json is not null
     `).run(normalizedOwnerClientId, normalizedOperationId, timestampFromMs(this.currentTime()));
     const row = this.database.sqlite.prepare(`
       select
@@ -305,10 +311,11 @@ export class MutationOperationStore {
     const now = timestampFromMs(this.currentTime());
     return this.database.sqlite
       .prepare(
-        `delete from mutation_operations
+        `update mutation_operations
+         set result_json = null
          where rowid in (
            select rowid from mutation_operations
-           where expires_at <= ?
+           where expires_at <= ? and result_json is not null
            order by expires_at, rowid
            limit ?
          )`,
@@ -329,22 +336,11 @@ export class MutationOperationStore {
     const recover = this.database.sqlite.transaction(() => {
       this.database.sqlite
         .prepare(
-          `delete from mutation_operations
-           where rowid in (
-             select rowid from mutation_operations
-             where expires_at <= ?
-             order by expires_at, rowid
-             limit ?
-           )`,
-        )
-        .run(nowTimestamp, this.cleanupLimit);
-      this.database.sqlite
-        .prepare(
           `update mutation_operations
            set state = 'outcome_unknown', result_json = null, updated_at = ?, expires_at = ?
-           where state = 'pending' and expires_at > ?`,
+           where state = 'pending'`,
         )
-        .run(nowTimestamp, expiresAt, nowTimestamp);
+        .run(nowTimestamp, expiresAt);
     });
     recover.immediate();
   }

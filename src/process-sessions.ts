@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import {
+  isProcessTreeAlive,
   resolveProcessCommand,
   terminateProcessTree,
   type ProcessCommand,
@@ -118,6 +119,8 @@ interface ManagedProcess {
   write(data: string): void;
   end?(): void;
   kill(signal?: NodeJS.Signals): void;
+  interrupt(): void;
+  treeAlive(): boolean;
   resize?(columns: number, rows: number): void;
 }
 
@@ -144,8 +147,10 @@ interface ProcessSession {
   cleanupTimer?: NodeJS.Timeout;
   runtimeTimer?: NodeJS.Timeout;
   escalationTimer?: NodeJS.Timeout;
+  treeExitTimer?: NodeJS.Timeout;
   timedOut: boolean;
   cancelRequested: boolean;
+  rootExited: boolean;
   outputId?: string;
   totalOutputBytes: number;
   quotaDroppedBytes: number;
@@ -594,7 +599,7 @@ export class ProcessSessionManager {
 
     const interruptRequested = chars.includes("\u0003") && session.running;
     if (interruptRequested) {
-      session.process?.kill("SIGINT");
+      session.process?.interrupt();
     }
     const writableChars = chars.replaceAll("\u0003", "");
     if (writableChars && session.running) {
@@ -767,6 +772,7 @@ export class ProcessSessionManager {
       running: true,
       timedOut: false,
       cancelRequested: false,
+      rootExited: false,
       exitPromise,
       resolveExit,
     };
@@ -806,6 +812,8 @@ export class ProcessSessionManager {
         child.stdin?.end();
       },
       kill: (signal = "SIGTERM") => terminateProcessTree(child, signal, detached),
+      interrupt: () => terminateProcessTree(child, "SIGINT", detached),
+      treeAlive: () => isProcessTreeAlive(child, detached),
       resize: input.tty ? () => undefined : undefined,
     };
     const stdoutDecoder = new StringDecoder("utf8");
@@ -854,7 +862,10 @@ export class ProcessSessionManager {
 
     session.process = {
       write: (data) => pty.write(data),
-      kill: (signal) => pty.kill(signal),
+      kill: (signal = "SIGTERM") => terminateProcessTree(pty, signal, true),
+      // Let the terminal driver deliver Ctrl-C to its foreground process group.
+      interrupt: () => pty.write("\u0003"),
+      treeAlive: () => isProcessTreeAlive(pty, true),
       resize: (columns, rows) => pty.resize(columns, rows),
     };
     pty.onData((data) => this.append(session, data));
@@ -874,15 +885,27 @@ export class ProcessSessionManager {
   }
 
   private finish(session: ProcessSession, exitCode?: number, signal?: string): void {
-    if (!session.running) return;
-    session.running = false;
+    if (!session.running || session.rootExited) return;
+    session.rootExited = true;
     session.stdinClosed = true;
     session.exitCode = exitCode;
     session.signal = signal;
+    this.finishWhenTreeExits(session);
+  }
+
+  private finishWhenTreeExits(session: ProcessSession): void {
+    if (!session.running) return;
+    if (session.process?.treeAlive()) {
+      session.treeExitTimer = setTimeout(() => this.finishWhenTreeExits(session), 25);
+      session.treeExitTimer.unref();
+      return;
+    }
+    session.running = false;
     this.finalizeDurableOutput(session);
     session.resolveExit();
     if (session.runtimeTimer) clearTimeout(session.runtimeTimer);
     if (session.escalationTimer) clearTimeout(session.escalationTimer);
+    if (session.treeExitTimer) clearTimeout(session.treeExitTimer);
     if (this.shuttingDown) return;
     session.cleanupTimer = setTimeout(
       () => this.sessions.delete(session.id),
@@ -1016,6 +1039,7 @@ export class ProcessSessionManager {
     if (session?.cleanupTimer) clearTimeout(session.cleanupTimer);
     if (session?.runtimeTimer) clearTimeout(session.runtimeTimer);
     if (session?.escalationTimer) clearTimeout(session.escalationTimer);
+    if (session?.treeExitTimer) clearTimeout(session.treeExitTimer);
     this.sessions.delete(sessionId);
   }
 

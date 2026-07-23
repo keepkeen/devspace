@@ -103,7 +103,8 @@ function testTtlCleanup(stateDir: string): void {
 
     now = 111;
     assert.equal(store.cleanupExpired(1), 1);
-    assert.deepEqual(store.reserve(first, "replacement-hash"), { status: "new" });
+    assert.deepEqual(store.reserve(first, "first-hash"), { status: "result_unavailable" });
+    assert.deepEqual(store.reserve(first, "replacement-hash"), { status: "conflict" });
     assert.deepEqual(store.reserve(second, "second-hash"), {
       status: "replay",
       result: "second-result",
@@ -215,7 +216,18 @@ function testStatusLookupAndGenerationSnapshot(stateDir: string): void {
     assert.equal(store.getOperationStatus("owner-b", key.operationId), undefined);
 
     now = 8_000;
-    assert.equal(store.getOperationStatus("owner-a", key.operationId), undefined);
+    assert.deepEqual(store.getOperationStatus("owner-a", key.operationId), {
+      operationId: key.operationId,
+      state: "settled",
+      tool: key.tool,
+      workspaceId: key.workspaceId,
+      workspaceGeneration: 7,
+      createdAt: "1970-01-01T00:00:01.000Z",
+      updatedAt: "1970-01-01T00:00:02.000Z",
+      expiresAt: "1970-01-01T00:00:07.000Z",
+      resultAvailable: false,
+    });
+    assert.deepEqual(store.reserve(key, "hash", 8), { status: "conflict" });
   } finally {
     store.close();
   }

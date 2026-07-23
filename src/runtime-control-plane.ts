@@ -40,6 +40,7 @@ interface OAuthUsage {
   clients: number;
   accessTokens: number;
   refreshTokens: number;
+  workspaceCleanupJobs: number;
   expiredAccessTokens: number;
   expiredRefreshTokens: number;
 }
@@ -48,6 +49,7 @@ interface RevocationCounts {
   clients: number;
   accessTokens: number;
   refreshTokens: number;
+  workspaceCleanupJobs: number;
 }
 
 interface AllowedRootsReloadResult {
@@ -77,6 +79,7 @@ export interface RuntimeControlPlaneOptions {
   workspaceUsage(): WorkspaceUsage;
   oauthUsage(): OAuthUsage;
   reloadAllowedRoots(): Promise<AllowedRootsReloadResult>;
+  beforeGlobalRevocation(): void | Promise<void>;
   revokeAll(): RevocationCounts;
   runtimeDiagnostics: RuntimeDiagnostics;
   onGlobalRevocation(counts: RevocationCounts): void | Promise<void>;
@@ -152,6 +155,7 @@ export function createRuntimeControlPlane(options: RuntimeControlPlaneOptions): 
           clients: oauthUsage.clients,
           accessTokens: oauthUsage.accessTokens,
           refreshTokens: oauthUsage.refreshTokens,
+          workspaceCleanupJobs: oauthUsage.workspaceCleanupJobs,
           expiredRecords: oauthUsage.expiredAccessTokens + oauthUsage.expiredRefreshTokens,
         },
       },
@@ -168,6 +172,7 @@ export function createRuntimeControlPlane(options: RuntimeControlPlaneOptions): 
       res.status(400).json({ error: "invalid_scope" });
       return;
     }
+    await options.beforeGlobalRevocation();
     const revoked = options.revokeAll();
     res.setHeader("Cache-Control", "no-store");
     await options.onGlobalRevocation(revoked);

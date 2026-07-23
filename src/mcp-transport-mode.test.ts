@@ -78,15 +78,15 @@ try {
     },
   });
   const workspaceId = String(
-    (opened.structuredContent as { workspaceId?: unknown } | undefined)?.workspaceId ?? "",
+    (opened.structuredContent as { workspace?: { ref?: unknown } } | undefined)?.workspace?.ref ?? "",
   );
   assert.ok(workspaceId);
-  const workspaceGeneration = Number(
-    (opened.structuredContent as { workspaceGeneration?: unknown } | undefined)?.workspaceGeneration,
+  let receipt = String(
+    (opened.structuredContent as { receipt?: unknown } | undefined)?.receipt ?? "",
   );
-  assert.ok(workspaceGeneration > 0);
+  assert.match(receipt, /^wctx2\./);
   const instructionRevision = String(
-    (opened.structuredContent as { instructionRevision?: unknown } | undefined)?.instructionRevision ?? "",
+    (opened.structuredContent as { instructions?: { revision?: unknown } } | undefined)?.instructions?.revision ?? "",
   );
   assert.ok(instructionRevision);
   const compactReopen = await firstChatGpt.callTool({
@@ -98,11 +98,9 @@ try {
     },
   });
   const compactStructured = compactReopen.structuredContent as {
-    instructionsIncluded?: unknown;
-    workspaceInstructions?: unknown;
+    instructions?: { items?: unknown };
   } | undefined;
-  assert.equal(compactStructured?.instructionsIncluded, false);
-  assert.deepEqual(compactStructured?.workspaceInstructions, []);
+  assert.deepEqual(compactStructured?.instructions?.items, []);
 
   const getResponse = await fetch(new URL("/mcp", origin), {
     headers: { authorization: `Bearer ${chatGptToken}` },
@@ -120,7 +118,7 @@ try {
 
   const loadedInstructions = await firstChatGpt.callTool({
     name: "load_workspace_instructions",
-    arguments: { workspaceId, workspaceGeneration, paths: ["."] },
+    arguments: { receipt, paths: ["."] },
   });
   const instructionToken = String(
     (loadedInstructions.structuredContent as { instructionToken?: unknown } | undefined)?.instructionToken ?? "",
@@ -129,7 +127,7 @@ try {
 
   const heldCommand = firstChatGpt.callTool({
     name: "exec_command",
-    arguments: { workspaceId, workspaceGeneration, instructionToken, cmd: "sleep 0.25", yieldTimeMs: 1_000 },
+    arguments: { receipt, instructionToken, cmd: "sleep 0.25", yieldTimeMs: 1_000 },
   });
   await delay(50);
   const overCapacity = await rawMcpPost(origin, chatGptToken, "concurrent-chatgpt-session");
@@ -147,7 +145,7 @@ try {
   assert.equal(secondObserved.some((entry) => entry.sessionId !== null), false);
   const directReuseAfterTransportClose = await secondChatGpt.callTool({
     name: "read",
-    arguments: { workspaceId, workspaceGeneration, path: "payload.txt" },
+    arguments: { receipt, path: "payload.txt" },
   });
   assert.match(JSON.stringify(directReuseAfterTransportClose.content), /transport-mode-ok/);
   const freshConversationOpen = await secondChatGpt.callTool({
@@ -155,14 +153,15 @@ try {
     arguments: { alias: "transport", contextMode: "full" },
   });
   const freshStructured = freshConversationOpen.structuredContent as {
-    instructionsIncluded?: unknown;
-    workspaceInstructions?: unknown[];
+    receipt?: unknown;
+    instructions?: { items?: unknown[] };
   } | undefined;
-  assert.equal(freshStructured?.instructionsIncluded, true);
-  assert.ok((freshStructured?.workspaceInstructions?.length ?? 0) > 0);
+  assert.ok((freshStructured?.instructions?.items?.length ?? 0) > 0);
+  receipt = String(freshStructured?.receipt ?? "");
+  assert.match(receipt, /^wctx2\./);
   const resumedMutationWithoutReload = await secondChatGpt.callTool({
     name: "exec_command",
-    arguments: { workspaceId, workspaceGeneration, cmd: "pwd" },
+    arguments: { receipt, cmd: "pwd" },
   });
   assert.equal(
     (resumedMutationWithoutReload.structuredContent as { error?: { code?: unknown } } | undefined)
@@ -171,7 +170,7 @@ try {
   );
   const reusedRead = await secondChatGpt.callTool({
     name: "read",
-    arguments: { workspaceId, workspaceGeneration, path: "payload.txt" },
+    arguments: { receipt, path: "payload.txt" },
   });
   assert.match(JSON.stringify(reusedRead.content), /transport-mode-ok/);
 

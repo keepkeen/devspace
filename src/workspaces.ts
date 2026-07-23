@@ -427,6 +427,12 @@ export class WorkspaceRegistry {
     return summary;
   }
 
+  activeSessionsSnapshot(): WorkspaceSession[] {
+    const sessions = this.store?.listActiveSessions?.()
+      ?? Array.from(this.workspaces.values()).map(workspaceToSessionSnapshot);
+    return sessions.map((session) => ({ ...session }));
+  }
+
   bumpAuthorityGenerations(ownerClientId?: string): number {
     const updates = this.store?.bumpActiveStateGenerations?.(ownerClientId);
     if (updates) {
@@ -468,6 +474,15 @@ export class WorkspaceRegistry {
     } finally {
       this.pendingHydrations.delete(identity);
     }
+  }
+
+  async getWorkspaceContext(
+    ownerClientId: string,
+    workspaceId: string,
+    workspaceGeneration?: number,
+  ): Promise<WorkspaceContext> {
+    const workspace = this.getWorkspace(ownerClientId, workspaceId, workspaceGeneration);
+    return this.contextForWorkspace(workspace, true);
   }
 
   assertWorkspaceWritable(workspace: Workspace): void {
@@ -987,6 +1002,15 @@ export class WorkspaceRegistry {
     return deleted;
   }
 
+  evictRevokedWorkspace(ownerClientId: string, workspaceId: string, root: string): void {
+    const workspace = this.workspaces.get(workspaceId);
+    if (workspace && workspace.ownerClientId !== ownerClientId) return;
+    this.workspaces.delete(workspaceId);
+    this.lifecycleStates.delete(workspaceId);
+    this.removeCheckoutWorkspaceId(workspaceId);
+    this.purgeInstructionCachesForUnusedRoot(workspace?.root ?? root);
+  }
+
   closeExpiredSessions(
     idleTtlMs: number,
     hasActiveProcess: (ownerClientId: string, workspaceId: string) => boolean,
@@ -1076,25 +1100,26 @@ export class WorkspaceRegistry {
     );
     const validatedRoot = assertAllowedPath(canonicalRoot, canonicalAllowedRoots);
     const checkoutKey = checkoutWorkspaceKey(ownerClientId, canonicalRoot);
-    const pending = this.pendingCheckoutWorkspaces.get(checkoutKey);
-    if (pending) {
-      return pending.then((context) => ({ ...context, reused: true }));
-    }
-
-    const opening = this.createWorkspaceContext({
-      ownerClientId,
-      alias,
-      root: validatedRoot,
-      canonicalRoot,
-      mode: "checkout",
-      writeAccess,
-      replaceWriteAccess,
-    });
+    const previous = this.pendingCheckoutWorkspaces.get(checkoutKey);
+    const opening = (async () => {
+      if (previous) await previous.catch(() => undefined);
+      return this.createWorkspaceContext({
+        ownerClientId,
+        alias,
+        root: validatedRoot,
+        canonicalRoot,
+        mode: "checkout",
+        writeAccess,
+        replaceWriteAccess,
+      });
+    })();
     this.pendingCheckoutWorkspaces.set(checkoutKey, opening);
     try {
       return await opening;
     } finally {
-      this.pendingCheckoutWorkspaces.delete(checkoutKey);
+      if (this.pendingCheckoutWorkspaces.get(checkoutKey) === opening) {
+        this.pendingCheckoutWorkspaces.delete(checkoutKey);
+      }
     }
   }
 
@@ -1236,7 +1261,7 @@ export class WorkspaceRegistry {
     const checkoutKey = input.canonicalRoot
       ? checkoutWorkspaceKey(input.ownerClientId, input.canonicalRoot)
       : undefined;
-    const indexedCheckoutId = !this.store && checkoutKey
+    const indexedCheckoutId = checkoutKey
       ? this.checkoutWorkspaceIds.get(checkoutKey)
       : undefined;
     const residentCheckoutId = indexedCheckoutId && this.workspaces.has(indexedCheckoutId)
@@ -1283,6 +1308,7 @@ export class WorkspaceRegistry {
         canonicalRoot: input.canonicalRoot,
         writeAccess: workspace.writeAccess,
         replaceWriteAccess: input.replaceWriteAccess,
+        requestedAlias: input.alias ?? null,
         stateGeneration: workspace.stateGeneration,
         maxActiveSessionsPerClient: this.config.resources.maxActiveWorkspacesPerClient,
       });
@@ -1292,6 +1318,13 @@ export class WorkspaceRegistry {
       reused = session.id !== workspace.id;
       if (input.alias && session.alias !== input.alias) {
         throw new WorkspaceAliasConflictError(session.alias ?? "the existing alias");
+      }
+      const resident = this.workspaces.get(session.id);
+      if (resident?.ownerClientId === session.ownerClientId) {
+        resident.root = session.root;
+        resident.writeAccess = session.writeAccess ?? resident.writeAccess;
+        resident.stateGeneration = session.stateGeneration ?? resident.stateGeneration;
+        return this.contextForWorkspace(resident, true);
       }
       workspace.id = session.id;
       workspace.alias = session.alias ?? this.store.allocateSessionAlias?.(
@@ -1309,7 +1342,15 @@ export class WorkspaceRegistry {
         ) ?? workspace.stateGeneration + 1;
       }
     } else if (residentCheckoutId) {
-      this.store?.touchSession(workspace.id, workspace.ownerClientId);
+      const resident = this.workspaces.get(residentCheckoutId)!;
+      if (input.alias && resident.alias !== input.alias) {
+        throw new WorkspaceAliasConflictError(resident.alias);
+      }
+      if (input.replaceWriteAccess && resident.writeAccess !== input.writeAccess) {
+        resident.writeAccess = input.writeAccess;
+        resident.stateGeneration += 1;
+      }
+      return this.contextForWorkspace(resident, true);
     } else if (workspace.mode === "worktree" && workspace.worktree && this.store?.createOrReuseManagedSession) {
       const session = this.store.createOrReuseManagedSession({
         id: workspace.id,
@@ -1360,64 +1401,94 @@ export class WorkspaceRegistry {
   }
 
   private async hydrateWorkspaceSession(session: WorkspaceSession): Promise<WorkspaceContext> {
-    let root: string;
-    try {
-      root = this.assertWorkspaceRootAllowed(session.root, session.mode, session.sourceRoot);
-    } catch {
-      this.invalidateWorkspace(session.id, session.ownerClientId, session.root);
-      throw new UnknownWorkspaceAliasError();
-    }
-    const alias = session.alias
-      ?? this.store?.allocateSessionAlias?.(session.id, session.ownerClientId)
-      ?? `ws-${randomUUID()}`;
-    const bumpedGeneration = this.store?.bumpStateGeneration?.(
-      session.id,
-      session.ownerClientId,
-    );
-    if (this.store?.bumpStateGeneration && bumpedGeneration === undefined) {
-      throw new UnknownWorkspaceAliasError();
-    }
-    const stateGeneration = bumpedGeneration ?? (session.stateGeneration ?? 1) + 1;
-    const workspace: Workspace = {
-      id: session.id,
+    this.store?.touchSession(session.id, session.ownerClientId);
+    const storedSession = this.store?.getSession(session.id, session.ownerClientId);
+    if (this.store && !storedSession) throw new UnknownWorkspaceAliasError();
+    session = storedSession ?? session;
+    const lifecycle = this.lifecycleStates.get(session.id) ?? {
       ownerClientId: session.ownerClientId,
-      alias,
-      root,
-      mode: session.mode,
-      writeAccess: session.writeAccess ?? "read_write",
-      stateGeneration,
-      sourceRoot: session.sourceRoot,
-      worktree: session.mode === "worktree"
-        ? {
-            path: root,
-            baseRef: session.baseRef ?? "HEAD",
-            baseSha: session.baseSha ?? "",
-            dirtySource: session.dirtySource,
-            detached: true,
-            managed: session.managed,
-          }
-        : undefined,
-      ...this.loadSkillsForWorkspace(root),
-      agentProfiles: await loadLocalAgentProfiles(this.config, root),
-      activatedSkillDirs: new Set(),
-      deliveredInstructionVersions: new Map(),
-      acknowledgedInstructionVersions: new Map(),
-      instructionAcknowledgementGeneration: 0,
-      pendingInstructionAcknowledgements: new Map(),
-      lastUsedAt: Date.now(),
+      phase: "open" as const,
+      activeOperations: 0,
     };
-    const context = await this.contextForWorkspace(workspace, true);
-    this.store?.touchSession(workspace.id, workspace.ownerClientId);
-    this.workspaces.set(workspace.id, workspace);
-    if (workspace.mode === "checkout") {
-      this.checkoutWorkspaceIds.set(
-        checkoutWorkspaceKey(workspace.ownerClientId, realpathSync(workspace.root)),
-        workspace.id,
-      );
+    if (lifecycle.ownerClientId !== session.ownerClientId || lifecycle.phase === "closing") {
+      throw new UnknownWorkspaceAliasError();
     }
-    this.ensureLifecycleState(workspace);
-    this.evictResidentWorkspaces();
-    return context;
+    this.lifecycleStates.set(session.id, lifecycle);
+    lifecycle.activeOperations += 1;
+    let published = false;
+    try {
+      let root: string;
+      try {
+        root = this.assertWorkspaceRootAllowed(session.root, session.mode, session.sourceRoot);
+      } catch {
+        this.invalidateWorkspace(session.id, session.ownerClientId, session.root);
+        throw new UnknownWorkspaceAliasError();
+      }
+      const alias = session.alias
+        ?? this.store?.allocateSessionAlias?.(session.id, session.ownerClientId)
+        ?? `ws-${randomUUID()}`;
+      const bumpedGeneration = this.store?.bumpStateGeneration?.(
+        session.id,
+        session.ownerClientId,
+      );
+      if (this.store?.bumpStateGeneration && bumpedGeneration === undefined) {
+        throw new UnknownWorkspaceAliasError();
+      }
+      const stateGeneration = bumpedGeneration ?? (session.stateGeneration ?? 1) + 1;
+      const workspace: Workspace = {
+        id: session.id,
+        ownerClientId: session.ownerClientId,
+        alias,
+        root,
+        mode: session.mode,
+        writeAccess: session.writeAccess ?? "read_write",
+        stateGeneration,
+        sourceRoot: session.sourceRoot,
+        worktree: session.mode === "worktree"
+          ? {
+              path: root,
+              baseRef: session.baseRef ?? "HEAD",
+              baseSha: session.baseSha ?? "",
+              dirtySource: session.dirtySource,
+              detached: true,
+              managed: session.managed,
+            }
+          : undefined,
+        ...this.loadSkillsForWorkspace(root),
+        agentProfiles: await loadLocalAgentProfiles(this.config, root),
+        activatedSkillDirs: new Set(),
+        deliveredInstructionVersions: new Map(),
+        acknowledgedInstructionVersions: new Map(),
+        instructionAcknowledgementGeneration: 0,
+        pendingInstructionAcknowledgements: new Map(),
+        lastUsedAt: Date.now(),
+      };
+      const context = await this.contextForWorkspace(workspace, true);
+      const activeSession = this.store?.getSession(workspace.id, workspace.ownerClientId);
+      if (this.store && !activeSession) throw new UnknownWorkspaceAliasError();
+      if (activeSession) {
+        workspace.writeAccess = activeSession.writeAccess ?? workspace.writeAccess;
+        workspace.stateGeneration = activeSession.stateGeneration ?? workspace.stateGeneration;
+      }
+      this.workspaces.set(workspace.id, workspace);
+      if (workspace.mode === "checkout") {
+        this.checkoutWorkspaceIds.set(
+          checkoutWorkspaceKey(workspace.ownerClientId, realpathSync(workspace.root)),
+          workspace.id,
+        );
+      }
+      this.ensureLifecycleState(workspace);
+      published = true;
+      this.evictResidentWorkspaces();
+      return context;
+    } finally {
+      lifecycle.activeOperations -= 1;
+      if (lifecycle.activeOperations === 0) lifecycle.resolveDrained?.();
+      if (!published && lifecycle.activeOperations === 0 && this.lifecycleStates.get(session.id) === lifecycle) {
+        this.lifecycleStates.delete(session.id);
+      }
+      this.evictResidentWorkspaces();
+    }
   }
 
   private async reuseManagedSession(
@@ -1436,11 +1507,18 @@ export class WorkspaceRegistry {
 
   private async contextForWorkspace(workspace: Workspace, reused: boolean): Promise<WorkspaceContext> {
     const refreshedSkills = this.loadSkillsForWorkspace(workspace.root);
+    const retainedActivatedSkillDirs = retainActivatedSkillDirs(
+      workspace.skills,
+      refreshedSkills.skills,
+      workspace.activatedSkillDirs,
+    );
+    workspace.lastUsedAt = Date.now();
+    this.store?.touchSession(workspace.id, workspace.ownerClientId);
     const refreshedAgentProfiles = await loadLocalAgentProfiles(this.config, workspace.root);
     workspace.skills = refreshedSkills.skills;
     workspace.skillDiagnostics = refreshedSkills.skillDiagnostics;
     workspace.agentProfiles = refreshedAgentProfiles;
-    workspace.activatedSkillDirs.clear();
+    workspace.activatedSkillDirs = retainedActivatedSkillDirs;
     const agentsFiles = await this.loadInitialAgentsFiles(workspace.root);
     return {
       workspace,
@@ -1856,6 +1934,44 @@ function computeInstructionRevision(files: LoadedAgentsFile[]): string {
     hash.update(content);
   }
   return `sha256-v1:${hash.digest("base64url")}`;
+}
+
+function retainActivatedSkillDirs(
+  previousSkills: readonly Skill[],
+  refreshedSkills: readonly Skill[],
+  activatedSkillDirs: ReadonlySet<string>,
+): Set<string> {
+  const previousById = new Map(previousSkills.map((skill) => [skill.skillId, skill]));
+  const retained = new Set<string>();
+  for (const refreshed of refreshedSkills) {
+    const previous = previousById.get(refreshed.skillId);
+    if (!previous || !activatedSkillDirs.has(resolve(previous.baseDir))) continue;
+    if (previous.manifestHash !== refreshed.manifestHash) continue;
+    if (previous.openAiMetadataHash !== refreshed.openAiMetadataHash) continue;
+    retained.add(resolve(refreshed.baseDir));
+  }
+  return retained;
+}
+
+function workspaceToSessionSnapshot(workspace: Workspace): WorkspaceSession {
+  const lastUsedAt = new Date(workspace.lastUsedAt).toISOString();
+  return {
+    id: workspace.id,
+    ownerClientId: workspace.ownerClientId,
+    alias: workspace.alias,
+    root: workspace.root,
+    status: "active",
+    mode: workspace.mode,
+    sourceRoot: workspace.sourceRoot,
+    baseRef: workspace.worktree?.baseRef,
+    baseSha: workspace.worktree?.baseSha,
+    dirtySource: workspace.worktree?.dirtySource ?? false,
+    managed: workspace.worktree?.managed ?? false,
+    writeAccess: workspace.writeAccess,
+    stateGeneration: workspace.stateGeneration,
+    createdAt: lastUsedAt,
+    lastUsedAt,
+  };
 }
 
 function computeSkillRevision(canonicalWorkspaceRoot: string, skills: readonly Skill[]): string {

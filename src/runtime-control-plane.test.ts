@@ -30,7 +30,7 @@ app.use(createRuntimeControlPlane({
   processUsage: () => ({ sessions: 3, running: 1, limit: 16 }),
   processOutputUsage: () => ({ outputs: 4, activeOutputs: 1, storedBytes: 1024, droppedBytes: 12, maxStorageBytes: 4096 }),
   workspaceUsage: () => ({ activePersisted: 4, resident: 2, closing: 0, leased: 1, maxResident: 32 }),
-  oauthUsage: () => ({ clients: 1, accessTokens: 2, refreshTokens: 2, expiredAccessTokens: 1, expiredRefreshTokens: 0 }),
+  oauthUsage: () => ({ clients: 1, accessTokens: 2, refreshTokens: 2, workspaceCleanupJobs: 0, expiredAccessTokens: 1, expiredRefreshTokens: 0 }),
   reloadAllowedRoots: async () => {
     rootsReloadCount += 1;
     return {
@@ -43,9 +43,10 @@ app.use(createRuntimeControlPlane({
       cleanupPending: rootsCleanupPending,
     };
   },
+  beforeGlobalRevocation: () => undefined,
   revokeAll: () => {
     revocationCount += 1;
-    return { clients: 1, accessTokens: 2, refreshTokens: 2 };
+    return { clients: 1, accessTokens: 2, refreshTokens: 2, workspaceCleanupJobs: 0 };
   },
   runtimeDiagnostics: diagnostics,
   onGlobalRevocation: ({ clients }) => {

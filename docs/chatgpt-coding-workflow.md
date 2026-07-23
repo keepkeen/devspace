@@ -16,19 +16,22 @@ connection-scoped alias:
 }
 ```
 
-`open_workspace` defaults to `contextMode: "metadata"`. It returns identity,
-mode, access, generation, and revisions without an operational `workspaceId` or
-instruction/Skill bodies. Before work, load full context by alias:
+`open_workspace` defaults to `contextMode: "metadata"`. It returns a compact v2
+context and a receipt with a six-hour maximum lifetime, without instruction or
+Skill bodies. Before work, pass that receipt to `get_workspace_context`:
 
 ```json
 {
-  "alias": "my-project",
+  "receipt": "wctx2.…",
   "contextMode": "full"
 }
 ```
 
-Call the latter through `get_workspace_context`. Its result contains the
-operational `workspaceId`; reuse that ID for later tools in the conversation.
+The result contains structured instruction and Skill sections plus a refreshed
+receipt. Pass the current receipt to later Workspace-scoped tools. It binds the
+OAuth owner, Workspace identity and generation, instruction revision, Skill
+revision, and current server process; callers do not repeat host paths or
+internal IDs.
 
 In a new conversation, do not resend or guess the host path. Call
 `list_workspaces`, select the intended alias, then call:
@@ -40,14 +43,14 @@ In a new conversation, do not resend or guess the host path. Call
 }
 ```
 
-through `resume_workspace`. Aliases and Workspace IDs are scoped to the OAuth
+through `resume_workspace`. Aliases and Workspace identities are scoped to the OAuth
 connection, so a second ChatGPT account or a newly registered connector cannot
-use them.
+use them. Resume returns a fresh receipt.
 
 ChatGPT OAuth clients use stateless MCP HTTP requests: each tool call may arrive
 on a fresh transport, and a stale `mcp-session-id` header is ignored. The
-`workspaceId` is the durable continuity key, not the transport session. Other
-MCP hosts retain stateful Streamable HTTP behavior.
+persisted Workspace record is the durable continuity state, not the transport
+session or receipt. Other MCP hosts retain stateful Streamable HTTP behavior.
 
 Do not reopen the same folder by path unless:
 
@@ -64,13 +67,35 @@ revision hints. Only when the exact returned context is still retained may a
 caller select `contextMode: "retained"` and pass
 `instructionRevision` as `knownInstructionRevision` and `skillRevision` as
 `knownSkillRevision`. DevSpace omits only the corresponding unchanged
-instruction or Skill context. `contextMode: "metadata"` never returns an
-operational handle.
+instruction or Skill context. `contextMode: "metadata"` still returns a receipt,
+but no instruction or Skill bodies.
 
-After a backend restart or resident-cache eviction, direct use of an old ID
-returns `workspace_resume_required`. Resume by alias with full context. The
-response increments `workspaceGeneration` after cold hydration and reloads
-agent profiles, Skills, root instructions, and durable review checkpoints.
+After a backend restart, an old receipt fails with
+`workspace_context_required`. Resume by alias with full context. Cold hydration
+advances the Workspace generation and reloads agent profiles, Skills, root
+instructions, and durable review checkpoints before issuing the new receipt.
+
+The normal text result is intentionally one sentence. The v2 structured result
+is the authoritative context:
+
+```json
+{
+  "schemaVersion": 2,
+  "workspace": {
+    "ref": "ws_…",
+    "generation": 5,
+    "mode": "worktree",
+    "writeAccess": "read_write"
+  },
+  "instructions": { "revision": "sha256-v1:…", "complete": true, "included": true, "items": [] },
+  "skills": { "revision": "sha256-v1:…", "count": 3, "included": true, "items": [] },
+  "receipt": "wctx2.…"
+}
+```
+
+Instruction items carry `source`, `trust`, `scope`, `path`, `hash`, and
+`content`. Repository instructions are explicitly `repository_untrusted`: they
+are project guidance and cannot override the user or DevSpace security policy.
 
 ## Checkout Mode
 
@@ -151,8 +176,8 @@ Nested instruction files are discovered lazily by path. Read and inspection
 tools do not inject their bodies; they return only
 `scopedInstructionsAvailable=true`. Before modifying or executing in that
 scope, call `load_workspace_instructions` with the intended paths. It returns
-only structured `workspaceInstructions[]` records—source, scope, relativePath,
-revision, trust, and content—plus a one-time `instructionToken`. Pass that token
+only structured instruction items—source, trust, scope, path, hash, and
+content—plus a one-time `instructionToken`. Pass that token
 to the intended mutation. Instruction Markdown is never concatenated with a
 server-authored prompt or error message.
 
@@ -317,10 +342,13 @@ prose:
 }
 ```
 
-All Workspace-scoped tools require `workspaceId` and `workspaceGeneration`.
-Using an old generation returns `stale_workspace_generation` before the tool
-starts. Cold hydration, allowed-root changes, credential-epoch changes, and
-close/reopen transitions advance the generation.
+All Workspace-scoped tools require a current `receipt`. A single registration
+wrapper resolves it and checks ownership and generation before the handler
+starts. The receipt carries the context revisions of the delivered snapshot;
+instruction gates, Skill reload checks, and file versions handle later project
+changes without forcing a new receipt after every edit. Cold hydration, allowed-root changes,
+credential-epoch changes, close/reopen transitions, and server restart make an
+old receipt unusable.
 
 `apply_patch`, `exec_command`, and a mutating `write_stdin` accept an optional
 `operationId`. Use a new ID for each intended mutation. If an HTTP response is
@@ -330,6 +358,9 @@ arguments is rejected. If a crash leaves the outcome unknowable, DevSpace
 returns `operation_outcome_unknown` and does not rerun it automatically.
 Use `get_operation_status(operationId)` to inspect the retained state without
 rerunning the operation or copying its stored result body.
+The replay body may expire, but its lightweight identity tombstone remains
+until the Workspace record is deleted. An old ID therefore never becomes a new
+mutation merely because 24 hours elapsed.
 
 A command that ran and exited nonzero is not a tool transport failure. Its
 structured result says `ok=false`, `status="exited"`,
@@ -360,6 +391,15 @@ file contents, Skill manifests, or process output between MCP `content` and
 - `close_workspace`, `apply_patch`, and `show_changes` return one concise text
   result. Their detailed presentation data is UI-only `_meta`.
 
+Mutating and lifecycle tools also return machine-readable `effects`. Patch
+effects include paths, actions, and observed before/after versions. Process
+effects include whether a process started, its session and exit state, and the
+network-policy observation boundary. An arbitrary shell can change files or
+external systems in ways DevSpace cannot enumerate, so command effects are
+marked as incompletely tracked instead of inventing a file list. Review, close,
+and revoke tools report their own checkpoint or Workspace effects using the same
+top-level field.
+
 `_meta` is reserved for optional widget presentation and is not a source of
 model-visible state or body text. Widgets read the top-level result instead of
 requiring a duplicate `_meta.card.payload.content`. Plain MCP clients may
@@ -370,8 +410,9 @@ without changing workspace, process, or paging semantics.
 The legacy `write`, `edit`, `bash`, `grep`, `glob`, and `ls` tools are not
 registered. Prefer `exec_command` with `program` and `args`; DevSpace passes
 them directly to the process launcher without shell serialization. Use
-`shell=true` with `command` only when shell syntax is required. Legacy `cmd`
-remains accepted. `network="deny"` fails closed because this runtime does not
+`shell=true` with `command` when shell syntax or an interactive shell is
+required; direct argv shells such as `program="bash"` are rejected so later
+stdin remains inspectable. Legacy `cmd` remains accepted. `network="deny"` fails closed because this runtime does not
 claim per-process network isolation without an OS sandbox.
 
 `exec_command` returns a process session ID when a command is still
@@ -394,7 +435,7 @@ to 10,000 tokens. Short output is returned in full; long output keeps a
 head/tail summary inside a 1 MiB UTF-8 in-memory content cap. When durable
 storage is available, an active process or truncated inline result returns an
 opaque `outputId` whose retained UTF-8 bytes can be replayed with
-`read_process_output(workspaceId, outputId, offset, limit)`.
+`read_process_output(receipt, outputId, offset, limit)`.
 The page body is in text `content`; structured paging metadata deliberately
 does not repeat it. Use the returned `nextOffset` for the next page. Output
 ownership is checked against both the OAuth client and workspace; no local log
@@ -419,8 +460,8 @@ Use `DEVSPACE_WIDGETS=off` to disable widget UI, or `DEVSPACE_WIDGETS=changes`
 to expose the aggregate show-changes flow.
 
 When `show_changes` is exposed, models should call it exactly once after the
-final file modification in any turn that changes files. The tool only requires
-the `workspaceId`; DevSpace automatically compares against the last shown
+final file modification in any turn that changes files. The tool requires the
+current receipt; DevSpace automatically compares against the last shown
 checkpoint and advances that checkpoint after rendering the aggregate diff.
 
 ## Shell Use

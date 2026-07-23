@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmod, mkdtemp, readFile, readdir, rename, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -36,6 +36,9 @@ assert.equal(await isSamePatchFile("/tmp/Foo.txt", "/tmp/foo.txt", differentIden
 await writeFile(join(root, "alpha.txt"), "one\ntwo\nthree\n");
 await writeFile(join(root, "remove.txt"), "remove me\n");
 await writeFile(join(root, "windows.txt"), "first\r\nsecond\r\n");
+const alphaBefore = await readFileVersion(join(root, "alpha.txt"));
+const removeBefore = await readFileVersion(join(root, "remove.txt"));
+const windowsBefore = await readFileVersion(join(root, "windows.txt"));
 
 const result = await applyPatch(
   root,
@@ -59,10 +62,30 @@ const result = await applyPatch(
 );
 
 assert.deepEqual(result.files, [
-  { path: "nested/added.txt", operation: "add" },
-  { path: "alpha.txt", operation: "update" },
-  { path: "windows.txt", operation: "update" },
-  { path: "remove.txt", operation: "delete" },
+  {
+    path: "nested/added.txt",
+    operation: "add",
+    observedBefore: null,
+    observedAfter: await readFileVersion(join(root, "nested/added.txt")),
+  },
+  {
+    path: "alpha.txt",
+    operation: "update",
+    observedBefore: alphaBefore,
+    observedAfter: await readFileVersion(join(root, "alpha.txt")),
+  },
+  {
+    path: "windows.txt",
+    operation: "update",
+    observedBefore: windowsBefore,
+    observedAfter: await readFileVersion(join(root, "windows.txt")),
+  },
+  {
+    path: "remove.txt",
+    operation: "delete",
+    observedBefore: removeBefore,
+    observedAfter: null,
+  },
 ]);
 assert.equal(result.additions, 4);
 assert.equal(result.removals, 3);
@@ -86,7 +109,14 @@ const moveResult = await applyPatch(
 *** End Patch`,
 );
 assert.deepEqual(moveResult.files, [
-  { path: "moved/alpha.txt", previousPath: "alpha.txt", operation: "move" },
+  {
+    path: "moved/alpha.txt",
+    previousPath: "alpha.txt",
+    operation: "move",
+    observedBefore: result.files[1]!.observedAfter,
+    observedAfter: await readFileVersion(join(root, "moved/alpha.txt")),
+    overwrittenBefore: null,
+  },
 ]);
 assert.equal(await readFile(join(root, "moved/alpha.txt"), "utf8"), "ONE\nchanged\nthree\n");
 if (process.platform !== "win32") {
@@ -232,6 +262,7 @@ assert.throws(
 
 const preparedRoot = await mkdtemp(join(tmpdir(), "devspace-prepared-patch-"));
 await writeFile(join(preparedRoot, "before.txt"), "before\n");
+const preparedBefore = await readFileVersion(join(preparedRoot, "before.txt"));
 const prepared = preparePatch(`*** Begin Patch
 *** Update File: before.txt
 *** Move to: after.txt
@@ -244,8 +275,20 @@ const prepared = preparePatch(`*** Begin Patch
 assert.deepEqual(prepared.paths, ["before.txt", "after.txt", "extra.txt"]);
 const preparedResult = await applyPreparedPatch(preparedRoot, prepared);
 assert.deepEqual(preparedResult.files, [
-  { path: "after.txt", previousPath: "before.txt", operation: "move" },
-  { path: "extra.txt", operation: "add" },
+  {
+    path: "after.txt",
+    previousPath: "before.txt",
+    operation: "move",
+    observedBefore: preparedBefore,
+    observedAfter: await readFileVersion(join(preparedRoot, "after.txt")),
+    overwrittenBefore: null,
+  },
+  {
+    path: "extra.txt",
+    operation: "add",
+    observedBefore: null,
+    observedAfter: await readFileVersion(join(preparedRoot, "extra.txt")),
+  },
 ]);
 assert.equal(await readFile(join(preparedRoot, "after.txt"), "utf8"), "after\n");
 assert.equal(await readFile(join(preparedRoot, "extra.txt"), "utf8"), "extra\n");
@@ -294,9 +337,114 @@ assert.deepEqual(
   [],
 );
 
+const parentRaceRoot = await mkdtemp(join(tmpdir(), "devspace-patch-parent-race-"));
+const parentRaceOutside = await mkdtemp(join(tmpdir(), "devspace-patch-parent-race-outside-"));
+const parentRaceVictim = join(parentRaceRoot, "victim");
+const parentRaceDisplaced = join(parentRaceRoot, "victim-displaced");
+await mkdir(join(parentRaceRoot, "safe"));
+await mkdir(parentRaceVictim);
+await writeFile(join(parentRaceRoot, "safe/first.txt"), "first original\n");
+await writeFile(join(parentRaceVictim, "second.txt"), "second original\n");
+await writeFile(join(parentRaceOutside, "second.txt"), "outside original\n");
+let parentRaceRenameCount = 0;
+await assert.rejects(
+  applyPatch(
+    parentRaceRoot,
+    `*** Begin Patch
+*** Update File: safe/first.txt
+@@
+-first original
++first updated
+*** Update File: victim/second.txt
+@@
+-second original
++second updated
+*** End Patch`,
+    {
+      commitOperations: {
+        rename: async (source, destination) => {
+          parentRaceRenameCount += 1;
+          if (parentRaceRenameCount === 2) {
+            await rename(parentRaceVictim, parentRaceDisplaced);
+            await symlink(
+              parentRaceOutside,
+              parentRaceVictim,
+              process.platform === "win32" ? "junction" : "dir",
+            );
+          }
+          await rename(source, destination);
+        },
+      },
+    },
+  ),
+  (error: unknown) =>
+    error instanceof InvalidPatchError &&
+    error.path === "victim/second.txt" &&
+    /parent changed during patch commit/.test(error.publicText),
+);
+assert.equal(await readFile(join(parentRaceRoot, "safe/first.txt"), "utf8"), "first original\n");
+assert.equal(await readFile(join(parentRaceDisplaced, "second.txt"), "utf8"), "second original\n");
+assert.equal(await readFile(join(parentRaceOutside, "second.txt"), "utf8"), "outside original\n");
+assert.deepEqual(
+  (await readdir(parentRaceRoot)).filter((path) => path.startsWith(".devspace-patch-")),
+  [],
+);
+await rm(parentRaceVictim);
+await rename(parentRaceDisplaced, parentRaceVictim);
+
+const destinationRaceRoot = await mkdtemp(join(tmpdir(), "devspace-patch-destination-race-"));
+await writeFile(join(destinationRaceRoot, "first.txt"), "first original\n");
+await writeFile(join(destinationRaceRoot, "second.txt"), "second original\n");
+const destinationRaceFirstVersion = await readFileVersion(join(destinationRaceRoot, "first.txt"));
+const destinationRaceSecondVersion = await readFileVersion(join(destinationRaceRoot, "second.txt"));
+assert(destinationRaceFirstVersion);
+assert(destinationRaceSecondVersion);
+let destinationRaceRenameCount = 0;
+await assert.rejects(
+  applyPatch(
+    destinationRaceRoot,
+    `*** Begin Patch
+*** Update File: first.txt
+@@
+-first original
++first updated
+*** Update File: second.txt
+@@
+-second original
++second updated
+*** End Patch`,
+    {
+      ifMatch: {
+        "first.txt": destinationRaceFirstVersion,
+        "second.txt": destinationRaceSecondVersion,
+      },
+      commitOperations: {
+        rename: async (source, destination) => {
+          destinationRaceRenameCount += 1;
+          if (destinationRaceRenameCount === 2) {
+            await writeFile(join(destinationRaceRoot, "second.txt"), "concurrent update\n");
+          }
+          await rename(source, destination);
+        },
+      },
+    },
+  ),
+  (error: unknown) =>
+    error instanceof FileVersionConflictError &&
+    error.path === "second.txt" &&
+    error.expected === destinationRaceSecondVersion &&
+    error.actual?.hash !== destinationRaceSecondVersion.hash,
+);
+assert.equal(await readFile(join(destinationRaceRoot, "first.txt"), "utf8"), "first original\n");
+assert.equal(await readFile(join(destinationRaceRoot, "second.txt"), "utf8"), "concurrent update\n");
+assert.deepEqual(
+  (await readdir(destinationRaceRoot)).filter((path) => path.startsWith(".devspace-patch-")),
+  [],
+);
+
 const overwriteRoot = await mkdtemp(join(tmpdir(), "devspace-apply-patch-overwrite-"));
 await writeFile(join(overwriteRoot, "duplicate.txt"), "old content\n");
-await applyPatch(
+const overwriteAddResult = await applyPatch(
   overwriteRoot,
   `*** Begin Patch
 *** Add File: duplicate.txt
@@ -304,10 +452,13 @@ await applyPatch(
 *** End Patch`,
 );
 assert.equal(await readFile(join(overwriteRoot, "duplicate.txt"), "utf8"), "new content\n");
+assert.equal(overwriteAddResult.files[0]?.operation, "update");
+assert.notEqual(overwriteAddResult.files[0]?.observedBefore, null);
 
 await writeFile(join(overwriteRoot, "source.txt"), "from\n");
 await writeFile(join(overwriteRoot, "destination.txt"), "existing\n");
-await applyPatch(
+const overwrittenDestination = await readFileVersion(join(overwriteRoot, "destination.txt"));
+const overwriteMoveResult = await applyPatch(
   overwriteRoot,
   `*** Begin Patch
 *** Update File: source.txt
@@ -319,6 +470,7 @@ await applyPatch(
 );
 assert.equal(await readFile(join(overwriteRoot, "destination.txt"), "utf8"), "new\n");
 await assert.rejects(readFile(join(overwriteRoot, "source.txt"), "utf8"), /ENOENT/);
+assert.deepEqual(overwriteMoveResult.files[0]?.overwrittenBefore, overwrittenDestination);
 
 const noNewlineRoot = await mkdtemp(join(tmpdir(), "devspace-apply-patch-newline-"));
 await writeFile(join(noNewlineRoot, "no-newline.txt"), "old");

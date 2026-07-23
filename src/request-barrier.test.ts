@@ -3,6 +3,11 @@ import { ActiveRequestBarrier } from "./request-barrier.js";
 
 const barrier = new ActiveRequestBarrier();
 assert.equal(await barrier.waitForIdle(10), true);
+
+const releaseWithoutTimeout = barrier.enter();
+const waitsWithoutTimeout = barrier.waitForIdle();
+releaseWithoutTimeout();
+assert.equal(await waitsWithoutTimeout, true);
 const releaseFirst = barrier.enter();
 const releaseSecond = barrier.enter();
 let drained = false;

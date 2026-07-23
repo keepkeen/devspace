@@ -16,12 +16,12 @@ export type ProcessCommand = string | DirectProcessCommand;
 
 export interface KillableProcess {
   pid?: number;
-  kill(signal?: NodeJS.Signals): boolean;
+  kill(signal?: NodeJS.Signals): boolean | void;
 }
 
 interface ProcessTreeRuntime {
   platform: NodeJS.Platform;
-  killGroup(pid: number, signal: NodeJS.Signals): void;
+  killGroup(pid: number, signal: NodeJS.Signals | 0): void;
   killWindowsTree(pid: number): boolean;
 }
 
@@ -197,6 +197,20 @@ export function terminateProcessTree(
   }
 
   child.kill(signal);
+}
+
+export function isProcessTreeAlive(
+  child: KillableProcess,
+  detached: boolean,
+  runtime: ProcessTreeRuntime = defaultProcessTreeRuntime,
+): boolean {
+  if (runtime.platform === "win32" || !detached || !child.pid) return false;
+  try {
+    runtime.killGroup(child.pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+  }
 }
 
 /** Exported for tests — PATH-style join helper not required at runtime. */

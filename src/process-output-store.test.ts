@@ -42,6 +42,7 @@ try {
   testTtlAndBoundedCleanup(join(root, "ttl"));
   testRestartRecovery(join(root, "restart"));
   testCleanupIntentRecovery(join(root, "cleanup-restart"));
+  testWorkspaceRetirement(join(root, "workspace-retirement"));
   testLiveCleanupIntentRecovery(join(root, "cleanup-live"));
   testAppendMetadataRollback(join(root, "append-rollback"));
   testOrphanCleanup(join(root, "orphan-cleanup"));
@@ -367,6 +368,45 @@ function testCleanupIntentRecovery(stateDir: string): void {
     assert.throws(() => restoredStore.metadata("owner", "workspace", outputId), ProcessOutputNotFoundError);
   } finally {
     restoredStore.close();
+  }
+}
+
+function testWorkspaceRetirement(stateDir: string): void {
+  const firstStore = createStore(stateDir);
+  const active = firstStore.create({ ownerClientId: "owner", workspaceId: "retired" });
+  firstStore.append(active, "active output");
+  const completed = firstStore.create({ ownerClientId: "owner", workspaceId: "retired" });
+  firstStore.append(completed, "completed output");
+  firstStore.complete(completed);
+  const retained = firstStore.create({ ownerClientId: "owner", workspaceId: "other" });
+  firstStore.append(retained, "keep");
+  firstStore.close();
+
+  const restarted = createStore(stateDir);
+  try {
+    assert.deepEqual(restarted.retireWorkspace("owner", "retired"), {
+      deleted: 2,
+      bytesReclaimed: Buffer.byteLength("active outputcompleted output"),
+    });
+    assert.deepEqual(restarted.retireWorkspace("owner", "retired"), {
+      deleted: 0,
+      bytesReclaimed: 0,
+    });
+    assert.equal(existsSync(logPath(stateDir, active)), false);
+    assert.equal(existsSync(logPath(stateDir, completed)), false);
+    assert.equal(restarted.read("owner", "other", retained, { offset: 0, limit: 10 }).content, "keep");
+    assert.deepEqual(restarted.usageSnapshot(), {
+      outputs: 1,
+      activeOutputs: 0,
+      completedOutputs: 1,
+      totalBytes: 4,
+      storedBytes: 4,
+      droppedBytes: 0,
+      maxStorageBytes: 10_000,
+      availableBytes: 9_996,
+    });
+  } finally {
+    restarted.close();
   }
 }
 

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -104,6 +104,98 @@ const ownerClientId = "client-a";
 const node = process.platform === "win32"
   ? `"${process.execPath}"`
   : JSON.stringify(process.execPath);
+
+interface ProcessTreePids {
+  child: number;
+  grandchild: number;
+}
+
+async function waitForFile(path: string, timeoutMs = 2_000): Promise<string> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      return await readFile(path, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+    }
+  }
+  throw new Error(`Timed out waiting for ${path}`);
+}
+
+function processExists(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
+async function assertProcessTreeExited(pids: ProcessTreePids, timeoutMs = 2_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!processExists(pids.child) && !processExists(pids.grandchild)) return;
+    await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+  }
+  assert.fail(`PTY descendants survived termination: ${JSON.stringify(pids)}`);
+}
+
+async function startStubbornPtyTree(
+  treeManager: ProcessSessionManager,
+  workspaceId: string,
+  markerPath: string,
+  readyPath: string,
+  runtimeLimitMs?: number,
+): Promise<{ sessionId: number; pids: ProcessTreePids }> {
+  const grandchildScript = [
+    "const fs = require('node:fs');",
+    "process.on('SIGTERM', () => {});",
+    "process.on('SIGHUP', () => {});",
+    "fs.writeFileSync(process.argv[1], 'ready');",
+    "setInterval(() => {}, 1000);",
+  ].join("\n");
+  const childScript = [
+    "const fs = require('node:fs');",
+    "const { spawn } = require('node:child_process');",
+    `const grandchild = spawn(process.execPath, ['-e', ${JSON.stringify(grandchildScript)}, process.argv[2]], { stdio: 'ignore' });`,
+    "process.on('SIGTERM', () => {});",
+    "process.on('SIGHUP', () => {});",
+    "fs.writeFileSync(process.argv[1], JSON.stringify({ child: process.pid, grandchild: grandchild.pid }));",
+    "setInterval(() => {}, 1000);",
+  ].join("\n");
+  const rootScript = [
+    "const { spawn } = require('node:child_process');",
+    `spawn(process.execPath, ['-e', ${JSON.stringify(childScript)}, process.argv[1], process.argv[2]], { stdio: 'ignore' });`,
+    "process.on('SIGTERM', () => {});",
+    "process.on('SIGHUP', () => {});",
+    "setInterval(() => {}, 1000);",
+  ].join("\n");
+  const started = await treeManager.start({
+    ownerClientId,
+    workspaceId,
+    cwd: process.cwd(),
+    command: { program: process.execPath, args: ["-e", rootScript, markerPath, readyPath] },
+    tty: true,
+    runtimeLimitMs,
+    yieldTimeMs: 5,
+  });
+  assert.ok(started.sessionId);
+  const pids = JSON.parse(await waitForFile(markerPath)) as ProcessTreePids;
+  await waitForFile(readyPath);
+  return { sessionId: started.sessionId, pids };
+}
+
+function forceKillLeftovers(pids: ProcessTreePids | undefined): void {
+  if (!pids) return;
+  for (const pid of [pids.child, pids.grandchild]) {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+    }
+  }
+}
 
 const foreground = await manager.start({
   ownerClientId,
@@ -536,6 +628,24 @@ try {
     });
     assert.equal(resizedPty.running, false);
     assert.match(resizedPty.output, /columns:120/);
+
+    const interruptiblePty = await manager.start({
+      ownerClientId,
+      workspaceId: "workspace-a",
+      cwd: process.cwd(),
+      command: { program: process.execPath, args: ["-e", "setInterval(() => {}, 1000)"] },
+      tty: true,
+      yieldTimeMs: 10,
+    });
+    assert.ok(interruptiblePty.sessionId);
+    const interruptedPty = await manager.write({
+      ownerClientId,
+      workspaceId: "workspace-a",
+      sessionId: interruptiblePty.sessionId,
+      chars: "\u0003",
+      yieldTimeMs: 2_000,
+    });
+    assert.equal(interruptedPty.running, false);
   }
 } finally {
   await manager.shutdown();
@@ -760,6 +870,82 @@ try {
   );
 } finally {
   await closeManager.shutdown();
+}
+
+if (process.platform !== "win32") {
+  const ptyTreeRoot = await mkdtemp(join(tmpdir(), "devspace-pty-tree-"));
+  let timeoutPids: ProcessTreePids | undefined;
+  let workspacePids: ProcessTreePids | undefined;
+  let shutdownPids: ProcessTreePids | undefined;
+  try {
+    const ptyTimeoutManager = new ProcessSessionManager({
+      maxRuntimeMs: 2_000,
+      terminationGraceMs: 50,
+    });
+    try {
+      const started = await startStubbornPtyTree(
+        ptyTimeoutManager,
+        "pty-timeout",
+        join(ptyTreeRoot, "timeout-pids.json"),
+        join(ptyTreeRoot, "timeout-ready"),
+        1_000,
+      );
+      timeoutPids = started.pids;
+      const timedOutTree = await ptyTimeoutManager.write({
+        ownerClientId,
+        workspaceId: "pty-timeout",
+        sessionId: started.sessionId,
+        yieldTimeMs: 2_000,
+      });
+      assert.equal(timedOutTree.running, false);
+      assert.equal(timedOutTree.timedOut, true);
+      await assertProcessTreeExited(started.pids);
+      timeoutPids = undefined;
+    } finally {
+      await ptyTimeoutManager.shutdown();
+      forceKillLeftovers(timeoutPids);
+    }
+
+    const ptyWorkspaceManager = new ProcessSessionManager({
+      maxRuntimeMs: 10_000,
+      terminationGraceMs: 50,
+    });
+    try {
+      const started = await startStubbornPtyTree(
+        ptyWorkspaceManager,
+        "pty-workspace",
+        join(ptyTreeRoot, "workspace-pids.json"),
+        join(ptyTreeRoot, "workspace-ready"),
+      );
+      workspacePids = started.pids;
+      assert.equal(await ptyWorkspaceManager.terminateWorkspace(ownerClientId, "pty-workspace"), 1);
+      await assertProcessTreeExited(started.pids);
+      workspacePids = undefined;
+    } finally {
+      await ptyWorkspaceManager.shutdown();
+      forceKillLeftovers(workspacePids);
+    }
+
+    const ptyShutdownManager = new ProcessSessionManager({
+      maxRuntimeMs: 10_000,
+      terminationGraceMs: 50,
+    });
+    const started = await startStubbornPtyTree(
+      ptyShutdownManager,
+      "pty-shutdown",
+      join(ptyTreeRoot, "shutdown-pids.json"),
+      join(ptyTreeRoot, "shutdown-ready"),
+    );
+    shutdownPids = started.pids;
+    await ptyShutdownManager.shutdown();
+    await assertProcessTreeExited(started.pids);
+    shutdownPids = undefined;
+  } finally {
+    forceKillLeftovers(timeoutPids);
+    forceKillLeftovers(workspacePids);
+    forceKillLeftovers(shutdownPids);
+    await rm(ptyTreeRoot, { recursive: true, force: true });
+  }
 }
 
 const durableRoot = await mkdtemp(join(tmpdir(), "devspace-process-session-output-"));

@@ -110,6 +110,53 @@ try {
     [false, true],
   );
 
+  const pendingAliasStore = new SqliteWorkspaceStore(join(root, ".pending-alias-state"));
+  const pendingAliasRegistry = new WorkspaceRegistry(config, pendingAliasStore);
+  const pendingAliasResults = await Promise.allSettled([
+    pendingAliasRegistry.openWorkspace(ownerClientId, {
+      path: root,
+      alias: "pending-alpha",
+      writeAccess: "read_only",
+    }),
+    pendingAliasRegistry.openWorkspace(ownerClientId, {
+      path: root,
+      alias: "pending-beta",
+      writeAccess: "read_write",
+    }),
+  ]);
+  assert.equal(
+    pendingAliasResults.filter((result) => result.status === "fulfilled").length,
+    1,
+  );
+  assert.equal(
+    pendingAliasResults.filter((result) => result.status === "rejected").length,
+    1,
+  );
+  const pendingAliasRejection = pendingAliasResults.find((result) => result.status === "rejected");
+  assert.match(String(
+    pendingAliasRejection?.status === "rejected" ? pendingAliasRejection.reason : "",
+  ), /alias/i);
+  pendingAliasStore.close();
+
+  const pendingAccessStore = new SqliteWorkspaceStore(join(root, ".pending-access-state"));
+  const pendingAccessRegistry = new WorkspaceRegistry(config, pendingAccessStore);
+  const [pendingReadOnly, pendingReadWrite] = await Promise.all([
+    pendingAccessRegistry.openWorkspace(ownerClientId, {
+      path: root,
+      alias: "pending-access",
+      writeAccess: "read_only",
+    }),
+    pendingAccessRegistry.openWorkspace(ownerClientId, {
+      path: root,
+      alias: "pending-access",
+      writeAccess: "read_write",
+    }),
+  ]);
+  assert.equal(pendingReadOnly.workspace.id, pendingReadWrite.workspace.id);
+  assert.ok(["read_only", "read_write"].includes(pendingReadWrite.workspace.writeAccess));
+  assert.equal(pendingReadWrite.workspace.stateGeneration, 2);
+  pendingAccessStore.close();
+
   const registry = new WorkspaceRegistry(config);
   const {
     workspace,
@@ -212,6 +259,31 @@ try {
 
   const residentSkillRegistry = new WorkspaceRegistry(skillRevisionConfig);
   const residentSkillContext = await residentSkillRegistry.openWorkspace(ownerClientId, emptySkillsProject);
+  const residentRevisionSkill = residentSkillContext.workspace.skills.find(
+    (skill) => skill.name === "revision-skill",
+  )!;
+  await residentSkillRegistry.loadSkill(
+    ownerClientId,
+    residentSkillContext.workspace.id,
+    residentRevisionSkill.skillId,
+  );
+  const originalDateNow = Date.now;
+  const unchangedResidentContext = await (async () => {
+    try {
+      Date.now = () => 4_242_424_242;
+      return await residentSkillRegistry.resumeWorkspace(
+        ownerClientId,
+        residentSkillContext.workspace.alias,
+      );
+    } finally {
+      Date.now = originalDateNow;
+    }
+  })();
+  assert.equal(unchangedResidentContext.workspace.lastUsedAt, 4_242_424_242);
+  assert.equal(
+    unchangedResidentContext.workspace.activatedSkillDirs.has(residentRevisionSkill.baseDir),
+    true,
+  );
   await writeFile(
     revisionSkillManifest,
     "---\nname: revision-skill\ndescription: Resident refresh description.\n---\n",
@@ -224,6 +296,10 @@ try {
   assert.equal(
     refreshedResidentContext.workspace.skills.find((skill) => skill.name === "revision-skill")?.description,
     "Resident refresh description.",
+  );
+  assert.equal(
+    refreshedResidentContext.workspace.activatedSkillDirs.has(residentRevisionSkill.baseDir),
+    false,
   );
 
   const revisionProject = join(root, "revision-project");
@@ -1020,6 +1096,86 @@ try {
   const worktreesAfterRollback = (await execFileAsync("git", ["worktree", "list", "--porcelain"], { cwd: gitRoot })).stdout;
   assert.equal(worktreesAfterRollback, worktreesBeforeRollback);
 
+  const hydrationSession = {
+    id: "ws-hydration-race",
+    ownerClientId,
+    alias: "hydration-race",
+    root: canonicalRoot,
+    status: "active" as const,
+    mode: "checkout" as const,
+    dirtySource: false,
+    managed: false,
+    writeAccess: "read_only" as const,
+    stateGeneration: 1,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    lastUsedAt: "2026-01-01T00:00:00.000Z",
+  };
+  let hydrationActive = true;
+  let hydrationTouches = 0;
+  const hydrationStore: WorkspaceStore = {
+    createSession: () => hydrationSession,
+    getActiveSessionByAlias: (_owner, alias) => hydrationActive && alias === hydrationSession.alias
+      ? { ...hydrationSession }
+      : undefined,
+    getSession: (id, owner) => hydrationActive && id === hydrationSession.id && owner === ownerClientId
+      ? { ...hydrationSession }
+      : undefined,
+    bumpStateGeneration: () => {
+      hydrationSession.stateGeneration += 1;
+      return hydrationSession.stateGeneration;
+    },
+    touchSession: () => {
+      hydrationTouches += 1;
+    },
+    closeSession: () => {
+      hydrationActive = false;
+      return true;
+    },
+    deleteSession: () => false,
+    countManagedWorktrees: () => 0,
+    listExpiredSessions: () => [{ ...hydrationSession }],
+    isReady: () => true,
+  };
+  const hydrationRegistry = new WorkspaceRegistry(config, hydrationStore);
+  const reservedHydration = hydrationRegistry.resumeWorkspace(ownerClientId, hydrationSession.alias);
+  assert.equal(hydrationRegistry.usageSnapshot(ownerClientId).leased, 1);
+  assert.deepEqual(hydrationRegistry.closeExpiredSessions(-1, () => false), []);
+  const hydratedContext = await reservedHydration;
+  assert.equal(hydratedContext.workspace.id, hydrationSession.id);
+  assert.equal(hydrationTouches >= 2, true);
+
+  const disappearingSession = {
+    ...hydrationSession,
+    id: "ws-hydration-disappearing",
+    alias: "hydration-disappearing",
+    stateGeneration: 1,
+  };
+  let disappearingActive = true;
+  const disappearingStore: WorkspaceStore = {
+    ...hydrationStore,
+    getActiveSessionByAlias: (_owner, alias) => disappearingActive && alias === disappearingSession.alias
+      ? { ...disappearingSession }
+      : undefined,
+    getSession: (id, owner) => disappearingActive && id === disappearingSession.id && owner === ownerClientId
+      ? { ...disappearingSession }
+      : undefined,
+    bumpStateGeneration: () => {
+      disappearingSession.stateGeneration += 1;
+      return disappearingSession.stateGeneration;
+    },
+    touchSession: () => undefined,
+    listExpiredSessions: () => [],
+  };
+  const disappearingRegistry = new WorkspaceRegistry(config, disappearingStore);
+  const disappearingHydration = disappearingRegistry.resumeWorkspace(
+    ownerClientId,
+    disappearingSession.alias,
+  );
+  disappearingActive = false;
+  await assert.rejects(disappearingHydration, /workspace alias is unavailable/);
+  assert.equal(disappearingRegistry.usageSnapshot(ownerClientId).resident, 0);
+  assert.equal(disappearingRegistry.usageSnapshot(ownerClientId).leased, 0);
+
   const worktreeReadmePath = registry.resolvePath(worktreeWorkspace.workspace, "README.md");
   assert.equal(worktreeReadmePath.startsWith(worktreeWorkspace.workspace.root), true);
 
@@ -1041,18 +1197,54 @@ try {
   const repeatedPersistentWorkspace = await persistentRegistry.openWorkspace(ownerClientId, root);
   assert.equal(repeatedPersistentWorkspace.workspace.id, persistentWorkspace.workspace.id);
   assert.equal(persistentWorkspace.workspace.writeAccess, "read_only");
+  const readOnlyGeneration = persistentWorkspace.workspace.stateGeneration;
   const writablePersistentWorkspace = await persistentRegistry.openWorkspace(ownerClientId, {
     path: root,
     writeAccess: "read_write",
   });
+  assert.equal(writablePersistentWorkspace.workspace, persistentWorkspace.workspace);
   assert.equal(writablePersistentWorkspace.workspace.writeAccess, "read_write");
+  assert.equal(writablePersistentWorkspace.workspace.stateGeneration, readOnlyGeneration + 1);
+  assert.throws(
+    () => persistentRegistry.getWorkspace(ownerClientId, persistentWorkspace.workspace.id, readOnlyGeneration),
+    /generation is stale/,
+  );
   const preservedWritableWorkspace = await persistentRegistry.openWorkspace(ownerClientId, root);
   assert.equal(preservedWritableWorkspace.workspace.writeAccess, "read_write");
+  assert.equal(preservedWritableWorkspace.workspace.stateGeneration, readOnlyGeneration + 1);
   const downgradedPersistentWorkspace = await persistentRegistry.openWorkspace(ownerClientId, {
     path: root,
     writeAccess: "read_only",
   });
   assert.equal(downgradedPersistentWorkspace.workspace.writeAccess, "read_only");
+  assert.equal(downgradedPersistentWorkspace.workspace.stateGeneration, readOnlyGeneration + 2);
+
+  const activityDatabase = new Database(databasePath(stateDir));
+  activityDatabase.prepare("update workspace_sessions set last_used_at = ? where id = ?")
+    .run("2026-01-01T00:00:00.000Z", persistentWorktree.workspace.id);
+  persistentWorktree.workspace.lastUsedAt = 0;
+  const activeManagedReuse = await persistentRegistry.openWorkspace(ownerClientId, {
+    path: gitRoot,
+    mode: "worktree",
+  });
+  assert.equal(activeManagedReuse.workspace, persistentWorktree.workspace);
+  assert.equal(activeManagedReuse.workspace.lastUsedAt > 0, true);
+  const refreshedManagedActivity = activityDatabase.prepare(
+    "select last_used_at as lastUsedAt from workspace_sessions where id = ?",
+  ).get(persistentWorktree.workspace.id) as { lastUsedAt: string };
+  assert.equal(refreshedManagedActivity.lastUsedAt > "2026-01-01T00:00:00.000Z", true);
+  activityDatabase.close();
+
+  const activeSnapshot = persistentRegistry.activeSessionsSnapshot();
+  assert.equal(activeSnapshot.some((session) => session.id === persistentWorkspace.workspace.id), true);
+  const snapshottedCheckout = activeSnapshot.find((session) => session.id === persistentWorkspace.workspace.id)!;
+  snapshottedCheckout.alias = "mutated-snapshot";
+  assert.notEqual(
+    persistentRegistry.activeSessionsSnapshot().find(
+      (session) => session.id === persistentWorkspace.workspace.id,
+    )?.alias,
+    "mutated-snapshot",
+  );
   firstStore.close();
 
   const secondStore = new SqliteWorkspaceStore(stateDir);

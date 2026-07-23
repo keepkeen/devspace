@@ -52,6 +52,11 @@ const migrations: Migration[] = [
     name: "workspace-worktree-source-state",
     up: migrateWorkspaceWorktreeSourceState,
   },
+  {
+    version: 10,
+    name: "oauth-revocation-cleanup",
+    up: migrateOAuthRevocationCleanup,
+  },
 ];
 
 export function migrateDatabase(sqlite: Database.Database): void {
@@ -402,6 +407,59 @@ function migrateWorkspaceWorktreeSourceState(sqlite: Database.Database): void {
     "dirty_source",
     "text not null default 'false'",
   );
+}
+
+function migrateOAuthRevocationCleanup(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists oauth_revocation_cleanup_jobs (
+      id integer primary key autoincrement,
+      owner_client_id text not null,
+      workspace_id text not null,
+      workspace_root text not null,
+      workspace_mode text not null check (workspace_mode in ('checkout', 'worktree')),
+      source_root text,
+      managed text not null check (managed in ('true', 'false')),
+      dirty_source text not null check (dirty_source in ('true', 'false')),
+      status text not null default 'pending'
+        check (status in ('pending', 'claimed', 'failed', 'completed')),
+      claim_token text,
+      lease_expires_at text,
+      attempts integer not null default 0 check (attempts >= 0),
+      last_error text,
+      created_at text not null,
+      updated_at text not null,
+      completed_at text,
+      unique (owner_client_id, workspace_id),
+      check (
+        (status = 'claimed' and claim_token is not null and lease_expires_at is not null)
+        or (status != 'claimed' and lease_expires_at is null)
+      ),
+      check (
+        (status = 'completed' and completed_at is not null)
+        or (status != 'completed' and completed_at is null)
+      )
+    );
+
+    create index if not exists oauth_revocation_cleanup_jobs_status_idx
+      on oauth_revocation_cleanup_jobs(status, lease_expires_at, created_at, id);
+
+    create index if not exists oauth_revocation_cleanup_jobs_completed_idx
+      on oauth_revocation_cleanup_jobs(completed_at, id)
+      where status = 'completed';
+
+    create table if not exists oauth_revocation_dirty_worktree_artifacts (
+      job_id integer primary key,
+      owner_client_id text not null,
+      workspace_id text not null,
+      workspace_root text not null,
+      source_root text,
+      reason text not null,
+      recorded_at text not null
+    );
+
+    create index if not exists oauth_revocation_dirty_worktree_artifacts_recorded_idx
+      on oauth_revocation_dirty_worktree_artifacts(recorded_at, job_id);
+  `);
 }
 
 function addColumnIfMissing(

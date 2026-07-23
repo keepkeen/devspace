@@ -46,7 +46,7 @@ export interface ReviewCheckpointManager {
     since?: ReviewSince;
     markReviewed?: boolean;
   }): Promise<ReviewChangesResult>;
-  cleanupWorkspace(input: { workspaceId: string }): Promise<void>;
+  cleanupWorkspace(input: { workspaceId: string; root?: string }): Promise<void>;
   cleanupStaleRefs(input: {
     gitRoot: string;
     activeWorkspaceIds?: Iterable<string>;
@@ -160,9 +160,23 @@ export function createReviewCheckpointManager(): ReviewCheckpointManager {
       });
     },
 
-    async cleanupWorkspace({ workspaceId }) {
-      const state = states.get(workspaceId);
-      if (!state) return;
+    async cleanupWorkspace({ workspaceId, root }) {
+      let state = states.get(workspaceId);
+      if (!state) {
+        if (root === undefined) return;
+        const eligibility = await getGitEligibility(root);
+        if (!eligibility.ok || !eligibility.gitRoot) return;
+        state = {
+          root,
+          gitRoot: eligibility.gitRoot,
+          ...reviewRefs(workspaceId),
+          operationTail: Promise.resolve(),
+          closing: false,
+        };
+        states.set(workspaceId, state);
+      } else if (root !== undefined && state.root !== root) {
+        throw new Error(`Workspace ${workspaceId} is already initialized for a different root.`);
+      }
       state.closing = true;
       try {
         await state.initialization;

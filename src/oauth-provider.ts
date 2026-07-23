@@ -344,6 +344,10 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     return this.oauthStore.revokeAll();
   }
 
+  queueOrphanedWorkspaceCleanup(): number {
+    return this.oauthStore.queueOrphanedWorkspaceCleanup();
+  }
+
   diagnosticSnapshot(): OAuthDiagnosticSnapshot {
     return this.oauthStore.diagnosticSnapshot();
   }

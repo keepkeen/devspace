@@ -19,7 +19,8 @@ const publicBaseUrl = "https://devspace.chatgpt-flow.test";
 const resource = `${publicBaseUrl}/mcp`;
 const ownerPassword = "chatgpt-flow-e2e-owner-password-long-enough";
 const clients = new Set<Client>();
-const trackedWorkspaceGenerations = new Map<string, number>();
+const trackedWorkspaceReceipts = new Map<string, string>();
+const trackedAliasReceipts = new Map<string, string>();
 let active: Awaited<ReturnType<typeof startServer>> | undefined;
 const capturedLogs: string[] = [];
 const originalConsole = {
@@ -84,18 +85,17 @@ try {
   assertToolSucceeded(opened);
   const workspaceA = workspaceId(opened);
   const generationA = Number(
-    (opened.structuredContent as { workspaceGeneration?: unknown } | undefined)?.workspaceGeneration,
+    (opened.structuredContent as { workspace?: { generation?: unknown } } | undefined)?.workspace?.generation,
   );
   assert.ok(generationA > 0);
-  const staleGenerationRead = await firstRound.callTool({
+  const invalidReceiptRead = await firstRound.callTool({
     name: "read",
     arguments: {
-      workspaceId: workspaceA,
-      workspaceGeneration: generationA + 1,
+      receipt: `wctx2.${"A".repeat(43)}`,
       path: "payload.txt",
     },
   });
-  assertToolRejected(staleGenerationRead, /stale_workspace_generation/);
+  assertToolRejected(invalidReceiptRead, /workspace_context_required/);
 
   const directArgv = await firstRound.callTool({
     name: "exec_command",
@@ -257,12 +257,15 @@ try {
     arguments: { workspaceId: workspaceA, cmd: "exit 7" },
   });
   assert.notEqual(nonzero.isError, true);
-  assert.deepEqual(nonzero.structuredContent, {
-    ok: false,
-    status: "exited",
-    commandExecuted: true,
-    exitCode: 7,
-  });
+  assert.equal((nonzero.structuredContent as { ok?: unknown }).ok, false);
+  assert.equal((nonzero.structuredContent as { status?: unknown }).status, "exited");
+  assert.equal((nonzero.structuredContent as { commandExecuted?: unknown }).commandExecuted, true);
+  assert.equal((nonzero.structuredContent as { exitCode?: unknown }).exitCode, 7);
+  assert.equal(
+    (nonzero.structuredContent as { effects?: { process?: { observed?: { exitCode?: unknown } } } })
+      .effects?.process?.observed?.exitCode,
+    7,
+  );
 
   const denied = await firstRound.callTool({
     name: "exec_command",
@@ -306,10 +309,7 @@ try {
   });
   assertToolSucceeded(reopened);
   assert.equal(workspaceId(reopened), workspaceA);
-  assert.equal(
-    (reopened.structuredContent as { reused?: unknown } | undefined)?.reused,
-    true,
-  );
+  assert.match(String((reopened.structuredContent as { receipt?: unknown } | undefined)?.receipt), /^wctx2\./);
   const newSessionRead = await newSession.callTool({
     name: "read",
     arguments: { workspaceId: workspaceA, path: "conversation.txt" },
@@ -359,8 +359,8 @@ try {
       arguments: { workspaceId: concurrentWorkspaceA, path: "payload.txt" },
     }),
   ]);
-  assertToolRejected(aReadsB, /unknown_workspace/);
-  assertToolRejected(bReadsA, /unknown_workspace/);
+  assertToolRejected(aReadsB, /workspace_context_required/);
+  assertToolRejected(bReadsA, /workspace_context_required/);
 
   const node = JSON.stringify(process.execPath);
   const [backgroundA, backgroundB] = await Promise.all([
@@ -430,7 +430,7 @@ try {
   assert.equal(await readFile(join(workspaceRoot, "conversation.txt"), "utf8"), "round-two\nnew-session\n");
 
   const initialGeneration = Number(
-    (opened.structuredContent as { workspaceGeneration?: unknown } | undefined)?.workspaceGeneration,
+    (opened.structuredContent as { workspace?: { generation?: unknown } } | undefined)?.workspace?.generation,
   );
   assert.ok(initialGeneration >= 1);
   await active.close();
@@ -440,7 +440,7 @@ try {
     name: "read",
     arguments: { workspaceId: workspaceA, path: "payload.txt" },
   });
-  assertToolRejected(coldRead, /workspace_resume_required/);
+  assertToolRejected(coldRead, /workspace_context_required/);
   assert.equal(
     (coldRead.structuredContent as { error?: { recovery?: unknown } } | undefined)?.error?.recovery,
     "resume_workspace",
@@ -455,7 +455,7 @@ try {
   assertToolSucceeded(afterRestartResume);
   assert.equal(workspaceId(afterRestartResume), workspaceA);
   assert.ok(
-    Number((afterRestartResume.structuredContent as { workspaceGeneration?: unknown }).workspaceGeneration)
+    Number((afterRestartResume.structuredContent as { workspace?: { generation?: unknown } }).workspace?.generation)
       > initialGeneration,
   );
   const resumedRead = await afterRestart.callTool({
@@ -465,7 +465,7 @@ try {
   assertToolSucceeded(resumedRead);
   assert.match(JSON.stringify(resumedRead.content), /new-session/);
   const resumedGeneration = Number(
-    (afterRestartResume.structuredContent as { workspaceGeneration?: unknown }).workspaceGeneration,
+    (afterRestartResume.structuredContent as { workspace?: { generation?: unknown } }).workspace?.generation,
   );
   const closedWorkspace = await afterRestart.callTool({
     name: "close_workspace",
@@ -484,7 +484,7 @@ try {
   assertToolSucceeded(reopenedWorkspace);
   assert.equal(workspaceId(reopenedWorkspace), workspaceA);
   assert.equal(
-    Number((reopenedWorkspace.structuredContent as { workspaceGeneration?: unknown }).workspaceGeneration),
+    Number((reopenedWorkspace.structuredContent as { workspace?: { generation?: unknown } }).workspace?.generation),
     resumedGeneration + 2,
   );
   await closeClient(afterRestart);
@@ -762,23 +762,41 @@ async function connectClient(
 }
 
 function enableWorkspaceGenerationTracking(client: Client): void {
+  const scopedTools = new Set([
+    "get_workspace_context", "load_workspace_instructions", "list_skills", "load_skill",
+    "close_workspace", "revoke_workspace", "read", "batch_read", "batch_inspect",
+    "apply_patch", "show_changes", "exec_command", "write_stdin", "read_process_output",
+  ]);
   const original = client.callTool.bind(client);
   client.callTool = (async (...callArgs: Parameters<Client["callTool"]>) => {
     const request = callArgs[0];
-    const requestArguments = request.arguments as Record<string, unknown> | undefined;
+    const requestArguments = request.arguments as Record<string, unknown> | undefined ?? {};
     const workspaceId = typeof requestArguments?.workspaceId === "string"
       ? requestArguments.workspaceId
       : undefined;
-    if (workspaceId && requestArguments?.workspaceGeneration === undefined) {
-      const generation = trackedWorkspaceGenerations.get(workspaceId);
-      if (generation !== undefined) {
-        callArgs[0] = { ...request, arguments: { ...requestArguments, workspaceGeneration: generation } };
-      }
+    const alias = typeof requestArguments.alias === "string" ? requestArguments.alias : undefined;
+    const receipt = typeof requestArguments.receipt === "string"
+      ? requestArguments.receipt
+      : workspaceId
+        ? trackedWorkspaceReceipts.get(workspaceId)
+        : alias
+          ? trackedAliasReceipts.get(alias)
+          : undefined;
+    if (scopedTools.has(request.name) && receipt) {
+      const {
+        workspaceId: _workspaceId,
+        workspaceGeneration: _workspaceGeneration,
+        alias: _alias,
+        ...rest
+      } = requestArguments;
+      callArgs[0] = { ...request, arguments: { ...rest, receipt } };
     }
     const result = await original(...callArgs);
     const structured = result.structuredContent as Record<string, unknown> | undefined;
-    if (typeof structured?.workspaceId === "string" && typeof structured.workspaceGeneration === "number") {
-      trackedWorkspaceGenerations.set(structured.workspaceId, structured.workspaceGeneration);
+    const workspace = structured?.workspace as Record<string, unknown> | undefined;
+    if (typeof workspace?.ref === "string" && typeof structured?.receipt === "string") {
+      trackedWorkspaceReceipts.set(workspace.ref, structured.receipt);
+      if (alias) trackedAliasReceipts.set(alias, structured.receipt);
     }
     return result;
   }) as Client["callTool"];
@@ -790,7 +808,7 @@ async function closeClient(client: Client): Promise<void> {
 }
 
 function workspaceId(result: Awaited<ReturnType<Client["callTool"]>>): string {
-  const id = (result.structuredContent as { workspaceId?: unknown } | undefined)?.workspaceId;
+  const id = (result.structuredContent as { workspace?: { ref?: unknown } } | undefined)?.workspace?.ref;
   assert.equal(typeof id, "string");
   assert.ok(id);
   return String(id);

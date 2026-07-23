@@ -21,6 +21,7 @@ import {
   toolCallWorkspaceId,
   readinessSnapshot,
   workspaceOperationId,
+  toolCallWorkspaceReceipt,
   workspaceAppAssetPaths,
 } from "./server.js";
 import type { Skill } from "./skills.js";
@@ -515,8 +516,12 @@ assert.equal(generated.body.generation, "generation-test");
 
 assert.equal(workspaceOperationId({
   method: "tools/call",
-  params: { name: "read_file", arguments: { workspaceId: "ws_test" } },
-}), "ws_test");
+  params: { name: "read", arguments: { workspaceId: "ws_test" } },
+}), undefined);
+assert.equal(toolCallWorkspaceReceipt({
+  method: "tools/call",
+  params: { name: "read", arguments: { receipt: `wctx2.${"A".repeat(43)}` } },
+}), `wctx2.${"A".repeat(43)}`);
 assert.equal(workspaceOperationId({
   method: "tools/call",
   params: { name: "close_workspace", arguments: { workspaceId: "ws_test" } },

@@ -8,6 +8,35 @@ import {
 
 const MAX_CLEANUP_BATCH_SIZE = 10_000;
 
+interface RevocationCleanupJobRow {
+  id: number;
+  ownerClientId: string;
+  workspaceId: string;
+  workspaceRoot: string;
+  workspaceMode: WorkspaceMode;
+  sourceRoot: string | null;
+  managed: string;
+  dirtySource: string;
+  status: RevocationCleanupJobStatus;
+  claimToken: string | null;
+  leaseExpiresAt: string | null;
+  attempts: number;
+  lastError: string | null;
+  createdAt: string;
+  updatedAt: string;
+  completedAt: string | null;
+}
+
+interface RevocationDirtyWorktreeArtifactRow {
+  jobId: number;
+  ownerClientId: string;
+  workspaceId: string;
+  workspaceRoot: string;
+  sourceRoot: string | null;
+  reason: string;
+  recordedAt: string;
+}
+
 export type WorkspaceMode = "checkout" | "worktree";
 export type WorkspaceStatus = "active" | "closed" | "revoked";
 export type WorkspaceWriteAccess = "read_only" | "read_write";
@@ -68,6 +97,42 @@ export interface WorkspaceSessionCursor {
   id: string;
 }
 
+export type RevocationCleanupJobStatus = "pending" | "claimed" | "failed" | "completed";
+
+export interface RevocationCleanupJob {
+  id: number;
+  ownerClientId: string;
+  workspaceId: string;
+  workspaceRoot: string;
+  workspaceMode: WorkspaceMode;
+  sourceRoot?: string;
+  managed: boolean;
+  dirtySource: boolean;
+  status: RevocationCleanupJobStatus;
+  claimToken?: string;
+  leaseExpiresAt?: string;
+  attempts: number;
+  lastError?: string;
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string;
+}
+
+export interface RevocationDirtyWorktreeArtifact {
+  jobId: number;
+  ownerClientId: string;
+  workspaceId: string;
+  workspaceRoot: string;
+  sourceRoot?: string;
+  reason: string;
+  recordedAt: string;
+}
+
+export interface RevocationHistoryCleanupResult {
+  jobs: number;
+  workspaceSessions: number;
+}
+
 export interface WorkspaceStore {
   createSession(input: {
     id: string;
@@ -110,6 +175,7 @@ export interface WorkspaceStore {
     canonicalRoot: string;
     writeAccess?: WorkspaceWriteAccess;
     replaceWriteAccess?: boolean;
+    requestedAlias?: string | null;
     stateGeneration?: number;
     maxActiveSessionsPerClient?: number;
   }): WorkspaceSession;
@@ -124,7 +190,33 @@ export interface WorkspaceStore {
   bumpStateGeneration?(id: string, ownerClientId: string): number | undefined;
   bumpActiveStateGenerations?(ownerClientId?: string): WorkspaceGenerationUpdate[];
   revokeSession?(id: string, ownerClientId: string): number | undefined;
-  reactivateClosedSession?(id: string, ownerClientId: string): number | undefined;
+  listRevocationCleanupJobs?(limit?: number): RevocationCleanupJob[];
+  claimRevocationCleanupJob?(
+    id: number,
+    options?: { leaseMs?: number; now?: number },
+  ): RevocationCleanupJob | undefined;
+  finalizeRevocationCleanupJob?(input: {
+    id: number;
+    claimToken: string;
+    retainedDirtyWorktreeReason?: string;
+    now?: number;
+  }): boolean;
+  failRevocationCleanupJob?(input: {
+    id: number;
+    claimToken: string;
+    error: string;
+    now?: number;
+  }): boolean;
+  listRevocationDirtyWorktreeArtifacts?(limit?: number): RevocationDirtyWorktreeArtifact[];
+  cleanupRevocationHistory?(
+    before: string,
+    limit: number,
+  ): RevocationHistoryCleanupResult;
+  reactivateClosedSession?(
+    id: string,
+    ownerClientId: string,
+    maxActiveSessionsPerClient?: number,
+  ): number | undefined;
   getSession(id: string, ownerClientId: string): WorkspaceSession | undefined;
   touchSession(id: string, ownerClientId: string): void;
   closeSession(id: string, ownerClientId: string): boolean;
@@ -313,6 +405,7 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
     canonicalRoot: string;
     writeAccess?: WorkspaceWriteAccess;
     replaceWriteAccess?: boolean;
+    requestedAlias?: string | null;
     stateGeneration?: number;
     maxActiveSessionsPerClient?: number;
   }): WorkspaceSession {
@@ -347,7 +440,7 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
       limit 1
     `);
     const selectLegacy = this.database.sqlite.prepare(`
-      select id
+      select id, alias, status
       from workspace_sessions
       where owner_client_id = @ownerClientId
         and root = @root
@@ -366,6 +459,10 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
           write_access = case
             when @replaceWriteAccess = 1 then @writeAccess
             else write_access
+          end,
+          state_generation = state_generation + case
+            when @replaceWriteAccess = 1 and write_access != @writeAccess then 1
+            else 0
           end,
           last_used_at = @now
       where id = @existingId
@@ -399,11 +496,20 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
         where canonical_root is not null and mode = 'checkout' and status = 'active'
       do update set
         root = excluded.root,
+        alias = coalesce(workspace_sessions.alias, excluded.alias),
         write_access = case
           when @replaceWriteAccess = 1 then excluded.write_access
           else workspace_sessions.write_access
         end,
+        state_generation = workspace_sessions.state_generation + case
+          when @replaceWriteAccess = 1
+            and workspace_sessions.write_access != excluded.write_access then 1
+          else 0
+        end,
         last_used_at = excluded.last_used_at
+      where @requestedAlias is null
+        or workspace_sessions.alias is null
+        or workspace_sessions.alias = @requestedAlias
       returning
         id,
         owner_client_id as ownerClientId,
@@ -422,20 +528,63 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
         last_used_at as lastUsedAt
     `);
     const getOrCreate = this.database.sqlite.transaction(
-      (values: Omit<typeof input, "replaceWriteAccess"> & {
+      (values: Omit<typeof input, "replaceWriteAccess" | "requestedAlias"> & {
         replaceWriteAccess: 0 | 1;
+        requestedAlias: string | null;
         now: string;
       }): WorkspaceSessionRow => {
         const existing = selectCanonical.get(values) as WorkspaceSessionRow | undefined;
         if (existing) {
+          if (
+            values.requestedAlias !== null
+            && existing.alias !== null
+            && existing.alias !== values.requestedAlias
+          ) {
+            return existing;
+          }
+          if (existing.status === "closed") {
+            this.assertActiveSessionQuota(values.ownerClientId, values.maxActiveSessionsPerClient);
+          }
           return updateExisting.get({
             ...values,
             existingId: existing.id,
           }) as WorkspaceSessionRow;
         }
 
-        const legacy = selectLegacy.get(values) as { id: string } | undefined;
+        const legacy = selectLegacy.get(values) as
+          | Pick<WorkspaceSessionRow, "id" | "alias" | "status">
+          | undefined;
         if (legacy) {
+          if (
+            values.requestedAlias !== null
+            && legacy.alias !== null
+            && legacy.alias !== values.requestedAlias
+          ) {
+            return this.database.sqlite.prepare(`
+              select
+                id,
+                owner_client_id as ownerClientId,
+                alias,
+                root,
+                canonical_root as canonicalRoot,
+                status,
+                mode,
+                source_root as sourceRoot,
+                base_ref as baseRef,
+                base_sha as baseSha,
+                dirty_source as dirtySource,
+                managed,
+                write_access as writeAccess,
+                state_generation as stateGeneration,
+                created_at as createdAt,
+                last_used_at as lastUsedAt
+              from workspace_sessions
+              where id = @id
+            `).get(legacy) as WorkspaceSessionRow;
+          }
+          if (legacy.status === "closed") {
+            this.assertActiveSessionQuota(values.ownerClientId, values.maxActiveSessionsPerClient);
+          }
           return updateExisting.get({
             ...values,
             existingId: legacy.id,
@@ -444,7 +593,9 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
 
         this.assertActiveSessionQuota(values.ownerClientId, values.maxActiveSessionsPerClient);
 
-        return insertCheckout.get(values) as WorkspaceSessionRow;
+        const inserted = insertCheckout.get(values) as WorkspaceSessionRow | undefined;
+        if (inserted) return inserted;
+        return selectCanonical.get(values) as WorkspaceSessionRow;
       },
     );
     const row = getOrCreate.immediate({
@@ -452,6 +603,9 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
       alias,
       writeAccess,
       replaceWriteAccess: input.replaceWriteAccess ? 1 : 0,
+      requestedAlias: input.requestedAlias === undefined
+        ? input.alias ?? null
+        : input.requestedAlias,
       stateGeneration,
       now,
     });
@@ -589,17 +743,257 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
     return row?.stateGeneration;
   }
 
-  reactivateClosedSession(id: string, ownerClientId: string): number | undefined {
+  listRevocationCleanupJobs(limit = 100): RevocationCleanupJob[] {
+    const rows = this.database.sqlite.prepare(`
+      select
+        id,
+        owner_client_id as ownerClientId,
+        workspace_id as workspaceId,
+        workspace_root as workspaceRoot,
+        workspace_mode as workspaceMode,
+        source_root as sourceRoot,
+        managed,
+        dirty_source as dirtySource,
+        status,
+        claim_token as claimToken,
+        lease_expires_at as leaseExpiresAt,
+        attempts,
+        last_error as lastError,
+        created_at as createdAt,
+        updated_at as updatedAt,
+        completed_at as completedAt
+      from oauth_revocation_cleanup_jobs
+      where status != 'completed'
+      order by created_at, id
+      limit ?
+    `).all(cleanupBatchSize(limit)) as RevocationCleanupJobRow[];
+    return rows.map(rowToRevocationCleanupJob);
+  }
+
+  claimRevocationCleanupJob(
+    id: number,
+    options: { leaseMs?: number; now?: number } = {},
+  ): RevocationCleanupJob | undefined {
+    const jobId = positiveInteger(id, "Revocation cleanup job id");
+    const leaseMs = positiveInteger(options.leaseMs ?? 5 * 60_000, "Revocation cleanup lease");
+    const nowMs = nonNegativeInteger(options.now ?? Date.now(), "Revocation cleanup clock");
+    const now = new Date(nowMs).toISOString();
+    const leaseExpiresAt = new Date(nowMs + leaseMs).toISOString();
+    const claimToken = randomUUID();
     const row = this.database.sqlite.prepare(`
+      update oauth_revocation_cleanup_jobs
+      set status = 'claimed',
+          claim_token = @claimToken,
+          lease_expires_at = @leaseExpiresAt,
+          attempts = attempts + 1,
+          last_error = null,
+          updated_at = @now
+      where id = @id
+        and (
+          status in ('pending', 'failed')
+          or (status = 'claimed' and lease_expires_at <= @now)
+        )
+      returning
+        id,
+        owner_client_id as ownerClientId,
+        workspace_id as workspaceId,
+        workspace_root as workspaceRoot,
+        workspace_mode as workspaceMode,
+        source_root as sourceRoot,
+        managed,
+        dirty_source as dirtySource,
+        status,
+        claim_token as claimToken,
+        lease_expires_at as leaseExpiresAt,
+        attempts,
+        last_error as lastError,
+        created_at as createdAt,
+        updated_at as updatedAt,
+        completed_at as completedAt
+    `).get({ id: jobId, claimToken, leaseExpiresAt, now }) as
+      | RevocationCleanupJobRow
+      | undefined;
+    return row ? rowToRevocationCleanupJob(row) : undefined;
+  }
+
+  finalizeRevocationCleanupJob(input: {
+    id: number;
+    claimToken: string;
+    retainedDirtyWorktreeReason?: string;
+    now?: number;
+  }): boolean {
+    const id = positiveInteger(input.id, "Revocation cleanup job id");
+    const claimToken = nonEmptyString(input.claimToken, "Revocation cleanup claim token");
+    const now = new Date(nonNegativeInteger(input.now ?? Date.now(), "Revocation cleanup clock"))
+      .toISOString();
+    const reason = input.retainedDirtyWorktreeReason === undefined
+      ? undefined
+      : nonEmptyString(input.retainedDirtyWorktreeReason, "Dirty worktree retention reason");
+    const finalize = this.database.sqlite.transaction(() => {
+      const job = this.database.sqlite.prepare(`
+        select
+          id,
+          owner_client_id as ownerClientId,
+          workspace_id as workspaceId,
+          workspace_root as workspaceRoot,
+          workspace_mode as workspaceMode,
+          source_root as sourceRoot,
+          managed,
+          dirty_source as dirtySource,
+          status,
+          claim_token as claimToken,
+          lease_expires_at as leaseExpiresAt,
+          attempts,
+          last_error as lastError,
+          created_at as createdAt,
+          updated_at as updatedAt,
+          completed_at as completedAt
+        from oauth_revocation_cleanup_jobs
+        where id = ?
+      `).get(id) as RevocationCleanupJobRow | undefined;
+      if (!job) return false;
+      if (job.status === "completed") return job.claimToken === claimToken;
+      if (job.status !== "claimed" || job.claimToken !== claimToken) return false;
+
+      if (reason !== undefined) {
+        if (job.workspaceMode !== "worktree" || job.managed !== "true") {
+          throw new Error("Only managed worktree cleanup jobs can retain a dirty worktree artifact.");
+        }
+        this.database.sqlite.prepare(`
+          insert into oauth_revocation_dirty_worktree_artifacts (
+            job_id, owner_client_id, workspace_id, workspace_root,
+            source_root, reason, recorded_at
+          ) values (?, ?, ?, ?, ?, ?, ?)
+          on conflict(job_id) do update set
+            reason = excluded.reason,
+            recorded_at = excluded.recorded_at
+        `).run(
+          job.id,
+          job.ownerClientId,
+          job.workspaceId,
+          job.workspaceRoot,
+          job.sourceRoot,
+          reason,
+          now,
+        );
+      }
+      const result = this.database.sqlite.prepare(`
+        update oauth_revocation_cleanup_jobs
+        set status = 'completed',
+            lease_expires_at = null,
+            last_error = null,
+            updated_at = @now,
+            completed_at = @now
+        where id = @id and status = 'claimed' and claim_token = @claimToken
+      `).run({ id, claimToken, now });
+      return result.changes === 1;
+    });
+    return finalize.immediate();
+  }
+
+  failRevocationCleanupJob(input: {
+    id: number;
+    claimToken: string;
+    error: string;
+    now?: number;
+  }): boolean {
+    const id = positiveInteger(input.id, "Revocation cleanup job id");
+    const claimToken = nonEmptyString(input.claimToken, "Revocation cleanup claim token");
+    const error = nonEmptyString(input.error, "Revocation cleanup error");
+    const now = new Date(nonNegativeInteger(input.now ?? Date.now(), "Revocation cleanup clock"))
+      .toISOString();
+    const result = this.database.sqlite.prepare(`
+      update oauth_revocation_cleanup_jobs
+      set status = 'failed',
+          lease_expires_at = null,
+          last_error = @error,
+          updated_at = @now
+      where id = @id
+        and claim_token = @claimToken
+        and status in ('claimed', 'failed')
+    `).run({ id, claimToken, error, now });
+    return result.changes === 1;
+  }
+
+  listRevocationDirtyWorktreeArtifacts(limit = 100): RevocationDirtyWorktreeArtifact[] {
+    const rows = this.database.sqlite.prepare(`
+      select
+        job_id as jobId,
+        owner_client_id as ownerClientId,
+        workspace_id as workspaceId,
+        workspace_root as workspaceRoot,
+        source_root as sourceRoot,
+        reason,
+        recorded_at as recordedAt
+      from oauth_revocation_dirty_worktree_artifacts
+      order by recorded_at desc, job_id desc
+      limit ?
+    `).all(cleanupBatchSize(limit)) as RevocationDirtyWorktreeArtifactRow[];
+    return rows.map(rowToRevocationDirtyWorktreeArtifact);
+  }
+
+  cleanupRevocationHistory(before: string, limit: number): RevocationHistoryCleanupResult {
+    const boundedLimit = cleanupBatchSize(limit);
+    const cutoff = validIsoDate(before, "Revocation history cutoff");
+    const cleanup = this.database.sqlite.transaction(() => {
+      const jobs = this.database.sqlite.prepare(`
+        delete from oauth_revocation_cleanup_jobs
+        where id in (
+          select id
+          from oauth_revocation_cleanup_jobs
+          where status = 'completed' and completed_at < ?
+          order by completed_at, id
+          limit ?
+        )
+      `).run(cutoff, boundedLimit).changes;
+      const workspaceSessions = this.database.sqlite.prepare(`
+        delete from workspace_sessions
+        where id in (
+          select workspace.id
+          from workspace_sessions as workspace
+          where workspace.status = 'revoked'
+            and workspace.last_used_at < @before
+            and not exists (
+              select 1
+              from oauth_revocation_cleanup_jobs as job
+              where job.owner_client_id = workspace.owner_client_id
+                and job.workspace_id = workspace.id
+                and job.status != 'completed'
+            )
+          order by workspace.last_used_at, workspace.id
+          limit @limit
+        )
+      `).run({ before: cutoff, limit: boundedLimit }).changes;
+      return { jobs, workspaceSessions };
+    });
+    return cleanup.immediate();
+  }
+
+  reactivateClosedSession(
+    id: string,
+    ownerClientId: string,
+    maxActiveSessionsPerClient?: number,
+  ): number | undefined {
+    const reactivate = this.database.sqlite.transaction(() => {
+      const closed = this.database.sqlite.prepare(`
+        select 1
+        from workspace_sessions
+        where id = ? and owner_client_id = ? and status = 'closed'
+      `).get(id, ownerClientId);
+      if (!closed) return undefined;
+      this.assertActiveSessionQuota(ownerClientId, maxActiveSessionsPerClient);
+      return this.database.sqlite.prepare(`
       update workspace_sessions
       set status = 'active',
           state_generation = state_generation + 1,
           last_used_at = ?
       where id = ? and owner_client_id = ? and status = 'closed'
       returning state_generation as stateGeneration
-    `).get(new Date().toISOString(), id, ownerClientId) as
-      | { stateGeneration: number }
-      | undefined;
+      `).get(new Date().toISOString(), id, ownerClientId) as
+        | { stateGeneration: number }
+        | undefined;
+    });
+    const row = reactivate.immediate();
     return row?.stateGeneration;
   }
 
@@ -621,7 +1015,11 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
     this.database.db
       .update(workspaceSessions)
       .set({ lastUsedAt: new Date().toISOString() })
-      .where(and(eq(workspaceSessions.id, id), eq(workspaceSessions.ownerClientId, ownerClientId)))
+      .where(and(
+        eq(workspaceSessions.id, id),
+        eq(workspaceSessions.ownerClientId, ownerClientId),
+        eq(workspaceSessions.status, "active"),
+      ))
       .run();
   }
 
@@ -803,6 +1201,41 @@ function rowToActiveWorkspaceSummary(row: WorkspaceSessionRow): ActiveWorkspaceS
   };
 }
 
+function rowToRevocationCleanupJob(row: RevocationCleanupJobRow): RevocationCleanupJob {
+  return {
+    id: row.id,
+    ownerClientId: row.ownerClientId,
+    workspaceId: row.workspaceId,
+    workspaceRoot: row.workspaceRoot,
+    workspaceMode: row.workspaceMode,
+    ...(row.sourceRoot === null ? {} : { sourceRoot: row.sourceRoot }),
+    managed: row.managed === "true",
+    dirtySource: row.dirtySource === "true",
+    status: row.status,
+    ...(row.claimToken === null ? {} : { claimToken: row.claimToken }),
+    ...(row.leaseExpiresAt === null ? {} : { leaseExpiresAt: row.leaseExpiresAt }),
+    attempts: row.attempts,
+    ...(row.lastError === null ? {} : { lastError: row.lastError }),
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+    ...(row.completedAt === null ? {} : { completedAt: row.completedAt }),
+  };
+}
+
+function rowToRevocationDirtyWorktreeArtifact(
+  row: RevocationDirtyWorktreeArtifactRow,
+): RevocationDirtyWorktreeArtifact {
+  return {
+    jobId: row.jobId,
+    ownerClientId: row.ownerClientId,
+    workspaceId: row.workspaceId,
+    workspaceRoot: row.workspaceRoot,
+    ...(row.sourceRoot === null ? {} : { sourceRoot: row.sourceRoot }),
+    reason: row.reason,
+    recordedAt: row.recordedAt,
+  };
+}
+
 function generateWorkspaceAlias(): string {
   return `ws-${randomUUID()}`;
 }
@@ -826,4 +1259,36 @@ function cleanupBatchSize(limit: number): number {
     throw new Error("Workspace cleanup limit must be a positive integer.");
   }
   return Math.min(limit, MAX_CLEANUP_BATCH_SIZE);
+}
+
+function positiveInteger(value: number, label: string): number {
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new Error(`${label} must be a positive integer.`);
+  }
+  return value;
+}
+
+function nonNegativeInteger(value: number, label: string): number {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`${label} must be a non-negative integer.`);
+  }
+  return value;
+}
+
+function nonEmptyString(value: string, label: string): string {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error(`${label} must be a non-empty string.`);
+  }
+  return value;
+}
+
+function validIsoDate(value: string, label: string): string {
+  if (typeof value !== "string") {
+    throw new Error(`${label} must be an ISO date string.`);
+  }
+  const parsed = new Date(value);
+  if (!Number.isFinite(parsed.getTime())) {
+    throw new Error(`${label} must be an ISO date string.`);
+  }
+  return parsed.toISOString();
 }

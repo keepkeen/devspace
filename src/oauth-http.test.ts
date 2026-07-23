@@ -4,8 +4,10 @@ import { createServer as createHttpServer, type Server as HttpServer } from "nod
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { loadConfig } from "./config.js";
-import { internalRevocationToken } from "./internal-auth.js";
+import { internalDiagnosticsToken, internalRevocationToken } from "./internal-auth.js";
 import { createServer } from "./server.js";
 
 const root = await mkdtemp(join(tmpdir(), "devspace-oauth-http-test-"));
@@ -100,6 +102,39 @@ try {
   assert.equal(rejectedRefreshToken.status, 400, "password rotation must revoke old refresh tokens");
 
   const replacementTokens = await issueTokens(active.origin, clientId, changedOwnerToken);
+  const mcpClient = new Client({ name: "oauth-revocation-cleanup-test", version: "1.0.0" });
+  await mcpClient.connect(new StreamableHTTPClientTransport(new URL("/mcp", active.origin), {
+    requestInit: {
+      headers: { authorization: `Bearer ${String(replacementTokens.access_token)}` },
+    },
+  }));
+  const openedWorkspace = await mcpClient.callTool({
+    name: "open_workspace",
+    arguments: { path: workspaceRoot, contextMode: "full", writeAccess: "read_write" },
+  });
+  assert.notEqual(openedWorkspace.isError, true, JSON.stringify(openedWorkspace.content));
+  const workspaceId = String(
+    (openedWorkspace.structuredContent as { workspace?: { ref?: unknown } } | undefined)?.workspace?.ref ?? "",
+  );
+  const receipt = String(
+    (openedWorkspace.structuredContent as { receipt?: unknown } | undefined)?.receipt ?? "",
+  );
+  assert.ok(workspaceId);
+  assert.match(receipt, /^wctx2\./);
+  const backgroundProcess = await mcpClient.callTool({
+    name: "exec_command",
+    arguments: {
+      receipt,
+      program: process.execPath,
+      args: ["-e", "setInterval(() => {}, 1000)"],
+      yieldTimeMs: 0,
+    },
+  });
+  assert.notEqual(backgroundProcess.isError, true, JSON.stringify(backgroundProcess.content));
+  assert.equal(
+    typeof (backgroundProcess.structuredContent as { sessionId?: unknown } | undefined)?.sessionId,
+    "number",
+  );
 
   const revocation = await fetch(new URL("/internal/security/revoke", active.origin), {
     method: "POST",
@@ -111,9 +146,28 @@ try {
   });
   assert.equal(revocation.status, 200);
   const revoked = await revocation.json() as {
-    revoked?: { clients?: unknown; accessTokens?: unknown; refreshTokens?: unknown };
+    revoked?: { clients?: unknown; accessTokens?: unknown; refreshTokens?: unknown; workspaceCleanupJobs?: unknown };
   };
-  assert.deepEqual(revoked.revoked, { clients: 1, accessTokens: 1, refreshTokens: 1 });
+  assert.deepEqual(revoked.revoked, {
+    clients: 1,
+    accessTokens: 1,
+    refreshTokens: 1,
+    workspaceCleanupJobs: 1,
+  });
+  await mcpClient.close().catch(() => undefined);
+
+  const diagnostics = await fetch(new URL("/internal/diagnostics", active.origin), {
+    headers: { "x-devspace-internal-token": internalDiagnosticsToken(changedOwnerToken) },
+  });
+  assert.equal(diagnostics.status, 200);
+  const diagnosticBody = await diagnostics.json() as {
+    usage?: {
+      processSessions?: { running?: unknown };
+      workspaces?: { active?: unknown };
+    };
+  };
+  assert.equal(diagnosticBody.usage?.processSessions?.running, 0);
+  assert.equal(diagnosticBody.usage?.workspaces?.active, 0);
 
   const revokedAccessToken = await fetch(new URL("/mcp", active.origin), {
     headers: { authorization: `Bearer ${replacementTokens.access_token}` },

@@ -12,6 +12,10 @@ export interface AppliedPatchFile {
   path: string;
   previousPath?: string;
   operation: PatchOperation;
+  observedBefore: FileVersion | null;
+  observedAfter: FileVersion | null;
+  /** Prior version of a distinct move destination; undefined when not a move. */
+  overwrittenBefore?: FileVersion | null;
 }
 
 export interface ApplyPatchResult {
@@ -88,6 +92,7 @@ type StagedTextFile = TextFile | null;
 interface TransactionEntry {
   destination: string;
   file: StagedTextFile;
+  validation: DestinationValidation;
   replacement?: string;
 }
 
@@ -99,6 +104,20 @@ interface CommitRecord {
 
 type FileIdentity = Pick<Stats, "dev" | "ino">;
 type FileIdentityReader = (path: string) => Promise<FileIdentity>;
+
+interface ParentValidation {
+  path: string;
+  canonicalPath: string;
+  identity: FileIdentity;
+}
+
+interface DestinationValidation {
+  displayPath: string;
+  identity: FileIdentity | null;
+  observedVersion: FileVersion | null;
+  expectedVersion: FileVersionPrecondition;
+  parent: ParentValidation;
+}
 
 function patchError(message: string, path?: string): InvalidPatchError {
   const publicPath = path !== undefined && isPublicRelativePath(path) ? path : undefined;
@@ -459,7 +478,12 @@ export async function applyPreparedPatch(
       const original = await readStagedOptional(absolute, action.path);
       staged.set(absolute, { content: action.content, mode: original?.mode });
       patches.push(unifiedFilePatch(action.path, action.path, original?.content ?? null, action.content));
-      results.push({ path: action.path, operation: "add" });
+      results.push({
+        path: action.path,
+        operation: original ? "update" : "add",
+        observedBefore: null,
+        observedAfter: null,
+      });
       continue;
     }
 
@@ -469,7 +493,12 @@ export async function applyPreparedPatch(
     if (action.kind === "delete") {
       staged.set(absolute, null);
       patches.push(unifiedFilePatch(action.path, action.path, file.content, null));
-      results.push({ path: action.path, operation: "delete" });
+      results.push({
+        path: action.path,
+        operation: "delete",
+        observedBefore: null,
+        observedAfter: null,
+      });
       continue;
     }
 
@@ -482,41 +511,112 @@ export async function applyPreparedPatch(
       staged.set(destination, { content: updated, mode: file.mode });
       if (!samePatchFile) staged.set(absolute, null);
       patches.push(unifiedFilePatch(action.path, action.moveTo, file.content, updated));
-      results.push({ path: action.moveTo, previousPath: action.path, operation: "move" });
+      results.push({
+        path: action.moveTo,
+        previousPath: action.path,
+        operation: "move",
+        observedBefore: null,
+        observedAfter: null,
+        ...(!samePatchFile ? { overwrittenBefore: null } : {}),
+      });
     } else {
       staged.set(absolute, { content: updated, mode: file.mode });
       patches.push(unifiedFilePatch(action.path, action.path, file.content, updated));
-      results.push({ path: action.path, operation: "update" });
+      results.push({
+        path: action.path,
+        operation: "update",
+        observedBefore: null,
+        observedAfter: null,
+      });
     }
   }
 
-  await validateFilePreconditions(rootPath, options.ifMatch, touched);
-  await commitPatchTransaction(rootPath, staged, options.commitOperations?.rename ?? rename);
+  const validations = await validateCommitDestinations(rootPath, options.ifMatch, touched);
+  await commitPatchTransaction(
+    rootPath,
+    staged,
+    validations,
+    options.commitOperations?.rename ?? rename,
+  );
+  const observedFiles = await observeAppliedFiles(rootPath, results, validations);
 
   const unifiedPatch = patches.filter(Boolean).join("\n");
   const stats = countPatchStats(unifiedPatch);
-  return { files: results, patch: unifiedPatch, ...stats };
+  return { files: observedFiles, patch: unifiedPatch, ...stats };
 }
 
-async function validateFilePreconditions(
+async function observeAppliedFiles(
+  rootPath: string,
+  files: readonly AppliedPatchFile[],
+  validations: ReadonlyMap<string, DestinationValidation>,
+): Promise<AppliedPatchFile[]> {
+  return Promise.all(files.map(async (file) => {
+    const beforePath = await resolveConfinedPath(rootPath, file.previousPath ?? file.path);
+    const before = validations.get(beforePath);
+    if (!before) throw new Error(`Missing patch observation: ${file.previousPath ?? file.path}`);
+
+    const afterPath = await resolveConfinedPath(rootPath, file.path);
+    const destinationBefore = file.previousPath !== undefined && afterPath !== beforePath
+      ? validations.get(afterPath)
+      : undefined;
+    if (file.previousPath !== undefined && afterPath !== beforePath && !destinationBefore) {
+      throw new Error(`Missing patch destination observation: ${file.path}`);
+    }
+    return {
+      path: file.path,
+      ...(file.previousPath === undefined ? {} : { previousPath: file.previousPath }),
+      operation: file.operation,
+      observedBefore: before.observedVersion,
+      observedAfter: await readFileVersion(afterPath),
+      ...(file.previousPath !== undefined && afterPath !== beforePath
+        ? { overwrittenBefore: destinationBefore!.observedVersion }
+        : {}),
+    };
+  }));
+}
+
+async function validateCommitDestinations(
   rootPath: string,
   ifMatch: ApplyPatchOptions["ifMatch"],
   touched: ReadonlyMap<string, string>,
-): Promise<void> {
-  if (!ifMatch) return;
+): Promise<ReadonlyMap<string, DestinationValidation>> {
+  const preconditions = new Map<
+    string,
+    { path: string; expected: FileVersionPrecondition }
+  >();
 
-  for (const [path, expected] of Object.entries(ifMatch)) {
+  for (const [path, expected] of Object.entries(ifMatch ?? {})) {
     const absolute = await resolveConfinedPath(rootPath, path);
     assertFilePrecondition(path, expected);
     if (!touched.has(absolute)) {
       throw patchError(`precondition path is not touched by the patch: ${path}`, path);
     }
-
-    const actual = await readFileVersion(absolute);
-    if (!sameFileVersion(expected, actual)) {
-      throw new FileVersionConflictError(path, expected, actual);
-    }
+    preconditions.set(absolute, { path, expected });
   }
+
+  const validations = new Map<string, DestinationValidation>();
+  for (const [absolute, displayPath] of touched) {
+    const snapshot = await readDestinationSnapshot(absolute);
+    const precondition = preconditions.get(absolute);
+
+    if (precondition && !sameFileVersion(precondition.expected, snapshot.version)) {
+      throw new FileVersionConflictError(
+        precondition.path,
+        precondition.expected,
+        snapshot.version,
+      );
+    }
+
+    validations.set(absolute, {
+      displayPath,
+      identity: snapshot.identity,
+      observedVersion: snapshot.version,
+      expectedVersion: precondition?.expected ?? snapshot.version,
+      parent: await captureExistingParent(rootPath, dirname(absolute), displayPath),
+    });
+  }
+
+  return validations;
 }
 
 function assertFilePrecondition(path: string, version: FileVersionPrecondition): void {
@@ -565,6 +665,7 @@ async function readUtf8Text(absolute: string, displayPath: string): Promise<stri
 async function commitPatchTransaction(
   rootPath: string,
   staged: ReadonlyMap<string, StagedTextFile>,
+  validations: ReadonlyMap<string, DestinationValidation>,
   renameFile: PatchCommitOperations["rename"],
 ): Promise<void> {
   const transactionRoot = resolve(
@@ -580,6 +681,8 @@ async function commitPatchTransaction(
   try {
     let index = 0;
     for (const [destination, file] of staged) {
+      const validation = validations.get(destination);
+      if (!validation) throw new Error(`Missing patch destination validation: ${destination}`);
       const replacement = file
         ? resolve(transactionRoot, `replacement-${index}`)
         : undefined;
@@ -590,14 +693,20 @@ async function commitPatchTransaction(
           file.mode === undefined ? undefined : { mode: file.mode },
         );
       }
-      entries.push({ destination, file, replacement });
+      entries.push({ destination, file, validation, replacement });
       index += 1;
     }
 
     try {
       for (const [entryIndex, entry] of entries.entries()) {
         await ensureDestinationParent(entry.destination, rootPath, createdDirectories);
-        const destinationExisted = await patchDestinationExists(entry.destination);
+        const parentIdentity = await revalidateDestinationParent(
+          rootPath,
+          entry.destination,
+          entry.validation,
+        );
+        await revalidateDestination(entry.destination, entry.validation);
+        const destinationExisted = entry.validation.identity !== null;
         const backup = destinationExisted
           ? resolve(transactionRoot, `backup-${entryIndex}`)
           : undefined;
@@ -607,8 +716,28 @@ async function commitPatchTransaction(
           backup,
         });
 
-        if (backup) await renameFile(entry.destination, backup);
+        if (backup) {
+          await revalidateDestinationParent(
+            rootPath,
+            entry.destination,
+            entry.validation,
+            parentIdentity,
+          );
+          await revalidateDestination(entry.destination, entry.validation);
+          await renameFile(entry.destination, backup);
+        }
         if (entry.file && entry.replacement) {
+          await revalidateDestinationParent(
+            rootPath,
+            entry.destination,
+            entry.validation,
+            parentIdentity,
+          );
+          await revalidateDestination(entry.destination, {
+            ...entry.validation,
+            identity: null,
+            expectedVersion: null,
+          });
           await renameFile(entry.replacement, entry.destination);
         }
       }
@@ -632,6 +761,135 @@ async function commitPatchTransaction(
       await rm(transactionRoot, { recursive: true, force: true });
     }
   }
+}
+
+async function captureExistingParent(
+  rootPath: string,
+  parent: string,
+  displayPath: string,
+): Promise<ParentValidation> {
+  let current = parent;
+  while (isInside(rootPath, current)) {
+    try {
+      const canonicalPath = await realpath(current);
+      if (!isInside(rootPath, canonicalPath)) {
+        throw patchError(
+          `destination parent resolves outside the workspace: ${displayPath}`,
+          displayPath,
+        );
+      }
+      const metadata = await stat(canonicalPath);
+      if (!metadata.isDirectory()) {
+        throw patchError(`destination parent is not a directory: ${displayPath}`, displayPath);
+      }
+      return {
+        path: current,
+        canonicalPath,
+        identity: metadata,
+      };
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT") throw error;
+      if (current === rootPath) throw error;
+      current = dirname(current);
+    }
+  }
+
+  throw patchError(`destination parent escapes the workspace: ${displayPath}`, displayPath);
+}
+
+async function revalidateDestinationParent(
+  rootPath: string,
+  destination: string,
+  validation: DestinationValidation,
+  expectedDirectIdentity?: FileIdentity,
+): Promise<FileIdentity> {
+  const parent = dirname(destination);
+  let canonicalParent: string;
+  let directMetadata: Stats;
+  let anchorCanonical: string;
+  let anchorMetadata: Stats;
+  try {
+    canonicalParent = await realpath(parent);
+    anchorCanonical = await realpath(validation.parent.path);
+    [directMetadata, anchorMetadata] = await Promise.all([
+      stat(canonicalParent),
+      stat(anchorCanonical),
+    ]);
+  } catch {
+    throw patchError(
+      `destination parent changed during patch commit: ${validation.displayPath}`,
+      validation.displayPath,
+    );
+  }
+
+  if (
+    !isInside(rootPath, canonicalParent) ||
+    !directMetadata.isDirectory() ||
+    anchorCanonical !== validation.parent.canonicalPath ||
+    !sameFileIdentity(anchorMetadata, validation.parent.identity) ||
+    (expectedDirectIdentity !== undefined &&
+      !sameFileIdentity(directMetadata, expectedDirectIdentity))
+  ) {
+    throw patchError(
+      `destination parent changed during patch commit: ${validation.displayPath}`,
+      validation.displayPath,
+    );
+  }
+
+  return directMetadata;
+}
+
+async function revalidateDestination(
+  destination: string,
+  validation: DestinationValidation,
+): Promise<void> {
+  const snapshot = await readDestinationSnapshot(destination);
+  if (
+    !sameOptionalFileIdentity(snapshot.identity, validation.identity) ||
+    !sameFileVersion(validation.expectedVersion, snapshot.version)
+  ) {
+    throw new FileVersionConflictError(
+      validation.displayPath,
+      validation.expectedVersion,
+      snapshot.version,
+    );
+  }
+}
+
+async function readDestinationSnapshot(
+  path: string,
+): Promise<{ identity: FileIdentity | null; version: FileVersion | null }> {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const before = await readOptionalFileIdentity(path);
+    const version = await readFileVersion(path);
+    const after = await readOptionalFileIdentity(path);
+    if (sameOptionalFileIdentity(before, after)) return { identity: after, version };
+  }
+
+  throw new Error("Patch destination changed while it was being validated");
+}
+
+async function readOptionalFileIdentity(path: string): Promise<FileIdentity | null> {
+  try {
+    return await lstat(path);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return null;
+    throw error;
+  }
+}
+
+function sameOptionalFileIdentity(
+  left: FileIdentity | null,
+  right: FileIdentity | null,
+): boolean {
+  if (left === null || right === null) return left === right;
+  return sameFileIdentity(left, right);
+}
+
+function sameFileIdentity(left: FileIdentity, right: FileIdentity): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
 }
 
 async function ensureDestinationParent(
@@ -700,20 +958,6 @@ async function rollbackPatchCommit(
 async function pathExists(path: string): Promise<boolean> {
   try {
     await lstat(path);
-    return true;
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === "ENOENT" || code === "ENOTDIR") return false;
-    throw error;
-  }
-}
-
-async function patchDestinationExists(path: string): Promise<boolean> {
-  try {
-    const metadata = await lstat(path);
-    if (!metadata.isFile() && !metadata.isSymbolicLink()) {
-      throw new Error(`Patch destination is no longer a file: ${path}`);
-    }
     return true;
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;

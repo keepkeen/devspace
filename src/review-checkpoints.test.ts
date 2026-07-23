@@ -100,7 +100,8 @@ try {
     "refs/devspace/review/ws_review/open",
   ]);
 
-  await manager.cleanupWorkspace({ workspaceId: "ws_review" });
+  const cleanupAfterRestart = createReviewCheckpointManager();
+  await cleanupAfterRestart.cleanupWorkspace({ workspaceId: "ws_review", root });
   assert.deepEqual(await reviewRefNames(root), []);
 } finally {
   await rm(root, { recursive: true, force: true });

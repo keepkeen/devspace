@@ -24,8 +24,13 @@ export class ActiveRequestBarrier {
     }
   }
 
-  async waitForIdle(timeoutMs: number): Promise<boolean> {
+  async waitForIdle(timeoutMs?: number): Promise<boolean> {
     if (this.active === 0) return true;
+    if (timeoutMs === undefined) {
+      return await new Promise<true>((resolve) => {
+        this.idleWaiters.add(() => resolve(true));
+      });
+    }
     let timer: NodeJS.Timeout | undefined;
     let resolveIdle: (() => void) | undefined;
     try {
