@@ -19,6 +19,18 @@ const ordered = await runBoundedBatch(
 );
 assert.deepEqual(ordered.items.map((item) => item.path), ["slow", "fast"]);
 
+const referencedDuplicates = await runBoundedBatch(
+  [
+    { operation: "read", path: "same", ref: "first" },
+    { operation: "read", path: "same", ref: "second" },
+  ],
+  async () => ({ ok: true, result: "content" }),
+);
+assert.deepEqual(referencedDuplicates.items.map((item) => item.ref), ["first", "second"]);
+assert.equal(referencedDuplicates.items[0]?.ok, true);
+assert.equal(referencedDuplicates.items[1]?.ok, false);
+assert.match(referencedDuplicates.items[1]?.result ?? "", /Duplicate batch item skipped/);
+
 const partialFailure = await runBoundedBatch(
   [
     { operation: "read", path: "ok" },

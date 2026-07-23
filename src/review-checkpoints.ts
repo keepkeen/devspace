@@ -88,6 +88,19 @@ export function createReviewCheckpointManager(): ReviewCheckpointManager {
         }
 
         state.gitRoot = eligibility.gitRoot;
+        const refStatuses = await Promise.all([
+          reviewRefStatus(eligibility.gitRoot, state.openRef),
+          reviewRefStatus(eligibility.gitRoot, state.baselineRef),
+        ]);
+        if (refStatuses.every((status) => status === "valid")) return;
+        if (!refStatuses.every((status) => status === "missing")) {
+          throw new Error(
+            `Internal review checkpoint error for workspace ${workspaceId}: `
+            + `open ref is ${refStatuses[0]} and baseline ref is ${refStatuses[1]}. `
+            + "Refusing to reset review history.",
+          );
+        }
+
         const commit = await createWorkingTreeSnapshot(eligibility.gitRoot);
         await git(eligibility.gitRoot, ["update-ref", state.openRef, commit]);
         await git(eligibility.gitRoot, ["update-ref", state.baselineRef, commit]);
@@ -111,8 +124,9 @@ export function createReviewCheckpointManager(): ReviewCheckpointManager {
       await initializeWorkspace(workspaceId, root);
       const state = states.get(workspaceId);
 
+      if (state?.diagnostic) throw new Error(state.diagnostic);
       if (!state?.gitRoot) {
-        throw new Error(state?.diagnostic ?? "show_changes requires a Git workspace in this version.");
+        throw new Error("show_changes requires a Git workspace in this version.");
       }
       if (state.closing) throw new Error(`Review checkpoints for workspace ${workspaceId} are being cleaned up.`);
 
@@ -193,6 +207,28 @@ export function createReviewCheckpointManager(): ReviewCheckpointManager {
       return deleting.length;
     },
   };
+}
+
+type ReviewRefStatus = "missing" | "valid" | "invalid";
+
+async function reviewRefStatus(gitRoot: string, ref: string): Promise<ReviewRefStatus> {
+  try {
+    await git(gitRoot, ["show-ref", "--verify", "--quiet", ref]);
+  } catch (error) {
+    return commandExitCode(error) === 1 ? "missing" : "invalid";
+  }
+
+  try {
+    await git(gitRoot, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`]);
+    return "valid";
+  } catch {
+    return "invalid";
+  }
+}
+
+function commandExitCode(error: unknown): number | undefined {
+  if (!error || typeof error !== "object" || !("code" in error)) return undefined;
+  return typeof error.code === "number" ? error.code : undefined;
 }
 
 async function serialize<T>(state: WorkspaceReviewState, operation: () => Promise<T>): Promise<T> {

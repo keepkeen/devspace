@@ -153,10 +153,26 @@ normal Owner-password approval page.
 `workspaceId` values are scoped to the OAuth client that opened them. Normal MCP
 transport reconnects do not invalidate them. If ChatGPT refreshes or
 re-authorizes the app as a new OAuth client, an older ID is intentionally
-rejected; discard it and call `open_workspace` again for that project.
+rejected; that connection cannot see the former connection's aliases, so open
+the project again with its path.
 
-Workspace session metadata is persisted, but clients should still treat
-`open_workspace` as the way to begin a fresh working session.
+In a new conversation on the same OAuth connection, call `list_workspaces` and
+then `resume_workspace(alias, contextMode="full")`; the host path does not need
+to be repeated. After a backend restart or resident-cache eviction, directly
+using an old ID returns `workspace_resume_required`. Resume by alias before any
+file or process operation. The response returns the same durable ID with a
+newer `workspaceGeneration` only after instructions, Skills, profiles, and
+review checkpoints are hydrated.
+
+Every later Workspace tool must include that generation. If policy, credential
+epoch, or lifecycle state changes, `stale_workspace_generation` instructs the
+client to list/resume rather than guessing whether an old handle is safe.
+
+`open_workspace` is for the first use of a host path. Its default metadata mode
+does not return an operational `workspaceId`; call
+`get_workspace_context(alias, contextMode="full")` before work. Revision hints
+are only a cache optimization in explicit `retained` mode and do not prove that
+a new model conversation remembers the bodies.
 
 ChatGPT OAuth clients use stateless MCP POST requests, so an old transport
 session header does not invalidate or consume the workspace. Non-ChatGPT MCP
@@ -292,8 +308,9 @@ metadata and only show text results.
 
 `batch_read` and `batch_inspect` intentionally keep their independent payloads
 in `structuredContent.items[]`. Text `content` contains only a short completion
-summary; request order maps each compact `ok/result` item back to its input,
-and paths/operations plus the former aggregate `result` are not emitted.
+summary. Give inputs short `ref` values when order alone is fragile; results
+echo refs and report top-level `completed`, `partial`, or `failed` plus counts.
+Host paths/operations and the former aggregate `result` are not emitted.
 Update clients or adapters that only display text content, or use single-item
 tools when structured results are unavailable.
 

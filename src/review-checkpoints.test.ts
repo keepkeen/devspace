@@ -43,6 +43,15 @@ try {
   assert.equal(firstReview.files.some((file) => file.path === "new.txt"), true);
   assert.match(firstReview.patch, /world/);
 
+  const restartedManager = createReviewCheckpointManager();
+  const afterRestart = await restartedManager.reviewChanges({
+    workspaceId: "ws_review",
+    root,
+    markReviewed: false,
+  });
+  assert.equal(afterRestart.summary.files, 2);
+  assert.match(afterRestart.patch, /world/);
+
   const stillUnreviewed = await manager.reviewChanges({
     workspaceId: "ws_review",
     root,
@@ -59,6 +68,25 @@ try {
     manager.reviewChanges({ workspaceId: "ws_review", root }),
   ]);
   assert.deepEqual(serialized.map((review) => review.summary.files), [1, 0]);
+
+  await manager.initializeWorkspace({ workspaceId: "ws_missing_ref", root });
+  await git(root, ["update-ref", "-d", "refs/devspace/review/ws_missing_ref/baseline"]);
+  const missingRefManager = createReviewCheckpointManager();
+  await assert.rejects(
+    missingRefManager.reviewChanges({ workspaceId: "ws_missing_ref", root }),
+    /Internal review checkpoint error.*open ref is valid and baseline ref is missing.*Refusing to reset review history/,
+  );
+  await missingRefManager.cleanupWorkspace({ workspaceId: "ws_missing_ref" });
+
+  await manager.initializeWorkspace({ workspaceId: "ws_corrupt_ref", root });
+  const tree = (await execFileAsync("git", ["rev-parse", "HEAD^{tree}"], { cwd: root })).stdout.trim();
+  await git(root, ["update-ref", "refs/devspace/review/ws_corrupt_ref/baseline", tree]);
+  const corruptRefManager = createReviewCheckpointManager();
+  await assert.rejects(
+    corruptRefManager.reviewChanges({ workspaceId: "ws_corrupt_ref", root }),
+    /Internal review checkpoint error.*open ref is valid and baseline ref is invalid.*Refusing to reset review history/,
+  );
+  await corruptRefManager.cleanupWorkspace({ workspaceId: "ws_corrupt_ref" });
 
   await manager.initializeWorkspace({ workspaceId: "ws_stale", root });
   const removed = await manager.cleanupStaleRefs({

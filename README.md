@@ -253,26 +253,34 @@ OpenAI 目前把自定义 MCP 集成称为 **developer-mode app（开发者模�
 
 ## 怎么使用
 
-在提示词里明确要求使用 DevSpace，并给出准确的本地路径：
+第一次连接项目时，在提示词里明确要求使用 DevSpace，并给出准确的本地路径和一个
+容易记忆的别名：
 
 ```text
-使用 DevSpace 打开 /Users/alice/code/my-app。
+使用 DevSpace 把 /Users/alice/code/my-app 打开为别名 my-app。
 先阅读项目指令，找出失败的测试并修复，运行最小范围的验证，
 最后总结修改了哪些文件。
 ```
 
 正常的调用流程是：
 
-1. ChatGPT 用本地项目路径调用 `open_workspace`。
-2. DevSpace 返回 `workspaceId` 和当前目录适用的项目指令。
+1. ChatGPT 用本地项目路径和别名调用 `open_workspace`。默认只返回 metadata，
+   不把项目指令或 Skill 目录立即塞入上下文。
+2. 模型调用 `get_workspace_context(alias, full)`，取得 `workspaceId`、项目指令和
+   Skill 目录。只有显式的 `contextMode: "retained"` 才会使用 revision 跳过正文。
 3. 后续读取、搜索、编辑和命令调用都复用这个 `workspaceId`。
 4. ChatGPT 的每次工具调用都可以使用新的无状态 HTTP 传输；真正需要复用的是
    `workspaceId`，因此传输重连或旧 MCP session header 不会中断 workspace。
-   同一个已授权客户端也可以在之后的对话中重新打开并复用同一路径。
+   新对话不需要再次发送绝对路径：先调用 `list_workspaces`，再通过
+   `resume_workspace(alias, full)` 恢复。
    如果你删除、刷新或重新授权了 ChatGPT 应用，新的 OAuth 客户端不能复用旧
-   `workspaceId`；模型应丢弃被拒绝的 ID，并立即再次调用 `open_workspace`。
+   `workspaceId` 或别名；模型应丢弃被拒绝的 ID，并重新打开项目。
 5. 只有你明确要求释放 workspace 时，模型才应调用 `close_workspace`。长时间
    未使用的 workspace 也可能在达到配置的空闲期限后自动过期。
+
+新建 checkout 默认只读。需要直接修改当前 checkout 时，明确使用
+`writeAccess: "read_write"`；更推荐使用 `mode: "worktree"` 获得隔离的可写工作区。
+旧版本已经持久化的 checkout 会保留原来的可写权限，避免升级时突然中断任务。
 
 不要让 ChatGPT 使用云端 Python 或 Code Interpreter 去检查本地路径。它们仍可
 用于与本地项目无关的计算和数据处理；本地项目操作应通过 DevSpace 完成。
@@ -286,19 +294,23 @@ worktree，否则不建议两个账号同时写入同一个项目。
 
 ### `AGENTS.md` 和 Skill
 
-打开 workspace 时，DevSpace 会返回根目录适用的 `AGENTS.md`、`CLAUDE.md`
-等指令。需要用户级指令时，可在管理面板或
+首次 `open_workspace` 默认只返回 metadata；随后调用
+`get_workspace_context(alias, full)`，DevSpace 才会返回根目录适用的
+结构化的 `workspaceInstructions[]`，其中包含来源、作用域、相对路径、修订号、
+信任级别和正文，不再把 Markdown 标题与服务端提示拼在一起。需要用户级指令时，可在管理面板或
 `DEVSPACE_USER_INSTRUCTIONS_PATH` 中显式指定一个文件；默认不会读取
-`~/.codex/AGENTS.md`，`DEVSPACE_AGENT_DIR` 只用于兼容 Skill。嵌套目录中的指令
-只在 ChatGPT 第一次进入该目录时加载，避免首次打开大型仓库就递归扫描所有文件夹。
+`~/.codex/AGENTS.md`，`DEVSPACE_AGENT_DIR` 只用于兼容 Skill。读取嵌套目录时只返回
+`scopedInstructionsAvailable=true`；准备修改或执行前，模型调用
+`load_workspace_instructions` 获取该作用域的结构化指令和一次性确认 Token。
 纯空白指令文件会跳过，用户、根目录和嵌套
 指令链合计最多 32 KiB；后台进程后续通过 `write_stdin` 进入新目录时也会先经过
-同一套指令确认。`open_workspace` 返回基于初始指令路径和内容生成的
+同一套指令确认。完整上下文返回基于初始指令路径和内容生成的
 `sha256-v1:` `instructionRevision`，便于客户端识别未变化的指令链，避免重复污染上下文。
 Skill 目录使用独立的 `skillRevision`；只有模型仍保留旧目录时才传
-`knownSkillRevision`，目录未变化便不会重复返回。
+`knownSkillRevision`，目录未变化便不会重复返回。revision 只在显式
+`contextMode: "retained"` 时生效；新对话和上下文压缩后应使用 `full`。
 
-DevSpace 也会告诉 ChatGPT 当前可用的本地 Skill。ChatGPT 网页端没有 Codex 的
+DevSpace 也会告诉 ChatGPT 当前可用的本地 Skill；`list_skills` 支持搜索和分页。ChatGPT 网页端没有 Codex 的
 `$skill`/`/skills` 界面，因此模型通过 `load_skill` 完整加载对应 `SKILL.md`；
 加载成功后才允许读取支持文件并执行工作流。同名 Skill 不会被覆盖，模型使用
 `skillId`、隐私安全的逻辑路径和作用域区分。加载后可通过
@@ -310,23 +322,44 @@ DevSpace 也会告诉 ChatGPT 当前可用的本地 Skill。ChatGPT 网页端没
 
 DevSpace 只提供一套稳定的 Codex 风格工具：`read`、`batch_read`、
 `batch_inspect`、`apply_patch`、`exec_command`、`write_stdin` 和
-`read_process_output`，再加 workspace 与可选 Skill 工具。不再按模式切换
+`read_process_output`，再加 `list_workspaces`、`resume_workspace`、
+`get_workspace_context`、`load_workspace_instructions`、`get_operation_status`、
+`revoke_workspace` 和可选 Skill 工具。不再按模式切换
 `bash`、`exec_command` 或文件工具名称，避免 ChatGPT 对旧工具表产生缓存混淆。
 
-需要发送多行 Python、SQL 或 SSH 脚本时，模型可使用 `exec_command`
+`exec_command` 优先使用 `program` + `args` 直接启动程序，参数不会经过 Shell
+重新解析。只有需要管道、重定向等 Shell 语法时才使用 `shell: true` + `command`；
+旧 `cmd` 仍兼容。需要发送多行 Python、SQL 或 SSH 脚本时，模型可使用
 的结构化 `stdin` 字段，避免多层引号在远端解析失败。提供 `stdin` 后默认自动
 关闭输入流；需要继续交互时可设 `closeStdin: false`，之后通过 `write_stdin`
 追加内容或关闭输入流。PTY 不模拟 Ctrl-D 作为 EOF。
 
+`apply_patch`、`exec_command` 和会写入进程的 `write_stdin` 支持可选
+`operationId`。每次新操作使用新 ID；网络响应丢失时用同一 ID 重试，服务端会重放
+已保存结果而不会再次执行。所有失败均返回结构化 `error.code`、`retryable`、
+`safeToRetry` 和 `recovery`。命令非零退出不是“命令未执行”：结果会返回
+`ok: false`、`status: "exited"`、`commandExecuted: true` 和 `exitCode`。
+`get_operation_status(operationId)` 可查询保留状态而不会重新执行或重复返回大结果。
+
+所有 Workspace 工具都要求 `workspaceId` 与 `workspaceGeneration`。服务重启、OAuth
+重新授权、授权根变更和关闭/重新打开会使旧代次失效。`read` 返回 `contentHash` 和精确字符串形式的
+`mtimeNs`；`apply_patch.ifMatch` 可在写入前检查一个或多个路径，防止不同对话静默覆盖。
+
+同一 OAuth 连接重复打开相同提交的 managed worktree 时会默认复用；只有明确需要另一份
+隔离环境时才设置 `forceNew: true`。`list_workspaces` 会返回持久化的 `dirtySource`，
+空项目、顶层条目以及 Git 分支/脏状态则通过紧凑的 `project` 字段返回。过期清理只删除
+干净 worktree，绝不自动删除带修改的 worktree。
+
 如果已经明确知道多个相互独立的文件或搜索目标，`batch_read` 和
-`batch_inspect` 可以减少 MCP 往返。如果下一个目标依赖上一次搜索结果，模型
+`batch_inspect` 可以减少 MCP 往返。输入可携带短 `ref`，输出会回显 `ref` 并明确给出
+`completed`、`partial` 或 `failed` 以及成功/失败数量。如果下一个目标依赖上一次搜索结果，模型
 仍应按顺序检查，而不是强行批量处理。
 
 DevSpace 对较大的工具结果只保留一份模型可见正文，避免同一文件或命令输出在
 `content` 和 `structuredContent` 中重复占用上下文。单项读取和 Skill 加载只在
 `content` 返回正文；进程结构化结果只在需要时返回 `sessionId`、`outputId` 或异常
-状态；批量工具按请求顺序在 `structuredContent.items[]` 保留 `ok/result`，不再
-回显路径、操作或拼接后的聚合 `result`。`_meta` 只承载可选的
+状态；批量工具在 `structuredContent.items[]` 保留 `ref/ok/result`，不回显本机路径或
+拼接后的聚合 `result`。`_meta` 只承载可选的
 ChatGPT 组件信息，普通 MCP 客户端可以忽略。依赖旧重复字段的客户端需要按上述
 归属读取结果；详细契约见[ChatGPT 编码工作流](./docs/chatgpt-coding-workflow.md)。
 单个 `SKILL.md` 的加载上限为 64 KiB。
@@ -343,8 +376,9 @@ DevSpace 服务  +  HTTPS Tunnel
 固定 Tunnel 域名。ChatGPT 对话结束不会自动关闭本地 workspace；workspace
 状态保存在 SQLite 中，不依赖某一条 HTTP 连接。
 
-服务重启后，ChatGPT 可能创建新的 MCP 传输会话，但已持久化的 checkout
-workspace 仍然可以复用。
+服务重启后，ChatGPT 可能创建新的 MCP 传输会话。已持久化的 checkout
+workspace 不会丢失，但旧 ID 在直接执行前会要求恢复；模型应先
+`list_workspaces`，再用别名调用 `resume_workspace(alias, full)`。
 
 <details>
 <summary><strong>小火箭或其他 TUN 代理</strong></summary>
@@ -408,7 +442,7 @@ DEVSPACE_LAUNCHD_SERVICE_LABEL=com.waishnav.devspace node dist/cli.js admin
 | 完整生命周期 | workspace 操作租约、独占关闭、请求排空、进程终止和统一清理，避免资源仍在使用时被提前关闭。 |
 | 真正的资源限制 | 全局和单客户端配额覆盖 MCP 会话、workspace、进程、worktree、输出和命令时间。超时命令先接收 `SIGTERM`，宽限期后仍未退出则使用 `SIGKILL`。 |
 | 客户端身份隔离 | MCP 会话、workspace、进程和持久化状态都校验 OAuth 所有权，一个客户端不能复用另一个客户端的 ID。 |
-| 项目指令 | 用户级说明显式启用且带修订号；根目录指令立即加载；空文件跳过；全链限制为 32 KiB；嵌套 `AGENTS.md`/`CLAUDE.md` 按路径懒加载，写入、命令及交互式 `write_stdin` 跨目录前都要确认新指令。 |
+| 项目指令 | 指令以带来源、作用域和修订号的结构化记录返回；只读工具只提示可用性，修改前通过 `load_workspace_instructions` 显式加载并确认；空文件跳过，全链限制为 32 KiB。 |
 | 本地 Skill | 在已批准根目录内从项目祖先发现 Skill，并支持用户、Admin 和 DevSpace bundled 来源；保留同名项并显示来源；8,000 UTF-8 字节目录预算避免挤占上下文；`load_skill` 为 ChatGPT 网页端提供可审计的显式加载。 |
 | 更安全的命令流程 | 阻止高风险命令模式，限制内联输出大小，并支持轮询或中断后台/PTY 进程；持久存储可用时，完整输出以受限 `outputId` 保存，可用 `read_process_output` 分页恢复。 |
 | 管理面板 | localhost React 面板可管理目录和配额，通过 revision/ETag 防止覆盖并发配置，验证重启结果并提供脱敏诊断。 |

@@ -39,11 +39,13 @@ try {
 }
 
 async function testAuditFailuresAreBestEffort(stateDir: string): Promise<void> {
+  const authorizationEpochs: string[] = [];
   const provider = new SingleUserOAuthProvider(
     oauthConfig,
     mcpUrl,
     stateDir,
     () => { throw new Error("audit sink unavailable"); },
+    (clientId) => authorizationEpochs.push(clientId),
   );
   try {
     const client = await provider.clientsStore.registerClient?.({
@@ -60,6 +62,7 @@ async function testAuditFailuresAreBestEffort(stateDir: string): Promise<void> {
       resource: mcpUrl,
     }, approval.response);
     assert.equal((approval.response as unknown as { statusCode: number }).statusCode, 302);
+    assert.deepEqual(authorizationEpochs, [client.client_id]);
 
     const code = "audit-code";
     provider["codes"].set(code, {
@@ -153,6 +156,9 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
       { version: 4, name: "workspace-oauth-ownership" },
       { version: 5, name: "workspace-checkout-reuse" },
       { version: 6, name: "oauth-owner-credential" },
+      { version: 7, name: "workspace-resume-idempotency" },
+      { version: 8, name: "workspace-generation-operation-identity" },
+      { version: 9, name: "workspace-worktree-source-state" },
     ]);
   } finally {
     database.close();

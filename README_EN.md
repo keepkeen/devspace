@@ -259,28 +259,38 @@ refresh ChatGPT's cached tool definitions.
 
 ## How to use it
 
-Ask ChatGPT to use DevSpace and provide the exact local path:
+For the first connection to a project, provide its exact path and a memorable alias:
 
 ```text
-Use DevSpace to open /Users/alice/code/my-app.
+Use DevSpace to open /Users/alice/code/my-app as alias my-app.
 Read the project instructions, find the failing tests, fix the problem,
 run the smallest relevant verification, and summarize the changed files.
 ```
 
 The expected workflow is:
 
-1. ChatGPT calls `open_workspace` with the local project path.
-2. DevSpace returns a `workspaceId` and the applicable project instructions.
+1. ChatGPT calls `open_workspace` with the path and alias. The default response
+   is metadata-only, so instructions and Skills are not injected yet.
+2. It calls `get_workspace_context(alias, full)` for the `workspaceId`, project
+   instructions, and Skill catalog. Only explicit `contextMode: "retained"`
+   permits revision-based body suppression.
 3. ChatGPT reuses that `workspaceId` for reads, searches, edits, and commands.
 4. Each ChatGPT tool call may use a fresh stateless HTTP transport. Continuity
    comes from `workspaceId`, so reconnects and stale MCP session headers do not
    interrupt the workspace. The same authorized client can reopen and reuse the
-   same path in later conversations.
+   same workspace in later conversations. A new conversation calls
+   `list_workspaces`, then `resume_workspace(alias, full)`, without resending an
+   absolute host path.
    If the ChatGPT app is deleted, refreshed, or re-authorized as a new OAuth
    client, discard any rejected old `workspaceId` and call `open_workspace`
    again immediately.
 5. `close_workspace` is used only when you explicitly ask to release it.
    Unused workspaces may also expire after the configured idle period.
+
+New checkout workspaces default to read-only. Use explicit
+`writeAccess: "read_write"` when the current checkout must be modified, or
+prefer `mode: "worktree"` for an isolated writable workspace. Existing
+persisted checkouts retain write access across the upgrade.
 
 Do not tell ChatGPT to use hosted Python or Code Interpreter to inspect a local
 path. Those tools are still fine for unrelated calculations or generated data;
@@ -296,22 +306,27 @@ use separate Git worktrees.
 
 ### `AGENTS.md` and Skills
 
-When a workspace opens, DevSpace returns root-level instructions such as
-`AGENTS.md` or `CLAUDE.md`. One user-level file may be explicitly selected in
-the Admin panel or with `DEVSPACE_USER_INSTRUCTIONS_PATH`. DevSpace does not
+The initial `open_workspace` call returns metadata by default. After
+`get_workspace_context(alias, full)`, DevSpace returns structured
+`workspaceInstructions[]` records with source, scope, relative path, revision,
+trust, and content. One user-level file may be explicitly
+selected in the Admin panel or with `DEVSPACE_USER_INSTRUCTIONS_PATH`. DevSpace does not
 implicitly read `~/.codex/AGENTS.md`; `DEVSPACE_AGENT_DIR` is only a Skill
-compatibility root. Nested instructions are loaded only when ChatGPT
-enters that directory, which avoids scanning an entire large repository up
-front. Whitespace-only files are skipped, the combined user/root/nested
+compatibility root. Reads only advertise `scopedInstructionsAvailable=true`.
+Before a mutation or command, ChatGPT calls `load_workspace_instructions` for
+the intended paths and receives structured instructions plus a one-time token.
+Whitespace-only files are skipped, the combined user/root/nested
 instruction chain is limited to 32 KiB, and interactive `write_stdin` input is
 gated when a running process may enter a newly instructed directory. Each
-`open_workspace` result includes a `sha256-v1:` `instructionRevision` over the
+full-context result includes a `sha256-v1:` `instructionRevision` over the
 ordered initial path/content pairs so clients can recognize an unchanged chain.
 The Skill catalog has an independent `skillRevision`; pass
-`knownSkillRevision` only while the prior catalog is still retained, and an
-unchanged catalog will not be sent again.
+`knownSkillRevision` only with explicit `contextMode: "retained"` while the
+prior catalog is still retained. Use `full` after a new conversation or context
+compaction.
 
-DevSpace also advertises matching local Skills. ChatGPT web has no Codex
+DevSpace also advertises matching local Skills; `list_skills` adds bounded
+search and pagination. ChatGPT web has no Codex
 `$skill` or `/skills` picker, so the model calls `load_skill` to load one
 complete `SKILL.md`. Supporting files remain unavailable until that succeeds.
 It can then read references, scripts, and other support files through paths
@@ -325,26 +340,54 @@ See the detailed
 
 DevSpace exposes one stable Codex-style surface: `read`, `batch_read`,
 `batch_inspect`, `apply_patch`, `exec_command`, `write_stdin`, and
-`read_process_output`, plus workspace and optional Skill tools. It no longer
+`read_process_output`, plus `list_workspaces`, `resume_workspace`,
+`get_workspace_context`, `load_workspace_instructions`, `get_operation_status`,
+`revoke_workspace`, and optional Skill tools. It no longer
 switches between `bash`, `exec_command`, or dedicated file-tool names, avoiding
 stale ChatGPT tool-schema confusion.
 
-For multiline Python, SQL, or SSH scripts, the model can use the structured
+`exec_command` prefers direct `program` plus `args`, preserving argument
+boundaries without shell parsing. Use `shell: true` plus `command` only for
+shell syntax; legacy `cmd` remains compatible. For multiline Python, SQL, or SSH scripts, the model can use the structured
 `stdin` field on `exec_command` instead of fragile nested quoting. Stdin
 closes by default after an initial payload; set `closeStdin: false` to continue
 through `write_stdin`, which can append data or close the stream. PTY sessions
 do not emulate EOF with Ctrl-D.
 
+`apply_patch`, `exec_command`, and mutating `write_stdin` calls accept an
+optional `operationId`. Use a fresh ID for a new operation and reuse it only
+after a lost network response; DevSpace replays the stored result instead of
+executing twice. Failures expose structured `error.code`, `retryable`,
+`safeToRetry`, and `recovery`. A non-zero command exit returns `ok: false`,
+`status: "exited"`, `commandExecuted: true`, and `exitCode`; it is distinct
+from a command that never started.
+`get_operation_status(operationId)` checks retained state without executing or
+repeating the stored result body.
+
+Every Workspace-scoped tool requires both `workspaceId` and
+`workspaceGeneration`. Restarts, OAuth reauthorization, allowed-root changes, and close/reopen cycles
+stale old handles. `read` returns `contentHash` and exact string `mtimeNs`;
+`apply_patch.ifMatch` checks one or more paths before the first write.
+
+Equivalent managed-worktree opens reuse the same active worktree for one OAuth
+connection and base commit; set `forceNew: true` only for an explicitly separate
+isolation. `list_workspaces` returns persisted `dirtySource`, while compact
+`project` context reports an empty project, bounded top-level names, and
+best-effort Git branch/dirty state. Expiry removes only clean worktrees and
+never automatically deletes a dirty one.
+
 When several independent files or searches are already known, `batch_read` and
-`batch_inspect` reduce MCP round trips. DevSpace does not force batching when
+`batch_inspect` reduce MCP round trips. Optional short input refs are echoed,
+and results explicitly report `completed`, `partial`, or `failed` with counts.
+DevSpace does not force batching when
 the next file depends on the result of the previous search.
 
 DevSpace keeps each large model-visible payload in one place so the same file
 or command output does not consume context in both `content` and
 `structuredContent`. Reads and Skill loads put body text only in `content`;
 process structures emit only actionable handles or exceptional state. Batch
-tools keep ordered `ok/result` entries in `structuredContent.items[]` without
-echoing paths or operations, and there is no aggregate `result`. `_meta` is
+tools keep `ref/ok/result` entries in `structuredContent.items[]` without
+echoing host paths, and there is no aggregate `result`. `_meta` is
 optional ChatGPT component data and can be
 ignored by ordinary MCP clients. Clients that consumed the old duplicate
 fields must follow these result locations; see the
@@ -365,7 +408,8 @@ end without closing the local workspace; DevSpace's workspace state is stored
 in SQLite and is not tied to one HTTP connection.
 
 If the server restarts, ChatGPT may open a fresh MCP transport. Existing
-checkout workspaces remain reusable from persisted state.
+checkout workspaces remain available, but an old ID requires hydration before
+direct use: call `list_workspaces`, then `resume_workspace(alias, full)`.
 
 <details>
 <summary><strong>Shadowrocket or another TUN proxy</strong></summary>
@@ -433,7 +477,7 @@ The comparison is against upstream commit
 | Safer lifecycle | Workspace operation leases, exclusive close, request draining, process termination, and cleanup rules prevent resources from being closed while still in use. |
 | Real resource limits | Global and per-client limits cover MCP sessions, workspaces, processes, worktrees, output, and command runtime. Hung commands receive `SIGTERM` and then `SIGKILL` after a grace period. |
 | Client isolation | OAuth ownership is enforced for MCP sessions, workspaces, processes, and stored state. One client cannot reuse another client's IDs. |
-| Project instructions | User instructions are explicit and revisioned, root instructions load immediately, empty files are skipped, the chain is capped at 32 KiB, and nested instructions gate mutations, commands, and interactive process input. |
+| Project instructions | Instructions are structured with source, scope, and revision; reads advertise availability only, mutations explicitly load and acknowledge them, empty files are skipped, and the chain is capped at 32 KiB. |
 | Local Skills | Skills come from repository ancestors within an approved root plus user, Admin, and DevSpace bundled scopes; duplicate names remain visible, the catalog is capped at 8,000 UTF-8 bytes, and ChatGPT web loads a selected Skill through `load_skill`. |
 | Safer shell workflow | High-risk command patterns are blocked and inline output stays bounded; background/PTY sessions can be polled or interrupted, while available durable output is replayable by opaque `outputId` through `read_process_output`. |
 | Admin panel | A localhost-only React panel manages roots and limits, detects concurrent config edits with revision/ETag checks, verifies restarts, and exposes sanitized diagnostics. |

@@ -107,7 +107,8 @@ MCP clients discover metadata from:
 ```
 
 Workspace and MCP resources are owned by the OAuth `clientId`. Reauthorizing the
-same registered client preserves access; a separately registered client cannot
+same registered client preserves access but advances its active Workspace
+generations, so conversations must resume them; a separately registered client cannot
 reuse another client's MCP session, workspace, or process identifiers.
 Changing the Owner password and restarting DevSpace revokes all access and refresh
 tokens, but preserves public OAuth client registrations so ChatGPT and other MCP
@@ -133,7 +134,7 @@ reset is required.
 | `DEVSPACE_MAX_COMMAND_RUNTIME_SECONDS` | `3600` | Hard upper runtime for every command. |
 | `DEVSPACE_PROCESS_SHUTDOWN_GRACE_SECONDS` | `5` | SIGTERM grace period before SIGKILL. |
 | `DEVSPACE_HTTP_DRAIN_TIMEOUT_SECONDS` | `30` | Drain deadline before remaining HTTP sockets are closed. |
-| `DEVSPACE_WORKSPACE_IDLE_TTL_SECONDS` | `604800` | Close inactive non-worktree workspace sessions during lifecycle cleanup. |
+| `DEVSPACE_WORKSPACE_IDLE_TTL_SECONDS` | `604800` | Close inactive checkout sessions and clean managed worktrees. Dirty managed worktrees are retained. |
 | `DEVSPACE_MAX_RESIDENT_WORKSPACES` | `256` | Maximum workspaces retained in memory. |
 | `DEVSPACE_MAX_ACTIVE_WORKSPACES_PER_CLIENT` | `32` | Maximum active persisted workspaces owned by one OAuth client. |
 | `DEVSPACE_MAX_MANAGED_WORKTREES` | `64` | Maximum managed worktrees retained on disk. |
@@ -143,6 +144,12 @@ Call it only after the user explicitly asks to close or release that workspace.
 It terminates running processes and closes the logical session. A clean managed
 worktree is removed; a dirty managed worktree is retained and the workspace
 stays open so its changes remain manageable.
+
+Equivalent managed worktree opens are reused by default for the same OAuth
+client, source repository, and base commit. `forceNew: true` explicitly creates
+a separate worktree and remains subject to the configured quotas. Missing
+managed directories are reconciled out of active session listings and quota
+counts.
 
 ## Project Instructions
 
@@ -162,12 +169,19 @@ instruction chain has a combined 32 KiB UTF-8 budget and is never silently
 truncated. Blank candidates are scanned with a 1 MiB hard limit so a huge file
 cannot consume unbounded memory while being classified as empty.
 
-`open_workspace` computes a stable `sha256-v1:` `instructionRevision` from the
-ordered initial instruction paths and contents. A client can use it to detect
-an unchanged initial chain and avoid retaining duplicate instruction bodies.
-It independently computes `skillRevision` over the full discovered Skill set;
-clients may pass `knownSkillRevision` only while retaining the corresponding
-catalog so unchanged Skill entries can be omitted safely.
+Full workspace context computes a stable `sha256-v1:` `instructionRevision`
+from the ordered initial instruction paths and contents. It independently
+computes `skillRevision` over the full discovered Skill set. Revision hints are
+honored only when the caller explicitly selects `contextMode: "retained"` and
+still retains the corresponding bodies. `contextMode: "full"` ignores hints;
+the default metadata response from `open_workspace` contains neither an
+operational `workspaceId` nor instruction or Skill bodies.
+
+Full context represents instructions as structured `workspaceInstructions[]`
+records. Read/search tools only advertise `scopedInstructionsAvailable=true`;
+they never append instruction Markdown to file or search output. Call
+`load_workspace_instructions` with intended mutation paths to receive the
+applicable records and one-time token.
 
 Configure fallbacks in `~/.devspace/config.json`:
 
@@ -202,20 +216,29 @@ returning a process session.
 | `DEVSPACE_INSTRUCTION_SCAN_DEADLINE_MS` | `5000` |
 
 These variables remain accepted for configuration compatibility but are no
-longer used for a recursive workspace scan. `open_workspace` now returns
-`instructionScan.lazy=true`, loads only explicit user/root instructions, and discovers
-cached nested instructions when later tools enter their directory scope.
+longer used for a recursive workspace scan. Full context loading returns
+`instructionScan.lazy=true`, loads only explicit user/root instructions, and
+discovers cached nested instructions when later tools enter their directory
+scope.
 
 ## Fixed Tool Surface
 
-DevSpace exposes one Codex-style surface: `open_workspace`, `close_workspace`,
-`read`, `batch_read`, `batch_inspect`, optional `load_skill`, `apply_patch`,
-`exec_command`, `write_stdin`, and `read_process_output`. The legacy
+DevSpace exposes one Codex-style surface: `open_workspace`, `list_workspaces`,
+`resume_workspace`, `get_workspace_context`, `load_workspace_instructions`,
+`get_operation_status`, `close_workspace`, `revoke_workspace`, `read`,
+`batch_read`, `batch_inspect`, optional `list_skills`/`load_skill`,
+`apply_patch`, `exec_command`, `write_stdin`, and `read_process_output`. The legacy
 `toolMode`, `DEVSPACE_TOOL_MODE`, and `DEVSPACE_MINIMAL_TOOLS` settings are
 ignored so an old configuration file can still start without changing the
 model-facing protocol.
 
-Commands run without a PTY by default. Set `tty: true` on
+Every Workspace-scoped call requires the current `workspaceId` and
+`workspaceGeneration`. Stale generations fail before the tool starts. A successful
+OAuth authorization advances all active generations owned by that client.
+
+Commands run without a PTY by default. Prefer `program` plus `args` for direct
+execution; argument boundaries reach `spawn`/PTY unchanged. Use `shell: true`
+plus `command` only for shell syntax. Legacy `cmd` remains accepted. Set `tty: true` on
 `exec_command` for interactive terminal programs. PTY support uses the optional
 `node-pty` dependency; `write_stdin` can send input, poll output, and resize PTY
 sessions.
@@ -225,6 +248,8 @@ and similar payloads. Supplying `stdin` closes the pipe by default so
 programs waiting for EOF can finish; set `closeStdin: false` when additional
 `write_stdin` calls will follow. `write_stdin` can later set `closeStdin: true`.
 PTY input must remain open because DevSpace does not emulate EOF with Ctrl-D.
+`network: "deny"` is rejected on this runtime because DevSpace does not claim
+network isolation without an operating-system sandbox.
 
 ### Command policy
 
@@ -244,6 +269,27 @@ OAuth and the roots allowlist constrain MCP identity and dedicated file tools,
 but permitted shell commands run with the DevSpace OS user's permissions. If
 hard shell filesystem confinement is required, run DevSpace under a dedicated
 OS account or container with only the approved roots mounted.
+
+New checkout workspaces default to `writeAccess: "read_only"`. File reads and
+inspection remain available, but shell execution and mutation tools are
+blocked because command parsing is not a read-only OS sandbox. Use a managed
+worktree for the recommended writable flow, or explicitly request
+`writeAccess: "read_write"` when modifying the user's current checkout is
+intended. Existing persisted checkout sessions retain their previous writable
+authority during migration.
+
+`apply_patch`, `exec_command`, and mutating `write_stdin` accept an optional
+`operationId` of at most 128 characters. It is unique within the OAuth client;
+its record stores the Workspace, generation, and tool. Retrying an identical request with the same ID replays its
+stored result; changing the request conflicts, and an uncertain post-crash
+outcome is never executed automatically. Structured errors expose `code`,
+`retryable`, `safeToRetry`, `recovery`, and execution phase. Nonzero command
+exits instead report `commandExecuted: true`, `status: "exited"`, and the exit
+code.
+`get_operation_status` returns state and result availability without returning
+the stored body. Reads expose `contentHash` and decimal-string `mtimeNs`;
+`apply_patch.ifMatch` validates all supplied path versions before its first
+write.
 
 ## Widgets
 
@@ -290,7 +336,8 @@ from:
 - `~/.devspace/agents/*.md`
 - project `.devspace/agents/*.md`
 
-`open_workspace` returns a compact catalog containing profile names,
+Full context from `get_workspace_context` or `resume_workspace` returns a
+compact catalog containing profile names,
 descriptions, providers, and optional models/thinking levels so the host model can choose an
 agent without reading provider-specific launch details. `devspace agents ls`
 lists existing subagent sessions for the current workspace, scoped by the
@@ -307,7 +354,7 @@ Each manifest requires non-empty string `name` and `description` frontmatter.
 Duplicate names are retained and distinguished by stable ID, path, source, and
 scope. Optional `agents/openai.yaml` is supported; set
 `policy.allow_implicit_invocation: false` to require an explicit user request.
-The `open_workspace` Skill catalog is limited to 8,000 serialized UTF-8 bytes.
+The full-context Skill catalog is limited to 8,000 serialized UTF-8 bytes.
 ChatGPT web loads a selected manifest of at most 64 KiB with `load_skill`; only
 a complete, successful load opens access to that Skill's support files.
 

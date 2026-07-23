@@ -1,8 +1,19 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, readFile, stat, symlink, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { chmod, mkdtemp, readFile, readdir, rename, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { applyPatch, isSamePatchFile, parsePatch, replaceFile } from "./apply-patch.js";
+import {
+  applyPatch,
+  applyPreparedPatch,
+  FileVersionConflictError,
+  InvalidPatchError,
+  isSamePatchFile,
+  parsePatch,
+  preparePatch,
+  replaceFile,
+} from "./apply-patch.js";
+import { readFileVersion } from "./file-version.js";
 
 const root = await mkdtemp(join(tmpdir(), "devspace-apply-patch-"));
 const replacement = join(root, "replacement.txt");
@@ -117,7 +128,15 @@ await assert.rejects(
 +replacement
 *** End Patch`,
   ),
-  /could not find hunk context/,
+  (error: unknown) => {
+    assert(error instanceof InvalidPatchError);
+    assert.equal(error.code, "invalid_patch");
+    assert.equal(error.path, "moved/alpha.txt");
+    assert.match(error.publicText, /could not find hunk context/);
+    assert.equal(error.publicText.includes(root), false);
+    assert.equal(error.publicText.includes("not present"), false);
+    return true;
+  },
 );
 assert.equal(await readFile(join(root, "moved/alpha.txt"), "utf8"), "ONE\nchanged\nthree\n");
 
@@ -182,11 +201,97 @@ const trailingSpaceResult = await applyPatch(
 assert.equal(trailingSpaceResult.patch.endsWith("+new   "), true);
 assert.equal(await readFile(join(trailingSpaceRoot, "spaces.txt"), "utf8"), "new   \n");
 
-assert.throws(() => parsePatch("*** Begin Patch\n*** End Patch"), /contains no file actions/);
+let syntaxError: InvalidPatchError | undefined;
+assert.throws(
+  () => parsePatch("*** Begin Patch\n*** End Patch"),
+  (error: unknown) => {
+    assert(error instanceof InvalidPatchError);
+    syntaxError = error;
+    return true;
+  },
+);
+assert(syntaxError);
+assert.equal(syntaxError.code, "invalid_patch");
+assert.equal(syntaxError.publicText, "contains no file actions");
+assert.equal(syntaxError.path, undefined);
+assert.throws(
+  () => parsePatch(`*** Begin Patch
+*** Add File: ${join(root, "private.txt")}
+*** End Patch`),
+  (error: unknown) =>
+    error instanceof InvalidPatchError &&
+    error.path === undefined &&
+    /has no content/.test(error.publicText) &&
+    !error.publicText.includes(root),
+);
 assert.throws(() => parsePatch("*** Add File: bad.txt\n+x"), /missing .* marker/);
 assert.throws(
   () => parsePatch("*** Begin Patch\n*** Add File: empty.txt\n*** End Patch"),
   /has no content/,
+);
+
+const preparedRoot = await mkdtemp(join(tmpdir(), "devspace-prepared-patch-"));
+await writeFile(join(preparedRoot, "before.txt"), "before\n");
+const prepared = preparePatch(`*** Begin Patch
+*** Update File: before.txt
+*** Move to: after.txt
+@@
+-before
++after
+*** Add File: extra.txt
++extra
+*** End Patch`);
+assert.deepEqual(prepared.paths, ["before.txt", "after.txt", "extra.txt"]);
+const preparedResult = await applyPreparedPatch(preparedRoot, prepared);
+assert.deepEqual(preparedResult.files, [
+  { path: "after.txt", previousPath: "before.txt", operation: "move" },
+  { path: "extra.txt", operation: "add" },
+]);
+assert.equal(await readFile(join(preparedRoot, "after.txt"), "utf8"), "after\n");
+assert.equal(await readFile(join(preparedRoot, "extra.txt"), "utf8"), "extra\n");
+
+const rollbackRoot = await mkdtemp(join(tmpdir(), "devspace-patch-rollback-"));
+await writeFile(join(rollbackRoot, "first.txt"), "first original\n");
+await writeFile(join(rollbackRoot, "delete.txt"), "delete original\n");
+await writeFile(join(rollbackRoot, "last.txt"), "last original\n");
+const injectedCommitFailure = new Error("injected patch commit failure");
+let commitRenameCount = 0;
+await assert.rejects(
+  applyPatch(
+    rollbackRoot,
+    `*** Begin Patch
+*** Update File: first.txt
+@@
+-first original
++first updated
+*** Delete File: delete.txt
+*** Add File: created/new.txt
++new output
+*** Update File: last.txt
+@@
+-last original
++last updated
+*** End Patch`,
+    {
+      commitOperations: {
+        rename: async (source, destination) => {
+          commitRenameCount += 1;
+          if (commitRenameCount === 5) throw injectedCommitFailure;
+          await rename(source, destination);
+        },
+      },
+    },
+  ),
+  (error: unknown) => error === injectedCommitFailure,
+);
+assert.equal(await readFile(join(rollbackRoot, "first.txt"), "utf8"), "first original\n");
+assert.equal(await readFile(join(rollbackRoot, "delete.txt"), "utf8"), "delete original\n");
+assert.equal(await readFile(join(rollbackRoot, "last.txt"), "utf8"), "last original\n");
+await assert.rejects(readFile(join(rollbackRoot, "created/new.txt"), "utf8"), /ENOENT/);
+await assert.rejects(stat(join(rollbackRoot, "created")), /ENOENT/);
+assert.deepEqual(
+  (await readdir(rollbackRoot)).filter((path) => path.startsWith(".devspace-patch-")),
+  [],
 );
 
 const overwriteRoot = await mkdtemp(join(tmpdir(), "devspace-apply-patch-overwrite-"));
@@ -290,7 +395,11 @@ await assert.rejects(
 +no
 *** End Patch`,
   ),
-  /path must be relative/,
+  (error: unknown) =>
+    error instanceof InvalidPatchError &&
+    error.path === undefined &&
+    /path must be relative/.test(error.publicText) &&
+    !error.publicText.includes(lenientRoot),
 );
 
 await writeFile(join(lenientRoot, "binary.dat"), Buffer.from([0, 159, 146, 150]));
@@ -306,3 +415,129 @@ await assert.rejects(
   ),
   /not valid UTF-8|binary/,
 );
+
+const versionRoot = await mkdtemp(join(tmpdir(), "devspace-file-version-"));
+const versionPath = join(versionRoot, "raw.dat");
+const rawContents = Buffer.from([0, 159, 146, 150, 255]);
+await writeFile(versionPath, rawContents);
+const rawMetadata = await stat(versionPath, { bigint: true });
+assert.deepEqual(await readFileVersion(versionPath), {
+  hash: `sha256:${createHash("sha256").update(rawContents).digest("hex")}`,
+  mtimeNs: rawMetadata.mtimeNs.toString(10),
+});
+assert.equal(await readFileVersion(join(versionRoot, "missing.txt")), null);
+
+const preconditionRoot = await mkdtemp(join(tmpdir(), "devspace-patch-precondition-"));
+await writeFile(join(preconditionRoot, "first.txt"), "first\n");
+await writeFile(join(preconditionRoot, "second.txt"), "second\n");
+const firstVersion = await readFileVersion(join(preconditionRoot, "first.txt"));
+const secondVersion = await readFileVersion(join(preconditionRoot, "second.txt"));
+assert(firstVersion);
+assert(secondVersion);
+
+await applyPatch(
+  preconditionRoot,
+  `*** Begin Patch
+*** Update File: first.txt
+@@
+-first
++FIRST
+*** End Patch`,
+  { ifMatch: { "first.txt": firstVersion } },
+);
+assert.equal(await readFile(join(preconditionRoot, "first.txt"), "utf8"), "FIRST\n");
+
+await applyPatch(
+  preconditionRoot,
+  `*** Begin Patch
+*** Add File: created.txt
++created
+*** End Patch`,
+  { ifMatch: { "created.txt": null } },
+);
+assert.equal(await readFile(join(preconditionRoot, "created.txt"), "utf8"), "created\n");
+
+const createdVersion = await readFileVersion(join(preconditionRoot, "created.txt"));
+assert(createdVersion);
+await applyPatch(
+  preconditionRoot,
+  `*** Begin Patch
+*** Update File: created.txt
+@@
+-created
++updated
+*** End Patch`,
+  { ifMatch: { "created.txt": createdVersion.hash } },
+);
+assert.equal(await readFile(join(preconditionRoot, "created.txt"), "utf8"), "updated\n");
+
+const incorrectSecondVersion = {
+  ...secondVersion,
+  hash: `sha256:${"0".repeat(64)}`,
+};
+let conflict: FileVersionConflictError | undefined;
+try {
+  await applyPatch(
+    preconditionRoot,
+    `*** Begin Patch
+*** Update File: first.txt
+@@
+-FIRST
++changed first
+*** Update File: second.txt
+@@
+-second
++changed second
+*** End Patch`,
+    {
+      ifMatch: {
+        "first.txt": await readFileVersion(join(preconditionRoot, "first.txt")),
+        "second.txt": incorrectSecondVersion,
+      },
+    },
+  );
+} catch (error) {
+  assert(error instanceof FileVersionConflictError);
+  conflict = error;
+}
+assert(conflict);
+assert.equal(conflict.path, "second.txt");
+assert.deepEqual(conflict.expected, incorrectSecondVersion);
+assert.deepEqual(conflict.actual, secondVersion);
+assert.equal(conflict.message.includes(preconditionRoot), false);
+assert.equal(await readFile(join(preconditionRoot, "first.txt"), "utf8"), "FIRST\n");
+assert.equal(await readFile(join(preconditionRoot, "second.txt"), "utf8"), "second\n");
+
+const missingExpectedVersion = { ...secondVersion };
+await assert.rejects(
+  applyPatch(
+    preconditionRoot,
+    `*** Begin Patch
+*** Add File: absent.txt
++must remain absent
+*** End Patch`,
+    { ifMatch: { "absent.txt": missingExpectedVersion } },
+  ),
+  (error: unknown) =>
+    error instanceof FileVersionConflictError &&
+    error.path === "absent.txt" &&
+    error.actual === null,
+);
+await assert.rejects(readFile(join(preconditionRoot, "absent.txt"), "utf8"), /ENOENT/);
+
+await assert.rejects(
+  applyPatch(
+    preconditionRoot,
+    `*** Begin Patch
+*** Add File: second.txt
++must not overwrite
+*** End Patch`,
+    { ifMatch: { "second.txt": null } },
+  ),
+  (error: unknown) =>
+    error instanceof FileVersionConflictError &&
+    error.path === "second.txt" &&
+    error.expected === null &&
+    error.actual?.hash === secondVersion.hash,
+);
+assert.equal(await readFile(join(preconditionRoot, "second.txt"), "utf8"), "second\n");

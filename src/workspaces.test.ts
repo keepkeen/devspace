@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { mkdtemp, mkdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { platform, tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { promisify } from "node:util";
 import assert from "node:assert/strict";
 import Database from "better-sqlite3";
@@ -10,7 +10,13 @@ import { databasePath } from "./db/client.js";
 import { GitWorktreeError, removeManagedWorktree } from "./git-worktrees.js";
 import { MAX_PROJECT_INSTRUCTION_BYTES } from "./project-instructions.js";
 import { SqliteWorkspaceStore, type WorkspaceStore } from "./workspace-store.js";
-import { ensureCheckoutWorkspaceRoot, UnknownWorkspaceError, WorkspaceRegistry } from "./workspaces.js";
+import {
+  ensureCheckoutWorkspaceRoot,
+  InstructionBudgetError,
+  UnknownWorkspaceError,
+  WorkspaceQuotaError,
+  WorkspaceRegistry,
+} from "./workspaces.js";
 import { formatPathForPrompt } from "./skills.js";
 
 const execFileAsync = promisify(execFile);
@@ -23,6 +29,11 @@ assert.equal(
   new UnknownWorkspaceError("ws_old").message,
   "The workspace is no longer available.",
 );
+assert.equal(
+  new WorkspaceQuotaError("managed_worktree_quota", "Safe quota message").code,
+  "managed_worktree_quota",
+);
+assert.equal(new InstructionBudgetError("internal path details").publicText.includes("path"), false);
 
 try {
   const agentDir = join(root, ".pi", "agent");
@@ -112,6 +123,7 @@ try {
   assert.equal(reused, false);
   assert.match(instructionRevision, /^sha256-v1:[A-Za-z0-9_-]{43}$/);
   assert.match(skillRevision, /^sha256-v1:[A-Za-z0-9_-]{43}$/);
+  await registry.markAgentsFilesDelivered(workspace, agentsFiles);
   const sequentialCheckout = await registry.openWorkspace(ownerClientId, root);
   assert.equal(sequentialCheckout.reused, true);
   assert.equal(sequentialCheckout.instructionRevision, instructionRevision);
@@ -128,6 +140,20 @@ try {
   const otherOwnerCheckout = await registry.openWorkspace("client-b", root);
   assert.notEqual(otherOwnerCheckout.workspace.id, workspace.id);
   assert.equal(otherOwnerCheckout.skillRevision, skillRevision);
+
+  const generationRegistry = new WorkspaceRegistry({ ...config, allowedRoots: [root] });
+  const generationWorkspace = (await generationRegistry.openWorkspace(ownerClientId, root)).workspace;
+  const generationBeforeRootChange = generationWorkspace.stateGeneration;
+  generationRegistry.applyAllowedRoots([root, outsideRoot]);
+  assert.equal(generationWorkspace.stateGeneration, generationBeforeRootChange + 1);
+  assert.throws(
+    () => generationRegistry.getWorkspace(
+      ownerClientId,
+      generationWorkspace.id,
+      generationBeforeRootChange,
+    ),
+    /generation is stale/,
+  );
 
   const rediscoveredSkills = await new WorkspaceRegistry(config).openWorkspace(ownerClientId, root);
   assert.equal(rediscoveredSkills.skillRevision, skillRevision);
@@ -183,6 +209,22 @@ try {
   const policyChangedSkillRevision = await new WorkspaceRegistry(skillRevisionConfig)
     .openWorkspace(ownerClientId, emptySkillsProject);
   assert.notEqual(policyChangedSkillRevision.skillRevision, manifestChangedSkillRevision.skillRevision);
+
+  const residentSkillRegistry = new WorkspaceRegistry(skillRevisionConfig);
+  const residentSkillContext = await residentSkillRegistry.openWorkspace(ownerClientId, emptySkillsProject);
+  await writeFile(
+    revisionSkillManifest,
+    "---\nname: revision-skill\ndescription: Resident refresh description.\n---\n",
+  );
+  const refreshedResidentContext = await residentSkillRegistry.resumeWorkspace(
+    ownerClientId,
+    residentSkillContext.workspace.alias,
+  );
+  assert.notEqual(refreshedResidentContext.skillRevision, residentSkillContext.skillRevision);
+  assert.equal(
+    refreshedResidentContext.workspace.skills.find((skill) => skill.name === "revision-skill")?.description,
+    "Resident refresh description.",
+  );
 
   const revisionProject = join(root, "revision-project");
   const revisionInstructionsPath = join(root, "user-revision.md");
@@ -317,6 +359,7 @@ try {
   const leasedHotReloadOperation = leasedHotReloadRegistry.withWorkspaceOperation(
     ownerClientId,
     leasedHotReloadWorkspace.id,
+    leasedHotReloadWorkspace.stateGeneration,
     async () => {
       markHotReloadOperationStarted();
       await hotReloadOperationBarrier;
@@ -345,6 +388,7 @@ try {
   const activeOperation = lifecycleRegistry.withWorkspaceOperation(
     ownerClientId,
     lifecycleWorkspace.id,
+    lifecycleWorkspace.stateGeneration,
     async (leasedWorkspace) => {
       operationStarted();
       await operationBarrier;
@@ -354,7 +398,12 @@ try {
   await operationStartedPromise;
   const exclusiveClosePromise = lifecycleRegistry.acquireExclusiveClose(ownerClientId, lifecycleWorkspace.id);
   await assert.rejects(
-    lifecycleRegistry.withWorkspaceOperation(ownerClientId, lifecycleWorkspace.id, () => undefined),
+    lifecycleRegistry.withWorkspaceOperation(
+      ownerClientId,
+      lifecycleWorkspace.id,
+      lifecycleWorkspace.stateGeneration,
+      () => undefined,
+    ),
     /is closing/,
   );
   await assert.rejects(
@@ -373,7 +422,12 @@ try {
   const exclusiveClose = await exclusiveClosePromise;
   exclusiveClose.abort();
   assert.equal(
-    await lifecycleRegistry.withWorkspaceOperation(ownerClientId, lifecycleWorkspace.id, (current) => current.id),
+    await lifecycleRegistry.withWorkspaceOperation(
+      ownerClientId,
+      lifecycleWorkspace.id,
+      lifecycleWorkspace.stateGeneration,
+      (current) => current.id,
+    ),
     lifecycleWorkspace.id,
   );
   const committedClose = await lifecycleRegistry.acquireExclusiveClose(ownerClientId, lifecycleWorkspace.id);
@@ -463,7 +517,14 @@ try {
   );
   await assert.rejects(
     registry.loadSkill(ownerClientId, workspace.id, mutableSkill.skillId),
-    /changed after open_workspace/,
+    (error: unknown) =>
+      error instanceof Error && "code" in error && error.code === "skill_manifest_changed",
+  );
+  await writeFile(mutableSkillManifest, "x".repeat(70_000));
+  await assert.rejects(
+    registry.loadSkill(ownerClientId, workspace.id, mutableSkill.skillId),
+    (error: unknown) =>
+      error instanceof Error && "code" in error && error.code === "skill_too_large",
   );
   assert.throws(
     () => registry.resolveReadPath(skillActivatedWorkspace, mutableSkill.filePath),
@@ -479,7 +540,8 @@ try {
   );
   await assert.rejects(
     registry.loadSkill(ownerClientId, workspace.id, mutableMetadataSkill.skillId),
-    /OpenAI metadata changed after open_workspace; reopen the workspace/,
+    (error: unknown) =>
+      error instanceof Error && "code" in error && error.code === "skill_metadata_changed",
   );
   assert.throws(
     () => registry.resolveReadPath(skillActivatedWorkspace, join(mutableMetadataSkill.baseDir, "reference.md")),
@@ -541,6 +603,7 @@ try {
       content: "root override instructions\n",
     }],
   );
+  await fallbackRegistry.markAgentsFilesDelivered(fallbackOpen.workspace, fallbackOpen.agentsFiles);
   const nestedFallback = await fallbackRegistry.loadApplicableAgentsFiles(
     fallbackOpen.workspace,
     ["nested/file.txt"],
@@ -648,6 +711,10 @@ try {
   await writeFile(join(nestedBudgetProject, "AGENTS.md"), nestedRootContent);
   await writeFile(join(nestedBudgetProject, "nested", "AGENTS.md"), nestedContent);
   const nestedBudgetOpen = await budgetRegistry.openWorkspace(ownerClientId, nestedBudgetProject);
+  await budgetRegistry.markAgentsFilesDelivered(
+    nestedBudgetOpen.workspace,
+    nestedBudgetOpen.agentsFiles,
+  );
   const exactNestedInstructions = await budgetRegistry.loadApplicableAgentsFiles(
     nestedBudgetOpen.workspace,
     ["nested/file.txt"],
@@ -697,7 +764,7 @@ try {
     ["nested/file.txt"],
     { requireAcknowledged: true },
   );
-  assert.equal(mutationInstructions.length, 1);
+  assert.equal(mutationInstructions.length, 3);
   const generationBeforeAcknowledgement = registry.instructionAcknowledgementGeneration(workspace);
   const instructionToken = await registry.createInstructionAcknowledgement(workspace, mutationInstructions);
   await registry.acknowledgeInstructions(workspace, instructionToken);
@@ -882,7 +949,7 @@ try {
   assert.equal(worktreeWorkspace.workspace.mode, "worktree");
   assert.notEqual(worktreeWorkspace.workspace.root, gitRoot);
   assert.match(worktreeWorkspace.workspace.root, /git-project-[a-f0-9]{8}$/);
-  assert.equal(worktreeWorkspace.workspace.sourceRoot, gitRoot);
+  assert.equal(worktreeWorkspace.workspace.sourceRoot, await realpath(gitRoot));
   assert.equal(worktreeWorkspace.workspace.worktree?.baseRef, "HEAD");
   assert.equal(worktreeWorkspace.workspace.worktree?.dirtySource, true);
   assert.equal(worktreeWorkspace.workspace.worktree?.managed, true);
@@ -905,18 +972,28 @@ try {
     cappedRegistry.openWorkspace(ownerClientId, { path: gitRoot, mode: "worktree" }),
     cappedRegistry.openWorkspace(ownerClientId, { path: gitRoot, mode: "worktree" }),
   ]);
-  assert.equal(concurrentWorktrees.filter((result) => result.status === "fulfilled").length, 1);
-  assert.equal(concurrentWorktrees.filter((result) => result.status === "rejected").length, 1);
-  const cappedWorkspace = concurrentWorktrees.find(
-    (result): result is PromiseFulfilledResult<Awaited<ReturnType<WorkspaceRegistry["openWorkspace"]>>> =>
-      result.status === "fulfilled",
-  )!.value.workspace;
+  assert.equal(concurrentWorktrees.filter((result) => result.status === "fulfilled").length, 2);
+  const cappedContexts = concurrentWorktrees.map((result) => {
+    assert.equal(result.status, "fulfilled");
+    return result.value;
+  });
+  assert.equal(cappedContexts[0]!.workspace.id, cappedContexts[1]!.workspace.id);
+  const cappedWorkspace = cappedContexts[0]!.workspace;
+  await assert.rejects(
+    cappedRegistry.openWorkspace(ownerClientId, { path: gitRoot, mode: "worktree", forceNew: true }),
+    /Managed worktree limit reached/,
+  );
   const cappedRemoval = await removeManagedWorktree({
     sourceRoot: gitRoot,
     worktreePath: cappedWorkspace.root,
     config: cappedConfig,
   });
   assert.equal(cappedRemoval.removed, true);
+  assert.equal(
+    cappedRegistry.listWorkspaces(ownerClientId).some((summary) => summary.alias === cappedWorkspace.alias),
+    false,
+  );
+  assert.equal(cappedStore.countManagedWorktrees(), 0);
   assert.equal(cappedRegistry.deleteWorkspace(ownerClientId, cappedWorkspace.id), true);
   cappedStore.close();
 
@@ -955,8 +1032,27 @@ try {
     mode: "worktree",
   });
   assert.notEqual(persistentWorktree.workspace.id, worktreeWorkspace.workspace.id);
+  const reusedPersistentWorktree = await persistentRegistry.openWorkspace(ownerClientId, {
+    path: join(gitRoot, "."),
+    mode: "worktree",
+  });
+  assert.equal(reusedPersistentWorktree.workspace.id, persistentWorktree.workspace.id);
+  assert.equal(reusedPersistentWorktree.reused, true);
   const repeatedPersistentWorkspace = await persistentRegistry.openWorkspace(ownerClientId, root);
   assert.equal(repeatedPersistentWorkspace.workspace.id, persistentWorkspace.workspace.id);
+  assert.equal(persistentWorkspace.workspace.writeAccess, "read_only");
+  const writablePersistentWorkspace = await persistentRegistry.openWorkspace(ownerClientId, {
+    path: root,
+    writeAccess: "read_write",
+  });
+  assert.equal(writablePersistentWorkspace.workspace.writeAccess, "read_write");
+  const preservedWritableWorkspace = await persistentRegistry.openWorkspace(ownerClientId, root);
+  assert.equal(preservedWritableWorkspace.workspace.writeAccess, "read_write");
+  const downgradedPersistentWorkspace = await persistentRegistry.openWorkspace(ownerClientId, {
+    path: root,
+    writeAccess: "read_only",
+  });
+  assert.equal(downgradedPersistentWorkspace.workspace.writeAccess, "read_only");
   firstStore.close();
 
   const secondStore = new SqliteWorkspaceStore(stateDir);
@@ -967,7 +1063,9 @@ try {
   assert.equal(restoredWorkspace.root, canonicalRoot);
   assert.equal(restoredWorkspace.mode, "checkout");
   assert.deepEqual(
-    secondStore.listExpiredSessions(new Date(Date.now() + 1_000).toISOString(), 1).map((session) => session.id),
+    secondStore.listExpiredSessions(new Date(Date.now() + 1_000).toISOString(), 10)
+      .filter((session) => !session.managed)
+      .map((session) => session.id),
     [persistentWorkspace.workspace.id],
   );
 
@@ -978,11 +1076,29 @@ try {
   const persistedOtherOwner = await restoredRegistry.openWorkspace("client-b", root);
   assert.notEqual(persistedOtherOwner.workspace.id, persistentWorkspace.workspace.id);
   assert.equal(restoredRegistry.closeWorkspace("client-b", persistedOtherOwner.workspace.id), true);
-  const restoredWorktree = restoredRegistry.getWorkspace(ownerClientId, persistentWorktree.workspace.id);
+  assert.throws(
+    () => restoredRegistry.getWorkspace(ownerClientId, persistentWorktree.workspace.id),
+    /must be resumed before use/,
+  );
+  const worktreeAlias = persistentWorktree.workspace.alias;
+  const coldSummary = restoredRegistry.listWorkspaces(ownerClientId).find(
+    (summary) => summary.alias === worktreeAlias,
+  );
+  assert.equal(coldSummary?.hydrationStatus, "requires_resume");
+  assert.equal(coldSummary?.displayPath, `…/${basename(gitRoot)}`);
+  assert.equal(coldSummary?.displayPath.includes("~"), false);
+  const resumedWorktree = await restoredRegistry.resumeWorkspace(ownerClientId, worktreeAlias);
+  const restoredWorktree = resumedWorktree.workspace;
   assert.equal(restoredWorktree.mode, "worktree");
-  assert.equal(restoredWorktree.sourceRoot, gitRoot);
+  assert.equal(restoredWorktree.sourceRoot, await realpath(gitRoot));
   assert.equal(restoredWorktree.root, persistentWorktree.workspace.root);
   assert.equal(restoredWorktree.worktree?.managed, true);
+  assert.equal(restoredWorktree.worktree?.dirtySource, true);
+  assert.equal(restoredWorktree.stateGeneration, persistentWorktree.workspace.stateGeneration + 1);
+  assert.deepEqual(
+    restoredWorktree.agentProfiles.map((profile) => profile.name),
+    persistentWorktree.workspace.agentProfiles.map((profile) => profile.name),
+  );
   assert.equal(restoredRegistry.closeWorkspace("client-b", persistentWorkspace.workspace.id), false);
   assert.equal(restoredRegistry.closeWorkspace(ownerClientId, persistentWorkspace.workspace.id), true);
   assert.deepEqual(restoredRegistry.cleanupLifecycleState(Date.now() + 31 * 24 * 60 * 60_000), {
@@ -1004,6 +1120,88 @@ try {
   const expired = restoredRegistry.closeExpiredSessions(-1, () => false);
   assert.deepEqual(expired, []);
   secondStore.close();
+
+  const expiryStateDir = join(root, ".managed-expiry-state");
+  const expiryConfig = loadConfig({
+    DEVSPACE_CONFIG_DIR: join(root, ".managed-expiry-home"),
+    DEVSPACE_ALLOWED_ROOTS: root,
+    DEVSPACE_WORKTREE_ROOT: join(root, ".devspace", "expiry-worktrees"),
+    DEVSPACE_AGENT_DIR: agentDir,
+    DEVSPACE_MAX_RESIDENT_WORKSPACES: "1",
+    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+    PORT: "1",
+  });
+  const expiryStore = new SqliteWorkspaceStore(expiryStateDir);
+  const expiryRegistry = new WorkspaceRegistry(expiryConfig, expiryStore);
+  const dirtyExpiredWorktree = (await expiryRegistry.openWorkspace(ownerClientId, {
+    path: gitRoot,
+    mode: "worktree",
+  })).workspace;
+  await writeFile(join(dirtyExpiredWorktree.root, "dirty-local.txt"), "preserve me\n");
+  const cleanExpiredWorktree = (await expiryRegistry.openWorkspace(ownerClientId, {
+    path: gitRoot,
+    mode: "worktree",
+    forceNew: true,
+  })).workspace;
+  const expiryDatabase = new Database(databasePath(expiryStateDir));
+  expiryDatabase.prepare("update workspace_sessions set last_used_at = ? where id = ?")
+    .run("2026-01-01T00:00:00.000Z", dirtyExpiredWorktree.id);
+  expiryDatabase.prepare("update workspace_sessions set last_used_at = ? where id = ?")
+    .run("2026-01-01T00:00:01.000Z", cleanExpiredWorktree.id);
+  expiryDatabase.close();
+  assert.deepEqual(
+    expiryRegistry.closeExpiredSessions(-1, () => false),
+    [cleanExpiredWorktree.id],
+  );
+  await assert.rejects(stat(cleanExpiredWorktree.root));
+  assert.equal((await stat(dirtyExpiredWorktree.root)).isDirectory(), true);
+  assert.equal(expiryStore.countManagedWorktrees(), 1);
+  const dirtyExpiryRemoval = await removeManagedWorktree({
+    sourceRoot: gitRoot,
+    worktreePath: dirtyExpiredWorktree.root,
+    config: expiryConfig,
+  });
+  assert.equal(dirtyExpiryRemoval.reason, "dirty");
+  await rm(join(dirtyExpiredWorktree.root, "dirty-local.txt"));
+  assert.equal((await removeManagedWorktree({
+    sourceRoot: gitRoot,
+    worktreePath: dirtyExpiredWorktree.root,
+    config: expiryConfig,
+  })).removed, true);
+  assert.equal(expiryRegistry.deleteWorkspace(ownerClientId, dirtyExpiredWorktree.id), true);
+  expiryStore.close();
+
+  const rotationStateDir = join(root, ".expiry-rotation-state");
+  const rotationStore = new SqliteWorkspaceStore(rotationStateDir);
+  const rotationRegistry = new WorkspaceRegistry(expiryConfig, rotationStore);
+  for (let index = 0; index < 1_024; index += 1) {
+    const id = `blocked-${String(index).padStart(4, "0")}`;
+    rotationStore.createSession({ id, ownerClientId, alias: id, root });
+  }
+  rotationStore.createSession({ id: "zz-clean", ownerClientId, alias: "zz-clean", root });
+  const rotationDatabase = new Database(databasePath(rotationStateDir));
+  rotationDatabase.prepare("update workspace_sessions set last_used_at = ?")
+    .run("2026-01-01T00:00:00.000Z");
+  rotationDatabase.close();
+  assert.deepEqual(
+    rotationRegistry.closeExpiredSessions(-1, (_owner, workspaceId) => workspaceId.startsWith("blocked-")),
+    [],
+  );
+  assert.deepEqual(
+    rotationRegistry.closeExpiredSessions(-1, (_owner, workspaceId) => workspaceId.startsWith("blocked-")),
+    ["zz-clean"],
+  );
+  rotationStore.close();
+
+  const reopenStateDir = join(root, ".reopen-state");
+  const reopenStore = new SqliteWorkspaceStore(reopenStateDir);
+  const reopenRegistry = new WorkspaceRegistry(config, reopenStore);
+  const beforeClose = (await reopenRegistry.openWorkspace(ownerClientId, root)).workspace;
+  assert.equal(reopenRegistry.closeWorkspace(ownerClientId, beforeClose.id), true);
+  const afterReopen = (await reopenRegistry.openWorkspace(ownerClientId, root)).workspace;
+  assert.equal(afterReopen.id, beforeClose.id);
+  assert.equal(afterReopen.stateGeneration, beforeClose.stateGeneration + 2);
+  reopenStore.close();
 
   const concurrentStateDir = join(root, ".concurrent-state");
   const concurrentStoreA = new SqliteWorkspaceStore(concurrentStateDir);
@@ -1088,7 +1286,7 @@ try {
     );
     const escapedStateDir = join(root, ".escaped-checkout-state");
     const escapedStore = new SqliteWorkspaceStore(escapedStateDir);
-    escapedStore.createSession({
+    const escapedSession = escapedStore.createSession({
       id: "ws_escaped_checkout",
       ownerClientId,
       root: escapedCheckoutRoot,
@@ -1099,7 +1297,14 @@ try {
         ownerClientId,
         "ws_escaped_checkout",
       ),
-      /workspace is no longer available/,
+      /must be resumed before use/,
+    );
+    await assert.rejects(
+      new WorkspaceRegistry(config, escapedStore).resumeWorkspace(
+        ownerClientId,
+        escapedSession.alias!,
+      ),
+      /workspace alias is unavailable/,
     );
     escapedStore.close();
 
@@ -1117,7 +1322,7 @@ try {
       path: join(aliasRoot, "git-project"),
       mode: "worktree",
     });
-    assert.equal(aliasWorkspace.workspace.sourceRoot, join(aliasRoot, "git-project"));
+    assert.equal(aliasWorkspace.workspace.sourceRoot, await realpath(gitRoot));
 
     const aliasCheckout = await new WorkspaceRegistry(aliasConfig).openWorkspace(ownerClientId, aliasRoot);
     assert.deepEqual(
@@ -1133,10 +1338,14 @@ try {
     assert.equal(aliasedCheckout.skillRevision, realCheckout.skillRevision);
     aliasReuseStore.close();
     const restoredAliasStore = new SqliteWorkspaceStore(join(root, ".alias-reuse-state"));
-    const restoredAlias = new WorkspaceRegistry(aliasConfig, restoredAliasStore).getWorkspace(
-      ownerClientId,
-      realCheckout.workspace.id,
+    const restoredAliasRegistry = new WorkspaceRegistry(aliasConfig, restoredAliasStore);
+    assert.throws(
+      () => restoredAliasRegistry.getWorkspace(ownerClientId, realCheckout.workspace.id),
+      /must be resumed before use/,
     );
+    const restoredAlias = (
+      await restoredAliasRegistry.resumeWorkspace(ownerClientId, realCheckout.workspace.alias)
+    ).workspace;
     assert.equal(restoredAlias.root, canonicalRoot);
     restoredAliasStore.close();
   }

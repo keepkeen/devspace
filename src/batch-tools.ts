@@ -8,12 +8,14 @@ export const BATCH_TOTAL_MAX_CHARACTERS = 48_000;
 export interface BatchWorkItem {
   operation: string;
   path: string;
+  ref?: string;
 }
 
 export interface BatchItemResult {
   index: number;
   operation: string;
   path: string;
+  ref?: string;
   ok: boolean;
   result: string;
   truncated: boolean;
@@ -51,12 +53,14 @@ export async function runBoundedBatch<T extends BatchWorkItem>(
 
   const seen = new Set<string>();
   const results = await Promise.all(items.map(async (item, index): Promise<BatchItemResult> => {
-    const duplicateKey = JSON.stringify(item);
+    const { ref: _ref, ...operationIdentity } = item;
+    const duplicateKey = JSON.stringify(operationIdentity);
     if (seen.has(duplicateKey)) {
       return {
         index,
         operation: item.operation,
         path: item.path,
+        ...(item.ref ? { ref: item.ref } : {}),
         ok: false,
         result: "Duplicate batch item skipped.",
         truncated: false,
@@ -74,6 +78,7 @@ export async function runBoundedBatch<T extends BatchWorkItem>(
         index,
         operation: item.operation,
         path: item.path,
+        ...(item.ref ? { ref: item.ref } : {}),
         ok: response.ok,
         result: limited.text,
         truncated: limited.truncated,
@@ -88,6 +93,7 @@ export async function runBoundedBatch<T extends BatchWorkItem>(
         index,
         operation: item.operation,
         path: item.path,
+        ...(item.ref ? { ref: item.ref } : {}),
         ok: false,
         result: limited.text,
         truncated: limited.truncated,

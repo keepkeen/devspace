@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
+import { realpathSync, statSync } from "node:fs";
 import { mkdir, realpath, rm, stat } from "node:fs/promises";
 import { basename, join, relative, resolve } from "node:path";
 import type { ServerConfig } from "./config.js";
@@ -33,6 +34,13 @@ export interface ManagedWorktree {
   managed: boolean;
 }
 
+export interface ManagedWorktreeBase {
+  sourceRoot: string;
+  baseRef: string;
+  baseSha: string;
+  dirtySource: boolean;
+}
+
 export interface ManagedWorktreeRemovalResult {
   removed: boolean;
   reason?: "dirty" | "missing";
@@ -43,7 +51,7 @@ export async function removeManagedWorktree(input: {
   worktreePath: string;
   config: ServerConfig;
 }): Promise<ManagedWorktreeRemovalResult> {
-  const sourceRoot = assertAllowedPath(input.sourceRoot, input.config.allowedRoots);
+  const sourceRoot = await assertGitRootAllowed(input.sourceRoot, input.config.allowedRoots);
   const worktreePath = assertAllowedPath(input.worktreePath, [input.config.worktreeRoot]);
   try {
     const worktreeStats = await stat(worktreePath);
@@ -61,11 +69,34 @@ export async function removeManagedWorktree(input: {
   return { removed: true };
 }
 
-export async function createManagedWorktree(input: {
+export function removeManagedWorktreeSync(input: {
+  sourceRoot: string;
+  worktreePath: string;
+  config: ServerConfig;
+}): ManagedWorktreeRemovalResult {
+  const sourceRoot = assertGitRootAllowedSync(input.sourceRoot, input.config.allowedRoots);
+  const worktreePath = assertAllowedPath(input.worktreePath, [input.config.worktreeRoot]);
+  try {
+    if (!statSync(worktreePath).isDirectory()) return { removed: false, reason: "missing" };
+  } catch {
+    gitSync(["worktree", "prune"], sourceRoot, true);
+    return { removed: false, reason: "missing" };
+  }
+
+  if (gitSync(["status", "--porcelain=v1"], worktreePath).trim().length > 0) {
+    return { removed: false, reason: "dirty" };
+  }
+
+  gitSync(["worktree", "remove", worktreePath], sourceRoot);
+  gitSync(["worktree", "prune"], sourceRoot);
+  return { removed: true };
+}
+
+export async function resolveManagedWorktreeBase(input: {
   sourcePath: string;
   baseRef?: string;
   config: ServerConfig;
-}): Promise<ManagedWorktree> {
+}): Promise<ManagedWorktreeBase> {
   const sourcePath = assertAllowedPath(input.sourcePath, input.config.allowedRoots);
 
   try {
@@ -84,10 +115,22 @@ export async function createManagedWorktree(input: {
     );
   }
 
-  const sourceRoot = await resolveGitRoot(sourcePath, input.config.allowedRoots);
+  const logicalSourceRoot = await resolveGitRoot(sourcePath, input.config.allowedRoots);
+  const sourceRoot = await realpath(logicalSourceRoot);
   const baseRef = input.baseRef ?? "HEAD";
   const baseSha = await resolveBaseCommit(sourceRoot, baseRef);
   const dirtySource = (await git(["status", "--porcelain=v1"], sourceRoot)).trim().length > 0;
+  return { sourceRoot, baseRef, baseSha, dirtySource };
+}
+
+export async function createManagedWorktree(input: {
+  sourcePath: string;
+  baseRef?: string;
+  config: ServerConfig;
+  resolvedBase?: ManagedWorktreeBase;
+}): Promise<ManagedWorktree> {
+  const { sourceRoot, baseRef, baseSha, dirtySource } = input.resolvedBase
+    ?? await resolveManagedWorktreeBase(input);
   const worktreePath = managedWorktreePath({
     worktreeRoot: input.config.worktreeRoot,
     repoRoot: sourceRoot,
@@ -156,6 +199,26 @@ async function assertGitRootAllowed(gitRoot: string, allowedRoots: string[]): Pr
   }
 }
 
+function assertGitRootAllowedSync(gitRoot: string, allowedRoots: string[]): string {
+  try {
+    return assertAllowedPath(gitRoot, allowedRoots);
+  } catch {
+    const canonicalGitRoot = realpathSync(gitRoot);
+    for (const allowedRoot of allowedRoots) {
+      let canonicalAllowedRoot: string;
+      try {
+        canonicalAllowedRoot = realpathSync(allowedRoot);
+      } catch {
+        continue;
+      }
+      if (!isPathInsideRoot(canonicalGitRoot, canonicalAllowedRoot)) continue;
+      const logicalGitRoot = resolve(allowedRoot, relative(canonicalAllowedRoot, canonicalGitRoot));
+      return assertAllowedPath(logicalGitRoot, allowedRoots);
+    }
+    return assertAllowedPath(canonicalGitRoot, allowedRoots);
+  }
+}
+
 async function resolveBaseCommit(sourceRoot: string, baseRef: string): Promise<string> {
   try {
     return (await git(["rev-parse", "--verify", `${baseRef}^{commit}`], sourceRoot)).trim();
@@ -205,6 +268,20 @@ async function git(args: string[], cwd: string): Promise<string> {
       : "";
     const details = stderr || stdout || (error instanceof Error ? error.message : String(error));
     throw new Error(details);
+  }
+}
+
+function gitSync(args: string[], cwd: string, ignoreFailure = false): string {
+  try {
+    return execFileSync("git", args, {
+      cwd,
+      encoding: "utf8",
+      maxBuffer: 10 * 1024 * 1024,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch (error) {
+    if (ignoreFailure) return "";
+    throw error;
   }
 }
 

@@ -19,6 +19,7 @@ const publicBaseUrl = "https://devspace.chatgpt-flow.test";
 const resource = `${publicBaseUrl}/mcp`;
 const ownerPassword = "chatgpt-flow-e2e-owner-password-long-enough";
 const clients = new Set<Client>();
+const trackedWorkspaceGenerations = new Map<string, number>();
 let active: Awaited<ReturnType<typeof startServer>> | undefined;
 const capturedLogs: string[] = [];
 const originalConsole = {
@@ -37,7 +38,7 @@ try {
   await mkdir(workspaceRoot, { recursive: true });
   await writeFile(join(workspaceRoot, "payload.txt"), "chatgpt-flow-ready\n");
 
-  active = await startServer(loadConfig({
+  const mainConfig = loadConfig({
     DEVSPACE_CONFIG_DIR: join(root, "config"),
     DEVSPACE_STATE_DIR: join(root, "state"),
     DEVSPACE_ALLOWED_ROOTS: workspaceRoot,
@@ -55,7 +56,8 @@ try {
     DEVSPACE_MAX_PROCESS_SESSIONS_PER_CLIENT: "4",
     DEVSPACE_MAX_PROCESS_SESSIONS_PER_WORKSPACE: "4",
     PORT: "1",
-  }));
+  });
+  active = await startServer(mainConfig);
 
   const metadata = await discoverOAuth(active.origin);
   const [oauthA, oauthB] = await Promise.all([
@@ -72,10 +74,44 @@ try {
   const firstRound = await connectClient("same-conversation-round-one", oauthA.accessToken, active.origin);
   const opened = await firstRound.callTool({
     name: "open_workspace",
-    arguments: { path: workspaceRoot },
+    arguments: {
+      path: workspaceRoot,
+      alias: "primary",
+      writeAccess: "read_write",
+      contextMode: "full",
+    },
   });
   assertToolSucceeded(opened);
   const workspaceA = workspaceId(opened);
+  const generationA = Number(
+    (opened.structuredContent as { workspaceGeneration?: unknown } | undefined)?.workspaceGeneration,
+  );
+  assert.ok(generationA > 0);
+  const staleGenerationRead = await firstRound.callTool({
+    name: "read",
+    arguments: {
+      workspaceId: workspaceA,
+      workspaceGeneration: generationA + 1,
+      path: "payload.txt",
+    },
+  });
+  assertToolRejected(staleGenerationRead, /stale_workspace_generation/);
+
+  const directArgv = await firstRound.callTool({
+    name: "exec_command",
+    arguments: {
+      workspaceId: workspaceA,
+      program: process.execPath,
+      args: ["-e", "process.stdout.write(process.argv[1])", "literal * $HOME ; &&"],
+    },
+  });
+  assertToolSucceeded(directArgv);
+  assert.match(JSON.stringify(directArgv.content), /literal \* \$HOME ; &&/);
+  const unavailableNetworkDeny = await firstRound.callTool({
+    name: "exec_command",
+    arguments: { workspaceId: workspaceA, program: "true", network: "deny" },
+  });
+  assertToolRejected(unavailableNetworkDeny, /network_control_unavailable/);
 
   for (let run = 0; run < 2; run += 1) {
     const executed = await firstRound.callTool({
@@ -91,6 +127,142 @@ try {
   });
   assertToolSucceeded(repeatedExecution);
   assert.match(JSON.stringify(repeatedExecution.content), /safe-run\\nsafe-run\\n/);
+
+  assertToolSucceeded(await firstRound.callTool({
+    name: "exec_command",
+    arguments: { workspaceId: workspaceA, cmd: "printf 'one\\n' > optimistic.txt" },
+  }));
+  const optimisticRead = await firstRound.callTool({
+    name: "read",
+    arguments: { workspaceId: workspaceA, path: "optimistic.txt" },
+  });
+  const optimisticHash = String(
+    (optimisticRead.structuredContent as { contentHash?: unknown } | undefined)?.contentHash ?? "",
+  );
+  assert.match(optimisticHash, /^sha256:[a-f0-9]{64}$/);
+  const optimisticOperationId = "optimistic-update";
+  const optimisticPatch = await firstRound.callTool({
+    name: "apply_patch",
+    arguments: {
+      workspaceId: workspaceA,
+      operationId: optimisticOperationId,
+      ifMatch: { "optimistic.txt": optimisticHash },
+      patch: "*** Begin Patch\n*** Update File: optimistic.txt\n@@\n-one\n+two\n*** End Patch",
+    },
+  });
+  assertToolSucceeded(optimisticPatch);
+  const operationStatus = await firstRound.callTool({
+    name: "get_operation_status",
+    arguments: { operationId: optimisticOperationId },
+  });
+  assert.deepEqual(operationStatus.structuredContent, {
+    ok: true,
+    state: "settled",
+    tool: "apply_patch",
+    workspaceGeneration: generationA,
+    resultAvailable: true,
+    safeToRetry: false,
+  });
+  const staleOptimisticPatch = await firstRound.callTool({
+    name: "apply_patch",
+    arguments: {
+      workspaceId: workspaceA,
+      operationId: "optimistic-stale",
+      ifMatch: optimisticHash,
+      patch: "*** Begin Patch\n*** Update File: optimistic.txt\n@@\n-two\n+three\n*** End Patch",
+    },
+  });
+  assertToolRejected(staleOptimisticPatch, /file_version_conflict/);
+  const staleOperationStatus = await firstRound.callTool({
+    name: "get_operation_status",
+    arguments: { operationId: "optimistic-stale" },
+  });
+  assert.equal(
+    (staleOperationStatus.structuredContent as { state?: unknown } | undefined)?.state,
+    "settled",
+  );
+  assert.equal(await readFile(join(workspaceRoot, "optimistic.txt"), "utf8"), "two\n");
+
+  const idempotentArguments = {
+    workspaceId: workspaceA,
+    operationId: "append-once",
+    cmd: "printf 'once\\n' >> idempotent.txt",
+  };
+  const firstIdempotent = await firstRound.callTool({
+    name: "exec_command",
+    arguments: idempotentArguments,
+  });
+  const replayedIdempotent = await firstRound.callTool({
+    name: "exec_command",
+    arguments: idempotentArguments,
+  });
+  assertToolSucceeded(firstIdempotent);
+  assertToolSucceeded(replayedIdempotent);
+  assert.equal(await readFile(join(workspaceRoot, "idempotent.txt"), "utf8"), "once\n");
+  const patchArguments = {
+    workspaceId: workspaceA,
+    operationId: "patch-once",
+    patch: "*** Begin Patch\n*** Add File: patch-once.txt\n+once\n*** End Patch",
+  };
+  const firstPatch = await firstRound.callTool({ name: "apply_patch", arguments: patchArguments });
+  const replayedPatch = await firstRound.callTool({ name: "apply_patch", arguments: patchArguments });
+  assertToolSucceeded(firstPatch);
+  assertToolSucceeded(replayedPatch);
+  assert.equal(await readFile(join(workspaceRoot, "patch-once.txt"), "utf8"), "once\n");
+
+  const stdinProcess = await firstRound.callTool({
+    name: "exec_command",
+    arguments: {
+      workspaceId: workspaceA,
+      cmd: `${JSON.stringify(process.execPath)} -e "process.stdin.on('data', d => require('fs').appendFileSync('stdin-once.txt', d)); setTimeout(() => process.exit(0), 300)"`,
+      yieldTimeMs: 0,
+    },
+  });
+  assertToolSucceeded(stdinProcess);
+  const stdinSessionId = processSessionId(stdinProcess);
+  const stdinArguments = {
+    workspaceId: workspaceA,
+    sessionId: stdinSessionId,
+    operationId: "stdin-once",
+    chars: "once\n",
+    yieldTimeMs: 0,
+  };
+  assertToolSucceeded(await firstRound.callTool({ name: "write_stdin", arguments: stdinArguments }));
+  await firstRound.callTool({
+    name: "write_stdin",
+    arguments: { workspaceId: workspaceA, sessionId: stdinSessionId, yieldTimeMs: 1_000 },
+  });
+  const replayedStdinAfterExit = await firstRound.callTool({
+    name: "write_stdin",
+    arguments: stdinArguments,
+  });
+  assert.notEqual(
+    replayedStdinAfterExit.isError,
+    true,
+    "a settled stdin mutation must replay after its process session has exited",
+  );
+  assert.equal(await readFile(join(workspaceRoot, "stdin-once.txt"), "utf8"), "once\n");
+  const conflictingOperation = await firstRound.callTool({
+    name: "exec_command",
+    arguments: {
+      workspaceId: workspaceA,
+      operationId: "append-once",
+      cmd: "printf 'twice\\n' >> idempotent.txt",
+    },
+  });
+  assertToolRejected(conflictingOperation, /operation_id_conflict/);
+
+  const nonzero = await firstRound.callTool({
+    name: "exec_command",
+    arguments: { workspaceId: workspaceA, cmd: "exit 7" },
+  });
+  assert.notEqual(nonzero.isError, true);
+  assert.deepEqual(nonzero.structuredContent, {
+    ok: false,
+    status: "exited",
+    commandExecuted: true,
+    exitCode: 7,
+  });
 
   const denied = await firstRound.callTool({
     name: "exec_command",
@@ -124,9 +296,13 @@ try {
   await closeClient(secondRound);
 
   const newSession = await connectClient("same-account-new-session", oauthA.accessToken, active.origin);
+  const listed = await newSession.callTool({ name: "list_workspaces", arguments: {} });
+  assertToolSucceeded(listed);
+  assert.doesNotMatch(JSON.stringify(listed.structuredContent), new RegExp(workspaceRoot.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")));
+  assert.match(JSON.stringify(listed.structuredContent), /primary/);
   const reopened = await newSession.callTool({
-    name: "open_workspace",
-    arguments: { path: workspaceRoot },
+    name: "resume_workspace",
+    arguments: { alias: "primary", contextMode: "full" },
   });
   assertToolSucceeded(reopened);
   assert.equal(workspaceId(reopened), workspaceA);
@@ -152,8 +328,19 @@ try {
     connectClient("concurrent-client-b", oauthB.accessToken, active.origin),
   ]);
   const [concurrentOpenA, concurrentOpenB] = await Promise.all([
-    concurrentA.callTool({ name: "open_workspace", arguments: { path: workspaceRoot } }),
-    concurrentB.callTool({ name: "open_workspace", arguments: { path: workspaceRoot } }),
+    concurrentA.callTool({
+      name: "resume_workspace",
+      arguments: { alias: "primary", contextMode: "full" },
+    }),
+    concurrentB.callTool({
+      name: "open_workspace",
+      arguments: {
+        path: workspaceRoot,
+        alias: "primary",
+        writeAccess: "read_write",
+        contextMode: "full",
+      },
+    }),
   ]);
   assertToolSucceeded(concurrentOpenA);
   assertToolSucceeded(concurrentOpenB);
@@ -227,10 +414,80 @@ try {
   assertToolSucceeded(finishedB);
   assert.match(JSON.stringify(finishedA.content), /client-a-background/);
   assert.match(JSON.stringify(finishedB.content), /client-b-background/);
+  const revokedB = await concurrentB.callTool({
+    name: "revoke_workspace",
+    arguments: { workspaceId: workspaceB },
+  });
+  assertToolSucceeded(revokedB);
+  const revokedResume = await concurrentB.callTool({
+    name: "resume_workspace",
+    arguments: { alias: "primary", contextMode: "full" },
+  });
+  assertToolRejected(revokedResume, /unknown_workspace_alias/);
   await Promise.all([closeClient(concurrentA), closeClient(concurrentB)]);
 
   assert.equal(await readFile(join(workspaceRoot, "safe-runs.txt"), "utf8"), "safe-run\nsafe-run\n");
   assert.equal(await readFile(join(workspaceRoot, "conversation.txt"), "utf8"), "round-two\nnew-session\n");
+
+  const initialGeneration = Number(
+    (opened.structuredContent as { workspaceGeneration?: unknown } | undefined)?.workspaceGeneration,
+  );
+  assert.ok(initialGeneration >= 1);
+  await active.close();
+  active = await startServer(mainConfig);
+  const afterRestart = await connectClient("same-account-after-restart", oauthA.accessToken, active.origin);
+  const coldRead = await afterRestart.callTool({
+    name: "read",
+    arguments: { workspaceId: workspaceA, path: "payload.txt" },
+  });
+  assertToolRejected(coldRead, /workspace_resume_required/);
+  assert.equal(
+    (coldRead.structuredContent as { error?: { recovery?: unknown } } | undefined)?.error?.recovery,
+    "resume_workspace",
+  );
+  const afterRestartList = await afterRestart.callTool({ name: "list_workspaces", arguments: {} });
+  assertToolSucceeded(afterRestartList);
+  assert.match(JSON.stringify(afterRestartList.structuredContent), /requires_resume/);
+  const afterRestartResume = await afterRestart.callTool({
+    name: "resume_workspace",
+    arguments: { alias: "primary", contextMode: "full" },
+  });
+  assertToolSucceeded(afterRestartResume);
+  assert.equal(workspaceId(afterRestartResume), workspaceA);
+  assert.ok(
+    Number((afterRestartResume.structuredContent as { workspaceGeneration?: unknown }).workspaceGeneration)
+      > initialGeneration,
+  );
+  const resumedRead = await afterRestart.callTool({
+    name: "read",
+    arguments: { workspaceId: workspaceA, path: "conversation.txt" },
+  });
+  assertToolSucceeded(resumedRead);
+  assert.match(JSON.stringify(resumedRead.content), /new-session/);
+  const resumedGeneration = Number(
+    (afterRestartResume.structuredContent as { workspaceGeneration?: unknown }).workspaceGeneration,
+  );
+  const closedWorkspace = await afterRestart.callTool({
+    name: "close_workspace",
+    arguments: { workspaceId: workspaceA },
+  });
+  assertToolSucceeded(closedWorkspace);
+  const reopenedWorkspace = await afterRestart.callTool({
+    name: "open_workspace",
+    arguments: {
+      path: workspaceRoot,
+      alias: "primary",
+      writeAccess: "read_write",
+      contextMode: "full",
+    },
+  });
+  assertToolSucceeded(reopenedWorkspace);
+  assert.equal(workspaceId(reopenedWorkspace), workspaceA);
+  assert.equal(
+    Number((reopenedWorkspace.structuredContent as { workspaceGeneration?: unknown }).workspaceGeneration),
+    resumedGeneration + 2,
+  );
+  await closeClient(afterRestart);
 
   const quietServer = await startServer(loadConfig({
     DEVSPACE_CONFIG_DIR: join(root, "quiet-config"),
@@ -255,7 +512,7 @@ try {
     const quietClient = await connectClient("quiet-tool-logs", quietCredentials.accessToken, quietServer.origin);
     const quietOpen = await quietClient.callTool({
       name: "open_workspace",
-      arguments: { path: workspaceRoot },
+      arguments: { path: workspaceRoot, contextMode: "full" },
     });
     assertToolSucceeded(quietOpen);
     quietWorkspaceId = workspaceId(quietOpen);
@@ -500,7 +757,31 @@ async function connectClient(
   await client.connect(new StreamableHTTPClientTransport(new URL("/mcp", origin), {
     requestInit: { headers },
   }));
+  enableWorkspaceGenerationTracking(client);
   return client;
+}
+
+function enableWorkspaceGenerationTracking(client: Client): void {
+  const original = client.callTool.bind(client);
+  client.callTool = (async (...callArgs: Parameters<Client["callTool"]>) => {
+    const request = callArgs[0];
+    const requestArguments = request.arguments as Record<string, unknown> | undefined;
+    const workspaceId = typeof requestArguments?.workspaceId === "string"
+      ? requestArguments.workspaceId
+      : undefined;
+    if (workspaceId && requestArguments?.workspaceGeneration === undefined) {
+      const generation = trackedWorkspaceGenerations.get(workspaceId);
+      if (generation !== undefined) {
+        callArgs[0] = { ...request, arguments: { ...requestArguments, workspaceGeneration: generation } };
+      }
+    }
+    const result = await original(...callArgs);
+    const structured = result.structuredContent as Record<string, unknown> | undefined;
+    if (typeof structured?.workspaceId === "string" && typeof structured.workspaceGeneration === "number") {
+      trackedWorkspaceGenerations.set(structured.workspaceId, structured.workspaceGeneration);
+    }
+    return result;
+  }) as Client["callTool"];
 }
 
 async function closeClient(client: Client): Promise<void> {

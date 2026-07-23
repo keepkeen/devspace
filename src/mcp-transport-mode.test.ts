@@ -70,26 +70,39 @@ try {
   await firstChatGpt.listTools();
   const opened = await firstChatGpt.callTool({
     name: "open_workspace",
-    arguments: { path: workspaceRoot },
+    arguments: {
+      path: workspaceRoot,
+      alias: "transport",
+      writeAccess: "read_write",
+      contextMode: "full",
+    },
   });
   const workspaceId = String(
     (opened.structuredContent as { workspaceId?: unknown } | undefined)?.workspaceId ?? "",
   );
   assert.ok(workspaceId);
+  const workspaceGeneration = Number(
+    (opened.structuredContent as { workspaceGeneration?: unknown } | undefined)?.workspaceGeneration,
+  );
+  assert.ok(workspaceGeneration > 0);
   const instructionRevision = String(
     (opened.structuredContent as { instructionRevision?: unknown } | undefined)?.instructionRevision ?? "",
   );
   assert.ok(instructionRevision);
   const compactReopen = await firstChatGpt.callTool({
     name: "open_workspace",
-    arguments: { path: workspaceRoot, knownInstructionRevision: instructionRevision },
+    arguments: {
+      path: workspaceRoot,
+      contextMode: "retained",
+      knownInstructionRevision: instructionRevision,
+    },
   });
   const compactStructured = compactReopen.structuredContent as {
     instructionsIncluded?: unknown;
-    agentsFiles?: unknown;
+    workspaceInstructions?: unknown;
   } | undefined;
   assert.equal(compactStructured?.instructionsIncluded, false);
-  assert.deepEqual(compactStructured?.agentsFiles, []);
+  assert.deepEqual(compactStructured?.workspaceInstructions, []);
 
   const getResponse = await fetch(new URL("/mcp", origin), {
     headers: { authorization: `Bearer ${chatGptToken}` },
@@ -105,9 +118,18 @@ try {
   const staleStatelessResponse = await rawMcpPost(origin, chatGptToken, "stale-chatgpt-session");
   assert.equal(staleStatelessResponse.status, 200);
 
+  const loadedInstructions = await firstChatGpt.callTool({
+    name: "load_workspace_instructions",
+    arguments: { workspaceId, workspaceGeneration, paths: ["."] },
+  });
+  const instructionToken = String(
+    (loadedInstructions.structuredContent as { instructionToken?: unknown } | undefined)?.instructionToken ?? "",
+  );
+  assert.ok(instructionToken);
+
   const heldCommand = firstChatGpt.callTool({
     name: "exec_command",
-    arguments: { workspaceId, cmd: "sleep 0.25", yieldTimeMs: 1_000 },
+    arguments: { workspaceId, workspaceGeneration, instructionToken, cmd: "sleep 0.25", yieldTimeMs: 1_000 },
   });
   await delay(50);
   const overCapacity = await rawMcpPost(origin, chatGptToken, "concurrent-chatgpt-session");
@@ -125,22 +147,31 @@ try {
   assert.equal(secondObserved.some((entry) => entry.sessionId !== null), false);
   const directReuseAfterTransportClose = await secondChatGpt.callTool({
     name: "read",
-    arguments: { workspaceId, path: "payload.txt" },
+    arguments: { workspaceId, workspaceGeneration, path: "payload.txt" },
   });
   assert.match(JSON.stringify(directReuseAfterTransportClose.content), /transport-mode-ok/);
   const freshConversationOpen = await secondChatGpt.callTool({
-    name: "open_workspace",
-    arguments: { path: workspaceRoot },
+    name: "resume_workspace",
+    arguments: { alias: "transport", contextMode: "full" },
   });
   const freshStructured = freshConversationOpen.structuredContent as {
     instructionsIncluded?: unknown;
-    agentsFiles?: unknown[];
+    workspaceInstructions?: unknown[];
   } | undefined;
   assert.equal(freshStructured?.instructionsIncluded, true);
-  assert.ok((freshStructured?.agentsFiles?.length ?? 0) > 0);
+  assert.ok((freshStructured?.workspaceInstructions?.length ?? 0) > 0);
+  const resumedMutationWithoutReload = await secondChatGpt.callTool({
+    name: "exec_command",
+    arguments: { workspaceId, workspaceGeneration, cmd: "pwd" },
+  });
+  assert.equal(
+    (resumedMutationWithoutReload.structuredContent as { error?: { code?: unknown } } | undefined)
+      ?.error?.code,
+    "instructions_required",
+  );
   const reusedRead = await secondChatGpt.callTool({
     name: "read",
-    arguments: { workspaceId, path: "payload.txt" },
+    arguments: { workspaceId, workspaceGeneration, path: "payload.txt" },
   });
   assert.match(JSON.stringify(reusedRead.content), /transport-mode-ok/);
 

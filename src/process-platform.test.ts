@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
-import { resolveShellCommand, terminateProcessTree } from "./process-platform.js";
+import {
+  resolveProcessCommand,
+  resolveShellCommand,
+  terminateProcessTree,
+} from "./process-platform.js";
 
 // Prefer bash on Windows when available; otherwise fall back to cmd.exe.
 const winWithGitBash = resolveShellCommand("echo ok", "win32", {
@@ -43,6 +47,25 @@ assert.deepEqual(
 
 // Keep a reference so the unused var does not confuse future edits.
 assert.ok(winWithGitBash.executable);
+
+const directArgs = ["two words", "$(echo untouched)", "semi;colon", "*.ts", ""];
+assert.deepEqual(
+  resolveProcessCommand({ program: "/usr/bin/example tool", args: directArgs }),
+  { executable: "/usr/bin/example tool", args: directArgs },
+);
+assert.notEqual(resolveProcessCommand({ program: "example", args: directArgs }).args, directArgs);
+assert.throws(
+  () => resolveProcessCommand({ program: "", args: [] }),
+  /program must be a non-empty string/,
+);
+assert.throws(
+  () => resolveProcessCommand({ program: "bad\u0000program", args: [] }),
+  /program must not contain NUL bytes/,
+);
+assert.throws(
+  () => resolveProcessCommand({ program: "example", args: ["bad\u0000argument"] }),
+  /args must not contain NUL bytes/,
+);
 
 const windowsCalls: string[] = [];
 terminateProcessTree(

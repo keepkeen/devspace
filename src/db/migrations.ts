@@ -37,6 +37,21 @@ const migrations: Migration[] = [
     name: "oauth-owner-credential",
     up: migrateOAuthOwnerCredential,
   },
+  {
+    version: 7,
+    name: "workspace-resume-idempotency",
+    up: migrateWorkspaceResumeIdempotency,
+  },
+  {
+    version: 8,
+    name: "workspace-generation-operation-identity",
+    up: migrateWorkspaceGenerationOperationIdentity,
+  },
+  {
+    version: 9,
+    name: "workspace-worktree-source-state",
+    up: migrateWorkspaceWorktreeSourceState,
+  },
 ];
 
 export function migrateDatabase(sqlite: Database.Database): void {
@@ -80,6 +95,7 @@ function migrateWorkspaceState(sqlite: Database.Database): void {
       source_root text,
       base_ref text,
       base_sha text,
+      dirty_source text not null default 'false',
       managed text not null default 'false',
       created_at text not null,
       last_used_at text not null
@@ -112,6 +128,7 @@ function migrateWorkspaceState(sqlite: Database.Database): void {
   addColumnIfMissing(sqlite, "workspace_sessions", "source_root", "text");
   addColumnIfMissing(sqlite, "workspace_sessions", "base_ref", "text");
   addColumnIfMissing(sqlite, "workspace_sessions", "base_sha", "text");
+  addColumnIfMissing(sqlite, "workspace_sessions", "dirty_source", "text not null default 'false'");
   addColumnIfMissing(sqlite, "workspace_sessions", "managed", "text not null default 'false'");
 }
 
@@ -222,6 +239,169 @@ function migrateOAuthOwnerCredential(sqlite: Database.Database): void {
       updated_at text not null
     );
   `);
+}
+
+function migrateWorkspaceResumeIdempotency(sqlite: Database.Database): void {
+  // Existing sessions receive the compatibility access level and initial
+  // generation, while aliases remain nullable until first resumed/listed.
+  addColumnIfMissing(sqlite, "workspace_sessions", "alias", "text");
+  addColumnIfMissing(
+    sqlite,
+    "workspace_sessions",
+    "write_access",
+    "text not null default 'read_write' check (write_access in ('read_only', 'read_write'))",
+  );
+  addColumnIfMissing(
+    sqlite,
+    "workspace_sessions",
+    "state_generation",
+    "integer not null default 1 check (state_generation >= 1)",
+  );
+
+  sqlite.exec(`
+    create unique index if not exists workspace_sessions_owner_alias_uq
+      on workspace_sessions(owner_client_id, alias)
+      where alias is not null;
+
+    create trigger if not exists workspace_sessions_alias_immutable
+      before update of alias on workspace_sessions
+      when old.alias is not null and new.alias is not old.alias
+      begin
+        select raise(abort, 'workspace session alias is immutable');
+      end;
+
+    create table if not exists mutation_operations (
+      owner_client_id text not null,
+      workspace_id text not null,
+      tool text not null,
+      operation_id text not null,
+      request_hash text not null,
+      state text not null check (state in ('pending', 'settled', 'outcome_unknown')),
+      result_json text,
+      created_at text not null,
+      updated_at text not null,
+      expires_at text not null,
+      primary key (owner_client_id, workspace_id, tool, operation_id),
+      foreign key (workspace_id) references workspace_sessions(id) on delete cascade
+    );
+
+    create index if not exists mutation_operations_expires_at_idx
+      on mutation_operations(expires_at);
+  `);
+}
+
+function migrateWorkspaceGenerationOperationIdentity(sqlite: Database.Database): void {
+  const invalidStatus = sqlite.prepare(`
+    select status
+    from workspace_sessions
+    where status not in ('active', 'closed', 'revoked')
+    order by status
+    limit 1
+  `).get() as { status: string } | undefined;
+  if (invalidStatus) {
+    throw new Error(
+      `Cannot formalize workspace session statuses: unsupported status ${JSON.stringify(invalidStatus.status)}.`,
+    );
+  }
+
+  sqlite.exec(`
+    create unique index if not exists workspace_sessions_id_owner_uq
+      on workspace_sessions(id, owner_client_id);
+
+    create trigger if not exists workspace_sessions_status_insert_check
+      before insert on workspace_sessions
+      when new.status not in ('active', 'closed', 'revoked')
+      begin
+        select raise(abort, 'invalid workspace session status');
+      end;
+
+    create trigger if not exists workspace_sessions_status_update_check
+      before update of status on workspace_sessions
+      when new.status not in ('active', 'closed', 'revoked')
+      begin
+        select raise(abort, 'invalid workspace session status');
+      end;
+
+    create trigger if not exists workspace_sessions_revoked_terminal
+      before update of status on workspace_sessions
+      when old.status = 'revoked' and new.status != 'revoked'
+      begin
+        select raise(abort, 'revoked workspace session is terminal');
+      end;
+
+    create table mutation_operations_v8 (
+      owner_client_id text not null,
+      workspace_id text not null,
+      tool text not null,
+      operation_id text not null,
+      workspace_generation integer not null check (workspace_generation >= 1),
+      request_hash text not null,
+      state text not null check (state in ('pending', 'settled', 'outcome_unknown')),
+      result_json text,
+      created_at text not null,
+      updated_at text not null,
+      expires_at text not null,
+      primary key (owner_client_id, operation_id),
+      foreign key (workspace_id, owner_client_id)
+        references workspace_sessions(id, owner_client_id)
+        on delete cascade
+    );
+
+    insert into mutation_operations_v8 (
+      owner_client_id, workspace_id, tool, operation_id, workspace_generation,
+      request_hash, state, result_json, created_at, updated_at, expires_at
+    )
+    select
+      owner_client_id, workspace_id, tool, operation_id, workspace_generation,
+      request_hash, state, result_json, created_at, updated_at, expires_at
+    from (
+      select
+        operation.owner_client_id,
+        operation.workspace_id,
+        operation.tool,
+        operation.operation_id,
+        workspace.state_generation as workspace_generation,
+        operation.request_hash,
+        operation.state,
+        operation.result_json,
+        operation.created_at,
+        operation.updated_at,
+        operation.expires_at,
+        row_number() over (
+          partition by operation.owner_client_id, operation.operation_id
+          order by
+            case
+              when operation.state = 'settled' and operation.result_json is not null then 3
+              when operation.state = 'settled' then 2
+              when operation.state = 'outcome_unknown' then 1
+              else 0
+            end desc,
+            operation.updated_at desc,
+            operation.created_at desc,
+            operation.rowid desc
+        ) as preference_rank
+      from mutation_operations as operation
+      inner join workspace_sessions as workspace
+        on workspace.id = operation.workspace_id
+       and workspace.owner_client_id = operation.owner_client_id
+    ) as ranked
+    where preference_rank = 1;
+
+    drop table mutation_operations;
+    alter table mutation_operations_v8 rename to mutation_operations;
+
+    create index mutation_operations_expires_at_idx
+      on mutation_operations(expires_at);
+  `);
+}
+
+function migrateWorkspaceWorktreeSourceState(sqlite: Database.Database): void {
+  addColumnIfMissing(
+    sqlite,
+    "workspace_sessions",
+    "dirty_source",
+    "text not null default 'false'",
+  );
 }
 
 function addColumnIfMissing(

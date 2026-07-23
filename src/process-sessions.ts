@@ -1,7 +1,12 @@
 import { spawn } from "node:child_process";
 import { resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
-import { resolveShellCommand, terminateProcessTree } from "./process-platform.js";
+import {
+  resolveProcessCommand,
+  terminateProcessTree,
+  type ProcessCommand,
+  type ShellCommand,
+} from "./process-platform.js";
 import { ProcessOutputQuotaError, type ProcessOutputStore } from "./process-output-store.js";
 import { tokenizeSegment, unwrapCommandWrappers } from "./command-policy.js";
 import {
@@ -27,9 +32,10 @@ export const MAX_PROCESS_INPUT_BYTES = 1024 * 1024;
 export interface StartCommandInput {
   ownerClientId: string;
   workspaceId: string;
-  command: string;
+  command: ProcessCommand;
   cwd: string;
   workspaceRoot?: string;
+  environment?: Record<string, string>;
   tty?: boolean;
   columns?: number;
   rows?: number;
@@ -319,6 +325,7 @@ function shellInvocationOption(shell: string, option: string): ShellInvocationOp
 function processEnvironment(input?: {
   workspaceId?: string;
   workspaceRoot?: string;
+  overrides?: Record<string, string>;
 }): Record<string, string> {
   const environment: Record<string, string> = {
     ...Object.fromEntries(
@@ -334,6 +341,7 @@ function processEnvironment(input?: {
     LC_ALL: process.env.LC_ALL ?? "C.UTF-8",
     ...(input?.workspaceId ? { DEVSPACE_WORKSPACE_ID: input.workspaceId } : {}),
     ...(input?.workspaceRoot ? { DEVSPACE_WORKSPACE_ROOT: input.workspaceRoot } : {}),
+    ...(input?.overrides ?? {}),
   };
   // CDPATH changes the destination of an otherwise literal relative `cd`,
   // which would invalidate the instruction-scope check performed before spawn.
@@ -529,8 +537,9 @@ export class ProcessSessionManager {
     this.sessions.set(session.id, session);
 
     try {
-      if (input.tty && process.platform !== "win32") await this.startPty(session, input);
-      else this.startPipe(session, input);
+      const command = resolveProcessCommand(input.command);
+      if (input.tty && process.platform !== "win32") await this.startPty(session, input, command);
+      else this.startPipe(session, input, command);
       this.startRuntimeTimer(session, runtimeLimitMs);
       if (input.stdin) session.process?.write(input.stdin);
       if (closeStdin) this.closeProcessStdin(session);
@@ -763,17 +772,17 @@ export class ProcessSessionManager {
     };
   }
 
-  private startPipe(session: ProcessSession, input: StartCommandInput): void {
-    const shell = resolveShellCommand(input.command);
+  private startPipe(session: ProcessSession, input: StartCommandInput, command: ShellCommand): void {
     const detached = process.platform !== "win32";
-    // Spawn the resolved shell with its args directly. Using Node's
+    // Spawn the resolved process with its args directly. Using Node's
     // `shell: executable` form drops custom args (e.g. -c) and re-wraps the
     // command inconsistently with the PTY path.
-    const child = spawn(shell.executable, shell.args, {
+    const child = spawn(command.executable, command.args, {
       cwd: input.cwd,
       env: processEnvironment({
         workspaceId: input.workspaceId,
         workspaceRoot: input.workspaceRoot,
+        overrides: input.environment,
       }),
       stdio: "pipe",
       windowsHide: true,
@@ -810,7 +819,11 @@ export class ProcessSessionManager {
     if (session.cancelRequested) session.process.kill("SIGTERM");
   }
 
-  private async startPty(session: ProcessSession, input: StartCommandInput): Promise<void> {
+  private async startPty(
+    session: ProcessSession,
+    input: StartCommandInput,
+    command: ShellCommand,
+  ): Promise<void> {
     let nodePty: typeof import("node-pty");
     try {
       nodePty = await import("node-pty");
@@ -818,18 +831,18 @@ export class ProcessSessionManager {
       throw new Error("PTY support requires the optional node-pty dependency.");
     }
 
-    const shell = resolveShellCommand(input.command);
     if (session.cancelRequested) {
       this.finish(session, undefined, "SIGTERM");
       return;
     }
     let pty: import("node-pty").IPty;
     try {
-      pty = nodePty.spawn(shell.executable, shell.args, {
+      pty = nodePty.spawn(command.executable, command.args, {
         cwd: input.cwd,
         env: processEnvironment({
           workspaceId: input.workspaceId,
           workspaceRoot: input.workspaceRoot,
+          overrides: input.environment,
         }),
         name: "xterm-256color",
         cols: session.columns,

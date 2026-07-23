@@ -161,6 +161,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     resourceServerUrl: URL,
     stateDir: string,
     private readonly onAuditEvent?: (event: OAuthAuditEvent) => void,
+    private readonly onAuthorizationEpochChanged?: (clientId: string) => void,
   ) {
     this.resourceServerUrl = resourceUrlFromServerUrl(resourceServerUrl);
     this.oauthStore = new SqliteOAuthStore(stateDir);
@@ -242,6 +243,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
       return;
     }
     this.authorizationFailures.length = 0;
+    this.onAuthorizationEpochChanged?.(client.client_id);
     this.emitAudit("oauth_authorization_succeeded", client.client_id);
 
     const code = `code-${randomUUID()}`;

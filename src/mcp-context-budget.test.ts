@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -39,6 +39,7 @@ await Promise.all([
   mkdir(worktreeRoot, { recursive: true }),
   mkdir(join(workspaceRoot, "nested"), { recursive: true }),
   mkdir(join(workspaceRoot, "read-scope"), { recursive: true }),
+  mkdir(join(workspaceRoot, "readonly-project"), { recursive: true }),
   mkdir(join(workspaceRoot, ".agents", "skills", "context-budget", "references"), { recursive: true }),
 ]);
 await writeFile(join(workspaceRoot, "AGENTS.md"), `# Test instructions\n\n${openWorkspaceNeedle}\n`);
@@ -47,6 +48,7 @@ await writeFile(join(workspaceRoot, "read-scope", "AGENTS.md"), `${scopedInstruc
 await writeFile(join(workspaceRoot, "read-scope", "payload.txt"), `${scopedPayloadNeedle}\n`);
 await writeFile(join(workspaceRoot, "payload.txt"), `${readNeedle}\n`);
 await writeFile(join(workspaceRoot, "batch.txt"), `${batchNeedle}\n`);
+await writeFile(join(workspaceRoot, "readonly-project", "payload.txt"), "readonly payload\n");
 await writeFile(join(configDir, "internal.txt"), "private DevSpace state\n");
 await writeFile(
   join(workspaceRoot, ".agents", "skills", "context-budget", "SKILL.md"),
@@ -74,6 +76,7 @@ const configEnvironment = {
   DEVSPACE_AGENT_DIR: agentDir,
   DEVSPACE_OAUTH_OWNER_TOKEN: "context-budget-owner-token-long-enough",
   DEVSPACE_MAX_COMMAND_RUNTIME_SECONDS: "1",
+  DEVSPACE_MAX_MANAGED_WORKTREES: "1",
   DEVSPACE_WIDGETS: "changes",
   DEVSPACE_LOG_LEVEL: "silent",
 };
@@ -96,6 +99,7 @@ try {
       return response;
     },
   }));
+  enableWorkspaceGenerationTracking(client);
 
   const instructions = client.getInstructions() ?? "";
   const toolsList = await client.listTools();
@@ -107,16 +111,24 @@ try {
       "batch_read",
       "close_workspace",
       "exec_command",
+      "get_operation_status",
+      "get_workspace_context",
+      "list_skills",
+      "list_workspaces",
       "load_skill",
+      "load_workspace_instructions",
       "open_workspace",
       "read",
       "read_process_output",
+      "resume_workspace",
+      "revoke_workspace",
       "show_changes",
       "write_stdin",
     ],
     "tools/list must expose only the fixed DevSpace surface",
   );
   const toolsByName = new Map(toolsList.tools.map((tool) => [tool.name, tool]));
+  assert.equal(toolsByName.get("open_workspace")?.outputSchema, undefined);
   assert.doesNotMatch(toolsByName.get("write_stdin")?.description ?? "", /rerun/i);
   assert.match(
     toolsByName.get("read_process_output")?.description ?? "",
@@ -129,7 +141,29 @@ try {
   assert.match(readProcessOutputSchema, /unknown/);
   assert.match(readProcessOutputSchema, /active/);
   assert.doesNotMatch(readProcessOutputSchema, /completed|storedBytes|totalBytes|outputId/);
-  for (const name of ["read", "load_skill", "close_workspace", "apply_patch", "show_changes"]) {
+  const readOutputSchema = JSON.stringify(toolsByName.get("read")?.outputSchema);
+  assert.match(readOutputSchema, /contentHash/);
+  assert.match(readOutputSchema, /mtimeNs/);
+  assert.match(readOutputSchema, /scopedInstructionsAvailable/);
+  assert.doesNotMatch(readOutputSchema, /content[^H]/);
+  for (const name of [
+    "read", "batch_read", "batch_inspect", "load_workspace_instructions", "list_skills",
+    "load_skill", "exec_command", "write_stdin", "read_process_output", "apply_patch",
+    "close_workspace", "revoke_workspace", "show_changes",
+  ]) {
+    const schema = toolsByName.get(name)?.inputSchema as { required?: unknown } | undefined;
+    assert.ok(
+      Array.isArray(schema?.required) && schema.required.includes("workspaceGeneration"),
+      `${name} must require workspaceGeneration`,
+    );
+  }
+  const execInputSchema = JSON.stringify(toolsByName.get("exec_command")?.inputSchema);
+  assert.match(execInputSchema, /program/);
+  assert.match(execInputSchema, /args/);
+  assert.match(execInputSchema, /shell/);
+  assert.match(execInputSchema, /command/);
+  assert.match(JSON.stringify(toolsByName.get("apply_patch")?.inputSchema), /ifMatch/);
+  for (const name of ["load_skill", "close_workspace", "apply_patch", "show_changes"]) {
     assert.equal(toolsByName.get(name)?.outputSchema, undefined, `${name} should not advertise a redundant output schema`);
   }
   for (const name of [
@@ -145,18 +179,90 @@ try {
     assert.equal(toolsByName.get(name)?._meta, undefined, `${name} should omit empty widget metadata`);
   }
   assert.ok(
-    utf8Bytes(toolsList) < 11_500,
-    `tools/list must be under 11500 UTF-8 bytes; received ${utf8Bytes(toolsList)} (${toolsList.tools.map((tool) => `${tool.name}=${utf8Bytes(tool)}/${utf8Bytes(tool.inputSchema)}/${utf8Bytes(tool.outputSchema)}`).join(", ")})`,
+    utf8Bytes(toolsList) < 19_000,
+    `tools/list must be under 19000 UTF-8 bytes; received ${utf8Bytes(toolsList)} (${toolsList.tools.map((tool) => `${tool.name}=${utf8Bytes(tool)}/${utf8Bytes(tool.inputSchema)}/${utf8Bytes(tool.outputSchema)}`).join(", ")})`,
   );
   const resourcesList = await client.listResources();
-  const openWorkspace = await client.callTool({
+  const openMetadata = await client.callTool({
     name: "open_workspace",
-    arguments: { path: workspaceRoot },
+    arguments: { path: workspaceRoot, alias: "context-budget", writeAccess: "read_write" },
+  });
+  assert.equal(
+    (openMetadata.structuredContent as { contextMode?: unknown } | undefined)?.contextMode,
+    "metadata",
+  );
+  assert.equal(
+    (openMetadata.structuredContent as { workspaceId?: unknown } | undefined)?.workspaceId,
+    undefined,
+  );
+  assert.deepEqual(
+    (openMetadata.structuredContent as { workspaceInstructions?: unknown } | undefined)
+      ?.workspaceInstructions,
+    [],
+  );
+  const projectOrientation = (openMetadata.structuredContent as {
+    project?: { empty?: unknown; topLevel?: unknown; git?: unknown };
+  } | undefined)?.project;
+  assert.equal(projectOrientation?.empty, false);
+  assert.ok(Array.isArray(projectOrientation?.topLevel));
+  assert.match(JSON.stringify(projectOrientation?.topLevel), /AGENTS\.md/);
+  assert.doesNotMatch(JSON.stringify(projectOrientation), new RegExp(root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  const openWorkspace = await client.callTool({
+    name: "get_workspace_context",
+    arguments: { alias: "context-budget", contextMode: "full" },
   });
   const workspaceId = String(
     (openWorkspace.structuredContent as { workspaceId?: unknown } | undefined)?.workspaceId ?? "",
   );
   assert.ok(workspaceId, "open_workspace must return a structured workspaceId");
+  const workspaceInstructions = (openWorkspace.structuredContent as {
+    workspaceInstructions?: Array<Record<string, unknown>>;
+  } | undefined)?.workspaceInstructions ?? [];
+  const rootInstruction = workspaceInstructions.find((instruction) => instruction.relativePath === "AGENTS.md");
+  assert.deepEqual(Object.keys(rootInstruction ?? {}).sort(), [
+    "content", "relativePath", "revision", "scope", "source", "trust",
+  ]);
+  assert.equal(rootInstruction?.source, "repository");
+  assert.equal(rootInstruction?.scope, ".");
+  assert.equal(rootInstruction?.trust, "project");
+  assert.match(String(rootInstruction?.revision), /^sha256-v1:[a-f0-9]{64}$/);
+  assert.match(String(rootInstruction?.content), new RegExp(openWorkspaceNeedle));
+  assert.doesNotMatch(JSON.stringify(workspaceInstructions), new RegExp(root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  const readonlyMetadata = await client.callTool({
+    name: "open_workspace",
+    arguments: { path: join(workspaceRoot, "readonly-project"), alias: "readonly" },
+  });
+  assert.equal(
+    (readonlyMetadata.structuredContent as { workspaceId?: unknown } | undefined)?.workspaceId,
+    undefined,
+  );
+  const readonlyOpen = await client.callTool({
+    name: "get_workspace_context",
+    arguments: { alias: "readonly", contextMode: "full" },
+  });
+  const readonlyWorkspaceId = String(
+    (readonlyOpen.structuredContent as { workspaceId?: unknown } | undefined)?.workspaceId ?? "",
+  );
+  assert.ok(readonlyWorkspaceId);
+  assert.equal(
+    (readonlyOpen.structuredContent as { writeAccess?: unknown } | undefined)?.writeAccess,
+    "read_only",
+  );
+  const readonlyRead = await client.callTool({
+    name: "read",
+    arguments: { workspaceId: readonlyWorkspaceId, path: "payload.txt" },
+  });
+  assert.notEqual(readonlyRead.isError, true);
+  const readonlyExec = await client.callTool({
+    name: "exec_command",
+    arguments: { workspaceId: readonlyWorkspaceId, cmd: "touch denied.txt" },
+  });
+  assert.equal(readonlyExec.isError, true);
+  assert.equal(
+    (readonlyExec.structuredContent as { error?: { code?: unknown } } | undefined)?.error?.code,
+    "workspace_read_only",
+  );
+  await assert.rejects(access(join(workspaceRoot, "readonly-project", "denied.txt")), { code: "ENOENT" });
   const advertisedSkill = (openWorkspace.structuredContent as {
     skills?: Array<Record<string, unknown> & { skillId?: unknown; name?: unknown }>;
   } | undefined)?.skills?.find((skill) => skill.name === "context-budget");
@@ -193,10 +299,25 @@ try {
     (openWorkspace.structuredContent as { skillRevision?: unknown } | undefined)?.skillRevision ?? "",
   );
   assert.ok(skillRevision, "open_workspace must return a skillRevision");
-  const repeatedOpenWorkspace = await client.callTool({
-    name: "open_workspace",
+  const defaultFullReopen = await client.callTool({
+    name: "get_workspace_context",
     arguments: {
-      path: workspaceRoot,
+      alias: "context-budget",
+      knownInstructionRevision: instructionRevision,
+      knownSkillRevision: skillRevision,
+    },
+  });
+  assert.equal(
+    (defaultFullReopen.structuredContent as { instructionsIncluded?: unknown } | undefined)
+      ?.instructionsIncluded,
+    true,
+    "revision hints must not suppress context unless retained mode is explicit",
+  );
+  const repeatedOpenWorkspace = await client.callTool({
+    name: "get_workspace_context",
+    arguments: {
+      alias: "context-budget",
+      contextMode: "retained",
       knownInstructionRevision: instructionRevision,
       knownSkillRevision: skillRevision,
     },
@@ -212,7 +333,7 @@ try {
     false,
   );
   assert.deepEqual(
-    (repeatedOpenWorkspace.structuredContent as { agentsFiles?: unknown } | undefined)?.agentsFiles,
+    (repeatedOpenWorkspace.structuredContent as { workspaceInstructions?: unknown } | undefined)?.workspaceInstructions,
     [],
   );
   assert.equal(
@@ -224,8 +345,12 @@ try {
     [],
   );
   const instructionsOnlySuppressed = await client.callTool({
-    name: "open_workspace",
-    arguments: { path: workspaceRoot, knownInstructionRevision: instructionRevision },
+    name: "get_workspace_context",
+    arguments: {
+      alias: "context-budget",
+      contextMode: "retained",
+      knownInstructionRevision: instructionRevision,
+    },
   });
   assert.equal(
     (instructionsOnlySuppressed.structuredContent as { instructionsIncluded?: unknown } | undefined)
@@ -237,8 +362,12 @@ try {
     true,
   );
   const skillsOnlySuppressed = await client.callTool({
-    name: "open_workspace",
-    arguments: { path: workspaceRoot, knownSkillRevision: skillRevision },
+    name: "get_workspace_context",
+    arguments: {
+      alias: "context-budget",
+      contextMode: "retained",
+      knownSkillRevision: skillRevision,
+    },
   });
   assert.equal(
     (skillsOnlySuppressed.structuredContent as { instructionsIncluded?: unknown } | undefined)
@@ -250,7 +379,7 @@ try {
     false,
   );
   const firstOpenText = toolText(openWorkspace);
-  assert.equal(firstOpenText.match(/nested instructions load/gi)?.length, 1);
+  assert.equal(firstOpenText.match(/nested instructions load/gi)?.length, undefined);
   assert.equal(firstOpenText.match(/Load an applicable returned Skill before work/gi)?.length, 1);
   assert.doesNotMatch(firstOpenText, new RegExp(workspaceId));
   assert.doesNotMatch(firstOpenText, new RegExp(workspaceRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
@@ -280,19 +409,37 @@ try {
   });
   assert.notEqual(scopedRead.isError, true);
   const scopedReadBlocks = textBlocks(scopedRead);
-  assert.match(scopedReadBlocks[0]?.text ?? "", new RegExp(scopedInstructionNeedle));
-  assert.match(scopedReadBlocks.at(-1)?.text ?? "", new RegExp(scopedPayloadNeedle));
-  assert.ok(toolText(scopedRead).indexOf(scopedInstructionNeedle) < toolText(scopedRead).indexOf(scopedPayloadNeedle));
+  assert.equal(scopedReadBlocks.length, 1);
+  assert.match(scopedReadBlocks[0]?.text ?? "", new RegExp(scopedPayloadNeedle));
+  assert.doesNotMatch(toolText(scopedRead), new RegExp(scopedInstructionNeedle));
+  assert.equal(
+    (scopedRead.structuredContent as { scopedInstructionsAvailable?: unknown } | undefined)
+      ?.scopedInstructionsAvailable,
+    true,
+  );
   assert.doesNotMatch(toolText(scopedRead), /instructionToken=/);
   const repeatedScopedRead = await client.callTool({
     name: "read",
     arguments: { workspaceId, path: "read-scope/payload.txt" },
   });
-  assert.doesNotMatch(toolText(repeatedScopedRead), new RegExp(scopedInstructionNeedle));
+  assert.equal(
+    (repeatedScopedRead.structuredContent as { scopedInstructionsAvailable?: unknown } | undefined)
+      ?.scopedInstructionsAvailable,
+    true,
+  );
+  const loadedScopedInstructions = await client.callTool({
+    name: "load_workspace_instructions",
+    arguments: { workspaceId, paths: ["read-scope/payload.txt"] },
+  });
+  assert.match(JSON.stringify(loadedScopedInstructions.structuredContent), new RegExp(scopedInstructionNeedle));
+  assert.match(
+    String((loadedScopedInstructions.structuredContent as { instructionToken?: unknown }).instructionToken),
+    /^instructions_/,
+  );
   const staleWorkspaceResponseStart = httpResponses.length;
   const staleWorkspace = await client.callTool({
     name: "read",
-    arguments: { workspaceId: "ws_stale_context_budget", path: "payload.txt" },
+    arguments: { workspaceId: "ws_stale_context_budget", workspaceGeneration: 1, path: "payload.txt" },
   });
   const staleWorkspaceResponses = httpResponses.slice(staleWorkspaceResponseStart);
   assert.equal(staleWorkspace.isError, true);
@@ -320,10 +467,24 @@ try {
   });
   const partialBatchRead = await client.callTool({
     name: "batch_read",
-    arguments: { workspaceId, files: [{ path: "batch.txt" }, { path: "missing-partial.txt" }] },
+    arguments: { workspaceId, files: [{ ref: "present", path: "batch.txt" }, { ref: "missing", path: "missing-partial.txt" }] },
   });
   assert.notEqual(partialBatchRead.isError, true);
   assert.match(toolText(partialBatchRead), /partial: 1 failed/i);
+  const partialReadStructured = partialBatchRead.structuredContent as {
+    status?: unknown;
+    succeeded?: unknown;
+    failed?: unknown;
+    items?: Array<{ ref?: unknown; ok?: unknown; result?: unknown }>;
+  };
+  assert.equal(partialReadStructured.status, "partial");
+  assert.equal(partialReadStructured.succeeded, 1);
+  assert.equal(partialReadStructured.failed, 1);
+  assert.deepEqual(partialReadStructured.items?.map(({ ref, ok }) => ({ ref, ok })), [
+    { ref: "present", ok: true },
+    { ref: "missing", ok: false },
+  ]);
+  assert.match(String(partialReadStructured.items?.[1]?.result), /\[workspace\]\/missing-partial\.txt/);
   const failedBatchRead = await client.callTool({
     name: "batch_read",
     arguments: { workspaceId, files: [{ path: "missing-one.txt" }, { path: "missing-two.txt" }] },
@@ -336,13 +497,22 @@ try {
     arguments: {
       workspaceId,
       operations: [
-        { operation: "grep", pattern: batchNeedle, path: "batch.txt" },
-        { operation: "ls", path: "missing-partial-dir" },
+        { operation: "grep", ref: "match", pattern: batchNeedle, path: "batch.txt" },
+        { operation: "ls", ref: "missing", path: "missing-partial-dir" },
       ],
     },
   });
   assert.notEqual(partialBatchInspect.isError, true);
   assert.match(toolText(partialBatchInspect), /partial: 1 failed/i);
+  assert.equal(
+    (partialBatchInspect.structuredContent as { status?: unknown } | undefined)?.status,
+    "partial",
+  );
+  assert.deepEqual(
+    (partialBatchInspect.structuredContent as { items?: Array<{ ref?: unknown }> } | undefined)
+      ?.items?.map((item) => item.ref),
+    ["match", "missing"],
+  );
   const failedBatchInspect = await client.callTool({
     name: "batch_inspect",
     arguments: {
@@ -357,6 +527,20 @@ try {
   assert.match(toolText(failedBatchInspect), /Batch inspection failed/i);
   assert.deepEqual(Object.keys(advertisedSkill).sort(), ["description", "name", "skillId"]);
   assert.doesNotMatch(JSON.stringify(advertisedSkill), new RegExp(root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  const listedSkills = await client.callTool({
+    name: "list_skills",
+    arguments: { workspaceId, query: "context-budget", limit: 10 },
+  });
+  assert.equal(
+    (listedSkills.structuredContent as { total?: unknown } | undefined)?.total,
+    1,
+  );
+  assert.equal(
+    (listedSkills.structuredContent as { skills?: Array<{ skillId?: unknown }> } | undefined)
+      ?.skills?.[0]?.skillId,
+    advertisedSkill.skillId,
+  );
+  assert.doesNotMatch(JSON.stringify(listedSkills.structuredContent), new RegExp(root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   const loadSkill = await client.callTool({
     name: "load_skill",
     arguments: { workspaceId, skillId: advertisedSkill.skillId },
@@ -385,15 +569,46 @@ try {
     } | undefined)?.items?.[0]?.result ?? ""),
     new RegExp(skillReferenceNeedle),
   );
+  const skillManifestPath = join(workspaceRoot, ".agents", "skills", "context-budget", "SKILL.md");
+  await writeFile(
+    skillManifestPath,
+    "---\nname: context-budget\ndescription: Changed after discovery.\n---\n",
+  );
+  const changedSkill = await client.callTool({
+    name: "load_skill",
+    arguments: { workspaceId, skillId: advertisedSkill.skillId },
+  });
+  assert.equal(changedSkill.isError, true);
+  assert.equal(
+    ((changedSkill.structuredContent as { error?: { code?: unknown } } | undefined)?.error?.code),
+    "skill_manifest_changed",
+  );
+  await writeFile(
+    skillManifestPath,
+    `---\nname: context-budget\ndescription: Context budget fixture.\n---\n\n${skillNeedle}\n`,
+  );
+  const rootInstructionLoad = await client.callTool({
+    name: "load_workspace_instructions",
+    arguments: { workspaceId, paths: ["."] },
+  });
+  const rootInstructionToken = String(
+    (rootInstructionLoad.structuredContent as { instructionToken?: unknown } | undefined)?.instructionToken ?? "",
+  );
+  assert.match(rootInstructionToken, /^instructions_/);
   const execCommand = await client.callTool({
     name: "exec_command",
     arguments: {
       workspaceId,
+      instructionToken: rootInstructionToken,
       cmd: `${JSON.stringify(process.execPath)} -e "process.stdin.pipe(process.stdout)"`,
       stdin: `${processNeedle}\n`,
     },
   });
-  assert.deepEqual(execCommand.structuredContent, {});
+  assert.deepEqual(execCommand.structuredContent, {
+    ok: true,
+    status: "exited",
+    commandExecuted: true,
+  });
   const heredocShellInput = await client.callTool({
     name: "exec_command",
     arguments: {
@@ -412,6 +627,41 @@ try {
   assert.equal(deniedCommand.isError, true);
   assert.match(toolText(deniedCommand), /^No command was executed\./);
   assert.match(JSON.stringify(deniedCommand.content), /blocked by command policy/i);
+
+  for (const [args, expected] of [
+    [["sudo", "id"], /sudo|command_blocked/i],
+    [["rm", "-rf", "nested"], /recursive rm|command_blocked/i],
+  ] as const) {
+    const wrappedDenial = await client.callTool({
+      name: "exec_command",
+      arguments: { workspaceId, program: "env", args },
+    });
+    assert.equal(wrappedDenial.isError, true);
+    assert.match(toolText(wrappedDenial), expected);
+  }
+  const wrappedOutsideDirectory = await client.callTool({
+    name: "exec_command",
+    arguments: {
+      workspaceId,
+      program: "env",
+      args: ["--chdir", root, "touch", "argv-wrapper-outside.txt"],
+    },
+  });
+  assert.equal(wrappedOutsideDirectory.isError, true);
+  assert.match(toolText(wrappedOutsideDirectory), /wrapper path leaves the workspace/i);
+  for (const [program, args, expected] of [
+    ["env", [`-C${root}`, "touch", "argv-wrapper-attached.txt"], /wrapper path leaves/i],
+    ["time", [`-o${join(root, "time.txt")}`, "true"], /wrapper path leaves/i],
+    ["cp", [`-t${root}`, "nested/fixture.txt"], /target directory leaves/i],
+    ["mv", [`--target-directory=${root}`, "nested/fixture.txt"], /target directory leaves/i],
+  ] as const) {
+    const attachedPathDenial = await client.callTool({
+      name: "exec_command",
+      arguments: { workspaceId, program, args },
+    });
+    assert.equal(attachedPathDenial.isError, true);
+    assert.match(toolText(attachedPathDenial), expected);
+  }
 
   const timedOutCommand = await client.callTool({
     name: "exec_command",
@@ -449,7 +699,7 @@ try {
   assert.equal(typeof activeSessionId, "number");
   assert.deepEqual(
     Object.keys((activeCommand.structuredContent ?? {}) as Record<string, unknown>).sort(),
-    ["outputId", "sessionId"],
+    ["commandExecuted", "ok", "outputId", "sessionId", "status"],
   );
   const activeProcessOutput = await client.callTool({
     name: "read_process_output",
@@ -461,9 +711,10 @@ try {
   );
   assert.deepEqual(
     Object.keys((activeProcessOutput.structuredContent ?? {}) as Record<string, unknown>).sort(),
-    ["nextOffset", "status"],
+    ["nextOffset", "ok", "status"],
   );
-  assert.match(toolText(activeProcessOutput), /active-status.*current end; poll offset=/s);
+  assert.match(toolText(activeProcessOutput), /active-status/s);
+  assert.doesNotMatch(toolText(activeProcessOutput), /current end|poll offset|more: offset/i);
   await client.callTool({
     name: "write_stdin",
     arguments: { workspaceId, sessionId: activeSessionId, yieldTimeMs: 1_000 },
@@ -555,27 +806,74 @@ try {
 
   const nestedGate = await client.callTool({
     name: "exec_command",
-    arguments: { workspaceId, cmd: "pwd", workingDirectory: "nested" },
+    arguments: {
+      workspaceId,
+      operationId: "nested-instruction-once",
+      cmd: "pwd",
+      workingDirectory: "nested",
+    },
   });
   assert.equal(nestedGate.isError, true);
   const nestedGateText = JSON.stringify(nestedGate.content);
   assert.match(
     nestedGateText,
-    /No mutation or command was executed because new scoped instructions must be reviewed first/,
+    /Call load_workspace_instructions/,
   );
-  const instructionToken = nestedGateText.match(/instructionToken=([A-Za-z0-9_-]+)/)?.[1];
+  assert.doesNotMatch(nestedGateText, /Nested instructions/);
+  const nestedInstructionLoad = await client.callTool({
+    name: "load_workspace_instructions",
+    arguments: { workspaceId, paths: ["nested"] },
+  });
+  const instructionToken = String(
+    (nestedInstructionLoad.structuredContent as { instructionToken?: unknown } | undefined)?.instructionToken ?? "",
+  );
   assert.ok(instructionToken, "nested instruction gate must return an acknowledgement token");
   const nestedRetry = await client.callTool({
     name: "exec_command",
-    arguments: { workspaceId, instructionToken, cmd: "pwd", workingDirectory: "nested" },
+    arguments: {
+      workspaceId,
+      instructionToken,
+      operationId: "nested-instruction-once",
+      cmd: "pwd",
+      workingDirectory: "nested",
+    },
   });
   assert.notEqual(nestedRetry.isError, true);
   assert.match(JSON.stringify(nestedRetry.content), /nested/);
+  const nestedReplay = await client.callTool({
+    name: "exec_command",
+    arguments: {
+      workspaceId,
+      instructionToken,
+      operationId: "nested-instruction-once",
+      cmd: "pwd",
+      workingDirectory: "nested",
+    },
+  });
+  assert.notEqual(nestedReplay.isError, true, "a consumed instruction token must not block operation replay");
+  const invalidPatch = await client.callTool({
+    name: "apply_patch",
+    arguments: {
+      workspaceId,
+      patch: "*** Begin Patch\n*** Update File: payload.txt\n@@\n-context that is absent\n+replacement\n*** End Patch",
+    },
+  });
+  assert.equal(invalidPatch.isError, true);
+  assert.match(toolText(invalidPatch), /^invalid_patch: could not find hunk context in payload\.txt/);
+  assert.equal(
+    (invalidPatch.structuredContent as { error?: { recovery?: unknown } } | undefined)?.error?.recovery,
+    "read",
+  );
+  assert.equal(
+    (invalidPatch.structuredContent as { error?: { phase?: unknown } } | undefined)?.error?.phase,
+    "not_started",
+  );
   const invalidInstructionToken = await client.callTool({
     name: "exec_command",
     arguments: {
       workspaceId,
       instructionToken: "instructions_missing_context_budget",
+      operationId: "invalid-instruction-token-recovery",
       cmd: "pwd",
       workingDirectory: "nested",
     },
@@ -583,6 +881,20 @@ try {
   assert.equal(invalidInstructionToken.isError, true);
   assert.match(toolText(invalidInstructionToken), /^instruction_token_invalid:/);
   assert.doesNotMatch(toolText(invalidInstructionToken), /instructions_missing_context_budget/);
+  const recoveredInvalidInstructionToken = await client.callTool({
+    name: "exec_command",
+    arguments: {
+      workspaceId,
+      operationId: "invalid-instruction-token-recovery",
+      cmd: "pwd",
+      workingDirectory: "nested",
+    },
+  });
+  assert.notEqual(
+    recoveredInvalidInstructionToken.isError,
+    true,
+    "an invalid instruction token must release a not-started operationId",
+  );
 
   const background = await client.callTool({
     name: "exec_command",
@@ -602,15 +914,70 @@ try {
   assert.match(JSON.stringify(backgroundResult.content), /background-ok/);
   const dirtyWorkspace = await client.callTool({
     name: "open_workspace",
-    arguments: { path: workspaceRoot, mode: "worktree" },
+    arguments: { path: workspaceRoot, mode: "worktree", contextMode: "full" },
   });
   const dirtyWorkspaceId = String(
     (dirtyWorkspace.structuredContent as { workspaceId?: unknown } | undefined)?.workspaceId ?? "",
   );
-  const dirtyWorkspaceRoot = String(
-    (dirtyWorkspace.structuredContent as { root?: unknown } | undefined)?.root ?? "",
-  );
   assert.ok(dirtyWorkspaceId);
+  const deduplicatedWorktree = await client.callTool({
+    name: "open_workspace",
+    arguments: { path: workspaceRoot, mode: "worktree", contextMode: "full" },
+  });
+  assert.equal(
+    (deduplicatedWorktree.structuredContent as { workspaceId?: unknown } | undefined)?.workspaceId,
+    dirtyWorkspaceId,
+  );
+  assert.equal(
+    (deduplicatedWorktree.structuredContent as { reused?: unknown } | undefined)?.reused,
+    true,
+  );
+  const forcedWorktreeQuota = await client.callTool({
+    name: "open_workspace",
+    arguments: { path: workspaceRoot, mode: "worktree", forceNew: true },
+  });
+  assert.equal(forcedWorktreeQuota.isError, true);
+  assert.match(toolText(forcedWorktreeQuota), /^managed_worktree_quota:/);
+  assert.equal(
+    (forcedWorktreeQuota.structuredContent as { error?: { recovery?: unknown } } | undefined)?.error?.recovery,
+    "close_workspace",
+  );
+  const invalidBaseRef = await client.callTool({
+    name: "open_workspace",
+    arguments: { path: workspaceRoot, mode: "worktree", baseRef: "missing-ref-for-context-budget" },
+  });
+  assert.equal(invalidBaseRef.isError, true);
+  assert.match(toolText(invalidBaseRef), /^git_invalid_base_ref:/);
+  assert.doesNotMatch(toolText(invalidBaseRef), new RegExp(workspaceRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  const listedManagedWorkspace = ((await client.callTool({
+    name: "list_workspaces",
+    arguments: {},
+  })).structuredContent as {
+    workspaces?: Array<{ managed?: unknown; dirtySource?: unknown }>;
+  } | undefined)?.workspaces?.find((candidate) => candidate.managed === true);
+  assert.equal(typeof listedManagedWorkspace?.dirtySource, "boolean");
+  assert.equal(
+    listedManagedWorkspace?.dirtySource,
+    (dirtyWorkspace.structuredContent as { project?: { dirtySource?: unknown } } | undefined)?.project?.dirtySource,
+  );
+  assert.equal(
+    "root" in ((dirtyWorkspace.structuredContent ?? {}) as Record<string, unknown>),
+    false,
+    "workspace responses must not expose absolute host roots",
+  );
+  const dirtyInstructionLoad = await client.callTool({
+    name: "load_workspace_instructions",
+    arguments: { workspaceId: dirtyWorkspaceId, paths: ["."] },
+  });
+  const dirtyInstructionToken = String(
+    (dirtyInstructionLoad.structuredContent as { instructionToken?: unknown } | undefined)?.instructionToken ?? "",
+  );
+  assert.match(dirtyInstructionToken, /^instructions_/);
+  const dirtyPwd = await client.callTool({
+    name: "exec_command",
+    arguments: { workspaceId: dirtyWorkspaceId, instructionToken: dirtyInstructionToken, cmd: "pwd" },
+  });
+  const dirtyWorkspaceRoot = toolText(dirtyPwd).split("\n")[0]?.trim() ?? "";
   assert.ok(dirtyWorkspaceRoot);
   const siblingManagedRead = await client.callTool({
     name: "exec_command",
@@ -651,7 +1018,14 @@ try {
     arguments: { workspaceId: dirtyWorkspaceId },
   });
   assert.equal(dirtyClose.isError, true);
-  assert.equal(dirtyClose.structuredContent, undefined);
+  assert.equal(
+    (dirtyClose.structuredContent as { ok?: unknown } | undefined)?.ok,
+    false,
+  );
+  assert.equal(
+    typeof (dirtyClose.structuredContent as { error?: { code?: unknown } } | undefined)?.error?.code,
+    "string",
+  );
   assert.deepEqual((dirtyClose._meta as { card?: { summary?: unknown } } | undefined)?.card?.summary, {
     closed: false,
     processesTerminated: 1,
@@ -673,7 +1047,7 @@ try {
     name: "read_process_output",
     arguments: { workspaceId, outputId, offset: 0 },
   });
-  assert.deepEqual(readProcessOutput.structuredContent, { eof: true });
+  assert.deepEqual(readProcessOutput.structuredContent, { ok: true, eof: true });
   assert.match(toolText(readProcessOutput), /active-status/);
   assert.doesNotMatch(toolText(readProcessOutput), /completed|retained end|outputId/);
 
@@ -695,7 +1069,7 @@ try {
     (unknownProcessOutput.structuredContent as { status?: unknown } | undefined)?.status,
     "unknown",
   );
-  assert.deepEqual(unknownProcessOutput.structuredContent, { eof: true, status: "unknown" });
+  assert.deepEqual(unknownProcessOutput.structuredContent, { ok: true, eof: true, status: "unknown" });
   assert.match(
     toolText(unknownProcessOutput),
     /completion unknown; verify side effects before rerun/i,
@@ -789,7 +1163,15 @@ try {
   }
   assert.equal(measurements.batchRead.hiddenMetaHeavyCopies, 0);
   assert.equal(measurements.batchInspect.hiddenMetaHeavyCopies, 0);
-  assert.equal(read.structuredContent, undefined);
+  assert.match(
+    String((read.structuredContent as { contentHash?: unknown } | undefined)?.contentHash),
+    /^sha256:[a-f0-9]{64}$/,
+  );
+  assert.match(
+    String((read.structuredContent as { mtimeNs?: unknown } | undefined)?.mtimeNs),
+    /^\d+$/,
+  );
+  assert.equal((read.structuredContent as { content?: unknown } | undefined)?.content, undefined);
   assert.equal(loadSkill.structuredContent, undefined);
   assert.equal((loadSkill._meta as { tool?: unknown } | undefined)?.tool, "load_skill");
   assert.equal((execCommand.structuredContent as { result?: unknown } | undefined)?.result, undefined);
@@ -960,15 +1342,38 @@ function toolText(response: unknown): string {
 
 function assertFirst512Lifecycle(instructions: string): void {
   const first512 = instructions.slice(0, 512);
-  assert.match(first512, /open_workspace once for the exact path/);
-  assert.match(first512, /reuse workspaceId across turns\/transports/);
-  assert.match(first512, /unknown_workspace.*reopen the path.*replace ID/s);
-  assert.match(first512, /close_workspace only when asked/);
-  assert.match(first512, /Follow returned instructions/);
-  assert.match(first512, /Read\/open needs no retry/);
-  assert.match(first512, /blocked mutation\/command.*instructionToken/);
-  assert.match(first512, /Batch 2–8 independent known targets/);
-  assert.doesNotMatch(first512, /reconnect|MCP session is rejected/);
+  assert.match(first512, /user-approved local workspace/);
+  assert.match(first512, /lower-priority project context/);
+  assert.match(first512, /Never retry a mutating tool unless.*safe/);
+  assert.match(first512, /unrelated computation/);
+  assert.doesNotMatch(
+    first512,
+    /open_workspace|workspaceId|instructionToken|Batch|operationId|sessionId|outputId|DevSpace state/,
+  );
+}
+
+function enableWorkspaceGenerationTracking(client: Client): void {
+  const generations = new Map<string, number>();
+  const original = client.callTool.bind(client);
+  client.callTool = (async (...callArgs: Parameters<Client["callTool"]>) => {
+    const request = callArgs[0];
+    const requestArguments = request.arguments as Record<string, unknown> | undefined;
+    const workspaceId = typeof requestArguments?.workspaceId === "string"
+      ? requestArguments.workspaceId
+      : undefined;
+    if (workspaceId && requestArguments?.workspaceGeneration === undefined) {
+      const generation = generations.get(workspaceId);
+      if (generation !== undefined) {
+        callArgs[0] = { ...request, arguments: { ...requestArguments, workspaceGeneration: generation } };
+      }
+    }
+    const result = await original(...callArgs);
+    const structured = result.structuredContent as Record<string, unknown> | undefined;
+    if (typeof structured?.workspaceId === "string" && typeof structured.workspaceGeneration === "number") {
+      generations.set(structured.workspaceId, structured.workspaceGeneration);
+    }
+    return result;
+  }) as Client["callTool"];
 }
 
 function utf8Bytes(value: unknown): number {

@@ -106,6 +106,18 @@ Filesystem path containment applies to DevSpace file tools. Shell commands run
 as local commands and can do what your user account can do. This is why the MCP
 client must be trusted and the Owner password must stay private.
 
+For that reason, new checkout workspaces are read-only by default and do not
+permit shell execution. Use a managed worktree for writable model work. Direct
+writes to the user's current checkout require an explicit
+`writeAccess: "read_write"`; this is an authority choice, not a claim that the
+shell has been sandboxed.
+
+Direct `program` + `args` execution removes shell expansion and quoting
+ambiguity, but it is not an OS sandbox. `network: "deny"` fails closed unless a
+future runtime can enforce it. Workspace generations reject stale handles, and
+file `contentHash` preconditions reduce accidental concurrent overwrites; they
+do not replace OS isolation or coordination between users.
+
 ## Worktrees
 
 Managed worktrees reduce accidental edits to your active checkout, but they are

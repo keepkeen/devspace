@@ -118,6 +118,21 @@ assert.match(foreground.output, /foreground/);
 assert.equal(foreground.sessionId, undefined);
 assert.equal(foreground.stdinClosed, true);
 
+const literalArgs = ["two words", "$(echo not-executed)", "semi;colon", "*.ts", "'quoted'", ""];
+const directForeground = await manager.start({
+  ownerClientId,
+  workspaceId: "workspace-a",
+  cwd: process.cwd(),
+  command: {
+    program: process.execPath,
+    args: ["-e", "process.stdout.write(JSON.stringify(process.argv.slice(1)))", ...literalArgs],
+  },
+  yieldTimeMs: 2_000,
+});
+assert.equal(directForeground.running, false);
+assert.equal(directForeground.exitCode, 0);
+assert.deepEqual(JSON.parse(directForeground.output), literalArgs);
+
 const initialStdin = await manager.start({
   ownerClientId,
   workspaceId: "workspace-a",
@@ -483,6 +498,21 @@ try {
     assert.equal(pty.running, false);
     assert.match(pty.output, /pty-ok/);
   } else {
+    const directPty = await manager.start({
+      ownerClientId,
+      workspaceId: "workspace-a",
+      cwd: process.cwd(),
+      command: {
+        program: process.execPath,
+        args: ["-e", "process.stdout.write(JSON.stringify(process.argv.slice(1)))", ...literalArgs],
+      },
+      tty: true,
+      yieldTimeMs: 2_000,
+    });
+    assert.equal(directPty.running, false);
+    assert.equal(directPty.exitCode, 0);
+    assert.deepEqual(JSON.parse(directPty.output), literalArgs);
+
     const pty = await manager.start({
       ownerClientId,
       workspaceId: "workspace-a",

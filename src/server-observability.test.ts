@@ -7,7 +7,6 @@ import {
   SHOW_CHANGES_ANNOTATIONS,
   MAX_SKILL_CATALOG_BYTES,
   buildWorkspaceSkillCatalog,
-  combineBatchItemsWithInstructions,
   containsBatchedToolCall,
   commandInstructionScopePaths,
   jsonRpcRequestId,
@@ -522,6 +521,12 @@ assert.equal(workspaceOperationId({
   method: "tools/call",
   params: { name: "close_workspace", arguments: { workspaceId: "ws_test" } },
 }), undefined);
+for (const name of ["list_workspaces", "resume_workspace", "get_workspace_context"]) {
+  assert.equal(workspaceOperationId({
+    method: "tools/call",
+    params: { name, arguments: { alias: "project" } },
+  }), undefined);
+}
 assert.equal(toolCallWorkspaceId({
   method: "tools/call",
   params: { name: "close_workspace", arguments: { workspaceId: "ws_test" } },
@@ -547,10 +552,11 @@ assert.equal(recoverableWorkspaceError(new Error("database failure")), undefined
 
 const commonTools = [
   "apply_patch", "batch_inspect", "batch_read", "close_workspace", "exec_command",
-  "open_workspace", "read", "read_process_output", "write_stdin",
+  "get_operation_status", "get_workspace_context", "list_workspaces", "load_workspace_instructions",
+  "open_workspace", "read", "read_process_output", "resume_workspace", "revoke_workspace", "write_stdin",
 ];
 assert.deepEqual(toolSurface({ widgets: "off", skillsEnabled: true }), [
-  ...commonTools, "load_skill",
+  ...commonTools, "list_skills", "load_skill",
 ].sort());
 const changesSurface = toolSurface({ widgets: "changes", skillsEnabled: false });
 assert.ok(changesSurface.includes("show_changes"));
@@ -571,31 +577,3 @@ const publicAssets = workspaceAppAssetPaths();
 assert.equal(publicAssets.has("admin.html"), false);
 assert.equal([...publicAssets].some((path) => /(^|\/)admin-[^/]+\.(?:js|css)$/.test(path)), false);
 assert.equal([...publicAssets].every((path) => path.startsWith("assets/")), true);
-
-const batchItem = { index: 0, operation: "read", path: "file.ts", ok: true, result: "result", truncated: false };
-const combinedBatch = combineBatchItemsWithInstructions([batchItem], false, "instructions");
-assert.equal(combinedBatch.instructionsDelivered, true);
-assert.equal(combinedBatch.items[0]?.result, "result");
-assert.equal(combinedBatch.instructions, "instructions");
-
-const oversizedInstructions = combineBatchItemsWithInstructions(
-  [{ ...batchItem, result: "r".repeat(48_000) }],
-  false,
-  "x".repeat(60_000),
-);
-assert.equal(oversizedInstructions.instructionsDelivered, false);
-assert.equal(oversizedInstructions.truncated, true);
-assert.equal(oversizedInstructions.instructions, undefined);
-assert.match(oversizedInstructions.warning ?? "", /Use read on one target path/);
-assert.ok(
-  (oversizedInstructions.items[0]?.result.length ?? 0) + (oversizedInstructions.warning?.length ?? 0) <= 48_000,
-);
-
-const budgetedBatch = combineBatchItemsWithInstructions(
-  [{ ...batchItem, result: "r".repeat(48_000) }],
-  false,
-  "i".repeat(1_000),
-);
-assert.equal(budgetedBatch.instructionsDelivered, true);
-assert.equal(budgetedBatch.truncated, true);
-assert.ok((budgetedBatch.items[0]?.result.length ?? 0) + (budgetedBatch.instructions?.length ?? 0) <= 48_000);

@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { constants, type Stats } from "node:fs";
-import { access, lstat, mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { access, lstat, mkdir, readFile, realpath, rename, rm, rmdir, stat, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { TextDecoder } from "node:util";
 import { createTwoFilesPatch, FILE_HEADERS_ONLY } from "diff";
+import { readFileVersion, type FileVersion } from "./file-version.js";
 
 export type PatchOperation = "add" | "update" | "delete" | "move";
 
@@ -20,21 +21,63 @@ export interface ApplyPatchResult {
   removals: number;
 }
 
-interface HunkLine {
+export interface ApplyPatchOptions {
+  ifMatch?: Readonly<Record<string, FileVersionPrecondition>>;
+  commitOperations?: PatchCommitOperations;
+}
+
+export interface PatchCommitOperations {
+  rename(source: string, destination: string): Promise<void>;
+}
+
+export type FileVersionPrecondition =
+  | string
+  | { hash: string; mtimeNs?: string }
+  | null;
+
+export class FileVersionConflictError extends Error {
+  constructor(
+    readonly path: string,
+    readonly expected: FileVersionPrecondition,
+    readonly actual: FileVersion | null,
+  ) {
+    super(`File version conflict for ${path}`);
+    this.name = "FileVersionConflictError";
+  }
+}
+
+export class InvalidPatchError extends Error {
+  readonly code = "invalid_patch";
+
+  constructor(
+    readonly publicText: string,
+    readonly path?: string,
+  ) {
+    super(`Invalid patch: ${publicText}`);
+    this.name = "InvalidPatchError";
+  }
+}
+
+export interface HunkLine {
   kind: "context" | "add" | "remove";
   text: string;
 }
 
-interface UpdateHunk {
+export interface UpdateHunk {
   lines: HunkLine[];
   changeContext?: string;
   endOfFile?: boolean;
 }
 
-type PatchAction =
+export type PatchAction =
   | { kind: "add"; path: string; content: string }
   | { kind: "delete"; path: string }
   | { kind: "update"; path: string; moveTo?: string; hunks: UpdateHunk[] };
+
+export interface PreparedPatch {
+  readonly actions: readonly PatchAction[];
+  readonly paths: readonly string[];
+}
 
 interface TextFile {
   content: string;
@@ -42,11 +85,27 @@ interface TextFile {
 }
 
 type StagedTextFile = TextFile | null;
+interface TransactionEntry {
+  destination: string;
+  file: StagedTextFile;
+  replacement?: string;
+}
+
+interface CommitRecord {
+  destination: string;
+  destinationExisted: boolean;
+  backup?: string;
+}
+
 type FileIdentity = Pick<Stats, "dev" | "ino">;
 type FileIdentityReader = (path: string) => Promise<FileIdentity>;
 
-function patchError(message: string): Error {
-  return new Error(`Invalid patch: ${message}`);
+function patchError(message: string, path?: string): InvalidPatchError {
+  const publicPath = path !== undefined && isPublicRelativePath(path) ? path : undefined;
+  const publicText = path && !publicPath
+    ? message.split(path).join("the provided path")
+    : message;
+  return new InvalidPatchError(publicText, publicPath);
 }
 
 export function parsePatch(patch: string): PatchAction[] {
@@ -78,11 +137,11 @@ export function parsePatch(patch: string): PatchAction[] {
       while (index < lines.length && !isTopLevelHeader(lines[index])) {
         const line = lines[index++];
         if (!line.startsWith("+")) {
-          throw patchError(`added file line must start with +: ${line}`);
+          throw patchError(`added file lines must start with +: ${path}`, path);
         }
         content.push(line.slice(1));
       }
-      if (content.length === 0) throw patchError(`add file for ${path} has no content`);
+      if (content.length === 0) throw patchError(`add file has no content: ${path}`, path);
       actions.push({
         kind: "add",
         path,
@@ -108,7 +167,7 @@ export function parsePatch(patch: string): PatchAction[] {
       let current: UpdateHunk | undefined;
       const finishCurrent = (): void => {
         if (!current) return;
-        if (current.lines.length === 0) throw patchError(`empty update hunk for ${path}`);
+        if (current.lines.length === 0) throw patchError(`update hunk is empty: ${path}`, path);
         hunks.push(current);
         current = undefined;
       };
@@ -121,7 +180,7 @@ export function parsePatch(patch: string): PatchAction[] {
           continue;
         }
         if (trimmed === "*** End of File") {
-          if (!current) throw patchError(`end-of-file marker without update hunk for ${path}`);
+          if (!current) throw patchError(`end-of-file marker has no update hunk: ${path}`, path);
           current.endOfFile = true;
           index++;
           continue;
@@ -143,22 +202,34 @@ export function parsePatch(patch: string): PatchAction[] {
         else if (line.startsWith("+")) current.lines.push({ kind: "add", text: line.slice(1) });
         else if (line.startsWith("-")) current.lines.push({ kind: "remove", text: line.slice(1) });
         else if (line === "\\ No newline at end of file") continue;
-        else throw patchError(`hunk line must start with space, +, or -: ${line}`);
+        else throw patchError(`hunk lines must start with space, +, or -: ${path}`, path);
       }
       finishCurrent();
 
       if (hunks.length === 0 && !moveTo) {
-        throw patchError(`update for ${path} has no hunks or move destination`);
+        throw patchError(`update has no hunks or move destination: ${path}`, path);
       }
       actions.push({ kind: "update", path, moveTo, hunks });
       continue;
     }
 
-    throw patchError(`unknown action header: ${header}`);
+    throw patchError("unknown action header; use *** Add File, *** Delete File, or *** Update File");
   }
 
   if (actions.length === 0) throw patchError("contains no file actions");
   return actions;
+}
+
+export function preparePatch(patch: string): PreparedPatch {
+  const actions = parsePatch(patch);
+  return {
+    actions,
+    paths: actions.flatMap((action) =>
+      action.kind === "update" && action.moveTo
+        ? [action.path, action.moveTo]
+        : [action.path],
+    ),
+  };
 }
 
 function patchLines(patch: string): string[] {
@@ -190,15 +261,20 @@ function isInside(root: string, path: string): boolean {
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
 
-async function resolveConfinedPath(root: string, input: string): Promise<string> {
+function isPublicRelativePath(path: string): boolean {
+  if (!path || path.includes("\0") || isAbsolute(path)) return false;
+  const syntheticRoot = resolve("/", "__devspace_patch_root__");
+  return isInside(syntheticRoot, resolve(syntheticRoot, path));
+}
+
+async function resolveConfinedPath(rootPath: string, input: string): Promise<string> {
   if (!input || input.includes("\0") || isAbsolute(input)) {
-    throw patchError(`path must be relative to the workspace: ${input}`);
+    throw patchError("path must be relative to the workspace and non-empty");
   }
 
-  const rootPath = await realpath(root);
   const target = resolve(rootPath, input);
   if (!isInside(rootPath, target)) {
-    throw patchError(`path escapes the workspace: ${input}`);
+    throw patchError(`path escapes the workspace: ${input}`, input);
   }
 
   let existing = target;
@@ -206,7 +282,7 @@ async function resolveConfinedPath(root: string, input: string): Promise<string>
     try {
       const resolved = await realpath(existing);
       if (!isInside(rootPath, resolved)) {
-        throw patchError(`path resolves outside the workspace: ${input}`);
+        throw patchError(`path resolves outside the workspace through a symbolic link: ${input}`, input);
       }
       break;
     } catch (error) {
@@ -260,7 +336,7 @@ function applyHunks(path: string, content: string, hunks: UpdateHunk[]): string 
     if (hunk.changeContext) {
       const contextIndex = findSequence(lines, [hunk.changeContext], cursor);
       if (contextIndex < 0) {
-        throw patchError(`could not find hunk context in ${path}: ${hunk.changeContext}`);
+        throw patchError(`could not find hunk context in ${path}; read the file and regenerate the patch`, path);
       }
       cursor = contextIndex + 1;
     }
@@ -276,8 +352,7 @@ function applyHunks(path: string, content: string, hunks: UpdateHunk[]): string 
       : findSequence(lines, oldLines, cursor, hunk.endOfFile);
 
     if (index < 0) {
-      const preview = oldLines.slice(0, 3).join("\n");
-      throw patchError(`could not find hunk context in ${path}: ${preview}`);
+      throw patchError(`could not find hunk context in ${path}; read the file and regenerate the patch`, path);
     }
 
     lines.splice(index, oldLines.length, ...newLines);
@@ -340,11 +415,30 @@ export async function isSamePatchFile(
   }
 }
 
-export async function applyPatch(root: string, patch: string): Promise<ApplyPatchResult> {
-  const actions = parsePatch(patch);
+export async function applyPatch(
+  root: string,
+  patch: string,
+  options: ApplyPatchOptions = {},
+): Promise<ApplyPatchResult> {
+  return applyPreparedPatch(root, preparePatch(patch), options);
+}
+
+export async function applyPreparedPatch(
+  root: string,
+  prepared: PreparedPatch,
+  options: ApplyPatchOptions = {},
+): Promise<ApplyPatchResult> {
+  const rootPath = await realpath(root);
   const results: AppliedPatchFile[] = [];
   const patches: string[] = [];
   const staged = new Map<string, StagedTextFile>();
+  const touched = new Map<string, string>();
+
+  const resolveTouchedPath = async (path: string): Promise<string> => {
+    const absolute = await resolveConfinedPath(rootPath, path);
+    touched.set(absolute, path);
+    return absolute;
+  };
 
   const readStagedOptional = async (absolute: string, displayPath: string): Promise<StagedTextFile> => {
     if (staged.has(absolute)) return staged.get(absolute) ?? null;
@@ -355,13 +449,13 @@ export async function applyPatch(root: string, patch: string): Promise<ApplyPatc
 
   const readStagedRequired = async (absolute: string, displayPath: string): Promise<TextFile> => {
     const file = await readStagedOptional(absolute, displayPath);
-    if (!file) throw patchError(`file does not exist: ${displayPath}`);
+    if (!file) throw patchError(`file does not exist: ${displayPath}`, displayPath);
     return file;
   };
 
-  for (const action of actions) {
+  for (const action of prepared.actions) {
     if (action.kind === "add") {
-      const absolute = await resolveConfinedPath(root, action.path);
+      const absolute = await resolveTouchedPath(action.path);
       const original = await readStagedOptional(absolute, action.path);
       staged.set(absolute, { content: action.content, mode: original?.mode });
       patches.push(unifiedFilePatch(action.path, action.path, original?.content ?? null, action.content));
@@ -369,7 +463,7 @@ export async function applyPatch(root: string, patch: string): Promise<ApplyPatc
       continue;
     }
 
-    const absolute = await resolveConfinedPath(root, action.path);
+    const absolute = await resolveTouchedPath(action.path);
     const file = await readStagedRequired(absolute, action.path);
 
     if (action.kind === "delete") {
@@ -381,7 +475,7 @@ export async function applyPatch(root: string, patch: string): Promise<ApplyPatc
 
     const updated = applyHunks(action.path, file.content, action.hunks);
     if (action.moveTo) {
-      const destination = await resolveConfinedPath(root, action.moveTo);
+      const destination = await resolveTouchedPath(action.moveTo);
       const samePatchFile = await isSamePatchFile(absolute, destination);
       if (!samePatchFile) await readStagedOptional(destination, action.moveTo);
       if (samePatchFile) staged.delete(absolute);
@@ -396,23 +490,63 @@ export async function applyPatch(root: string, patch: string): Promise<ApplyPatc
     }
   }
 
-  for (const [absolute, file] of staged) {
-    if (file) await writeTextFile(absolute, file.content, file.mode);
-  }
-
-  for (const [absolute, file] of staged) {
-    if (!file) await rm(absolute, { force: true });
-  }
+  await validateFilePreconditions(rootPath, options.ifMatch, touched);
+  await commitPatchTransaction(rootPath, staged, options.commitOperations?.rename ?? rename);
 
   const unifiedPatch = patches.filter(Boolean).join("\n");
   const stats = countPatchStats(unifiedPatch);
   return { files: results, patch: unifiedPatch, ...stats };
 }
 
+async function validateFilePreconditions(
+  rootPath: string,
+  ifMatch: ApplyPatchOptions["ifMatch"],
+  touched: ReadonlyMap<string, string>,
+): Promise<void> {
+  if (!ifMatch) return;
+
+  for (const [path, expected] of Object.entries(ifMatch)) {
+    const absolute = await resolveConfinedPath(rootPath, path);
+    assertFilePrecondition(path, expected);
+    if (!touched.has(absolute)) {
+      throw patchError(`precondition path is not touched by the patch: ${path}`, path);
+    }
+
+    const actual = await readFileVersion(absolute);
+    if (!sameFileVersion(expected, actual)) {
+      throw new FileVersionConflictError(path, expected, actual);
+    }
+  }
+}
+
+function assertFilePrecondition(path: string, version: FileVersionPrecondition): void {
+  if (version === null) return;
+  if (typeof version === "string") {
+    if (/^sha256:[0-9a-f]{64}$/.test(version)) return;
+    throw patchError(`invalid file version precondition for ${path}`, path);
+  }
+  if (
+    typeof version !== "object" ||
+    !/^sha256:[0-9a-f]{64}$/.test(version.hash) ||
+    (version.mtimeNs !== undefined && !/^-?\d+$/.test(version.mtimeNs))
+  ) {
+    throw patchError(`invalid file version precondition for ${path}`, path);
+  }
+}
+
+function sameFileVersion(expected: FileVersionPrecondition, actual: FileVersion | null): boolean {
+  if (expected === null || actual === null) return expected === actual;
+  if (typeof expected === "string") return expected === actual.hash;
+  return (
+    expected.hash === actual.hash &&
+    (expected.mtimeNs === undefined || expected.mtimeNs === actual.mtimeNs)
+  );
+}
+
 async function readOptionalTextFile(absolute: string, displayPath: string): Promise<TextFile | null> {
   if (!(await fileExists(absolute))) return null;
   const metadata = await stat(absolute);
-  if (!metadata.isFile()) throw patchError(`path is not a regular file: ${displayPath}`);
+  if (!metadata.isFile()) throw patchError(`path is not a regular file: ${displayPath}`, displayPath);
   return { content: await readUtf8Text(absolute, displayPath), mode: metadata.mode };
 }
 
@@ -422,20 +556,168 @@ async function readUtf8Text(absolute: string, displayPath: string): Promise<stri
   try {
     content = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
   } catch {
-    throw patchError(`file is not valid UTF-8 text: ${displayPath}`);
+    throw patchError(`file is not valid UTF-8 text: ${displayPath}`, displayPath);
   }
-  if (content.includes("\0")) throw patchError(`file appears to be binary: ${displayPath}`);
+  if (content.includes("\0")) throw patchError(`file appears to be binary: ${displayPath}`, displayPath);
   return content;
 }
 
-async function writeTextFile(destination: string, content: string, mode?: number): Promise<void> {
-  await mkdir(dirname(destination), { recursive: true });
-  const temporary = `${destination}.devspace-patch-${process.pid}-${randomUUID()}`;
+async function commitPatchTransaction(
+  rootPath: string,
+  staged: ReadonlyMap<string, StagedTextFile>,
+  renameFile: PatchCommitOperations["rename"],
+): Promise<void> {
+  const transactionRoot = resolve(
+    rootPath,
+    `.devspace-patch-${process.pid}-${randomUUID()}`,
+  );
+  const entries: TransactionEntry[] = [];
+  const committed: CommitRecord[] = [];
+  const createdDirectories: string[] = [];
+  let cleanupTransaction = true;
+
+  await mkdir(transactionRoot);
   try {
-    await writeFile(temporary, content, mode === undefined ? undefined : { mode });
-    await replaceFile(temporary, destination, await fileExists(destination));
+    let index = 0;
+    for (const [destination, file] of staged) {
+      const replacement = file
+        ? resolve(transactionRoot, `replacement-${index}`)
+        : undefined;
+      if (file && replacement) {
+        await writeFile(
+          replacement,
+          file.content,
+          file.mode === undefined ? undefined : { mode: file.mode },
+        );
+      }
+      entries.push({ destination, file, replacement });
+      index += 1;
+    }
+
+    try {
+      for (const [entryIndex, entry] of entries.entries()) {
+        await ensureDestinationParent(entry.destination, rootPath, createdDirectories);
+        const destinationExisted = await patchDestinationExists(entry.destination);
+        const backup = destinationExisted
+          ? resolve(transactionRoot, `backup-${entryIndex}`)
+          : undefined;
+        committed.push({
+          destination: entry.destination,
+          destinationExisted,
+          backup,
+        });
+
+        if (backup) await renameFile(entry.destination, backup);
+        if (entry.file && entry.replacement) {
+          await renameFile(entry.replacement, entry.destination);
+        }
+      }
+    } catch (error) {
+      const rollbackErrors = await rollbackPatchCommit(
+        committed,
+        createdDirectories,
+        renameFile,
+      );
+      if (rollbackErrors.length > 0) {
+        cleanupTransaction = false;
+        throw new AggregateError(
+          [error, ...rollbackErrors],
+          "Patch commit failed and rollback was incomplete",
+        );
+      }
+      throw error;
+    }
+  } finally {
+    if (cleanupTransaction) {
+      await rm(transactionRoot, { recursive: true, force: true });
+    }
+  }
+}
+
+async function ensureDestinationParent(
+  destination: string,
+  rootPath: string,
+  createdDirectories: string[],
+): Promise<void> {
+  const parent = dirname(destination);
+  const missing: string[] = [];
+  let current = parent;
+
+  while (current !== rootPath && isInside(rootPath, current)) {
+    try {
+      const metadata = await stat(current);
+      if (!metadata.isDirectory()) {
+        throw new Error(`Patch destination parent is not a directory: ${current}`);
+      }
+      break;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT") throw error;
+      missing.push(current);
+      current = dirname(current);
+    }
+  }
+
+  if (missing.length === 0) return;
+  createdDirectories.push(...missing);
+  await mkdir(parent, { recursive: true });
+}
+
+async function rollbackPatchCommit(
+  committed: readonly CommitRecord[],
+  createdDirectories: readonly string[],
+  renameFile: PatchCommitOperations["rename"],
+): Promise<unknown[]> {
+  const errors: unknown[] = [];
+
+  for (const record of [...committed].reverse()) {
+    try {
+      if (record.backup && await pathExists(record.backup)) {
+        await rm(record.destination, { force: true });
+        await renameFile(record.backup, record.destination);
+      } else if (!record.destinationExisted) {
+        await rm(record.destination, { force: true });
+      }
+    } catch (error) {
+      errors.push(error);
+    }
+  }
+
+  for (const directory of createdDirectories) {
+    try {
+      await rmdir(directory);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTEMPTY" && code !== "EEXIST") {
+        errors.push(error);
+      }
+    }
+  }
+
+  return errors;
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await lstat(path);
+    return true;
   } catch (error) {
-    await rm(temporary, { force: true });
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return false;
+    throw error;
+  }
+}
+
+async function patchDestinationExists(path: string): Promise<boolean> {
+  try {
+    const metadata = await lstat(path);
+    if (!metadata.isFile() && !metadata.isSymbolicLink()) {
+      throw new Error(`Patch destination is no longer a file: ${path}`);
+    }
+    return true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return false;
     throw error;
   }
 }

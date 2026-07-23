@@ -7,6 +7,13 @@ export interface ShellCommand {
   args: string[];
 }
 
+export interface DirectProcessCommand {
+  program: string;
+  args: string[];
+}
+
+export type ProcessCommand = string | DirectProcessCommand;
+
 export interface KillableProcess {
   pid?: number;
   kill(signal?: NodeJS.Signals): boolean;
@@ -141,6 +148,35 @@ export function resolveShellCommand(
   if (bashOnPath) return bashCommand(bashOnPath, command);
 
   return { executable: "/bin/sh", args: ["-c", protectShellCdPath(command)] };
+}
+
+/** Resolve a shell command string or validate a direct executable/argv launch. */
+export function resolveProcessCommand(
+  command: ProcessCommand,
+  platform: NodeJS.Platform = process.platform,
+  environment: NodeJS.ProcessEnv = process.env,
+): ShellCommand {
+  if (typeof command === "string") {
+    return resolveShellCommand(command, platform, environment);
+  }
+  if (typeof command.program !== "string" || command.program.length === 0) {
+    throw new Error("Direct process program must be a non-empty string.");
+  }
+  if (command.program.includes("\u0000")) {
+    throw new Error("Direct process program must not contain NUL bytes.");
+  }
+  if (!Array.isArray(command.args)) {
+    throw new Error("Direct process args must be an array of strings.");
+  }
+  for (const argument of command.args) {
+    if (typeof argument !== "string") {
+      throw new Error("Direct process args must be an array of strings.");
+    }
+    if (argument.includes("\u0000")) {
+      throw new Error("Direct process args must not contain NUL bytes.");
+    }
+  }
+  return { executable: command.program, args: [...command.args] };
 }
 
 export function terminateProcessTree(
