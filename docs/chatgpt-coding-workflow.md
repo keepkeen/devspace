@@ -351,8 +351,31 @@ prose:
     "retryable": true,
     "safeToRetry": true,
     "recovery": "resume_workspace",
-    "phase": "not_started"
+    "phase": "not_started",
+    "effectsKnown": true
   }
+}
+```
+
+Workspace-scoped results also expose the current Workspace and context. A
+mutation adds one durable operation envelope:
+
+```json
+{
+  "ok": true,
+  "workspace": { "ref": "ws_…", "generation": 3 },
+  "context": {
+    "phase": "context_loaded",
+    "instructionRevision": "sha256-v1:…",
+    "skillRevision": "sha256-v1:…"
+  },
+  "operation": {
+    "id": "edit-17",
+    "phase": "committed",
+    "safeToRetry": false,
+    "effectsKnown": true
+  },
+  "effects": {}
 }
 ```
 
@@ -367,12 +390,15 @@ every edit. Cold hydration, allowed-root changes,
 credential-epoch changes, close/reopen transitions, and server restart make an
 old receipt unusable.
 
-`apply_patch`, `exec_command`, and a mutating `write_stdin` accept an optional
-`operationId`. Use a new ID for each intended mutation. If an HTTP response is
-lost, retry the identical call with the same ID: DevSpace replays the stored
-result instead of applying the mutation twice. Reusing an ID with different
-arguments is rejected. If a crash leaves the outcome unknowable, DevSpace
-returns `operation_outcome_unknown` and does not rerun it automatically.
+`apply_patch`, `exec_command`, `close_workspace`, `revoke_workspace`, and
+`show_changes` require an `operationId`. Mutating `write_stdin` requires one;
+pure polling does not. Use a new ID for each intended mutation. If an HTTP
+response is lost, retry the identical call with the same ID: DevSpace replays
+the stored result instead of applying the mutation twice. Reusing an ID with
+different arguments is rejected. Lifecycle results remain replayable after a
+close or revoke changes the Workspace generation. If a crash leaves the
+outcome unknowable, DevSpace returns `operation_outcome_unknown` and does not
+rerun it automatically.
 Use `get_operation_status(operationId)` to inspect the retained state without
 rerunning the operation or copying its stored result body.
 The replay body may expire, but its lightweight identity tombstone remains
@@ -390,7 +416,10 @@ file contents, Skill manifests, or process output between MCP `content` and
 
 - `read` and `load_skill` return their body only in text `content`. Successful
   reads add `contentHash` and exact decimal-string `mtimeNs` as structured
-  metadata; `apply_patch.ifMatch` can require those versions before any write.
+  metadata. `apply_patch` requires an `ifMatch` entry for every touched path by
+  default: use the latest version for an existing path and `null` for a path
+  expected not to exist. `preconditionMode="blind"` requires an explicit
+  `blindWriteReason` and should only follow direct user authorization.
 - `batch_read` and `batch_inspect` return a short text completion summary and
   keep ordered results in `structuredContent.items[]` as optional `ref`, `ok`,
   `result`, and exceptional `truncated=true`. Top-level `status`, `succeeded`,
@@ -408,14 +437,15 @@ file contents, Skill manifests, or process output between MCP `content` and
 - `close_workspace`, `apply_patch`, and `show_changes` return one concise text
   result. Their detailed presentation data is UI-only `_meta`.
 
-Mutating and lifecycle tools also return machine-readable `effects`. Patch
-effects include paths, actions, and observed before/after versions. Process
-effects include whether a process started, its session and exit state, and the
-network-policy observation boundary. An arbitrary shell can change files or
-external systems in ways DevSpace cannot enumerate, so command effects are
-marked as incompletely tracked instead of inventing a file list. Review, close,
-and revoke tools report their own checkpoint or Workspace effects using the same
-top-level field.
+Mutating and lifecycle tools also return machine-readable `effects`. Each
+effect states its evidence confidence: `observed` for versions and lifecycle
+state directly measured by DevSpace, `declared` for an enforced or requested
+policy such as network allowance, and `unknown` where an arbitrary process can
+produce effects DevSpace cannot enumerate. Patch effects include paths,
+actions, and observed before/after versions. Process effects include whether a
+process started, its session and exit state, and the network-policy observation
+boundary. Review, close, and revoke tools report their own checkpoint or
+Workspace effects using the same top-level field.
 
 `_meta` is reserved for optional widget presentation and is not a source of
 model-visible state or body text. Widgets read the top-level result instead of

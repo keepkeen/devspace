@@ -125,6 +125,7 @@ try {
     name: "exec_command",
     arguments: {
       receipt,
+      operationId: "oauth-background-process",
       program: process.execPath,
       args: ["-e", "setInterval(() => {}, 1000)"],
       yieldTimeMs: 0,

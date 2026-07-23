@@ -366,11 +366,13 @@ closes by default after an initial payload; set `closeStdin: false` to continue
 through `write_stdin`, which can append data or close the stream. PTY sessions
 do not emulate EOF with Ctrl-D.
 
-`apply_patch`, `exec_command`, and mutating `write_stdin` calls accept an
-optional `operationId`. Use a fresh ID for a new operation and reuse it only
-after a lost network response; DevSpace replays the stored result instead of
-executing twice. Failures expose structured `error.code`, `retryable`,
-`safeToRetry`, and `recovery`. A non-zero command exit returns `ok: false`,
+`apply_patch`, `exec_command`, `close_workspace`, `revoke_workspace`, and
+`show_changes` require an `operationId`. `write_stdin` also requires one when it
+sends input, closes stdin, or resizes a terminal; polling alone does not. Use a
+fresh ID for a new operation and reuse it only after a lost network response;
+DevSpace replays the stored result instead of executing twice. Failures expose
+structured `error.code`, `retryable`, `safeToRetry`, `recovery`, `phase`, and
+`effectsKnown`. A non-zero command exit returns `ok: false`,
 `status: "exited"`, `commandExecuted: true`, and `exitCode`; it is distinct
 from a command that never started.
 `get_operation_status(operationId)` checks retained state without executing or
@@ -381,8 +383,17 @@ registration layer validates ownership, generation, context phase, and private
 context-session binding before the handler starts. Metadata receipts can only
 promote context or close/revoke the Workspace. Restarts, OAuth
 reauthorization, allowed-root changes, and close/reopen cycles stale old
-receipts. `read` returns `contentHash` and exact string `mtimeNs`;
-`apply_patch.ifMatch` checks one or more paths before the first write.
+receipts. `read` returns `contentHash` and exact string `mtimeNs`. By default,
+`apply_patch` requires an `ifMatch` entry for every touched path: use the latest
+read version for an existing path and explicit `null` for a path expected not
+to exist. Blind mode requires `preconditionMode: "blind"` plus a
+`blindWriteReason`, and should only follow explicit user authorization.
+
+Workspace-scoped results use a common `workspace` and `context` envelope.
+Mutations add `operation` with `not_started`, `committed`, or
+`outcome_unknown`, plus retry and effect-knowledge semantics. Effects identify
+their evidence as `observed`, `declared`, or `unknown` rather than claiming a
+precise file list for arbitrary process behavior.
 
 Equivalent managed-worktree opens reuse the same active worktree for one OAuth
 connection and base commit; set `forceNew: true` only for an explicitly separate

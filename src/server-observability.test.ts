@@ -18,6 +18,7 @@ import {
   processResult,
   recoverableWorkspaceError,
   toolSurface,
+  toolCallOperationId,
   toolCallWorkspaceId,
   readinessSnapshot,
   workspaceOperationId,
@@ -522,6 +523,14 @@ assert.equal(toolCallWorkspaceReceipt({
   method: "tools/call",
   params: { name: "read", arguments: { receipt: `wctx3.${"A".repeat(43)}` } },
 }), `wctx3.${"A".repeat(43)}`);
+assert.equal(toolCallOperationId({
+  method: "tools/call",
+  params: { name: "exec_command", arguments: { operationId: "operation-17" } },
+}), "operation-17");
+assert.equal(toolCallOperationId({
+  method: "tools/call",
+  params: { name: "exec_command", arguments: { operationId: "x".repeat(129) } },
+}), undefined);
 assert.equal(workspaceOperationId({
   method: "tools/call",
   params: { name: "close_workspace", arguments: { workspaceId: "ws_test" } },

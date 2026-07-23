@@ -35,12 +35,14 @@ assert.deepEqual(patchEffects, {
   observedAt,
   files: [
     {
+      confidence: "observed",
       operation: "delete",
       path: "old.txt",
       observedBefore: before,
       observedAfter: null,
     },
     {
+      confidence: "observed",
       operation: "update",
       path: "new.txt",
       previousPath: "old.txt",
@@ -48,6 +50,7 @@ assert.deepEqual(patchEffects, {
       observedAfter: after,
     },
     {
+      confidence: "observed",
       operation: "delete",
       path: "deleted.txt",
       observedBefore: before,
@@ -84,6 +87,7 @@ const startInput = {
 assert.deepEqual(createProcessStartEffects(startInput), {
   observedAt,
   process: {
+    confidence: "unknown",
     action: "start",
     submitted: startInput.submitted,
     observed: {
@@ -94,7 +98,7 @@ assert.deepEqual(createProcessStartEffects(startInput), {
     },
     untrackedSideEffects: true,
   },
-  network: { allowed: true, observed: false },
+  network: { confidence: "declared", allowed: true, observed: false },
 });
 
 const interactEffects = createProcessInteractEffects({
@@ -116,6 +120,7 @@ const interactEffects = createProcessInteractEffects({
   },
 });
 assert.deepEqual(interactEffects.process, {
+  confidence: "unknown",
   action: "interact",
   submitted: {
     stdinBytes: 0,
@@ -143,6 +148,7 @@ assert.deepEqual(createWorkspaceOpenEffects({
 }), {
   observedAt,
   workspace: {
+    confidence: "observed",
     action: "open",
     result: "opened",
     worktree: "created",
@@ -158,6 +164,7 @@ assert.deepEqual(createWorkspaceCloseEffects({
 }), {
   observedAt,
   workspace: {
+    confidence: "observed",
     action: "close",
     result: "retained",
     worktree: "retained",
@@ -173,6 +180,7 @@ assert.deepEqual(createWorkspaceRevokeEffects({
 }), {
   observedAt,
   workspace: {
+    confidence: "observed",
     action: "revoke",
     result: "revoked",
     worktree: "removed",
@@ -184,7 +192,7 @@ const reviewInput = { observedAt, since: "last_shown" as const, advanced: true }
 const reviewEffects = createReviewEffects(reviewInput);
 assert.deepEqual(reviewEffects, {
   observedAt,
-  reviewCheckpoint: { since: "last_shown", advanced: true },
+  reviewCheckpoint: { confidence: "observed", since: "last_shown", advanced: true },
 });
 
 assert.equal(

@@ -13,6 +13,7 @@ export interface ToolEffects {
 }
 
 export interface FileEffect {
+  confidence: "observed";
   path: string;
   previousPath?: string;
   operation: PatchOperation;
@@ -40,6 +41,7 @@ export interface ProcessObservedEffect {
 }
 
 export interface ProcessEffect {
+  confidence: "unknown";
   action: "start" | "interact";
   submitted: ProcessSubmittedEffect;
   observed: ProcessObservedEffect;
@@ -48,6 +50,7 @@ export interface ProcessEffect {
 }
 
 export interface NetworkEffect {
+  confidence: "declared";
   allowed: boolean;
   observed: false;
 }
@@ -60,6 +63,7 @@ export type WorkspaceWorktreeEffect =
   | "retained";
 
 export interface WorkspaceEffect {
+  confidence: "observed";
   action: "open" | "close" | "revoke";
   result: "opened" | "reused" | "closed" | "revoked" | "retained";
   worktree: WorkspaceWorktreeEffect;
@@ -67,6 +71,7 @@ export interface WorkspaceEffect {
 }
 
 export interface ReviewCheckpointEffect {
+  confidence: "observed";
   since: ReviewSince;
   advanced: boolean;
 }
@@ -115,6 +120,7 @@ export function createApplyPatchEffects(
     files: files.flatMap((file): FileEffect[] => {
       if (file.operation !== "move" || file.previousPath === undefined) {
         return [{
+          confidence: "observed",
           path: file.path,
           operation: file.operation,
           observedBefore: cloneFileVersion(file.observedBefore),
@@ -123,12 +129,14 @@ export function createApplyPatchEffects(
       }
       return [
         {
+          confidence: "observed",
           path: file.previousPath,
           operation: "delete",
           observedBefore: cloneFileVersion(file.observedBefore),
           observedAfter: null,
         },
         {
+          confidence: "observed",
           path: file.path,
           previousPath: file.previousPath,
           operation: file.overwrittenBefore ? "update" : "add",
@@ -152,6 +160,7 @@ export function createWorkspaceOpenEffects(input: WorkspaceOpenEffectsInput): To
   return {
     observedAt: input.observedAt,
     workspace: {
+      confidence: "observed",
       action: "open",
       result: input.reused ? "reused" : "opened",
       worktree: input.managedWorktree
@@ -166,6 +175,7 @@ export function createWorkspaceCloseEffects(input: WorkspaceCloseEffectsInput): 
   return {
     observedAt: input.observedAt,
     workspace: {
+      confidence: "observed",
       action: "close",
       result: input.closed ? "closed" : "retained",
       worktree: workspaceEndState(
@@ -181,6 +191,7 @@ export function createWorkspaceRevokeEffects(input: WorkspaceRevokeEffectsInput)
   return {
     observedAt: input.observedAt,
     workspace: {
+      confidence: "observed",
       action: "revoke",
       result: input.revoked ? "revoked" : "retained",
       worktree: workspaceEndState(
@@ -196,6 +207,7 @@ export function createReviewEffects(input: ReviewEffectsInput): ToolEffects {
   return {
     observedAt: input.observedAt,
     reviewCheckpoint: {
+      confidence: "observed",
       since: input.since,
       advanced: input.advanced,
     },
@@ -210,6 +222,7 @@ function createProcessEffects(
   return {
     observedAt,
     process: {
+      confidence: "unknown",
       action,
       submitted: {
         stdinBytes: submitted.stdinBytes,
@@ -236,7 +249,13 @@ function createProcessEffects(
     },
     ...(input.networkAllowed === undefined
       ? {}
-      : { network: { allowed: input.networkAllowed, observed: false as const } }),
+      : {
+          network: {
+            confidence: "declared" as const,
+            allowed: input.networkAllowed,
+            observed: false as const,
+          },
+        }),
   };
 }
 

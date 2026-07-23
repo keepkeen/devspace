@@ -280,6 +280,31 @@ async function connectClient(
       return response;
     },
   }));
+  let operationSequence = 0;
+  const originalCallTool = client.callTool.bind(client);
+  client.callTool = (async (...callArgs: Parameters<Client["callTool"]>) => {
+    const request = callArgs[0];
+    const requestArguments = {
+      ...(request.arguments as Record<string, unknown> | undefined ?? {}),
+    };
+    const mutatingWriteStdin = request.name === "write_stdin" && (
+      requestArguments.chars !== undefined ||
+      requestArguments.closeStdin === true ||
+      requestArguments.columns !== undefined ||
+      requestArguments.rows !== undefined
+    );
+    if (
+      requestArguments.operationId === undefined &&
+      (new Set([
+        "exec_command", "apply_patch", "close_workspace", "revoke_workspace", "show_changes",
+      ]).has(request.name) || mutatingWriteStdin)
+    ) {
+      operationSequence += 1;
+      requestArguments.operationId = `${name}-auto-${operationSequence}`;
+    }
+    callArgs[0] = { ...request, arguments: requestArguments };
+    return originalCallTool(...callArgs);
+  }) as Client["callTool"];
   return client;
 }
 

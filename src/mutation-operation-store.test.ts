@@ -197,8 +197,8 @@ function testStatusLookupAndGenerationSnapshot(stateDir: string): void {
     now = 2_000;
     assert.deepEqual(store.settle(key, "hash", { secret: "result-body" }), { status: "settled" });
     assert.deepEqual(store.reserve(key, "hash", 7), {
-      status: "stale_generation",
-      currentGeneration: 8,
+      status: "replay",
+      result: { secret: "result-body" },
     });
     const status = store.getOperationStatus("owner-a", key.operationId);
     assert.deepEqual(status, {

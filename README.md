@@ -345,10 +345,12 @@ DevSpace 只提供一套稳定的 Codex 风格工具：`read`、`batch_read`、
 关闭输入流；需要继续交互时可设 `closeStdin: false`，之后通过 `write_stdin`
 追加内容或关闭输入流。PTY 不模拟 Ctrl-D 作为 EOF。
 
-`apply_patch`、`exec_command` 和会写入进程的 `write_stdin` 支持可选
-`operationId`。每次新操作使用新 ID；网络响应丢失时用同一 ID 重试，服务端会重放
-已保存结果而不会再次执行。所有失败均返回结构化 `error.code`、`retryable`、
-`safeToRetry` 和 `recovery`。命令非零退出不是“命令未执行”：结果会返回
+`apply_patch`、`exec_command`、`close_workspace`、`revoke_workspace` 和
+`show_changes` 必须提供 `operationId`；`write_stdin` 在发送输入、关闭 stdin 或调整终端
+尺寸时也必须提供，纯轮询不需要。每次新操作使用新 ID；网络响应丢失时用同一 ID 重试，
+服务端会重放已保存结果而不会再次执行。所有失败均返回结构化 `error.code`、
+`retryable`、`safeToRetry`、`recovery`、`phase` 和 `effectsKnown`。命令非零退出不是
+“命令未执行”：结果会返回
 `ok: false`、`status: "exited"`、`commandExecuted: true` 和 `exitCode`。
 `get_operation_status(operationId)` 可查询保留状态而不会重新执行或重复返回大结果。
 结果正文到期后会被清除，但该 ID 的轻量去重记录会保留到 Workspace 记录删除；旧 ID
@@ -361,12 +363,15 @@ receipt 还绑定签发时的两类上下文修订号，供恢复和缓存去重
 门禁、Skill 重载和文件版本锁分别检查。服务重启、OAuth 重新授权、授权根变更和
 关闭/重新打开会使旧 receipt 失效，此时用 alias 恢复并获取新的 receipt。`read` 返回
 `contentHash` 和精确字符串形式的
-`mtimeNs`；`apply_patch.ifMatch` 可在写入前检查一个或多个路径，防止不同对话静默覆盖。
+`mtimeNs`。`apply_patch` 默认要求每个 touched path 都有 `ifMatch`：已有文件使用最新读取
+版本，预期不存在的新路径显式传 `null`。只有用户明确授权后，才可使用
+`preconditionMode: "blind"` 并提供 `blindWriteReason`。
 
-写入、命令、进程交互、变更展示、关闭和撤销操作还会返回统一的 `effects`。文件效果给出
-路径、动作和可观测的前后版本；进程效果给出是否启动、session、退出状态以及网络策略的
-可观测边界。Shell 内部可能产生的任意副作用无法被静态分析时，结果会明确标为未完整跟踪，
-不会伪造精确文件清单。
+写入、命令、进程交互、变更展示、关闭和撤销操作还会返回统一的 `workspace`、`context`、
+`operation` 和 `effects`。operation 明确给出 `not_started`、`committed` 或
+`outcome_unknown`，以及是否可安全重试和副作用是否已知。每项 effect 还标记证据可信度：
+DevSpace 直接测得的版本或生命周期状态为 `observed`，策略声明为 `declared`，任意进程可能
+产生而无法枚举的副作用为 `unknown`，不会伪造精确文件清单。
 
 同一 OAuth 连接重复打开相同提交的 managed worktree 时会默认复用；只有明确需要另一份
 隔离环境时才设置 `forceNew: true`。`list_workspaces` 会返回持久化的 `dirtySource`，

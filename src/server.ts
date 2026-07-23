@@ -166,7 +166,18 @@ interface PublicToolError {
   retryable?: boolean;
   safeToRetry?: boolean;
   recovery?: string;
-  phase?: "not_started" | "executed" | "outcome_unknown";
+  phase?: OperationPhase;
+  effectsKnown?: boolean;
+  operationId?: string;
+}
+
+type OperationPhase = "not_started" | "committed" | "outcome_unknown";
+
+interface OperationEnvelope {
+  id: string;
+  phase: OperationPhase;
+  safeToRetry: boolean;
+  effectsKnown: boolean;
 }
 
 class PublicActionError extends Error {
@@ -180,7 +191,29 @@ class PublicActionError extends Error {
   }
 }
 
+class MutationExecutionError extends Error {
+  constructor(
+    readonly operationId: string,
+    cause: unknown,
+  ) {
+    super("Mutation outcome is unknown.", { cause });
+    this.name = "MutationExecutionError";
+  }
+}
+
 function publicToolError(error: unknown, toolName: string): PublicToolError | undefined {
+  if (error instanceof MutationExecutionError) {
+    return {
+      code: "tool_failed",
+      text: "tool_failed: The mutation may have executed; inspect effects or operation status before any rerun.",
+      retryable: false,
+      safeToRetry: false,
+      recovery: "verify_effects",
+      phase: "outcome_unknown",
+      effectsKnown: false,
+      operationId: error.operationId,
+    };
+  }
   if (error instanceof PublicActionError) {
     return { code: error.code, text: `${error.code}: ${error.publicText}`, ...error.semantics };
   }
@@ -409,12 +442,110 @@ function structuredToolError(error: PublicToolError) {
         recovery: "correct_and_retry",
         phase: "not_started" as const,
       };
+  const phase = error.phase ?? defaults.phase;
   return {
     code: error.code,
     retryable: error.retryable ?? defaults.retryable,
     safeToRetry: error.safeToRetry ?? defaults.safeToRetry,
     recovery: error.recovery ?? defaults.recovery,
-    phase: error.phase ?? defaults.phase,
+    phase,
+    effectsKnown: error.effectsKnown ?? phase !== "outcome_unknown",
+  };
+}
+
+function operationEnvelope(
+  id: string,
+  phase: OperationPhase,
+  safeToRetry: boolean,
+  effectsKnown: boolean,
+): OperationEnvelope {
+  return { id, phase, safeToRetry, effectsKnown };
+}
+
+function attachOperationEnvelope<T>(
+  value: T,
+  operation: OperationEnvelope,
+): T {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const record = value as Record<string, unknown>;
+  const structured = record.structuredContent &&
+      typeof record.structuredContent === "object" &&
+      !Array.isArray(record.structuredContent)
+    ? record.structuredContent as Record<string, unknown>
+    : {};
+  return {
+    ...record,
+    structuredContent: { ...structured, operation },
+  } as T;
+}
+
+function operationSemanticsFromResult(value: unknown): Omit<OperationEnvelope, "id"> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return { phase: "committed", safeToRetry: false, effectsKnown: true };
+  }
+  const record = value as Record<string, unknown>;
+  const structured = record.structuredContent &&
+      typeof record.structuredContent === "object" &&
+      !Array.isArray(record.structuredContent)
+    ? record.structuredContent as Record<string, unknown>
+    : undefined;
+  const meta = record._meta && typeof record._meta === "object" && !Array.isArray(record._meta)
+    ? record._meta as Record<string, unknown>
+    : undefined;
+  const rawError = structured?.error ?? meta?.error;
+  const error = rawError && typeof rawError === "object" && !Array.isArray(rawError)
+    ? rawError as Record<string, unknown>
+    : undefined;
+  const normalizedError = typeof error?.code === "string"
+    ? structuredToolError({
+        code: error.code,
+        text: "",
+        ...(typeof error.retryable === "boolean" ? { retryable: error.retryable } : {}),
+        ...(typeof error.safeToRetry === "boolean" ? { safeToRetry: error.safeToRetry } : {}),
+        ...(typeof error.recovery === "string" ? { recovery: error.recovery } : {}),
+        ...(error.phase === "not_started" ||
+            error.phase === "committed" ||
+            error.phase === "outcome_unknown"
+          ? { phase: error.phase }
+          : {}),
+        ...(typeof error.effectsKnown === "boolean" ? { effectsKnown: error.effectsKnown } : {}),
+      })
+    : undefined;
+  const phase = normalizedError?.phase ?? "committed";
+  return {
+    phase,
+    safeToRetry: normalizedError?.safeToRetry ?? false,
+    effectsKnown: normalizedError?.effectsKnown ?? phase !== "outcome_unknown",
+  };
+}
+
+function attachWorkspaceEnvelope(
+  structured: Record<string, unknown>,
+): Record<string, unknown> {
+  const binding = requestContext.getStore()?.workspaceBinding;
+  if (!binding) return structured;
+  const existingWorkspace = structured.workspace &&
+      typeof structured.workspace === "object" &&
+      !Array.isArray(structured.workspace)
+    ? structured.workspace as Record<string, unknown>
+    : undefined;
+  const existingContext = structured.context &&
+      typeof structured.context === "object" &&
+      !Array.isArray(structured.context)
+    ? structured.context as Record<string, unknown>
+    : undefined;
+  return {
+    ...structured,
+    workspace: existingWorkspace ?? {
+      ref: binding.workspaceId,
+      generation: binding.generation,
+    },
+    context: {
+      phase: binding.phase,
+      instructionRevision: binding.instructionRevision,
+      skillRevision: binding.skillRevision,
+      ...(existingContext ?? {}),
+    },
   };
 }
 
@@ -431,6 +562,9 @@ const RELEASABLE_MUTATION_PREFLIGHT_CODES = new Set([
   "instructions_required",
   "instruction_state_changed",
   "instruction_token_invalid",
+  "if_match_required",
+  "if_match_ambiguous",
+  "blind_write_reason_required",
 ]);
 
 function releasableMutationPreflightCode(value: unknown): string | undefined {
@@ -469,36 +603,86 @@ async function runMutationOperation<T>(options: {
       throw new PublicActionError(
         "operation_id_conflict",
         "This operationId was already used with different arguments; use a new operationId.",
-        { retryable: false, safeToRetry: false, recovery: "new_operation_id" },
+        {
+          retryable: false,
+          safeToRetry: false,
+          recovery: "new_operation_id",
+          operationId: options.key.operationId,
+        },
       );
     }
     return await inFlight.result as T;
   }
 
   const reservation = options.store.reserve(options.key, requestHash, options.workspaceGeneration);
-  if (reservation.status === "replay") return reservation.result as T;
+  if (reservation.status === "replay") {
+    const replayed = reservation.result as T;
+    const record = replayed && typeof replayed === "object" && !Array.isArray(replayed)
+      ? replayed as Record<string, unknown>
+      : undefined;
+    const structured = record?.structuredContent &&
+        typeof record.structuredContent === "object" &&
+        !Array.isArray(record.structuredContent)
+      ? record.structuredContent as Record<string, unknown>
+      : undefined;
+    return structured?.operation
+      ? replayed
+      : attachOperationEnvelope(
+          replayed,
+          operationEnvelope(options.key.operationId, "committed", false, true),
+        );
+  }
   if (reservation.status === "conflict") {
     throw new PublicActionError(
       "operation_id_conflict",
       "This operationId was already used with different arguments; use a new operationId.",
-      { retryable: false, safeToRetry: false, recovery: "new_operation_id" },
+      {
+        retryable: false,
+        safeToRetry: false,
+        recovery: "new_operation_id",
+        operationId: options.key.operationId,
+      },
     );
   }
   if (reservation.status === "stale_generation") {
-    throw new StaleWorkspaceGenerationError();
+    throw new PublicActionError(
+      "stale_workspace_generation",
+      "Call list_workspaces, then resume_workspace with contextMode=\"full\" before retrying.",
+      {
+        retryable: true,
+        safeToRetry: true,
+        recovery: "resume_workspace",
+        phase: "not_started",
+        operationId: options.key.operationId,
+      },
+    );
   }
   if (reservation.status === "outcome_unknown") {
     throw new PublicActionError(
       "operation_outcome_unknown",
       "Do not rerun automatically; verify the operation's effects first.",
-      { retryable: false, safeToRetry: false, recovery: "verify_effects", phase: "outcome_unknown" },
+      {
+        retryable: false,
+        safeToRetry: false,
+        recovery: "verify_effects",
+        phase: "outcome_unknown",
+        effectsKnown: false,
+        operationId: options.key.operationId,
+      },
     );
   }
   if (reservation.status === "result_unavailable") {
     throw new PublicActionError(
       "operation_result_unavailable",
       "The operation completed, but its replay result is unavailable; verify effects instead of rerunning.",
-      { retryable: false, safeToRetry: false, recovery: "verify_effects" },
+      {
+        retryable: false,
+        safeToRetry: false,
+        recovery: "verify_effects",
+        phase: "committed",
+        effectsKnown: false,
+        operationId: options.key.operationId,
+      },
     );
   }
 
@@ -507,28 +691,54 @@ async function runMutationOperation<T>(options: {
       const value = await options.execute();
       if (releasableMutationPreflightCode(value)) {
         options.store.cancelPending(options.key, requestHash);
-        return value;
+        return attachOperationEnvelope(
+          value,
+          operationEnvelope(options.key.operationId, "not_started", true, true),
+        );
       }
-      options.store.settle(options.key, requestHash, value);
-      return value;
+      const semantics = operationSemanticsFromResult(value);
+      const enveloped = attachOperationEnvelope(
+        value,
+        operationEnvelope(
+          options.key.operationId,
+          semantics.phase,
+          semantics.safeToRetry,
+          semantics.effectsKnown,
+        ),
+      );
+      options.store.settle(options.key, requestHash, enveloped);
+      return enveloped;
     } catch (error) {
       const knownFailure = publicToolError(error, options.key.tool);
       if (knownFailure && (knownFailure.phase ?? "not_started") === "not_started") {
+        const structuredError = structuredToolError({
+          ...knownFailure,
+          operationId: options.key.operationId,
+        });
         const response = {
           content: [textBlock(knownFailure.text)],
           isError: true as const,
-          structuredContent: { ok: false, error: structuredToolError(knownFailure) },
-          _meta: { error: structuredToolError(knownFailure) },
+          structuredContent: { ok: false, error: structuredError },
+          _meta: { error: structuredError },
         };
+        const enveloped = attachOperationEnvelope(
+          response,
+          operationEnvelope(
+            options.key.operationId,
+            structuredError.phase,
+            structuredError.safeToRetry,
+            structuredError.effectsKnown,
+          ),
+        );
         if (RELEASABLE_MUTATION_PREFLIGHT_CODES.has(knownFailure.code)) {
           options.store.cancelPending(options.key, requestHash);
         } else {
-          options.store.settle(options.key, requestHash, response);
+          options.store.settle(options.key, requestHash, enveloped);
         }
-        return response as T;
+        return enveloped as T;
       }
       options.store.markOutcomeUnknown(options.key, requestHash);
-      throw error;
+      throw new MutationExecutionError(options.key.operationId, error);
     } finally {
       options.pending.delete(identity);
     }
@@ -588,9 +798,12 @@ const registerAppTool: typeof registerSdkAppTool = ((...args: unknown[]) => {
             ? existingError.recovery
             : undefined;
           const phase = existingError.phase === "not_started" ||
-              existingError.phase === "executed" ||
+              existingError.phase === "committed" ||
               existingError.phase === "outcome_unknown"
             ? existingError.phase
+            : undefined;
+          const effectsKnown = typeof existingError.effectsKnown === "boolean"
+            ? existingError.effectsKnown
             : undefined;
           const error = structuredToolError({
             code,
@@ -599,17 +812,27 @@ const registerAppTool: typeof registerSdkAppTool = ((...args: unknown[]) => {
             ...(safeToRetry === undefined ? {} : { safeToRetry }),
             ...(recovery === undefined ? {} : { recovery }),
             ...(phase === undefined ? {} : { phase }),
+            ...(effectsKnown === undefined ? {} : { effectsKnown }),
           });
           const structured = record.structuredContent && typeof record.structuredContent === "object" && !Array.isArray(record.structuredContent)
             ? record.structuredContent as Record<string, unknown>
             : {};
           return {
             ...record,
-            structuredContent: { ...structured, ok: false, error },
+            structuredContent: attachWorkspaceEnvelope({ ...structured, ok: false, error }),
             _meta: { ...meta, tool: toolName, error },
           };
         }
-        return { ...record, _meta: { ...meta, tool: toolName } };
+        const structured = record.structuredContent &&
+            typeof record.structuredContent === "object" &&
+            !Array.isArray(record.structuredContent)
+          ? record.structuredContent as Record<string, unknown>
+          : undefined;
+        return {
+          ...record,
+          ...(structured ? { structuredContent: attachWorkspaceEnvelope(structured) } : {}),
+          _meta: { ...meta, tool: toolName },
+        };
       } catch (error) {
         const publicError = publicToolError(error, toolName) ?? {
           code: "tool_failed",
@@ -618,12 +841,24 @@ const registerAppTool: typeof registerSdkAppTool = ((...args: unknown[]) => {
         if (publicError.code === "tool_failed") {
           toolErrorReporters.get(server)?.(toolName, error);
         }
-        return {
+        const structuredError = structuredToolError(publicError);
+        const result = {
           content: [{ type: "text" as const, text: publicError.text }],
           isError: true,
-          structuredContent: { ok: false, error: structuredToolError(publicError) },
-          _meta: { tool: toolName, error: structuredToolError(publicError) },
+          structuredContent: attachWorkspaceEnvelope({ ok: false, error: structuredError }),
+          _meta: { tool: toolName, error: structuredError },
         };
+        return publicError.operationId
+          ? attachOperationEnvelope(
+              result,
+              operationEnvelope(
+                publicError.operationId,
+                structuredError.phase,
+                structuredError.safeToRetry,
+                structuredError.effectsKnown,
+              ),
+            )
+          : result;
       }
     };
     args[handlerIndex] = (...handlerArgs: unknown[]) => barrier
@@ -1156,6 +1391,10 @@ function sendCallToolErrorResult(
   message: string,
   id: string | number | null,
   code?: string,
+  options: {
+    binding?: WorkspaceContextReceiptBinding;
+    operationId?: string;
+  } = {},
 ): void {
   const structuredError = code
     ? structuredToolError({
@@ -1170,6 +1409,35 @@ function sendCallToolErrorResult(
           : "open_workspace",
       })
     : undefined;
+  const structuredContent = structuredError
+    ? {
+        ok: false,
+        error: structuredError,
+        ...(options.binding
+          ? {
+              workspace: {
+                ref: options.binding.workspaceId,
+                generation: options.binding.generation,
+              },
+              context: {
+                phase: options.binding.phase,
+                instructionRevision: options.binding.instructionRevision,
+                skillRevision: options.binding.skillRevision,
+              },
+            }
+          : {}),
+        ...(options.operationId
+          ? {
+              operation: operationEnvelope(
+                options.operationId,
+                structuredError.phase,
+                structuredError.safeToRetry,
+                structuredError.effectsKnown,
+              ),
+            }
+          : {}),
+      }
+    : undefined;
   res.status(200).json({
     jsonrpc: "2.0",
     result: {
@@ -1177,7 +1445,7 @@ function sendCallToolErrorResult(
       isError: true,
       ...(structuredError
         ? {
-            structuredContent: { ok: false, error: structuredError },
+            structuredContent,
             _meta: { error: structuredError },
           }
         : {}),
@@ -1236,6 +1504,20 @@ export function toolCallWorkspaceReceipt(body: unknown): string | undefined {
   if (!args || typeof args !== "object" || Array.isArray(args)) return undefined;
   const receipt = (args as { receipt?: unknown }).receipt;
   return typeof receipt === "string" && receipt.length > 0 ? receipt : undefined;
+}
+
+export function toolCallOperationId(body: unknown): string | undefined {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return undefined;
+  const request = body as { method?: unknown; params?: unknown };
+  if (request.method !== "tools/call" || !request.params || typeof request.params !== "object") {
+    return undefined;
+  }
+  const args = (request.params as { arguments?: unknown }).arguments;
+  if (!args || typeof args !== "object" || Array.isArray(args)) return undefined;
+  const operationId = (args as { operationId?: unknown }).operationId;
+  return typeof operationId === "string" && operationId.length > 0 && operationId.length <= 128
+    ? operationId
+    : undefined;
 }
 
 export function workspaceOperationGeneration(body: unknown): number | undefined {
@@ -1956,7 +2238,7 @@ export function processModelState(snapshot: ProcessSnapshot) {
 }
 
 function processOutputSchema(extra: z.ZodRawShape = {}) {
-  return {
+  return z.object({
     ok: z.boolean(),
     ...structuredToolErrorFields,
     status: z.enum(["running", "exited"]).optional(),
@@ -1968,7 +2250,11 @@ function processOutputSchema(extra: z.ZodRawShape = {}) {
     timedOut: z.literal(true).optional(),
     effects: z.unknown().optional(),
     ...extra,
-  };
+  }).passthrough();
+}
+
+function extensibleOutputSchema<T extends z.ZodRawShape>(shape: T) {
+  return z.object(shape).passthrough();
 }
 
 function processToolResponse(
@@ -2030,7 +2316,7 @@ function registerWriteStdinTool(
       description: toolDescription({
         use: "polling or interacting with a live process.",
         avoid: "starting a replacement command.",
-        requires: "receipt and sessionId.",
+        requires: "receipt and sessionId; operationId when sending input, closing stdin, or resizing.",
         returns: "process state and input effects.",
       }),
       inputSchema: {
@@ -2070,6 +2356,18 @@ function registerWriteStdinTool(
       const startedAt = performance.now();
       const workspace = workspaces.getWorkspace(ownerClientId, workspaceId);
       const mutatesProcess = chars !== undefined || closeStdin === true || columns !== undefined || rows !== undefined;
+      if (mutatesProcess && !operationId) {
+        throw new PublicActionError(
+          "operation_id_required",
+          "A mutating write_stdin call requires a new operationId.",
+          {
+            retryable: true,
+            safeToRetry: true,
+            recovery: "add_operation_id",
+            phase: "not_started",
+          },
+        );
+      }
       if (mutatesProcess) workspaces.assertWorkspaceWritable(workspace);
       const execute = async () => {
         const processContext = processSessions.instructionContext(
@@ -2151,11 +2449,11 @@ function registerWriteStdinTool(
           snapshot,
         }) : undefined);
       };
-      if (!operationId || !mutatesProcess) return execute();
+      if (!mutatesProcess) return execute();
       return runMutationOperation({
         store: mutationOperations,
         pending: pendingMutationOperations,
-        key: { ownerClientId, workspaceId, tool: toolNames.writeStdin, operationId },
+        key: { ownerClientId, workspaceId, tool: toolNames.writeStdin, operationId: operationId! },
         workspaceGeneration,
         request: { sessionId, chars, closeStdin, columns, rows, yieldTimeMs, maxOutputTokens },
         execute,
@@ -2198,13 +2496,13 @@ function registerReadProcessOutputTool(
           .max(MAX_PROCESS_OUTPUT_READ_BYTES)
           .optional(),
       },
-      outputSchema: {
+      outputSchema: extensibleOutputSchema({
         ok: z.boolean(),
         ...structuredToolErrorFields,
         nextOffset: z.number().int().nonnegative().optional(),
         eof: z.literal(true).optional(),
         status: z.enum(["active", "unknown"]).optional(),
-      },
+      }),
       ...toolWidgetDescriptorMeta(config, "shell"),
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
@@ -2283,7 +2581,7 @@ function registerProcessTools(
       }),
       inputSchema: {
         ...workspaceHandleInputSchema,
-        operationId: z.string().min(1).max(128).optional(),
+        operationId: z.string().min(1).max(128),
         instructionToken: z.string().optional(),
         program: z.string().min(1).max(4_096).optional(),
         args: z.array(z.string().max(16_384)).max(1_024).optional(),
@@ -2556,7 +2854,6 @@ function registerProcessTools(
           networkAllowed: true,
         }));
       };
-      if (!operationId) return execute();
       return runMutationOperation({
         store: mutationOperations,
         pending: pendingMutationOperations,
@@ -2803,6 +3100,16 @@ function createMcpServer(
         workspaceGeneration: status.workspaceGeneration,
         resultAvailable: status.resultAvailable,
         safeToRetry: false,
+        workspace: {
+          ref: status.workspaceId,
+          generation: status.workspaceGeneration,
+        },
+        operation: operationEnvelope(
+          status.operationId,
+          status.state === "settled" ? "committed" : "outcome_unknown",
+          false,
+          status.state === "settled" && status.resultAvailable,
+        ),
       },
     };
   });
@@ -3099,11 +3406,12 @@ function createMcpServer(
       description: toolDescription({
         use: "closing on explicit user request.",
         avoid: "end-of-turn cleanup.",
-        requires: "a receipt.",
+        requires: "a receipt and operationId.",
         returns: "close effects; dirty worktrees stay open.",
       }),
       inputSchema: {
         ...workspaceHandleInputSchema,
+        operationId: z.string().min(1).max(128),
       },
       ...toolWidgetDescriptorMeta(config, "workspace", {
         invoking: "Closing workspace…",
@@ -3114,100 +3422,111 @@ function createMcpServer(
         openWorldHint: false,
       },
     },
-    async ({ workspaceId, workspaceGeneration }) => {
+    async ({ workspaceId, workspaceGeneration, operationId }) => {
       const startedAt = performance.now();
-      const closeLease = await workspaces.acquireExclusiveClose(
-        ownerClientId,
-        workspaceId,
-        workspaceGeneration,
-      );
-      const workspace = closeLease.workspace;
-      let processesTerminated = 0;
-      let worktreeRemoved = false;
-      let worktreeRetainedReason: "dirty" | undefined;
-      let closed = false;
-      try {
-        processesTerminated = await processSessions.terminateWorkspace(ownerClientId, workspaceId);
-        if (workspace.mode === "worktree" && workspace.sourceRoot && workspace.worktree?.managed) {
-          const removal = await removeManagedWorktree({
-            sourceRoot: workspace.sourceRoot,
-            worktreePath: workspace.root,
-            config,
-          });
-          worktreeRemoved = removal.removed;
-          if (removal.removed || removal.reason === "missing") {
+      const execute = async () => {
+        const closeLease = await workspaces.acquireExclusiveClose(
+          ownerClientId,
+          workspaceId,
+          workspaceGeneration,
+        );
+        const workspace = closeLease.workspace;
+        let processesTerminated = 0;
+        let worktreeRemoved = false;
+        let worktreeRetainedReason: "dirty" | undefined;
+        let closed = false;
+        try {
+          processesTerminated = await processSessions.terminateWorkspace(ownerClientId, workspaceId);
+          if (workspace.mode === "worktree" && workspace.sourceRoot && workspace.worktree?.managed) {
+            const removal = await removeManagedWorktree({
+              sourceRoot: workspace.sourceRoot,
+              worktreePath: workspace.root,
+              config,
+            });
+            worktreeRemoved = removal.removed;
+            if (removal.removed || removal.reason === "missing") {
+              try {
+                await reviewCheckpoints.cleanupWorkspace({ workspaceId });
+              } catch (error) {
+                runtimeDiagnostics.recordFailure("review_cleanup_failed", error);
+                logEvent(config.logging, "warn", "review_cleanup_failed", { workspaceId, ...errorFields(error) });
+              }
+              closed = closeLease.commit();
+            } else {
+              worktreeRetainedReason = "dirty";
+              closeLease.abort();
+            }
+          } else {
             try {
               await reviewCheckpoints.cleanupWorkspace({ workspaceId });
             } catch (error) {
               runtimeDiagnostics.recordFailure("review_cleanup_failed", error);
               logEvent(config.logging, "warn", "review_cleanup_failed", { workspaceId, ...errorFields(error) });
             }
-            closed = closeLease.commit({ delete: true });
-          } else {
-            worktreeRetainedReason = "dirty";
-            closeLease.abort();
+            closed = closeLease.commit();
           }
-        } else {
-          try {
-            await reviewCheckpoints.cleanupWorkspace({ workspaceId });
-          } catch (error) {
-            runtimeDiagnostics.recordFailure("review_cleanup_failed", error);
-            logEvent(config.logging, "warn", "review_cleanup_failed", { workspaceId, ...errorFields(error) });
-          }
-          closed = closeLease.commit();
+        } catch (error) {
+          closeLease.abort();
+          throw error;
+        } finally {
+          processSessions.reopenWorkspace(ownerClientId, workspaceId);
         }
-      } catch (error) {
-        closeLease.abort();
-        throw error;
-      } finally {
-        processSessions.reopenWorkspace(ownerClientId, workspaceId);
-      }
-      logToolCall(config, {
-        tool: "close_workspace",
-        workspaceId,
-        success: closed,
-        durationMs: Math.round(performance.now() - startedAt),
-      });
-      return {
-        content: [textBlock(
-          worktreeRetainedReason
-            ? `Workspace remains open: dirty worktree retained; ${processesTerminated} process(es) terminated.`
-            : `Workspace closed; ${processesTerminated} process(es) terminated.` +
-              (worktreeRemoved ? " Clean managed worktree removed." : ""),
-        )],
-        structuredContent: {
-          ok: !worktreeRetainedReason,
-          effects: createWorkspaceCloseEffects({
-            observedAt: new Date().toISOString(),
-            closed,
-            managedWorktree: workspace.worktree?.managed === true,
-            worktreeRemoved,
-            processesTerminated,
-          }),
-        },
-        _meta: {
+        logToolCall(config, {
           tool: "close_workspace",
-          ...(worktreeRetainedReason ? {
-            error: {
-              code: "workspace_dirty",
-              retryable: false,
-              safeToRetry: true,
-              recovery: "show_changes",
-              phase: "executed",
-            },
-          } : {}),
-          card: {
-            workspaceId,
-            summary: {
+          workspaceId,
+          success: closed,
+          durationMs: Math.round(performance.now() - startedAt),
+        });
+        return {
+          content: [textBlock(
+            worktreeRetainedReason
+              ? `Workspace remains open: dirty worktree retained; ${processesTerminated} process(es) terminated.`
+              : `Workspace closed; ${processesTerminated} process(es) terminated.` +
+                (worktreeRemoved ? " Clean managed worktree removed." : ""),
+          )],
+          structuredContent: {
+            ok: !worktreeRetainedReason,
+            effects: createWorkspaceCloseEffects({
+              observedAt: new Date().toISOString(),
               closed,
-              processesTerminated,
+              managedWorktree: workspace.worktree?.managed === true,
               worktreeRemoved,
-              ...(worktreeRetainedReason ? { reason: worktreeRetainedReason } : {}),
+              processesTerminated,
+            }),
+          },
+          _meta: {
+            tool: "close_workspace",
+            ...(worktreeRetainedReason ? {
+              error: {
+                code: "workspace_dirty",
+                retryable: false,
+                safeToRetry: false,
+                recovery: "show_changes",
+                phase: "committed",
+                effectsKnown: true,
+              },
+            } : {}),
+            card: {
+              workspaceId,
+              summary: {
+                closed,
+                processesTerminated,
+                worktreeRemoved,
+                ...(worktreeRetainedReason ? { reason: worktreeRetainedReason } : {}),
+              },
             },
           },
-        },
-        ...(worktreeRetainedReason ? { isError: true as const } : {}),
+          ...(worktreeRetainedReason ? { isError: true as const } : {}),
+        };
       };
+      return runMutationOperation({
+        store: mutationOperations,
+        pending: pendingMutationOperations,
+        key: { ownerClientId, workspaceId, tool: toolNames.closeWorkspace, operationId },
+        workspaceGeneration,
+        request: {},
+        execute,
+      });
     },
   );
 
@@ -3216,91 +3535,105 @@ function createMcpServer(
     description: toolDescription({
       use: "permanently revoking a workspace.",
       avoid: "temporary inactivity.",
-      requires: "receipt and explicit user intent.",
+      requires: "receipt, operationId, and explicit user intent.",
       returns: "revoke effects; dirty worktrees stay.",
     }),
-    inputSchema: workspaceHandleInputSchema,
+    inputSchema: {
+      ...workspaceHandleInputSchema,
+      operationId: z.string().min(1).max(128),
+    },
     ...toolWidgetDescriptorMeta(config, "workspace"),
     annotations: { destructiveHint: true, idempotentHint: true, openWorldHint: false },
-  }, async ({ workspaceId, workspaceGeneration }) => {
-    const closeLease = await workspaces.acquireExclusiveClose(
-      ownerClientId,
-      workspaceId,
-      workspaceGeneration,
-    );
-    try {
-      const processesTerminated = await processSessions.terminateWorkspace(ownerClientId, workspaceId);
-      const workspace = closeLease.workspace;
-      let worktreeRemoved = false;
-      if (workspace.worktree?.managed) {
-        const removal = await removeManagedWorktree({
-          sourceRoot: workspace.sourceRoot!,
-          worktreePath: workspace.root,
-          config,
-        });
-        if (removal.reason === "dirty") {
-          closeLease.abort();
-          return {
-            content: [textBlock(
-              `Workspace was not revoked because its managed worktree has uncommitted changes; ${processesTerminated} process(es) were terminated. Review or clean the worktree, then retry.`,
-            )],
-            isError: true as const,
-            structuredContent: {
-              ok: false,
-              processesTerminated,
-              worktreeRetained: true,
-              effects: createWorkspaceRevokeEffects({
-                observedAt: new Date().toISOString(),
-                revoked: false,
-                managedWorktree: true,
-                worktreeRemoved: false,
+  }, async ({ workspaceId, workspaceGeneration, operationId }) => {
+    const execute = async () => {
+      const closeLease = await workspaces.acquireExclusiveClose(
+        ownerClientId,
+        workspaceId,
+        workspaceGeneration,
+      );
+      try {
+        const processesTerminated = await processSessions.terminateWorkspace(ownerClientId, workspaceId);
+        const workspace = closeLease.workspace;
+        let worktreeRemoved = false;
+        if (workspace.worktree?.managed) {
+          const removal = await removeManagedWorktree({
+            sourceRoot: workspace.sourceRoot!,
+            worktreePath: workspace.root,
+            config,
+          });
+          if (removal.reason === "dirty") {
+            closeLease.abort();
+            return {
+              content: [textBlock(
+                `Workspace was not revoked because its managed worktree has uncommitted changes; ${processesTerminated} process(es) were terminated. Review or clean the worktree, then retry.`,
+              )],
+              isError: true as const,
+              structuredContent: {
+                ok: false,
                 processesTerminated,
-              }),
-            },
-            _meta: {
-              error: {
-                code: "workspace_dirty",
-                retryable: false,
-                safeToRetry: true,
-                recovery: "show_changes",
-                phase: processesTerminated > 0 ? "executed" : "not_started",
+                worktreeRetained: true,
+                effects: createWorkspaceRevokeEffects({
+                  observedAt: new Date().toISOString(),
+                  revoked: false,
+                  managedWorktree: true,
+                  worktreeRemoved: false,
+                  processesTerminated,
+                }),
               },
-            },
-          };
+              _meta: {
+                error: {
+                  code: "workspace_dirty",
+                  retryable: false,
+                  safeToRetry: false,
+                  recovery: "show_changes",
+                  phase: processesTerminated > 0 ? "committed" : "not_started",
+                  effectsKnown: true,
+                },
+              },
+            };
+          }
+          worktreeRemoved = removal.removed || removal.reason === "missing";
         }
-        worktreeRemoved = removal.removed || removal.reason === "missing";
-      }
-      await reviewCheckpoints.cleanupWorkspace({ workspaceId }).catch((error) => {
-        runtimeDiagnostics.recordFailure("review_cleanup_failed", error);
-      });
-      if (!closeLease.commit(workspace.worktree?.managed ? { delete: true } : { revoke: true })) {
-        throw new UnknownWorkspaceError(workspaceId);
-      }
-      return {
-        content: [textBlock(
-          worktreeRemoved
-            ? "Workspace access revoked and its clean managed worktree removed."
-            : "Workspace access revoked for this connection.",
-        )],
-        structuredContent: {
-          ok: true,
-          processesTerminated,
-          worktreeRemoved,
-          effects: createWorkspaceRevokeEffects({
-            observedAt: new Date().toISOString(),
-            revoked: true,
-            managedWorktree: workspace.worktree?.managed === true,
-            worktreeRemoved,
+        await reviewCheckpoints.cleanupWorkspace({ workspaceId }).catch((error) => {
+          runtimeDiagnostics.recordFailure("review_cleanup_failed", error);
+        });
+        if (!closeLease.commit({ revoke: true })) {
+          throw new UnknownWorkspaceError(workspaceId);
+        }
+        return {
+          content: [textBlock(
+            worktreeRemoved
+              ? "Workspace access revoked and its clean managed worktree removed."
+              : "Workspace access revoked for this connection.",
+          )],
+          structuredContent: {
+            ok: true,
             processesTerminated,
-          }),
-        },
-      };
-    } catch (error) {
-      closeLease.abort();
-      throw error;
-    } finally {
-      processSessions.reopenWorkspace(ownerClientId, workspaceId);
-    }
+            worktreeRemoved,
+            effects: createWorkspaceRevokeEffects({
+              observedAt: new Date().toISOString(),
+              revoked: true,
+              managedWorktree: workspace.worktree?.managed === true,
+              worktreeRemoved,
+              processesTerminated,
+            }),
+          },
+        };
+      } catch (error) {
+        closeLease.abort();
+        throw error;
+      } finally {
+        processSessions.reopenWorkspace(ownerClientId, workspaceId);
+      }
+    };
+    return runMutationOperation({
+      store: mutationOperations,
+      pending: pendingMutationOperations,
+      key: { ownerClientId, workspaceId, tool: toolNames.revokeWorkspace, operationId },
+      workspaceGeneration,
+      request: {},
+      execute,
+    });
   });
 
   registerWorkspaceTool(
@@ -3328,13 +3661,13 @@ function createMcpServer(
           .positive()
           .optional(),
       },
-      outputSchema: {
+      outputSchema: extensibleOutputSchema({
         ok: z.boolean(),
         ...structuredToolErrorFields,
         scopedInstructionsAvailable: z.literal(true).optional(),
         contentHash: z.string().optional(),
         mtimeNs: z.string().optional(),
-      },
+      }),
       ...toolWidgetDescriptorMeta(config, "read"),
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
@@ -3447,7 +3780,7 @@ function createMcpServer(
           .min(1)
           .max(BATCH_MAX_ITEMS),
       },
-      outputSchema: {
+      outputSchema: extensibleOutputSchema({
         ok: z.boolean(),
         ...structuredToolErrorFields,
         items: z.array(batchItemOutputSchema).optional(),
@@ -3456,7 +3789,7 @@ function createMcpServer(
         failed: z.number().int().nonnegative().optional(),
         scopedInstructionsAvailable: z.literal(true).optional(),
         truncated: z.literal(true).optional(),
-      },
+      }),
       ...toolWidgetDescriptorMeta(config, "read"),
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
@@ -3565,7 +3898,7 @@ function createMcpServer(
           .min(1)
           .max(BATCH_MAX_ITEMS),
       },
-      outputSchema: {
+      outputSchema: extensibleOutputSchema({
         ok: z.boolean(),
         ...structuredToolErrorFields,
         items: z.array(batchItemOutputSchema).optional(),
@@ -3574,7 +3907,7 @@ function createMcpServer(
         failed: z.number().int().nonnegative().optional(),
         scopedInstructionsAvailable: z.literal(true).optional(),
         truncated: z.literal(true).optional(),
-      },
+      }),
       ...toolWidgetDescriptorMeta(config, "search"),
       annotations: { readOnlyHint: true },
     },
@@ -3661,8 +3994,10 @@ function createMcpServer(
         }),
         inputSchema: {
           ...workspaceHandleInputSchema,
-          operationId: z.string().min(1).max(128).optional(),
+          operationId: z.string().min(1).max(128),
           instructionToken: z.string().optional(),
+          preconditionMode: z.enum(["strict", "blind"]).optional(),
+          blindWriteReason: z.string().min(1).max(500).optional(),
           ifMatch: z.union([
             z.string().regex(/^sha256:[a-f0-9]{64}$/u),
             z.record(
@@ -3683,7 +4018,16 @@ function createMcpServer(
         ...toolWidgetDescriptorMeta(config, "edit"),
         annotations: EDIT_TOOL_ANNOTATIONS,
       },
-      async ({ workspaceId, workspaceGeneration, operationId, instructionToken, ifMatch, patch }) => {
+      async ({
+        workspaceId,
+        workspaceGeneration,
+        operationId,
+        instructionToken,
+        preconditionMode,
+        blindWriteReason,
+        ifMatch,
+        patch,
+      }) => {
         const startedAt = performance.now();
         const workspace = workspaces.getWorkspace(ownerClientId, workspaceId);
         const execute = async () => {
@@ -3691,6 +4035,19 @@ function createMcpServer(
         const preparedPatch = preparePatch(patch);
         const patchPaths = [...preparedPatch.paths];
         const uniquePatchPaths = [...new Set(patchPaths)];
+        const effectivePreconditionMode = preconditionMode ?? "strict";
+        if (effectivePreconditionMode === "blind" && !blindWriteReason) {
+          throw new PublicActionError(
+            "blind_write_reason_required",
+            "Blind patching requires a concise reason tied to explicit user authorization.",
+            {
+              retryable: true,
+              safeToRetry: true,
+              recovery: "provide_blind_write_reason",
+              phase: "not_started",
+            },
+          );
+        }
         const normalizedIfMatch = typeof ifMatch === "string"
           ? uniquePatchPaths.length === 1
             ? { [uniquePatchPaths[0]!]: ifMatch }
@@ -3708,6 +4065,25 @@ function createMcpServer(
                   : version,
               ])) as Record<string, string | FileVersion | null>
             : undefined;
+          if (effectivePreconditionMode === "strict") {
+            const missingPreconditions = uniquePatchPaths.filter(
+              (path) => !normalizedIfMatch || !Object.hasOwn(normalizedIfMatch, path),
+            );
+            if (missingPreconditions.length > 0) {
+              throw new PublicActionError(
+                "if_match_required",
+                "Strict patching requires an ifMatch entry for every touched path. " +
+                  "Use the latest read version for existing files and null for paths expected not to exist. " +
+                  `Missing: ${missingPreconditions.join(", ")}`,
+                {
+                  retryable: true,
+                  safeToRetry: true,
+                  recovery: "read_files_and_add_if_match",
+                  phase: "not_started",
+                },
+              );
+            }
+          }
           const instructionGate = await applicableMutationGate(workspaces, workspace, patchPaths, instructionToken);
           if (instructionGate) return instructionGate;
           const applied = await applyPreparedPatch(workspace.root, preparedPatch, { ifMatch: normalizedIfMatch });
@@ -3727,6 +4103,13 @@ function createMcpServer(
             structuredContent: {
               ok: true,
               effects: createApplyPatchEffects(new Date().toISOString(), applied.files),
+              preconditions: {
+                mode: effectivePreconditionMode,
+                complete: uniquePatchPaths.every(
+                  (path) => Boolean(normalizedIfMatch && Object.hasOwn(normalizedIfMatch, path)),
+                ),
+                ...(effectivePreconditionMode === "blind" ? { blindWriteReason } : {}),
+              },
             },
             _meta: {
               tool: "apply_patch",
@@ -3744,13 +4127,12 @@ function createMcpServer(
             },
           };
         };
-        if (!operationId) return execute();
         return runMutationOperation({
           store: mutationOperations,
           pending: pendingMutationOperations,
           key: { ownerClientId, workspaceId, tool: toolNames.applyPatch, operationId },
           workspaceGeneration,
-          request: { patch, ifMatch },
+          request: { patch, ifMatch, preconditionMode, blindWriteReason },
           execute,
         });
       },
@@ -3766,11 +4148,12 @@ function createMcpServer(
         description: toolDescription({
           use: "reviewing changes since the checkpoint.",
           avoid: "ordinary file discovery.",
-          requires: "a writable receipt.",
+          requires: "a writable receipt and operationId.",
           returns: "diff metadata and checkpoint effects.",
         }),
         inputSchema: {
           ...workspaceHandleInputSchema,
+          operationId: z.string().min(1).max(128),
         },
         ...toolWidgetDescriptorMeta(config, "show_changes", {
           invoking: "Preparing changes…",
@@ -3778,47 +4161,57 @@ function createMcpServer(
         }),
         annotations: SHOW_CHANGES_ANNOTATIONS,
       },
-      async ({ workspaceId }) => {
+      async ({ workspaceId, workspaceGeneration, operationId }) => {
         const startedAt = performance.now();
         const workspace = workspaces.getWorkspace(ownerClientId, workspaceId);
-        workspaces.assertWorkspaceWritable(workspace);
-        const review = await reviewCheckpoints.reviewChanges({
-          workspaceId,
-          root: workspace.root,
-          since: "last_shown",
-          markReviewed: true,
-        });
+        const execute = async () => {
+          workspaces.assertWorkspaceWritable(workspace);
+          const review = await reviewCheckpoints.reviewChanges({
+            workspaceId,
+            root: workspace.root,
+            since: "last_shown",
+            markReviewed: true,
+          });
 
-        const content = [textBlock(review.result)];
-        logToolCall(config, {
-          tool: "show_changes",
-          workspaceId,
-          success: true,
-          durationMs: Math.round(performance.now() - startedAt),
-        });
-
-        return {
-          content,
-          structuredContent: {
-            ok: true,
-            effects: createReviewEffects({
-              observedAt: new Date().toISOString(),
-              since: "last_shown",
-              advanced: true,
-            }),
-          },
-          _meta: {
+          const content = [textBlock(review.result)];
+          logToolCall(config, {
             tool: "show_changes",
-            card: {
-              workspaceId,
-              summary: review.summary,
-              files: review.files,
-              payload: {
-                patch: review.patch,
+            workspaceId,
+            success: true,
+            durationMs: Math.round(performance.now() - startedAt),
+          });
+
+          return {
+            content,
+            structuredContent: {
+              ok: true,
+              effects: createReviewEffects({
+                observedAt: new Date().toISOString(),
+                since: "last_shown",
+                advanced: true,
+              }),
+            },
+            _meta: {
+              tool: "show_changes",
+              card: {
+                workspaceId,
+                summary: review.summary,
+                files: review.files,
+                payload: {
+                  patch: review.patch,
+                },
               },
             },
-          },
+          };
         };
+        return runMutationOperation({
+          store: mutationOperations,
+          pending: pendingMutationOperations,
+          key: { ownerClientId, workspaceId, tool: "show_changes", operationId },
+          workspaceGeneration,
+          request: { since: "last_shown", markReviewed: true },
+          execute,
+        });
       },
     );
   }
@@ -4530,6 +4923,7 @@ export function createServer(configInput?: ServerConfig): RunningServer {
           "workspace_context_required: Call list_workspaces, then resume_workspace with contextMode=\"full\" to obtain a fresh receipt.",
           jsonRpcRequestId(req.body),
           "workspace_context_required",
+          { operationId: toolCallOperationId(req.body) },
         );
         return;
       }
@@ -4542,6 +4936,10 @@ export function createServer(configInput?: ServerConfig): RunningServer {
           "workspace_context_incomplete: Call get_workspace_context with this receipt and contextMode=\"full\", then retry once with the returned receipt.",
           jsonRpcRequestId(req.body),
           "workspace_context_incomplete",
+          {
+            binding: workspaceBinding,
+            operationId: toolCallOperationId(req.body),
+          },
         );
         return;
       }
@@ -4583,6 +4981,7 @@ export function createServer(configInput?: ServerConfig): RunningServer {
             : error instanceof StaleWorkspaceGenerationError
               ? "stale_workspace_generation"
             : "unknown_workspace",
+          { operationId: toolCallOperationId(req.body) },
         );
         return;
       }

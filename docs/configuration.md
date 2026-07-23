@@ -296,20 +296,25 @@ worktree for the recommended writable flow, or explicitly request
 intended. Existing persisted checkout sessions retain their previous writable
 authority during migration.
 
-`apply_patch`, `exec_command`, and mutating `write_stdin` accept an optional
-`operationId` of at most 128 characters. It is unique within the OAuth client;
-its record stores the Workspace, generation, and tool. Retrying an identical request with the same ID replays its
-stored result; changing the request conflicts, and an uncertain post-crash
-outcome is never executed automatically. Structured errors expose `code`,
-`retryable`, `safeToRetry`, `recovery`, and execution phase. Nonzero command
-exits instead report `commandExecuted: true`, `status: "exited"`, and the exit
-code.
+`apply_patch`, `exec_command`, `close_workspace`, `revoke_workspace`, and
+`show_changes` require an `operationId` of at most 128 characters. A
+`write_stdin` call also requires one whenever it sends input, closes stdin, or
+resizes a process; polling alone does not. The ID is unique within the current
+connection principal, and its record stores the Workspace, generation, and
+tool. Retrying an identical request with the same ID replays its stored result;
+changing the request conflicts, and an uncertain post-crash outcome is never
+executed automatically. Structured errors expose `code`, `retryable`,
+`safeToRetry`, `recovery`, `phase`, and `effectsKnown`. Nonzero command exits
+instead report `commandExecuted: true`, `status: "exited"`, and the exit code.
 `get_operation_status` returns state and result availability without returning
 the stored body. Expired replay bodies are cleared while their operation-ID
 tombstones remain until Workspace deletion, so an old ID cannot execute again.
 Reads expose `contentHash` and decimal-string `mtimeNs`;
-`apply_patch.ifMatch` validates all supplied path versions before its first
-write.
+`apply_patch` defaults to strict preconditions and requires an `ifMatch` entry
+for every touched path before its first write. Use the latest read version for
+an existing path and explicit `null` for a path expected not to exist. Blind
+patching requires `preconditionMode: "blind"` plus `blindWriteReason`, and
+should only be used after explicit user authorization.
 
 ## Widgets
 

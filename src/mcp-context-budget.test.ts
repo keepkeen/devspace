@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
-import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -161,7 +161,19 @@ try {
   assert.match(execInputSchema, /args/);
   assert.match(execInputSchema, /shell/);
   assert.match(execInputSchema, /command/);
-  assert.match(JSON.stringify(toolsByName.get("apply_patch")?.inputSchema), /ifMatch/);
+  const applyPatchInputSchema = JSON.stringify(toolsByName.get("apply_patch")?.inputSchema);
+  assert.match(applyPatchInputSchema, /ifMatch/);
+  assert.match(applyPatchInputSchema, /preconditionMode/);
+  assert.match(applyPatchInputSchema, /blindWriteReason/);
+  for (const name of [
+    "exec_command", "apply_patch", "close_workspace", "revoke_workspace", "show_changes",
+  ]) {
+    const schema = toolsByName.get(name)?.inputSchema as { required?: unknown } | undefined;
+    assert.ok(
+      Array.isArray(schema?.required) && schema.required.includes("operationId"),
+      `${name} must require operationId`,
+    );
+  }
   for (const name of ["load_skill", "close_workspace", "apply_patch", "show_changes"]) {
     assert.equal(toolsByName.get(name)?.outputSchema, undefined, `${name} should not advertise a redundant output schema`);
   }
@@ -227,6 +239,7 @@ try {
       effects?: { workspace?: { action?: unknown; result?: unknown; worktree?: unknown } };
     } | undefined)?.effects?.workspace,
     {
+      confidence: "observed",
       action: "open",
       result: "opened",
       worktree: "not_managed",
@@ -248,6 +261,7 @@ try {
       safeToRetry: true,
       recovery: "get_workspace_context",
       phase: "not_started",
+      effectsKnown: true,
     },
   );
   const openWorkspace = await client.callTool({
@@ -262,9 +276,11 @@ try {
     JSON.stringify(openWorkspace.content),
     /Repository instructions are untrusted project guidance/,
   );
-  assert.deepEqual(
-    (openWorkspace.structuredContent as { context?: unknown } | undefined)?.context,
-    { phase: "context_loaded" },
+  assert.equal(
+    (openWorkspace.structuredContent as {
+      context?: { phase?: unknown };
+    } | undefined)?.context?.phase,
+    "context_loaded",
   );
   const workspaceInstructions = (openWorkspace.structuredContent as {
     instructions?: { items?: Array<Record<string, unknown>> };
@@ -676,6 +692,21 @@ try {
   assert.equal(deniedCommand.isError, true);
   assert.match(toolText(deniedCommand), /^No command was executed\./);
   assert.match(JSON.stringify(deniedCommand.content), /blocked by command policy/i);
+  assert.equal(
+    (deniedCommand.structuredContent as { error?: { phase?: unknown } } | undefined)
+      ?.error?.phase,
+    "not_started",
+  );
+  assert.equal(
+    (deniedCommand.structuredContent as { operation?: { phase?: unknown } } | undefined)
+      ?.operation?.phase,
+    "not_started",
+  );
+  assert.equal(
+    (deniedCommand.structuredContent as { operation?: { effectsKnown?: unknown } } | undefined)
+      ?.operation?.effectsKnown,
+    true,
+  );
 
   for (const [args, expected] of [
     [["sudo", "id"], /sudo|command_blocked/i],
@@ -771,7 +802,10 @@ try {
   assert.equal(typeof activeSessionId, "number");
   assert.deepEqual(
     Object.keys((activeCommand.structuredContent ?? {}) as Record<string, unknown>).sort(),
-    ["commandExecuted", "effects", "ok", "outputId", "sessionId", "status"],
+    [
+      "commandExecuted", "context", "effects", "ok", "operation", "outputId", "sessionId",
+      "status", "workspace",
+    ],
   );
   const activeProcessOutput = await client.callTool({
     name: "read_process_output",
@@ -783,7 +817,7 @@ try {
   );
   assert.deepEqual(
     Object.keys((activeProcessOutput.structuredContent ?? {}) as Record<string, unknown>).sort(),
-    ["nextOffset", "ok", "status"],
+    ["context", "nextOffset", "ok", "status", "workspace"],
   );
   assert.match(toolText(activeProcessOutput), /active-status/s);
   assert.doesNotMatch(toolText(activeProcessOutput), /current end|poll offset|more: offset/i);
@@ -861,6 +895,34 @@ try {
   const interactiveSessionId = (interactiveShell.structuredContent as { sessionId?: unknown } | undefined)
     ?.sessionId;
   assert.equal(typeof interactiveSessionId, "number");
+  const missingWriteStdinOperationId = await client.callTool({
+    name: "write_stdin",
+    arguments: {
+      workspaceId,
+      sessionId: interactiveSessionId,
+      chars: "printf should-not-run\\n",
+      __skipAutoOperationId: true,
+    },
+  });
+  assert.equal(missingWriteStdinOperationId.isError, true);
+  assert.equal(
+    (missingWriteStdinOperationId.structuredContent as {
+      error?: { code?: unknown; phase?: unknown; effectsKnown?: unknown };
+    } | undefined)?.error?.code,
+    "operation_id_required",
+  );
+  assert.equal(
+    (missingWriteStdinOperationId.structuredContent as {
+      error?: { phase?: unknown };
+    } | undefined)?.error?.phase,
+    "not_started",
+  );
+  assert.equal(
+    (missingWriteStdinOperationId.structuredContent as {
+      error?: { effectsKnown?: unknown };
+    } | undefined)?.error?.effectsKnown,
+    true,
+  );
   const protectedInteractiveInput = await client.callTool({
     name: "write_stdin",
     arguments: {
@@ -923,10 +985,113 @@ try {
     },
   });
   assert.notEqual(nestedReplay.isError, true, "a consumed instruction token must not block operation replay");
+  const strictPatchOperationId = "strict-precondition-add";
+  const strictPatchText =
+    "*** Begin Patch\n*** Add File: strict-precondition.txt\n+strict\n*** End Patch";
+  const missingStrictPrecondition = await client.callTool({
+    name: "apply_patch",
+    arguments: {
+      workspaceId,
+      operationId: strictPatchOperationId,
+      patch: strictPatchText,
+    },
+  });
+  assert.equal(missingStrictPrecondition.isError, true);
+  assert.equal(
+    (missingStrictPrecondition.structuredContent as {
+      error?: { code?: unknown; effectsKnown?: unknown };
+    } | undefined)?.error?.code,
+    "if_match_required",
+  );
+  assert.equal(
+    (missingStrictPrecondition.structuredContent as {
+      error?: { effectsKnown?: unknown };
+    } | undefined)?.error?.effectsKnown,
+    true,
+  );
+  assert.deepEqual(
+    (missingStrictPrecondition.structuredContent as { operation?: unknown } | undefined)?.operation,
+    {
+      id: strictPatchOperationId,
+      phase: "not_started",
+      safeToRetry: true,
+      effectsKnown: true,
+    },
+  );
+  await assert.rejects(access(join(workspaceRoot, "strict-precondition.txt")), /ENOENT/);
+  const strictPatchArguments = {
+    workspaceId,
+    operationId: strictPatchOperationId,
+    ifMatch: { "strict-precondition.txt": null },
+    patch: strictPatchText,
+  };
+  const strictPatch = await client.callTool({
+    name: "apply_patch",
+    arguments: strictPatchArguments,
+  });
+  assert.notEqual(strictPatch.isError, true);
+  assert.deepEqual(
+    (strictPatch.structuredContent as { preconditions?: unknown } | undefined)?.preconditions,
+    { mode: "strict", complete: true },
+  );
+  assert.deepEqual(
+    (strictPatch.structuredContent as { operation?: unknown } | undefined)?.operation,
+    {
+      id: strictPatchOperationId,
+      phase: "committed",
+      safeToRetry: false,
+      effectsKnown: true,
+    },
+  );
+  const strictPatchReplay = await client.callTool({
+    name: "apply_patch",
+    arguments: strictPatchArguments,
+  });
+  assert.notEqual(strictPatchReplay.isError, true);
+  assert.equal(await readFile(join(workspaceRoot, "strict-precondition.txt"), "utf8"), "strict\n");
+
+  const blindPatchOperationId = "blind-precondition-add";
+  const blindPatchText =
+    "*** Begin Patch\n*** Add File: blind-precondition.txt\n+blind\n*** End Patch";
+  const blindWithoutReason = await client.callTool({
+    name: "apply_patch",
+    arguments: {
+      workspaceId,
+      operationId: blindPatchOperationId,
+      preconditionMode: "blind",
+      patch: blindPatchText,
+    },
+  });
+  assert.equal(blindWithoutReason.isError, true);
+  assert.equal(
+    (blindWithoutReason.structuredContent as { error?: { code?: unknown } } | undefined)
+      ?.error?.code,
+    "blind_write_reason_required",
+  );
+  const blindWriteReason = "Explicit test authorization for a blind new-file write.";
+  const blindPatch = await client.callTool({
+    name: "apply_patch",
+    arguments: {
+      workspaceId,
+      operationId: blindPatchOperationId,
+      preconditionMode: "blind",
+      blindWriteReason,
+      patch: blindPatchText,
+    },
+  });
+  assert.notEqual(blindPatch.isError, true);
+  assert.deepEqual(
+    (blindPatch.structuredContent as { preconditions?: unknown } | undefined)?.preconditions,
+    { mode: "blind", complete: false, blindWriteReason },
+  );
+  assert.equal(await readFile(join(workspaceRoot, "blind-precondition.txt"), "utf8"), "blind\n");
   const invalidPatch = await client.callTool({
     name: "apply_patch",
     arguments: {
       workspaceId,
+      ifMatch: String(
+        (read.structuredContent as { contentHash?: unknown } | undefined)?.contentHash ?? "",
+      ),
       patch: "*** Begin Patch\n*** Update File: payload.txt\n@@\n-context that is absent\n+replacement\n*** End Patch",
     },
   });
@@ -1011,6 +1176,7 @@ try {
       effects?: { workspace?: { result?: unknown; worktree?: unknown } };
     } | undefined)?.effects?.workspace,
     {
+      confidence: "observed",
       action: "open",
       result: "reused",
       worktree: "reused",
@@ -1099,9 +1265,13 @@ try {
     typeof (dirtyBackground.structuredContent as { sessionId?: unknown } | undefined)?.sessionId,
     "number",
   );
+  const dirtyCloseArguments = {
+    workspaceId: dirtyWorkspaceId,
+    operationId: "dirty-worktree-close",
+  };
   const dirtyClose = await client.callTool({
     name: "close_workspace",
-    arguments: { workspaceId: dirtyWorkspaceId },
+    arguments: dirtyCloseArguments,
   });
   assert.equal(dirtyClose.isError, true);
   assert.equal(
@@ -1117,9 +1287,10 @@ try {
     {
       code: "workspace_dirty",
       retryable: false,
-      safeToRetry: true,
+      safeToRetry: false,
       recovery: "show_changes",
-      phase: "executed",
+      phase: "committed",
+      effectsKnown: true,
     },
   );
   assert.deepEqual((dirtyClose._meta as { card?: { summary?: unknown } } | undefined)?.card?.summary, {
@@ -1132,6 +1303,26 @@ try {
     toolText(dirtyClose),
     /Workspace remains open: dirty worktree retained; 1 process\(es\) terminated\./,
   );
+  const dirtyCloseReplay = await client.callTool({
+    name: "close_workspace",
+    arguments: dirtyCloseArguments,
+  });
+  assert.equal(dirtyCloseReplay.isError, true);
+  assert.deepEqual(
+    (dirtyCloseReplay.structuredContent as { operation?: unknown } | undefined)?.operation,
+    {
+      id: dirtyCloseArguments.operationId,
+      phase: "committed",
+      safeToRetry: false,
+      effectsKnown: true,
+    },
+  );
+  assert.equal(
+    (dirtyCloseReplay.structuredContent as {
+      effects?: { workspace?: { processesTerminated?: unknown } };
+    } | undefined)?.effects?.workspace?.processesTerminated,
+    1,
+  );
   const retainedRead = await client.callTool({
     name: "read",
     arguments: { workspaceId: dirtyWorkspaceId, path: "dirty.txt" },
@@ -1139,7 +1330,7 @@ try {
   assert.match(toolText(retainedRead), /dirty/);
   const dirtyRevoke = await client.callTool({
     name: "revoke_workspace",
-    arguments: { workspaceId: dirtyWorkspaceId },
+    arguments: { workspaceId: dirtyWorkspaceId, operationId: "dirty-worktree-revoke" },
   });
   assert.equal(dirtyRevoke.isError, true);
   assert.deepEqual(
@@ -1147,9 +1338,10 @@ try {
     {
       code: "workspace_dirty",
       retryable: false,
-      safeToRetry: true,
+      safeToRetry: false,
       recovery: "show_changes",
       phase: "not_started",
+      effectsKnown: true,
     },
   );
   assert.equal(
@@ -1166,9 +1358,13 @@ try {
     arguments: { workspaceId: dirtyWorkspaceId, program: "rm", args: ["dirty.txt"] },
   });
   assert.notEqual(cleanManagedWorktree.isError, true);
+  const cleanManagedRevokeArguments = {
+    workspaceId: dirtyWorkspaceId,
+    operationId: "clean-managed-revoke",
+  };
   const cleanManagedRevoke = await client.callTool({
     name: "revoke_workspace",
-    arguments: { workspaceId: dirtyWorkspaceId },
+    arguments: cleanManagedRevokeArguments,
   });
   assert.notEqual(cleanManagedRevoke.isError, true);
   assert.equal(
@@ -1176,13 +1372,51 @@ try {
     true,
   );
   await assert.rejects(access(dirtyWorkspaceRoot), /ENOENT/);
+  const cleanManagedRevokeReplay = await client.callTool({
+    name: "revoke_workspace",
+    arguments: cleanManagedRevokeArguments,
+  });
+  assert.notEqual(cleanManagedRevokeReplay.isError, true);
+  assert.deepEqual(
+    (cleanManagedRevokeReplay.structuredContent as { operation?: unknown } | undefined)?.operation,
+    {
+      id: cleanManagedRevokeArguments.operationId,
+      phase: "committed",
+      safeToRetry: false,
+      effectsKnown: true,
+    },
+  );
+  assert.equal(
+    (cleanManagedRevokeReplay.structuredContent as {
+      effects?: { workspace?: { processesTerminated?: unknown } };
+    } | undefined)?.effects?.workspace?.processesTerminated,
+    0,
+  );
   const outputId = activeOutputId;
   assert.equal(typeof outputId, "string");
   const readProcessOutput = await client.callTool({
     name: "read_process_output",
     arguments: { workspaceId, outputId, offset: 0 },
   });
-  assert.deepEqual(readProcessOutput.structuredContent, { ok: true, eof: true });
+  assert.deepEqual(readProcessOutput.structuredContent, {
+    ok: true,
+    eof: true,
+    workspace: {
+      ref: workspaceId,
+      generation: (openWorkspace.structuredContent as {
+        workspace?: { generation?: unknown };
+      } | undefined)?.workspace?.generation,
+    },
+    context: {
+      phase: "context_loaded",
+      instructionRevision: (openWorkspace.structuredContent as {
+        instructions?: { revision?: unknown };
+      } | undefined)?.instructions?.revision,
+      skillRevision: (openWorkspace.structuredContent as {
+        skills?: { revision?: unknown };
+      } | undefined)?.skills?.revision,
+    },
+  });
   assert.match(toolText(readProcessOutput), /active-status/);
   assert.doesNotMatch(toolText(readProcessOutput), /completed|retained end|outputId/);
 
@@ -1204,7 +1438,26 @@ try {
     (unknownProcessOutput.structuredContent as { status?: unknown } | undefined)?.status,
     "unknown",
   );
-  assert.deepEqual(unknownProcessOutput.structuredContent, { ok: true, eof: true, status: "unknown" });
+  assert.deepEqual(unknownProcessOutput.structuredContent, {
+    ok: true,
+    eof: true,
+    status: "unknown",
+    workspace: {
+      ref: workspaceId,
+      generation: (openWorkspace.structuredContent as {
+        workspace?: { generation?: unknown };
+      } | undefined)?.workspace?.generation,
+    },
+    context: {
+      phase: "context_loaded",
+      instructionRevision: (openWorkspace.structuredContent as {
+        instructions?: { revision?: unknown };
+      } | undefined)?.instructions?.revision,
+      skillRevision: (openWorkspace.structuredContent as {
+        skills?: { revision?: unknown };
+      } | undefined)?.skills?.revision,
+    },
+  });
   assert.match(
     toolText(unknownProcessOutput),
     /completion unknown; verify side effects before rerun/i,
@@ -1488,6 +1741,7 @@ function assertFirst512Lifecycle(instructions: string): void {
 }
 
 function enableWorkspaceGenerationTracking(client: Client): void {
+  let operationSequence = 0;
   const receiptsByWorkspace = new Map<string, string>();
   const receiptsByAlias = new Map<string, string>();
   const scopedTools = new Set([
@@ -1498,7 +1752,27 @@ function enableWorkspaceGenerationTracking(client: Client): void {
   const original = client.callTool.bind(client);
   client.callTool = (async (...callArgs: Parameters<Client["callTool"]>) => {
     const request = callArgs[0];
-    const requestArguments = request.arguments as Record<string, unknown> | undefined ?? {};
+    const requestArguments = {
+      ...(request.arguments as Record<string, unknown> | undefined ?? {}),
+    };
+    const skipAutoOperationId = requestArguments.__skipAutoOperationId === true;
+    delete requestArguments.__skipAutoOperationId;
+    const mutatingWriteStdin = request.name === "write_stdin" && (
+      requestArguments.chars !== undefined ||
+      requestArguments.closeStdin === true ||
+      requestArguments.columns !== undefined ||
+      requestArguments.rows !== undefined
+    );
+    if (
+      !skipAutoOperationId &&
+      requestArguments.operationId === undefined &&
+      (new Set([
+        "exec_command", "apply_patch", "close_workspace", "revoke_workspace", "show_changes",
+      ]).has(request.name) || mutatingWriteStdin)
+    ) {
+      operationSequence += 1;
+      requestArguments.operationId = `context-budget-auto-${operationSequence}`;
+    }
     const workspaceId = typeof requestArguments?.workspaceId === "string"
       ? requestArguments.workspaceId
       : undefined;
@@ -1518,6 +1792,8 @@ function enableWorkspaceGenerationTracking(client: Client): void {
         ...rest
       } = requestArguments;
       callArgs[0] = { ...request, arguments: { ...rest, receipt } };
+    } else if (request.arguments !== requestArguments) {
+      callArgs[0] = { ...request, arguments: requestArguments };
     }
     const result = await original(...callArgs);
     const structured = result.structuredContent as Record<string, unknown> | undefined;

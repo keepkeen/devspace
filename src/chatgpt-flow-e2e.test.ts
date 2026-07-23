@@ -21,6 +21,7 @@ const ownerPassword = "chatgpt-flow-e2e-owner-password-long-enough";
 const clients = new Set<Client>();
 const trackedWorkspaceReceipts = new Map<string, string>();
 const trackedAliasReceipts = new Map<string, string>();
+let automaticOperationSequence = 0;
 let active: Awaited<ReturnType<typeof startServer>> | undefined;
 const capturedLogs: string[] = [];
 const originalConsole = {
@@ -162,6 +163,13 @@ try {
     workspaceGeneration: generationA,
     resultAvailable: true,
     safeToRetry: false,
+    workspace: { ref: workspaceA, generation: generationA },
+    operation: {
+      id: optimisticOperationId,
+      phase: "committed",
+      safeToRetry: false,
+      effectsKnown: true,
+    },
   });
   const staleOptimisticPatch = await firstRound.callTool({
     name: "apply_patch",
@@ -202,6 +210,7 @@ try {
   const patchArguments = {
     workspaceId: workspaceA,
     operationId: "patch-once",
+    ifMatch: { "patch-once.txt": null },
     patch: "*** Begin Patch\n*** Add File: patch-once.txt\n+once\n*** End Patch",
   };
   const firstPatch = await firstRound.callTool({ name: "apply_patch", arguments: patchArguments });
@@ -770,7 +779,24 @@ function enableWorkspaceGenerationTracking(client: Client): void {
   const original = client.callTool.bind(client);
   client.callTool = (async (...callArgs: Parameters<Client["callTool"]>) => {
     const request = callArgs[0];
-    const requestArguments = request.arguments as Record<string, unknown> | undefined ?? {};
+    const requestArguments = {
+      ...(request.arguments as Record<string, unknown> | undefined ?? {}),
+    };
+    const mutatingWriteStdin = request.name === "write_stdin" && (
+      requestArguments.chars !== undefined ||
+      requestArguments.closeStdin === true ||
+      requestArguments.columns !== undefined ||
+      requestArguments.rows !== undefined
+    );
+    if (
+      requestArguments.operationId === undefined &&
+      (new Set([
+        "exec_command", "apply_patch", "close_workspace", "revoke_workspace", "show_changes",
+      ]).has(request.name) || mutatingWriteStdin)
+    ) {
+      automaticOperationSequence += 1;
+      requestArguments.operationId = `chatgpt-flow-auto-${automaticOperationSequence}`;
+    }
     const workspaceId = typeof requestArguments?.workspaceId === "string"
       ? requestArguments.workspaceId
       : undefined;
@@ -790,6 +816,8 @@ function enableWorkspaceGenerationTracking(client: Client): void {
         ...rest
       } = requestArguments;
       callArgs[0] = { ...request, arguments: { ...rest, receipt } };
+    } else if (request.arguments !== requestArguments) {
+      callArgs[0] = { ...request, arguments: requestArguments };
     }
     const result = await original(...callArgs);
     const structured = result.structuredContent as Record<string, unknown> | undefined;

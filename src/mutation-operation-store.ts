@@ -131,6 +131,26 @@ export class MutationOperationStore {
       if (row && !rowMatchesKey(row, normalizedKey)) return { status: "conflict" };
       if (row && row.request_hash !== normalizedHash) return { status: "conflict" };
 
+      if (row) {
+        if (
+          expectedGeneration !== undefined &&
+          row.workspace_generation !== expectedGeneration
+        ) {
+          return { status: "conflict" };
+        }
+        if (row.state === "outcome_unknown" || row.state === "pending") {
+          return { status: "outcome_unknown" };
+        }
+        if (row.result_json === null) return { status: "result_unavailable" };
+
+        try {
+          return { status: "replay", result: JSON.parse(row.result_json) as unknown };
+        } catch {
+          this.markSettledResultUnavailable(normalizedKey, nowTimestamp, expiresAt);
+          return { status: "result_unavailable" };
+        }
+      }
+
       const currentGeneration = this.getWorkspaceGeneration(normalizedKey);
       if (currentGeneration === undefined) {
         throw new Error("Mutation operation workspace does not belong to the OAuth client");
@@ -140,38 +160,23 @@ export class MutationOperationStore {
       }
       const observedGeneration = expectedGeneration ?? currentGeneration;
 
-      if (!row) {
-        this.database.sqlite
-          .prepare(
-            `insert into mutation_operations (
-              owner_client_id, workspace_id, tool, operation_id, workspace_generation,
-              request_hash, state, result_json, created_at, updated_at, expires_at
-            )
-            values (?, ?, ?, ?, ?, ?, 'pending', null, ?, ?, ?)`,
+      this.database.sqlite
+        .prepare(
+          `insert into mutation_operations (
+            owner_client_id, workspace_id, tool, operation_id, workspace_generation,
+            request_hash, state, result_json, created_at, updated_at, expires_at
           )
-          .run(
-            ...keyValues(normalizedKey),
-            observedGeneration,
-            normalizedHash,
-            nowTimestamp,
-            nowTimestamp,
-            expiresAt,
-          );
-        return { status: "new" };
-      }
-
-      if (row.workspace_generation !== observedGeneration) return { status: "conflict" };
-      if (row.state === "outcome_unknown" || row.state === "pending") {
-        return { status: "outcome_unknown" };
-      }
-      if (row.result_json === null) return { status: "result_unavailable" };
-
-      try {
-        return { status: "replay", result: JSON.parse(row.result_json) as unknown };
-      } catch {
-        this.markSettledResultUnavailable(normalizedKey, nowTimestamp, expiresAt);
-        return { status: "result_unavailable" };
-      }
+          values (?, ?, ?, ?, ?, ?, 'pending', null, ?, ?, ?)`,
+        )
+        .run(
+          ...keyValues(normalizedKey),
+          observedGeneration,
+          normalizedHash,
+          nowTimestamp,
+          nowTimestamp,
+          expiresAt,
+        );
+      return { status: "new" };
     });
 
     return reserveOperation.immediate();
