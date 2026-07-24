@@ -38,6 +38,7 @@ try {
   testConnectionPrincipalReconnect(join(root, "principal-reconnect"));
   testAuthorizationLimitPersistence(join(root, "authorization-limits"));
   testExpiredTokenCleanup(join(root, "expiration"));
+  testPendingClientCleanupAndCapacity(join(root, "pending-client-capacity"));
   testTransactionalTokenRotation(join(root, "rotation"));
   testDurableWorkspaceRevocationCleanup(join(root, "workspace-revocation"));
   testOrphanedWorkspaceReconciliation(join(root, "workspace-orphans"));
@@ -497,6 +498,8 @@ function testAuthorizationLimitPersistence(stateDir: string): void {
       refreshTokens: 0,
       reconnectCodes: 0,
       authorizationLimits: 1,
+      unapprovedClients: 0,
+      revokedPrincipals: 0,
     });
   } finally {
     restored.close();
@@ -530,6 +533,8 @@ function testExpiredTokenCleanup(stateDir: string): void {
     refreshTokens: 1,
     reconnectCodes: 0,
     authorizationLimits: 0,
+    unapprovedClients: 0,
+    revokedPrincipals: 0,
   });
   store.close();
 
@@ -540,6 +545,45 @@ function testExpiredTokenCleanup(stateDir: string): void {
     assert.equal(reopened.getRefreshToken("expired-refresh-hash"), undefined);
   } finally {
     reopened.close();
+  }
+}
+
+function testPendingClientCleanupAndCapacity(stateDir: string): void {
+  const store = new SqliteOAuthStore(stateDir);
+  const clients = new SqliteOAuthClientsStore(store, oauthConfig.allowedRedirectHosts);
+  try {
+    for (let index = 0; index < 64; index += 1) {
+      clients.registerClient({
+        redirect_uris: [redirectUri],
+        client_name: `Pending ${index}`,
+      });
+    }
+    assert.throws(
+      () => clients.registerClient({ redirect_uris: [redirectUri], client_name: "Overflow" }),
+      /Too many unapproved OAuth client registrations/,
+    );
+    const database = openDatabase(stateDir);
+    try {
+      database.sqlite.prepare(`
+        update oauth_clients
+        set issued_at = 0
+        where client_id = (
+          select client_id from oauth_clients
+          where principal_id is null
+          order by issued_at, client_id
+          limit 1
+        )
+      `).run();
+    } finally {
+      database.close();
+    }
+    assert.equal(store.cleanupExpired().unapprovedClients, 1);
+    assert.doesNotThrow(() => clients.registerClient({
+      redirect_uris: [redirectUri],
+      client_name: "Replacement",
+    }));
+  } finally {
+    store.close();
   }
 }
 
@@ -696,6 +740,27 @@ function testDurableWorkspaceRevocationCleanup(stateDir: string): void {
   } finally {
     restarted.close();
   }
+  const beforePrincipalCleanup = openDatabase(stateDir);
+  try {
+    assert.equal(beforePrincipalCleanup.sqlite.prepare(`
+      select count(*)
+      from connection_principals
+      where principal_id = ? and revoked_at is not null
+    `).pluck().get(principalId), 1);
+  } finally {
+    beforePrincipalCleanup.close();
+  }
+  new SqliteOAuthStore(stateDir).close();
+  const afterPrincipalCleanup = openDatabase(stateDir);
+  try {
+    assert.equal(afterPrincipalCleanup.sqlite.prepare(`
+      select count(*)
+      from connection_principals
+      where principal_id = ?
+    `).pluck().get(principalId), 0);
+  } finally {
+    afterPrincipalCleanup.close();
+  }
 }
 
 function testOrphanedWorkspaceReconciliation(stateDir: string): void {
@@ -761,6 +826,8 @@ async function testAuthorizationResponseHardening(stateDir: string): Promise<voi
       refreshTokens: 0,
       reconnectCodes: 0,
       authorizationLimits: 0,
+      unapprovedClients: 0,
+      revokedPrincipals: 0,
       authorizationCodes: 1,
     });
   } finally {

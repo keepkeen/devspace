@@ -28,6 +28,10 @@ export interface ShellProtectedPathViolation {
   reason: string;
 }
 
+export type DirectCommandPathViolation =
+  | ({ kind: "write" } & ShellWriteTargetViolation)
+  | ({ kind: "protected" } & ShellProtectedPathViolation);
+
 const ALL_OPERAND_TARGETS = new Set([
   "mkdir", "truncate", "rm", "rmdir", "tee",
 ]);
@@ -91,6 +95,85 @@ export function validateShellProtectedPaths(
     if (isShellAnalysisLimitError(error)) return protectedAnalysisLimitViolation();
     throw error;
   }
+}
+
+/**
+ * Apply the same visible-path guardrails to a direct program/argv invocation.
+ * Direct argv does not perform shell expansion, so every argument is treated
+ * as its literal value rather than rejecting harmless `$`, `*`, or `?` text.
+ */
+export function validateDirectCommandPaths(
+  program: string,
+  args: string[],
+  cwd: string,
+  workspaceRoot: string,
+  protectedRoots: string[],
+  allowedProtectedSubtrees: string[] = [],
+): DirectCommandPathViolation | undefined {
+  const canonicalRoot = realpathSync(workspaceRoot);
+  const canonicalProtectedRoots = protectedRoots.map((root) =>
+    resolvePotentialTarget(resolve(root))
+  );
+  const canonicalAllowedProtectedSubtrees = allowedProtectedSubtrees.map((root) =>
+    resolvePotentialTarget(resolve(root))
+  ).filter((root) => isWithin(canonicalRoot, root));
+  for (const target of literalPathCandidates([program, ...args])) {
+    if (pathEntersProtectedRoot(
+      target,
+      cwd,
+      canonicalProtectedRoots,
+      canonicalAllowedProtectedSubtrees,
+    )) {
+      return {
+        kind: "protected",
+        target,
+        reason: `Command path enters protected DevSpace internal state: ${target}`,
+      };
+    }
+  }
+
+  const executable = programBasename(program);
+  if (executable === "rm" && hasDestructiveRmFlag(args)) {
+    const operands = nonOptionOperands(args);
+    if (operands.length === 0) {
+      return {
+        kind: "write",
+        target: "<missing-rm-target>",
+        reason: "Forced or recursive rm requires an explicit workspace target",
+      };
+    }
+    const rootTarget = operands.find((target) =>
+      resolvePotentialTarget(resolveLiteralPath(target, cwd)) === canonicalRoot
+    );
+    if (rootTarget) {
+      return {
+        kind: "write",
+        target: rootTarget,
+        reason: "Forced or recursive rm cannot delete the workspace root itself",
+      };
+    }
+  }
+
+  const outside = directMutationTargets(executable, args).find((target) =>
+    !isAllowedDeviceTarget(target) &&
+    !targetInsideWorkspace(target, cwd, canonicalRoot)
+  );
+  if (outside) return { kind: "write", ...outsideViolation(outside) };
+
+  if (executable === "ln" && args.some((arg) =>
+    /^-[^-]*s/u.test(arg) || arg === "--symbolic"
+  )) {
+    const operands = nonOptionOperands(args);
+    const source = operands.at(-2);
+    if (source && !targetInsideWorkspace(source, cwd, canonicalRoot)) {
+      return {
+        kind: "write",
+        target: source,
+        reason: `Shell symlink target is outside the workspace: ${source}`,
+      };
+    }
+  }
+  return undefined;
 }
 
 function validateProtectedCommand(
@@ -407,7 +490,7 @@ function withoutRedirections(tokens: string[]): string[] {
   return result;
 }
 
-function directMutationTargets(program: string, args: string[]): string[] {
+export function directMutationTargets(program: string, args: string[]): string[] {
   const operands = nonOptionOperands(args);
   if (ALL_OPERAND_TARGETS.has(program)) return operands;
   if (program === "touch") {

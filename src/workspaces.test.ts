@@ -1215,6 +1215,20 @@ try {
   );
   releaseRecoveryOperation();
   await activeRecoveryOperation;
+  await mkdir(cappedWorkspace.root, { recursive: true });
+  assert.equal(
+    cappedRegistry.listWorkspaces(connectionPrincipalId)
+      .find((summary) => summary.alias === cappedWorkspace.alias)
+      ?.hydrationStatus,
+    "recovery_required",
+  );
+  await assert.rejects(
+    cappedRegistry.resumeWorkspace(connectionPrincipalId, cappedWorkspace.alias),
+    (error: unknown) =>
+      error instanceof WorkspaceRecoveryRequiredError &&
+      /no longer registered as the original Git worktree/.test(error.message),
+  );
+  await rm(cappedWorkspace.root, { recursive: true, force: true });
   assert.equal(cappedStore.countManagedWorktrees(), 1);
   const recoveredCapped = await cappedRegistry.resumeWorkspace(
     connectionPrincipalId,
@@ -1407,6 +1421,15 @@ try {
   assert.equal(refreshedManagedActivity.lastUsedAt > "2026-01-01T00:00:00.000Z", true);
   activityDatabase.close();
 
+  await writeFile(join(persistentWorktree.workspace.root, "resume-head.txt"), "latest head\n");
+  await git(persistentWorktree.workspace.root, ["add", "resume-head.txt"]);
+  await git(persistentWorktree.workspace.root, ["commit", "-m", "Advance persisted worktree"]);
+  const persistedWorktreeHead = (await execFileAsync(
+    "git",
+    ["rev-parse", "HEAD"],
+    { cwd: persistentWorktree.workspace.root },
+  )).stdout.trim();
+
   const activeSnapshot = persistentRegistry.activeSessionsSnapshot();
   assert.equal(activeSnapshot.some((session) => session.id === persistentWorkspace.workspace.id), true);
   const snapshottedCheckout = activeSnapshot.find((session) => session.id === persistentWorkspace.workspace.id)!;
@@ -1458,6 +1481,11 @@ try {
   assert.equal(restoredWorktree.root, persistentWorktree.workspace.root);
   assert.equal(restoredWorktree.worktree?.managed, true);
   assert.equal(restoredWorktree.worktree?.dirtySource, true);
+  assert.equal(restoredWorktree.worktree?.baseSha, persistedWorktreeHead);
+  assert.equal(
+    secondStore.getSession(persistentWorktree.workspace.id, connectionPrincipalId)?.baseSha,
+    persistedWorktreeHead,
+  );
   assert.equal(restoredWorktree.stateGeneration, persistentWorktree.workspace.stateGeneration + 1);
   assert.deepEqual(
     restoredWorktree.agentProfiles.map((profile) => profile.name),

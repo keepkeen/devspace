@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  validateDirectCommandPaths,
   validateShellProtectedPaths,
   validateShellWriteTargets,
 } from "./shell-write-targets.js";
@@ -119,6 +120,69 @@ try {
     assert(violation, `${command} should be rejected`);
     assert.match(violation.reason, /outside the workspace/);
   }
+
+  assert.equal(
+    validateDirectCommandPaths(
+      "rm",
+      ["-rf", "build/generated"],
+      root,
+      root,
+      [protectedRoot, stateRoot],
+    ),
+    undefined,
+    "direct argv should allow recursive cleanup inside the workspace",
+  );
+  assert.match(
+    validateDirectCommandPaths(
+      "rm",
+      ["-rf", "."],
+      root,
+      root,
+      [protectedRoot, stateRoot],
+    )?.reason ?? "",
+    /cannot delete the workspace root/i,
+  );
+  assert.match(
+    validateDirectCommandPaths(
+      "rm",
+      ["-rf", outside],
+      root,
+      root,
+      [protectedRoot, stateRoot],
+    )?.reason ?? "",
+    /outside the workspace/i,
+  );
+  assert.match(
+    validateDirectCommandPaths(
+      "cat",
+      [join(stateRoot, "metadata.sqlite")],
+      root,
+      root,
+      [protectedRoot, stateRoot],
+    )?.reason ?? "",
+    /protected DevSpace internal state/i,
+  );
+  assert.equal(
+    validateDirectCommandPaths(
+      "cp",
+      [join(outside, "readable-source.txt"), "build/copied.txt"],
+      root,
+      root,
+      [protectedRoot, stateRoot],
+    ),
+    undefined,
+    "direct argv should allow an outside read source with an inside destination",
+  );
+  assert.match(
+    validateDirectCommandPaths(
+      "ln",
+      ["-s", outside, "outside-created-link"],
+      root,
+      root,
+      [protectedRoot, stateRoot],
+    )?.reason ?? "",
+    /symlink target is outside the workspace/i,
+  );
 
   assert.match(
     validateShellWriteTargets(`rm -rf ${join(outside, "cache")}`, root, root)?.reason ?? "",

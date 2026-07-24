@@ -18,6 +18,7 @@ import {
   removeManagedWorktreeSync,
   resolveManagedWorktreeBase,
   restoreManagedWorktree,
+  validatedManagedWorktreeHead,
 } from "./git-worktrees.js";
 
 export { WorkspaceQuotaError } from "./workspace-store.js";
@@ -459,14 +460,19 @@ export class WorkspaceRegistry {
           createdAt: new Date(workspace.lastUsedAt).toISOString(),
           lastUsedAt: new Date(workspace.lastUsedAt).toISOString(),
         }));
+    const residentByAlias = new Map(
+      Array.from(this.workspaces.values())
+        .filter((workspace) => workspace.connectionPrincipalId === connectionPrincipalId)
+        .map((workspace) => [workspace.alias, workspace] as const),
+    );
+    const persistedByAlias = new Map(
+      (this.store?.listActiveSessions?.(connectionPrincipalId) ?? [])
+        .flatMap((session) => session.alias ? [[session.alias, session] as const] : []),
+    );
 
     return summaries.map((summary) => {
-      const session = this.store?.getActiveSessionByAlias?.(connectionPrincipalId, summary.alias);
-      const resident = Array.from(this.workspaces.values()).find(
-        (workspace) =>
-          workspace.connectionPrincipalId === connectionPrincipalId &&
-          workspace.alias === summary.alias,
-      );
+      const session = persistedByAlias.get(summary.alias);
+      const resident = residentByAlias.get(summary.alias);
       const available = resident
         ? this.workspaceRootAllowed(resident.root, resident.mode, resident.sourceRoot)
         : session
@@ -542,7 +548,24 @@ export class WorkspaceRegistry {
     );
     if (resident) {
       if (this.workspaceRootAllowed(resident.root, resident.mode, resident.sourceRoot)) {
-        return this.contextForWorkspace(resident, true);
+        if (resident.mode !== "worktree" || !resident.worktree?.managed || !resident.sourceRoot) {
+          return this.contextForWorkspace(resident, true);
+        }
+        const currentHead = await validatedManagedWorktreeHead(
+          resident.sourceRoot,
+          resident.root,
+        ).catch(() => undefined);
+        if (currentHead) {
+          if (resident.worktree.baseSha !== currentHead) {
+            resident.worktree.baseSha = currentHead;
+            this.store?.updateManagedSessionBaseSha?.(
+              resident.id,
+              resident.connectionPrincipalId,
+              currentHead,
+            );
+          }
+          return this.contextForWorkspace(resident, true);
+        }
       }
       const lifecycle = this.lifecycleStates.get(resident.id);
       if (lifecycle && (lifecycle.phase === "closing" || lifecycle.activeOperations > 0)) {
@@ -1795,11 +1818,35 @@ export class WorkspaceRegistry {
         ?? `ws-${randomUUID()}`;
       let recovery: WorkspaceContext["recovery"];
       let recoveredWorktree: WorkspaceWorktree | undefined;
+      let currentWorktreeHead: string | undefined;
       if (session.mode === "worktree" && session.managed) {
         try {
           const metadata = await stat(session.root);
           if (!metadata.isDirectory()) {
             throw new WorkspaceRecoveryRequiredError(alias, "the saved worktree path is not a directory");
+          }
+          if (!session.sourceRoot) {
+            throw new WorkspaceRecoveryRequiredError(
+              alias,
+              "the saved source repository metadata is incomplete",
+            );
+          }
+          currentWorktreeHead = await validatedManagedWorktreeHead(
+            session.sourceRoot,
+            session.root,
+          );
+          if (!currentWorktreeHead) {
+            throw new WorkspaceRecoveryRequiredError(
+              alias,
+              "the saved directory is no longer registered as the original Git worktree",
+            );
+          }
+          if (currentWorktreeHead !== session.baseSha) {
+            this.store?.updateManagedSessionBaseSha?.(
+              session.id,
+              session.connectionPrincipalId,
+              currentWorktreeHead,
+            );
           }
         } catch (error) {
           if (error instanceof WorkspaceRecoveryRequiredError) throw error;
@@ -1869,7 +1916,7 @@ export class WorkspaceRegistry {
           ? recoveredWorktree ?? {
               path: root,
               baseRef: session.baseRef ?? "HEAD",
-              baseSha: session.baseSha ?? "",
+              baseSha: currentWorktreeHead ?? session.baseSha ?? "",
               dirtySource: session.dirtySource,
               detached: true,
               managed: session.managed,
@@ -2042,6 +2089,9 @@ export class WorkspaceRegistry {
       }
       assertAllowedPath(realpathSync(sourceRoot), canonicalAllowedRoots);
       assertAllowedPath(realpathSync(root), [realpathSync(this.config.worktreeRoot)]);
+      if (!statSync(join(root, ".git")).isFile()) {
+        throw new Error(`Stored managed worktree is missing its Git link: ${root}`);
+      }
       return assertAllowedPath(root, [this.config.worktreeRoot]);
     }
 

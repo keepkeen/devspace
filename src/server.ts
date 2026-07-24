@@ -45,6 +45,8 @@ import {
 } from "./bash-prompt.js";
 import { classifyCommand } from "./command-policy.js";
 import {
+  directMutationTargets,
+  validateDirectCommandPaths,
   validateShellProtectedPaths,
   validateShellWriteTargets,
 } from "./shell-write-targets.js";
@@ -150,6 +152,8 @@ import {
 } from "./oauth-scopes.js";
 
 const SHELL_COMMAND_MAX_CHARACTERS = 100_000;
+const MAX_PROCESS_ENVIRONMENT_ENTRIES = 128;
+const MAX_PROCESS_ENVIRONMENT_BYTES = 128 * 1_024;
 
 type Transport = StreamableHTTPServerTransport;
 type McpTransportMode = "stateful" | "stateless";
@@ -1167,6 +1171,29 @@ function assertOAuthScopes(requiredScopes: readonly DevSpaceCapabilityScope[]): 
   );
 }
 
+export function processEnvironmentViolation(
+  environment: Record<string, string> | undefined,
+): string | undefined {
+  const entries = Object.entries(environment ?? {});
+  if (entries.length > MAX_PROCESS_ENVIRONMENT_ENTRIES) {
+    return `Environment overrides are limited to ${MAX_PROCESS_ENVIRONMENT_ENTRIES} entries.`;
+  }
+  let totalBytes = 0;
+  for (const [name, value] of entries) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(name) || value.includes("\0")) {
+      return "Environment names must be portable identifiers and values cannot contain NUL bytes.";
+    }
+    if (["DEVSPACE_WORKSPACE_ID", "DEVSPACE_WORKSPACE_ROOT", "CDPATH"].includes(name)) {
+      return `Environment variable ${name} is managed by DevSpace.`;
+    }
+    totalBytes += Buffer.byteLength(name, "utf8") + Buffer.byteLength(value, "utf8") + 2;
+    if (totalBytes > MAX_PROCESS_ENVIRONMENT_BYTES) {
+      return `Environment overrides exceed the ${MAX_PROCESS_ENVIRONMENT_BYTES}-byte limit.`;
+    }
+  }
+  return undefined;
+}
+
 function toolDescription(parts: {
   use: string;
   avoid: string;
@@ -1889,7 +1916,10 @@ function directCommandScopePaths(
   workspace: Workspace,
   program: string,
   args: string[],
+  cwd: string,
   workingDirectory: string | undefined,
+  protectedRoots: string[],
+  allowedProtectedSubtrees: string[],
 ): { paths: string[] } | { error: { content: ToolContent[]; isError: true } } {
   const tokens = [program, ...args];
   const chain = executableChain(tokens);
@@ -1907,9 +1937,6 @@ function directCommandScopePaths(
   }
   const executable = basename(effective[0]!).toLowerCase();
   const effectiveArgs = effective.slice(1);
-  if (executable === "rm" && effectiveArgs.some((argument) => /^-[^-]*[rf]/u.test(argument) || argument === "--recursive" || argument === "--force")) {
-    return { error: rejectedToolResult("command_blocked", "No command was executed. Forced or recursive rm is blocked.") };
-  }
   let delegated = effective;
   let launchesShell = false;
   for (let depth = 0; depth < 8; depth += 1) {
@@ -1929,6 +1956,25 @@ function directCommandScopePaths(
       error: rejectedToolResult(
         "explicit_shell_required",
         "No command was executed. Interactive shell programs are not accepted as direct argv; use shell=true with command so each input can be checked.",
+      ),
+    };
+  }
+
+  const pathViolation = validateDirectCommandPaths(
+    effective[0]!,
+    effectiveArgs,
+    cwd,
+    workspace.root,
+    protectedRoots,
+    allowedProtectedSubtrees,
+  );
+  if (pathViolation) {
+    return {
+      error: rejectedToolResult(
+        pathViolation.kind === "protected"
+          ? "protected_path_blocked"
+          : "command_write_outside_workspace",
+        `No command was executed. ${pathViolation.reason}`,
       ),
     };
   }
@@ -1987,13 +2033,7 @@ function directCommandScopePaths(
       if (separateTarget) index += 1;
     }
   }
-  const operands = effectiveArgs.filter((argument) => argument.length > 0 && !argument.startsWith("-"));
-  const mutationOperands = executable === "cp" || executable === "mv"
-    ? operands
-    : ["mkdir", "touch", "rm", "rmdir", "tee", "chmod", "chown"].includes(executable)
-      ? operands
-      : [];
-  for (const operand of mutationOperands) {
+  for (const operand of directMutationTargets(executable, effectiveArgs)) {
     try {
       workspaces.confineWorkspacePath(workspace, operand);
       paths.add(operand);
@@ -2784,13 +2824,9 @@ function registerProcessTools(
           { retryable: false, safeToRetry: false, recovery: "use_os_sandbox" },
         );
       }
-      for (const [name, value] of Object.entries(environment ?? {})) {
-        if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(name) || value.includes("\0")) {
-          throw new PublicActionError("environment_invalid", "Environment names must be portable identifiers and values cannot contain NUL bytes.");
-        }
-        if (["DEVSPACE_WORKSPACE_ID", "DEVSPACE_WORKSPACE_ROOT", "CDPATH"].includes(name)) {
-          throw new PublicActionError("environment_reserved", `Environment variable ${name} is managed by DevSpace.`);
-        }
+      const environmentViolation = processEnvironmentViolation(environment);
+      if (environmentViolation) {
+        throw new PublicActionError("environment_invalid", environmentViolation);
       }
       if (requestedCwd !== undefined && workingDirectory !== undefined) {
         throw new PublicActionError("command_shape_invalid", "Provide cwd or legacy workingDirectory, not both.");
@@ -2817,7 +2853,16 @@ function registerProcessTools(
       const commandText = direct ? [program, ...directArgs].join(" ") : shellCommand!;
       const cwd = workspaces.resolveWorkingDirectory(workspace, effectiveWorkingDirectory);
       const commandScopes = direct
-        ? directCommandScopePaths(workspaces, workspace, program, directArgs, effectiveWorkingDirectory)
+        ? directCommandScopePaths(
+            workspaces,
+            workspace,
+            program,
+            directArgs,
+            cwd,
+            effectiveWorkingDirectory,
+            protectedShellRoots(config),
+            allowedProtectedShellSubtrees(workspace),
+          )
         : commandInstructionScopePaths(workspace.root, shellCommand!, cwd, effectiveWorkingDirectory);
       if ("error" in commandScopes) return commandScopes.error;
       const effectiveCloseStdin = closeStdin ?? stdin !== undefined;

@@ -275,6 +275,13 @@ try {
         { id: "ws-b", connectionPrincipalId: "client-b" },
       ],
     );
+    assert.deepEqual(
+      second.listActiveSessions("client-a").map(({ id, connectionPrincipalId }) => ({
+        id,
+        connectionPrincipalId,
+      })),
+      [{ id: "ws-a", connectionPrincipalId: "client-a" }],
+    );
     assert.equal(second.closeSessions([
       { id: "ws-a", connectionPrincipalId: "wrong-client" },
       { id: "ws-b", connectionPrincipalId: "client-b" },

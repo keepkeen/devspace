@@ -43,6 +43,8 @@ export interface OAuthCleanupCounts {
   refreshTokens: number;
   reconnectCodes: number;
   authorizationLimits: number;
+  unapprovedClients: number;
+  revokedPrincipals: number;
 }
 
 export type OAuthAuthorizationLimitScope = "session" | "client" | "ip" | "global";
@@ -102,6 +104,9 @@ const DEFAULT_RECONNECT_CODE_TTL_MS = 10 * 60_000;
 const MAX_RECONNECT_CODE_TTL_MS = 30 * 60_000;
 const RECONNECT_CODE_PREFIX = "reconnect-";
 const MAX_AUTHORIZATION_LIMIT_KEY_LENGTH = 4_096;
+const PENDING_OAUTH_CLIENT_TTL_SECONDS = 60 * 60;
+const MAX_PENDING_OAUTH_CLIENTS = 64;
+const MAX_TOTAL_OAUTH_CLIENTS = 512;
 
 interface AuthorizationLimitRow {
   tokens: number;
@@ -180,11 +185,31 @@ export class SqliteOAuthStore {
       response_types: client.response_types ?? ["code"],
     };
 
-    this.database.sqlite.prepare(`
-      insert into oauth_clients (
-        client_id, principal_id, client_json, issued_at
-      ) values (?, null, ?, ?)
-    `).run(registered.client_id, JSON.stringify(registered), now);
+    const register = this.database.sqlite.transaction(() => {
+      this.cleanupExpiredUnapprovedClients(now);
+      const counts = this.database.sqlite.prepare(`
+        select
+          count(*) as total,
+          count(*) filter (where principal_id is null) as pending
+        from oauth_clients
+      `).get() as { total: number; pending: number };
+      if (counts.pending >= MAX_PENDING_OAUTH_CLIENTS) {
+        throw new InvalidRequestError(
+          "Too many unapproved OAuth client registrations are pending; retry after older registrations expire",
+        );
+      }
+      if (counts.total >= MAX_TOTAL_OAUTH_CLIENTS) {
+        throw new InvalidRequestError(
+          "OAuth client registration capacity reached; revoke unused clients before registering another",
+        );
+      }
+      this.database.sqlite.prepare(`
+        insert into oauth_clients (
+          client_id, principal_id, client_json, issued_at
+        ) values (?, null, ?, ?)
+      `).run(registered.client_id, JSON.stringify(registered), now);
+    });
+    register.immediate();
 
     return registered;
   }
@@ -675,6 +700,29 @@ export class SqliteOAuthStore {
       authorizationLimits: this.database.sqlite
         .prepare("delete from oauth_authorization_limits where expires_at <= ?")
         .run(nowMs).changes,
+      unapprovedClients: this.cleanupExpiredUnapprovedClients(nowSeconds),
+      revokedPrincipals: this.database.sqlite.prepare(`
+        delete from connection_principals
+        where principal_id in (
+          select principal.principal_id
+          from connection_principals as principal
+          where principal.revoked_at is not null
+            and not exists (
+              select 1 from oauth_clients as client
+              where client.principal_id = principal.principal_id
+            )
+            and not exists (
+              select 1 from workspace_sessions as workspace
+              where workspace.owner_client_id = principal.principal_id
+            )
+            and not exists (
+              select 1 from oauth_principal_reconnect_codes as reconnect
+              where reconnect.principal_id = principal.principal_id
+            )
+          order by principal.last_used_at, principal.principal_id
+          limit 1000
+        )
+      `).run().changes,
     }));
     return cleanup.immediate();
   }
@@ -724,6 +772,13 @@ export class SqliteOAuthStore {
     return this.database.sqlite
       .prepare("delete from oauth_principal_reconnect_codes where expires_at <= ?")
       .run(nowMs).changes;
+  }
+
+  private cleanupExpiredUnapprovedClients(nowSeconds: number): number {
+    return this.database.sqlite.prepare(`
+      delete from oauth_clients
+      where principal_id is null and issued_at < ?
+    `).run(nowSeconds - PENDING_OAUTH_CLIENT_TTL_SECONDS).changes;
   }
 
   private evaluateAuthorizationLimits(

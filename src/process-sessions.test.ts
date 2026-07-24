@@ -347,14 +347,16 @@ await assert.rejects(
 
 const previousCdPath = process.env.CDPATH;
 const previousSecret = process.env.DEVSPACE_TEST_SECRET;
+const previousJavaHome = process.env.JAVA_HOME;
 process.env.CDPATH = "/tmp/should-not-leak";
 process.env.DEVSPACE_TEST_SECRET = "must-not-leak";
+process.env.JAVA_HOME = "/tmp/devspace-java-home";
 const environment = await manager.start({
   connectionPrincipalId,
   workspaceId: "workspace-a",
   workspaceRoot: "/tmp/devspace-workspace-a",
   cwd: process.cwd(),
-  command: `${node} -e "console.log([process.env.NO_COLOR, process.env.TERM, process.env.PAGER, process.env.GIT_PAGER, process.env.GH_PAGER, process.env.CODEX_CI, process.env.DEVSPACE_WORKSPACE_ID, process.env.DEVSPACE_WORKSPACE_ROOT, process.env.CDPATH ?? 'unset', process.env.DEVSPACE_TEST_SECRET ?? 'unset', process.env.DEVSPACE_EXPLICIT_ENV, process.env.PATH ? 'path' : 'no-path'].join(','))"`,
+  command: `${node} -e "console.log([process.env.NO_COLOR, process.env.TERM, process.env.PAGER, process.env.GIT_PAGER, process.env.GH_PAGER, process.env.CODEX_CI, process.env.DEVSPACE_WORKSPACE_ID, process.env.DEVSPACE_WORKSPACE_ROOT, process.env.CDPATH ?? 'unset', process.env.DEVSPACE_TEST_SECRET ?? 'unset', process.env.DEVSPACE_EXPLICIT_ENV, process.env.PATH ? 'path' : 'no-path', process.env.JAVA_HOME].join(','))"`,
   environment: { DEVSPACE_EXPLICIT_ENV: "explicit" },
   yieldTimeMs: 2_000,
 });
@@ -362,10 +364,12 @@ if (previousCdPath === undefined) delete process.env.CDPATH;
 else process.env.CDPATH = previousCdPath;
 if (previousSecret === undefined) delete process.env.DEVSPACE_TEST_SECRET;
 else process.env.DEVSPACE_TEST_SECRET = previousSecret;
+if (previousJavaHome === undefined) delete process.env.JAVA_HOME;
+else process.env.JAVA_HOME = previousJavaHome;
 assert.equal(environment.running, false);
 assert.match(
   environment.output,
-  /1,dumb,cat,cat,cat,1,workspace-a,\/tmp\/devspace-workspace-a,unset,unset,explicit,path/,
+  /1,dumb,cat,cat,cat,1,workspace-a,\/tmp\/devspace-workspace-a,unset,unset,explicit,path,\/tmp\/devspace-java-home/,
 );
 
 const background = await manager.start({

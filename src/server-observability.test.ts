@@ -13,6 +13,7 @@ import {
   isExpectedPiToolError,
   processInputInstructionScopePaths,
   processInputPolicyViolation,
+  processEnvironmentViolation,
   processCallSucceeded,
   processModelState,
   processResult,
@@ -599,6 +600,18 @@ assert.deepEqual(requiredOAuthScopesForToolCall({
   },
 }), ["workspace:read", "workspace:write", "worktree:create"]);
 assert.deepEqual(requiredOAuthScopesForTool("revoke_workspace"), ["workspace:revoke"]);
+assert.equal(processEnvironmentViolation({ VALID_NAME: "value" }), undefined);
+assert.match(
+  processEnvironmentViolation(Object.fromEntries(
+    Array.from({ length: 129 }, (_, index) => [`ENV_${index}`, "value"]),
+  )) ?? "",
+  /limited to 128 entries/,
+);
+assert.match(
+  processEnvironmentViolation({ TOO_LARGE: "x".repeat(128 * 1_024) }) ?? "",
+  /byte limit/,
+);
+assert.match(processEnvironmentViolation({ CDPATH: "/tmp" }) ?? "", /managed by DevSpace/);
 assert.equal(workspaceOperationId({
   method: "tools/call",
   params: { name: "close_workspace", arguments: { workspaceId: "ws_test" } },

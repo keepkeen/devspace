@@ -709,7 +709,7 @@ try {
 
   for (const [args, expected] of [
     [["sudo", "id"], /sudo|command_blocked/i],
-    [["rm", "-rf", "nested"], /recursive rm|command_blocked/i],
+    [["rm", "-rf", root], /outside the workspace|command_write_outside_workspace/i],
   ] as const) {
     const wrappedDenial = await client.callTool({
       name: "exec_command",
@@ -731,8 +731,8 @@ try {
   for (const [program, args, expected] of [
     ["env", [`-C${root}`, "touch", "argv-wrapper-attached.txt"], /wrapper path leaves/i],
     ["time", [`-o${join(root, "time.txt")}`, "true"], /wrapper path leaves/i],
-    ["cp", [`-t${root}`, "nested/fixture.txt"], /target directory leaves/i],
-    ["mv", [`--target-directory=${root}`, "nested/fixture.txt"], /target directory leaves/i],
+    ["cp", [`-t${root}`, "nested/fixture.txt"], /outside the workspace|target directory leaves/i],
+    ["mv", [`--target-directory=${root}`, "nested/fixture.txt"], /outside the workspace|target directory leaves/i],
   ] as const) {
     const attachedPathDenial = await client.callTool({
       name: "exec_command",

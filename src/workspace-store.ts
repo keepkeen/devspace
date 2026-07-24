@@ -232,7 +232,7 @@ export interface WorkspaceStore {
   deleteSession(id: string, connectionPrincipalId: string): boolean;
   countManagedWorktrees(): number;
   countActiveSessions?(connectionPrincipalId?: string): number;
-  listActiveSessions?(): WorkspaceSession[];
+  listActiveSessions?(connectionPrincipalId?: string): WorkspaceSession[];
   closeSessions?(sessions: Array<{ id: string; connectionPrincipalId: string }>): number;
   listExpiredSessions(
     before: string,
@@ -1111,11 +1111,16 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
     return (row as { count: number }).count;
   }
 
-  listActiveSessions(): WorkspaceSession[] {
+  listActiveSessions(connectionPrincipalId?: string): WorkspaceSession[] {
     return this.database.db
       .select()
       .from(workspaceSessions)
-      .where(eq(workspaceSessions.status, "active"))
+      .where(connectionPrincipalId === undefined
+        ? eq(workspaceSessions.status, "active")
+        : and(
+            eq(workspaceSessions.status, "active"),
+            eq(workspaceSessions.connectionPrincipalId, connectionPrincipalId),
+          ))
       .all()
       .map(rowToWorkspaceSession);
   }

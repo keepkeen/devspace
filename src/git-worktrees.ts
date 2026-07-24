@@ -171,14 +171,13 @@ export async function restoreManagedWorktree(input: {
 }): Promise<ManagedWorktree> {
   const sourceRoot = await assertGitRootAllowed(input.sourceRoot, input.config.allowedRoots);
   const worktreePath = assertAllowedPath(input.worktreePath, [input.config.worktreeRoot]);
-  const registeredHead = await registeredWorktreeHead(sourceRoot, worktreePath).catch(() => undefined);
+  const registeredHead = await managedWorktreeHead(sourceRoot, worktreePath).catch(() => undefined);
   const recoverySha = registeredHead ?? input.baseSha;
   await mkdir(dirname(worktreePath), { recursive: true });
   await git(["worktree", "prune"], sourceRoot).catch(() => undefined);
   try {
     await git(["worktree", "add", "--detach", worktreePath, recoverySha], sourceRoot);
   } catch (error) {
-    await rm(worktreePath, { recursive: true, force: true });
     const message = error instanceof Error ? error.message : String(error);
     throw new GitWorktreeError(
       "GIT_WORKTREE_CREATE_FAILED",
@@ -196,7 +195,7 @@ export async function restoreManagedWorktree(input: {
   };
 }
 
-async function registeredWorktreeHead(
+export async function managedWorktreeHead(
   sourceRoot: string,
   worktreePath: string,
 ): Promise<string | undefined> {
@@ -214,6 +213,29 @@ async function registeredWorktreeHead(
     if (listedPath === expected && /^[0-9a-f]{40,64}$/u.test(head ?? "")) return head;
   }
   return undefined;
+}
+
+export async function validatedManagedWorktreeHead(
+  sourceRoot: string,
+  worktreePath: string,
+): Promise<string | undefined> {
+  try {
+    const registeredHead = await managedWorktreeHead(sourceRoot, worktreePath);
+    if (!registeredHead) return undefined;
+    const [actualHead, sourceCommonDir, worktreeCommonDir] = await Promise.all([
+      git(["rev-parse", "HEAD"], worktreePath),
+      git(["rev-parse", "--git-common-dir"], sourceRoot),
+      git(["rev-parse", "--git-common-dir"], worktreePath),
+    ]);
+    const canonicalSourceCommonDir = await realpath(resolve(sourceRoot, sourceCommonDir.trim()));
+    const canonicalWorktreeCommonDir = await realpath(resolve(worktreePath, worktreeCommonDir.trim()));
+    return actualHead.trim() === registeredHead &&
+        canonicalSourceCommonDir === canonicalWorktreeCommonDir
+      ? registeredHead
+      : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 async function canonicalMissingPath(path: string): Promise<string> {
