@@ -6,7 +6,7 @@ import { promisify } from "node:util";
 import assert from "node:assert/strict";
 import Database from "better-sqlite3";
 import { loadConfig } from "./config.js";
-import { databasePath } from "./db/client.js";
+import { databasePath, openDatabase } from "./db/client.js";
 import { GitWorktreeError, removeManagedWorktree } from "./git-worktrees.js";
 import { MAX_PROJECT_INSTRUCTION_BYTES } from "./project-instructions.js";
 import { SqliteWorkspaceStore, type WorkspaceStore } from "./workspace-store.js";
@@ -112,7 +112,7 @@ try {
     [false, true],
   );
 
-  const pendingAliasStore = new SqliteWorkspaceStore(join(root, ".pending-alias-state"));
+  const pendingAliasStore = createTestWorkspaceStore(join(root, ".pending-alias-state"));
   const pendingAliasRegistry = new WorkspaceRegistry(config, pendingAliasStore);
   const pendingAliasResults = await Promise.allSettled([
     pendingAliasRegistry.openWorkspace(connectionPrincipalId, {
@@ -140,7 +140,7 @@ try {
   ), /alias/i);
   pendingAliasStore.close();
 
-  const pendingAccessStore = new SqliteWorkspaceStore(join(root, ".pending-access-state"));
+  const pendingAccessStore = createTestWorkspaceStore(join(root, ".pending-access-state"));
   const pendingAccessRegistry = new WorkspaceRegistry(config, pendingAccessStore);
   const [pendingReadOnly, pendingReadWrite] = await Promise.all([
     pendingAccessRegistry.openWorkspace(connectionPrincipalId, {
@@ -335,7 +335,7 @@ try {
   assert.notEqual(alternateRevisionOpen.instructionRevision, secondRevisionOpen.instructionRevision);
 
   const hotReloadConfig = { ...config, allowedRoots: [root] };
-  const hotReloadStore = new SqliteWorkspaceStore(join(root, ".hot-reload-state"));
+  const hotReloadStore = createTestWorkspaceStore(join(root, ".hot-reload-state"));
   const hotReloadRegistry = new WorkspaceRegistry(hotReloadConfig, hotReloadStore);
   const revokedWorkspace = (await hotReloadRegistry.openWorkspace(connectionPrincipalId, root)).workspace;
   assert.throws(() => hotReloadRegistry.applyAllowedRoots([]), /At least one allowed root/);
@@ -387,7 +387,7 @@ try {
     /ENOENT/,
   );
 
-  const retryStore = new SqliteWorkspaceStore(join(root, ".hot-reload-retry-state"));
+  const retryStore = createTestWorkspaceStore(join(root, ".hot-reload-retry-state"));
   const retryRegistry = new WorkspaceRegistry({ ...config, allowedRoots: [root] }, retryStore);
   const retryWorkspace = (await retryRegistry.openWorkspace(connectionPrincipalId, root)).workspace;
   const closeSessions = retryStore.closeSessions.bind(retryStore);
@@ -514,7 +514,7 @@ try {
     () => lifecycleRegistry.getWorkspace(connectionPrincipalId, lifecycleWorkspace.id),
     /workspace is no longer available/,
   );
-  const leaseDeleteStore = new SqliteWorkspaceStore(join(root, ".lease-delete-state"));
+  const leaseDeleteStore = createTestWorkspaceStore(join(root, ".lease-delete-state"));
   const leaseDeleteRegistry = new WorkspaceRegistry(config, leaseDeleteStore);
   const leaseDeleteWorkspace = (await leaseDeleteRegistry.openWorkspace(connectionPrincipalId, root)).workspace;
   const deleteLease = await leaseDeleteRegistry.acquireExclusiveClose(connectionPrincipalId, leaseDeleteWorkspace.id);
@@ -1125,7 +1125,7 @@ try {
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
     PORT: "1",
   });
-  const cappedStore = new SqliteWorkspaceStore(join(root, ".capped-state"));
+  const cappedStore = createTestWorkspaceStore(join(root, ".capped-state"));
   const cappedRegistry = new WorkspaceRegistry(cappedConfig, cappedStore);
   const concurrentWorktrees = await Promise.allSettled([
     cappedRegistry.openWorkspace(connectionPrincipalId, { path: gitRoot, mode: "worktree" }),
@@ -1330,7 +1330,7 @@ try {
   assert.equal(worktreeReadmePath.startsWith(worktreeWorkspace.workspace.root), true);
 
   const stateDir = join(root, ".state");
-  const firstStore = new SqliteWorkspaceStore(stateDir);
+  const firstStore = createTestWorkspaceStore(stateDir);
   const persistentRegistry = new WorkspaceRegistry(config, firstStore);
   const persistentWorkspace = await persistentRegistry.openWorkspace(connectionPrincipalId, root);
   const persistentWorktree = await persistentRegistry.openWorkspace(connectionPrincipalId, {
@@ -1413,7 +1413,7 @@ try {
   );
   firstStore.close();
 
-  const secondStore = new SqliteWorkspaceStore(stateDir);
+  const secondStore = createTestWorkspaceStore(stateDir);
   const restoredRegistry = new WorkspaceRegistry(config, secondStore);
   const reopenedWorkspace = await restoredRegistry.openWorkspace(connectionPrincipalId, root);
   assert.equal(reopenedWorkspace.workspace.id, persistentWorkspace.workspace.id);
@@ -1506,7 +1506,7 @@ try {
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
     PORT: "1",
   });
-  const expiryStore = new SqliteWorkspaceStore(expiryStateDir);
+  const expiryStore = createTestWorkspaceStore(expiryStateDir);
   const expiryRegistry = new WorkspaceRegistry(expiryConfig, expiryStore);
   const dirtyExpiredWorktree = (await expiryRegistry.openWorkspace(connectionPrincipalId, {
     path: gitRoot,
@@ -1547,13 +1547,23 @@ try {
   expiryStore.close();
 
   const rotationStateDir = join(root, ".expiry-rotation-state");
-  const rotationStore = new SqliteWorkspaceStore(rotationStateDir);
+  const rotationStore = createTestWorkspaceStore(rotationStateDir);
   const rotationRegistry = new WorkspaceRegistry(expiryConfig, rotationStore);
   for (let index = 0; index < 1_024; index += 1) {
     const id = `blocked-${String(index).padStart(4, "0")}`;
-    rotationStore.createSession({ id, connectionPrincipalId, alias: id, root });
+    rotationStore.createSession({
+      id,
+      connectionPrincipalId,
+      alias: id,
+      root: join(root, "rotation", id),
+    });
   }
-  rotationStore.createSession({ id: "zz-clean", connectionPrincipalId, alias: "zz-clean", root });
+  rotationStore.createSession({
+    id: "zz-clean",
+    connectionPrincipalId,
+    alias: "zz-clean",
+    root: join(root, "rotation", "zz-clean"),
+  });
   const rotationDatabase = new Database(databasePath(rotationStateDir));
   rotationDatabase.prepare("update workspace_sessions set last_used_at = ?")
     .run("2026-01-01T00:00:00.000Z");
@@ -1569,7 +1579,7 @@ try {
   rotationStore.close();
 
   const reopenStateDir = join(root, ".reopen-state");
-  const reopenStore = new SqliteWorkspaceStore(reopenStateDir);
+  const reopenStore = createTestWorkspaceStore(reopenStateDir);
   const reopenRegistry = new WorkspaceRegistry(config, reopenStore);
   const beforeClose = (await reopenRegistry.openWorkspace(connectionPrincipalId, root)).workspace;
   assert.equal(reopenRegistry.closeWorkspace(connectionPrincipalId, beforeClose.id), true);
@@ -1579,8 +1589,8 @@ try {
   reopenStore.close();
 
   const concurrentStateDir = join(root, ".concurrent-state");
-  const concurrentStoreA = new SqliteWorkspaceStore(concurrentStateDir);
-  const concurrentStoreB = new SqliteWorkspaceStore(concurrentStateDir);
+  const concurrentStoreA = createTestWorkspaceStore(concurrentStateDir);
+  const concurrentStoreB = createTestWorkspaceStore(concurrentStateDir);
   const concurrentRegistryA = new WorkspaceRegistry(config, concurrentStoreA);
   const concurrentRegistryB = new WorkspaceRegistry(config, concurrentStoreB);
   const [storedConcurrentA, storedConcurrentB] = await Promise.all([
@@ -1637,24 +1647,31 @@ try {
   const migratedLegacyDatabase = new Database(databasePath(legacyStateDir), { readonly: true });
   assert.deepEqual(
     migratedLegacyDatabase.prepare(
-      "select id, status, canonical_root as canonicalRoot from workspace_sessions",
+      `select id, status, canonical_root as canonicalRoot, alias, write_access as writeAccess
+       from workspace_sessions`,
     ).get(),
-    { id: "ws_legacy", status: "active", canonicalRoot: null },
+    {
+      id: "ws_legacy",
+      status: "active",
+      canonicalRoot,
+      alias: basename(canonicalRoot),
+      writeAccess: "read_write",
+    },
   );
   assert.equal(
     migratedLegacyDatabase.prepare(
-      "select count(*) from sqlite_master where type = 'index' and name = 'workspace_sessions_active_checkout_owner_canonical_root_uq'",
+      "select count(*) from sqlite_master where type = 'index' and name = 'workspace_sessions_active_checkout_principal_canonical_root_uq'",
     ).pluck().get(),
     1,
   );
   migratedLegacyDatabase.close();
   const migratedLegacyStore = new SqliteWorkspaceStore(legacyStateDir);
-  const adoptedLegacy = await new WorkspaceRegistry(config, migratedLegacyStore).openWorkspace(
+  const migratedWorkspace = await new WorkspaceRegistry(config, migratedLegacyStore).openWorkspace(
     connectionPrincipalId,
     root,
   );
-  assert.equal(adoptedLegacy.workspace.id, "ws_legacy");
-  assert.equal(adoptedLegacy.reused, true);
+  assert.equal(migratedWorkspace.workspace.id, "ws_legacy");
+  assert.equal(migratedWorkspace.reused, true);
   migratedLegacyStore.close();
 
   if (platform() !== "win32") {
@@ -1665,7 +1682,7 @@ try {
       /Path is outside allowed roots/,
     );
     const escapedStateDir = join(root, ".escaped-checkout-state");
-    const escapedStore = new SqliteWorkspaceStore(escapedStateDir);
+    const escapedStore = createTestWorkspaceStore(escapedStateDir);
     const escapedSession = escapedStore.createSession({
       id: "ws_escaped_checkout",
       connectionPrincipalId,
@@ -1682,7 +1699,7 @@ try {
     await assert.rejects(
       new WorkspaceRegistry(config, escapedStore).resumeWorkspace(
         connectionPrincipalId,
-        escapedSession.alias!,
+        escapedSession.alias,
       ),
       /workspace alias is unavailable/,
     );
@@ -1709,14 +1726,14 @@ try {
       ["global override instructions\n", "root instructions\n"],
     );
 
-    const aliasReuseStore = new SqliteWorkspaceStore(join(root, ".alias-reuse-state"));
+    const aliasReuseStore = createTestWorkspaceStore(join(root, ".alias-reuse-state"));
     const aliasReuseRegistry = new WorkspaceRegistry(config, aliasReuseStore);
     const realCheckout = await aliasReuseRegistry.openWorkspace(connectionPrincipalId, root);
     const aliasedCheckout = await aliasReuseRegistry.openWorkspace(connectionPrincipalId, aliasRoot);
     assert.equal(aliasedCheckout.workspace.id, realCheckout.workspace.id);
     assert.equal(aliasedCheckout.skillRevision, realCheckout.skillRevision);
     aliasReuseStore.close();
-    const restoredAliasStore = new SqliteWorkspaceStore(join(root, ".alias-reuse-state"));
+    const restoredAliasStore = createTestWorkspaceStore(join(root, ".alias-reuse-state"));
     const restoredAliasRegistry = new WorkspaceRegistry(aliasConfig, restoredAliasStore);
     assert.throws(
       () => restoredAliasRegistry.getWorkspace(connectionPrincipalId, realCheckout.workspace.id),
@@ -1731,6 +1748,26 @@ try {
 } finally {
   await rm(root, { recursive: true, force: true });
   await rm(outsideRoot, { recursive: true, force: true });
+}
+
+function seedConnectionPrincipal(stateDir: string, principalId: string): void {
+  const database = openDatabase(stateDir);
+  try {
+    const now = new Date(0).toISOString();
+    database.sqlite.prepare(`
+      insert into connection_principals (principal_id, created_at, last_used_at, revoked_at)
+      values (?, ?, ?, null)
+      on conflict(principal_id) do nothing
+    `).run(principalId, now, now);
+  } finally {
+    database.close();
+  }
+}
+
+function createTestWorkspaceStore(stateDir: string): SqliteWorkspaceStore {
+  seedConnectionPrincipal(stateDir, connectionPrincipalId);
+  seedConnectionPrincipal(stateDir, "client-b");
+  return new SqliteWorkspaceStore(stateDir);
 }
 
 async function git(cwd: string, args: string[]): Promise<void> {

@@ -267,10 +267,10 @@ export class SqliteOAuthStore {
         (select count(*) from oauth_clients as client
           where client.principal_id = principal.principal_id) as clientCount,
         (select count(*) from workspace_sessions as workspace
-          where workspace.owner_client_id = principal.principal_id
+          where workspace.connection_principal_id = principal.principal_id
             and workspace.status = 'active') as activeWorkspaces,
         (select count(*) from workspace_sessions as workspace
-          where workspace.owner_client_id = principal.principal_id
+          where workspace.connection_principal_id = principal.principal_id
             and workspace.status in ('active', 'closed')) as retainedWorkspaces
       from connection_principals as principal
       where principal.revoked_at is null
@@ -279,7 +279,7 @@ export class SqliteOAuthStore {
     const aliases = this.database.sqlite.prepare(`
       select alias
       from workspace_sessions
-      where owner_client_id = ? and status in ('active', 'closed') and alias is not null
+      where connection_principal_id = ? and status in ('active', 'closed') and alias is not null
       order by last_used_at desc, alias
       limit 20
     `);
@@ -370,7 +370,7 @@ export class SqliteOAuthStore {
         const sourceUsage = this.database.sqlite.prepare(`
           select
             (select count(*) from oauth_clients where principal_id = @principalId) as clients,
-            (select count(*) from workspace_sessions where owner_client_id = @principalId) as workspaces
+            (select count(*) from workspace_sessions where connection_principal_id = @principalId) as workspaces
         `).get({ principalId: source.principalId }) as { clients: number; workspaces: number };
         if (sourceUsage.clients !== 1 || sourceUsage.workspaces !== 0) {
           throw new PrincipalReconnectError(
@@ -400,7 +400,7 @@ export class SqliteOAuthStore {
               select 1 from oauth_clients where principal_id = connection_principals.principal_id
             )
             and not exists (
-              select 1 from workspace_sessions where owner_client_id = connection_principals.principal_id
+              select 1 from workspace_sessions where connection_principal_id = connection_principals.principal_id
             )
         `).run(source.principalId);
       }
@@ -571,13 +571,13 @@ export class SqliteOAuthStore {
       const now = new Date().toISOString();
       const workspaceCleanupJobs = this.database.sqlite.prepare(`
         insert into oauth_revocation_cleanup_jobs (
-          owner_client_id, workspace_id, workspace_root, workspace_mode,
+          connection_principal_id, workspace_id, workspace_root, workspace_mode,
           source_root, managed, dirty_source, status, claim_token,
           lease_expires_at, attempts, last_error, created_at, updated_at,
           completed_at
         )
         select
-          workspace.owner_client_id,
+          workspace.connection_principal_id,
           workspace.id,
           workspace.root,
           workspace.mode,
@@ -594,9 +594,9 @@ export class SqliteOAuthStore {
           null
         from workspace_sessions as workspace
         inner join oauth_clients as client
-          on client.principal_id = workspace.owner_client_id
+          on client.principal_id = workspace.connection_principal_id
         where workspace.status in ('active', 'closed')
-        on conflict(owner_client_id, workspace_id) do nothing
+        on conflict(connection_principal_id, workspace_id) do nothing
       `).run({ now }).changes;
       this.database.sqlite.prepare(`
         update workspace_sessions
@@ -604,7 +604,7 @@ export class SqliteOAuthStore {
             state_generation = state_generation + 1,
             last_used_at = @now
         where status in ('active', 'closed')
-          and owner_client_id in (select principal_id from oauth_clients)
+          and connection_principal_id in (select principal_id from oauth_clients)
       `).run({ now });
       this.database.sqlite.prepare(`
         update connection_principals
@@ -630,13 +630,13 @@ export class SqliteOAuthStore {
       const now = new Date().toISOString();
       const queued = this.database.sqlite.prepare(`
         insert into oauth_revocation_cleanup_jobs (
-          owner_client_id, workspace_id, workspace_root, workspace_mode,
+          connection_principal_id, workspace_id, workspace_root, workspace_mode,
           source_root, managed, dirty_source, status, claim_token,
           lease_expires_at, attempts, last_error, created_at, updated_at,
           completed_at
         )
         select
-          workspace.owner_client_id,
+          workspace.connection_principal_id,
           workspace.id,
           workspace.root,
           workspace.mode,
@@ -653,13 +653,10 @@ export class SqliteOAuthStore {
           null
         from workspace_sessions as workspace
         left join connection_principals as principal
-          on principal.principal_id = workspace.owner_client_id
+          on principal.principal_id = workspace.connection_principal_id
         where workspace.status in ('active', 'closed')
-          and (
-            principal.revoked_at is not null
-            or (principal.principal_id is null and workspace.owner_client_id like 'devspace-%')
-          )
-        on conflict(owner_client_id, workspace_id) do nothing
+          and principal.revoked_at is not null
+        on conflict(connection_principal_id, workspace_id) do nothing
       `).run({ now }).changes;
       this.database.sqlite.prepare(`
         update workspace_sessions
@@ -667,14 +664,8 @@ export class SqliteOAuthStore {
             state_generation = state_generation + 1,
             last_used_at = @now
         where status in ('active', 'closed')
-          and (
-            owner_client_id in (
-              select principal_id from connection_principals where revoked_at is not null
-            )
-            or (
-              owner_client_id like 'devspace-%'
-              and owner_client_id not in (select principal_id from connection_principals)
-            )
+          and connection_principal_id in (
+            select principal_id from connection_principals where revoked_at is not null
           )
       `).run({ now });
       return queued;
@@ -722,7 +713,7 @@ export class SqliteOAuthStore {
             )
             and not exists (
               select 1 from workspace_sessions as workspace
-              where workspace.owner_client_id = principal.principal_id
+              where workspace.connection_principal_id = principal.principal_id
             )
             and not exists (
               select 1 from oauth_principal_reconnect_codes as reconnect

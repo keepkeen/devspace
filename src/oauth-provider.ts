@@ -22,6 +22,7 @@ import {
 } from "./oauth-store.js";
 import { requestIp } from "./logger.js";
 import {
+  DEFAULT_DEVSPACE_OAUTH_SCOPES,
   defaultOAuthAuthorizationScopes,
   oauthScopeDescription,
 } from "./oauth-scopes.js";
@@ -117,7 +118,7 @@ function formHtml(params: {
   resource?: URL;
   fields: Record<string, string | undefined>;
 }): string {
-  const scopes = params.scopes.length > 0 ? params.scopes : ["devspace"];
+  const scopes = params.scopes.length > 0 ? params.scopes : [...DEFAULT_DEVSPACE_OAUTH_SCOPES];
   const scopeItems = scopes
     .map((scope) =>
       `<li><code>${htmlEscape(scope)}</code><span>${htmlEscape(oauthScopeDescription(scope))}</span></li>`)

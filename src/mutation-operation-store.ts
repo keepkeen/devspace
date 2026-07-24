@@ -122,7 +122,7 @@ export class MutationOperationStore {
         .prepare(
           `update mutation_operations
            set result_json = null
-           where owner_client_id = ? and operation_id = ? and expires_at <= ?
+           where connection_principal_id = ? and operation_id = ? and expires_at <= ?
              and result_json is not null`,
         )
         .run(normalizedKey.connectionPrincipalId, normalizedKey.operationId, nowTimestamp);
@@ -163,7 +163,7 @@ export class MutationOperationStore {
       this.database.sqlite
         .prepare(
           `insert into mutation_operations (
-            owner_client_id, workspace_id, tool, operation_id, workspace_generation,
+            connection_principal_id, workspace_id, tool, operation_id, workspace_generation,
             request_hash, state, result_json, created_at, updated_at, expires_at
           )
           values (?, ?, ?, ?, ?, ?, 'pending', null, ?, ?, ?)`,
@@ -207,7 +207,7 @@ export class MutationOperationStore {
         .prepare(
           `update mutation_operations
            set state = 'settled', result_json = ?, updated_at = ?, expires_at = ?
-           where owner_client_id = ? and workspace_id = ? and tool = ? and operation_id = ?
+           where connection_principal_id = ? and workspace_id = ? and tool = ? and operation_id = ?
              and request_hash = ? and state = 'pending'`,
         )
         .run(
@@ -231,7 +231,7 @@ export class MutationOperationStore {
     const result = this.database.sqlite
       .prepare(
         `delete from mutation_operations
-         where owner_client_id = ? and workspace_id = ? and tool = ? and operation_id = ?
+         where connection_principal_id = ? and workspace_id = ? and tool = ? and operation_id = ?
            and request_hash = ? and state = 'pending'`,
       )
       .run(...keyValues(normalizedKey), normalizedHash);
@@ -260,7 +260,7 @@ export class MutationOperationStore {
         .prepare(
           `update mutation_operations
            set state = 'outcome_unknown', result_json = null, updated_at = ?, expires_at = ?
-           where owner_client_id = ? and workspace_id = ? and tool = ? and operation_id = ?
+           where connection_principal_id = ? and workspace_id = ? and tool = ? and operation_id = ?
              and request_hash = ? and state = 'pending'`,
         )
         .run(nowTimestamp, expiresAt, ...keyValues(normalizedKey), normalizedHash);
@@ -288,7 +288,7 @@ export class MutationOperationStore {
     this.database.sqlite.prepare(`
       update mutation_operations
       set result_json = null
-      where owner_client_id = ? and operation_id = ? and expires_at <= ?
+      where connection_principal_id = ? and operation_id = ? and expires_at <= ?
         and result_json is not null
     `).run(normalizedConnectionPrincipalId, normalizedOperationId, timestampFromMs(this.currentTime()));
     const row = this.database.sqlite.prepare(`
@@ -303,7 +303,7 @@ export class MutationOperationStore {
         expires_at as expiresAt,
         case when state = 'settled' and result_json is not null then 1 else 0 end as resultAvailable
       from mutation_operations
-      where owner_client_id = ? and operation_id = ?
+      where connection_principal_id = ? and operation_id = ?
     `).get(normalizedConnectionPrincipalId, normalizedOperationId) as
       | Omit<MutationOperationStatus, "resultAvailable"> & { resultAvailable: 0 | 1 }
       | undefined;
@@ -355,7 +355,7 @@ export class MutationOperationStore {
       .prepare(
         `select workspace_id, workspace_generation, tool, request_hash, state, result_json
          from mutation_operations
-         where owner_client_id = ? and operation_id = ?`,
+         where connection_principal_id = ? and operation_id = ?`,
       )
       .get(key.connectionPrincipalId, key.operationId) as MutationOperationRow | undefined;
   }
@@ -364,7 +364,7 @@ export class MutationOperationStore {
     const row = this.database.sqlite.prepare(`
       select state_generation as stateGeneration
       from workspace_sessions
-      where id = ? and owner_client_id = ?
+      where id = ? and connection_principal_id = ?
     `).get(key.workspaceId, key.connectionPrincipalId) as { stateGeneration: number } | undefined;
     return row?.stateGeneration;
   }
@@ -374,7 +374,7 @@ export class MutationOperationStore {
       .prepare(
         `update mutation_operations
          set result_json = null, updated_at = ?, expires_at = ?
-         where owner_client_id = ? and workspace_id = ? and tool = ? and operation_id = ?
+         where connection_principal_id = ? and workspace_id = ? and tool = ? and operation_id = ?
            and state = 'settled'`,
       )
       .run(now, expiresAt, ...keyValues(key));

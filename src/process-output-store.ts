@@ -105,7 +105,7 @@ export class ProcessOutputQuotaError extends Error {
 
 interface ProcessOutputRow {
   output_id: string;
-  owner_client_id: string;
+  connection_principal_id: string;
   workspace_id: string;
   status: ProcessOutputStatus;
   created_at: number;
@@ -244,7 +244,7 @@ export class ProcessOutputStore {
         this.database
           .prepare(
             `insert into process_outputs (
-              output_id, owner_client_id, workspace_id, status, created_at, updated_at,
+              output_id, connection_principal_id, workspace_id, status, created_at, updated_at,
               completed_at, total_bytes, stored_bytes, dropped_bytes, file_dev, file_ino
             ) values (?, ?, ?, 'active', ?, ?, null, 0, 0, 0, ?, ?)`,
           )
@@ -484,7 +484,7 @@ export class ProcessOutputStore {
       const result = this.database.prepare(`
         update process_outputs
         set status = 'unknown', updated_at = ?, completed_at = ?
-        where owner_client_id = ? and workspace_id = ? and status = 'active'
+        where connection_principal_id = ? and workspace_id = ? and status = 'active'
       `).run(now, now, owner, workspace);
       if (result.changes > 0) {
         this.database.prepare(`
@@ -499,7 +499,7 @@ export class ProcessOutputStore {
     const rows = this.database.prepare(`
       select *
       from process_outputs
-      where owner_client_id = ? and workspace_id = ?
+      where connection_principal_id = ? and workspace_id = ?
       order by output_id
     `).all(owner, workspace) as ProcessOutputRow[];
     let deleted = 0;
@@ -645,11 +645,12 @@ export class ProcessOutputStore {
 
   private initializeSchema(): void {
     const userVersion = this.database.pragma("user_version", { simple: true }) as number;
-    if (userVersion > 2) throw new Error(`Unsupported process output database version: ${userVersion}`);
+    if (userVersion > 3) throw new Error(`Unsupported process output database version: ${userVersion}`);
+    if (userVersion === 2) this.migrateVersionTwoSchema();
     this.database.exec(`
       create table if not exists process_outputs (
         output_id text primary key,
-        owner_client_id text not null,
+        connection_principal_id text not null,
         workspace_id text not null,
         status text not null check (status in ('active', 'completed', 'unknown')),
         created_at integer not null,
@@ -683,8 +684,68 @@ export class ProcessOutputStore {
       insert or ignore into process_output_usage (
         id, outputs, active_outputs, completed_outputs, total_bytes, stored_bytes, dropped_bytes
       ) values (1, 0, 0, 0, 0, 0, 0);
-      pragma user_version = 2;
+      pragma user_version = 3;
     `);
+  }
+
+  private migrateVersionTwoSchema(): void {
+    const columns = this.database.prepare("pragma table_info(process_outputs)").all() as Array<{ name: string }>;
+    if (columns.some((column) => column.name === "connection_principal_id")) {
+      this.database.pragma("user_version = 3");
+      return;
+    }
+    if (!columns.some((column) => column.name === "owner_client_id")) {
+      throw new Error("Process output database v2 is missing its ownership column");
+    }
+
+    const migrate = this.database.transaction(() => {
+      this.database.exec(`
+        create table process_outputs_v3 (
+          output_id text primary key,
+          connection_principal_id text not null,
+          workspace_id text not null,
+          status text not null check (status in ('active', 'completed', 'unknown')),
+          created_at integer not null,
+          updated_at integer not null,
+          completed_at integer,
+          total_bytes integer not null check (total_bytes >= 0),
+          stored_bytes integer not null check (stored_bytes >= 0),
+          dropped_bytes integer not null check (dropped_bytes >= 0),
+          file_dev text not null,
+          file_ino text not null,
+          check (total_bytes = stored_bytes + dropped_bytes),
+          check ((status = 'active' and completed_at is null) or (status != 'active' and completed_at is not null))
+        ) without rowid;
+
+        insert into process_outputs_v3 (
+          output_id, connection_principal_id, workspace_id, status, created_at, updated_at,
+          completed_at, total_bytes, stored_bytes, dropped_bytes, file_dev, file_ino
+        )
+        select
+          output_id, owner_client_id, workspace_id, status, created_at, updated_at,
+          completed_at, total_bytes, stored_bytes, dropped_bytes, file_dev, file_ino
+        from process_outputs;
+
+        create table process_output_deletions_v3 (
+          output_id text primary key references process_outputs_v3(output_id) on delete cascade
+        ) without rowid;
+
+        insert into process_output_deletions_v3 (output_id)
+        select output_id from process_output_deletions;
+
+        drop table process_output_deletions;
+        drop table process_outputs;
+        alter table process_outputs_v3 rename to process_outputs;
+        alter table process_output_deletions_v3 rename to process_output_deletions;
+
+        create index process_outputs_expiration
+          on process_outputs (completed_at, output_id)
+          where status in ('completed', 'unknown');
+
+        pragma user_version = 3;
+      `);
+    });
+    migrate.immediate();
   }
 
   private recoverPendingDeletions(): void {
@@ -888,7 +949,7 @@ export class ProcessOutputStore {
     const row = this.database
       .prepare(
         `select * from process_outputs
-         where output_id = ? and owner_client_id = ? and workspace_id = ?`,
+         where output_id = ? and connection_principal_id = ? and workspace_id = ?`,
       )
       .get(outputId, connectionPrincipalId, workspaceId) as ProcessOutputRow | undefined;
     if (!row || this.isExpired(row)) throw new ProcessOutputNotFoundError();

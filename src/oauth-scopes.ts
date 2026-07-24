@@ -1,5 +1,3 @@
-export const LEGACY_DEVSPACE_SCOPE = "devspace";
-
 export const DEVSPACE_CAPABILITY_SCOPES = [
   "workspace:read",
   "workspace:write",
@@ -11,10 +9,7 @@ export const DEVSPACE_CAPABILITY_SCOPES = [
 
 export type DevSpaceCapabilityScope = typeof DEVSPACE_CAPABILITY_SCOPES[number];
 
-export const DEFAULT_DEVSPACE_OAUTH_SCOPES = [
-  LEGACY_DEVSPACE_SCOPE,
-  ...DEVSPACE_CAPABILITY_SCOPES,
-] as const;
+export const DEFAULT_DEVSPACE_OAUTH_SCOPES = [...DEVSPACE_CAPABILITY_SCOPES] as const;
 
 const SCOPE_DESCRIPTIONS: Record<DevSpaceCapabilityScope, string> = {
   "workspace:read": "Read approved workspace files, instructions, Skills, and metadata",
@@ -29,7 +24,7 @@ export function oauthScopeAllows(
   grantedScopes: readonly string[],
   requiredScope: DevSpaceCapabilityScope,
 ): boolean {
-  return grantedScopes.includes(LEGACY_DEVSPACE_SCOPE) || grantedScopes.includes(requiredScope);
+  return grantedScopes.includes(requiredScope);
 }
 
 export function missingOAuthScopes(
@@ -43,15 +38,9 @@ export function defaultOAuthAuthorizationScopes(
   supportedScopes: readonly string[],
 ): string[] {
   const supported = new Set(supportedScopes);
-  const granular = DEVSPACE_CAPABILITY_SCOPES.filter((scope) => supported.has(scope));
-  if (granular.length > 0) return [...granular];
-  if (supported.has(LEGACY_DEVSPACE_SCOPE)) return [LEGACY_DEVSPACE_SCOPE];
-  return [...supportedScopes];
+  return DEVSPACE_CAPABILITY_SCOPES.filter((scope) => supported.has(scope));
 }
 
 export function oauthScopeDescription(scope: string): string {
-  if (scope === LEGACY_DEVSPACE_SCOPE) {
-    return "Legacy full DevSpace access (all capabilities)";
-  }
   return SCOPE_DESCRIPTIONS[scope as DevSpaceCapabilityScope] ?? scope;
 }

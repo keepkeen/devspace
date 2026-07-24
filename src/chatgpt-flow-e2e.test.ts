@@ -10,6 +10,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { loadConfig } from "./config.js";
 import { connectionRef, oauthClientRef, workspaceActivityRef } from "./logger.js";
+import { DEFAULT_DEVSPACE_OAUTH_SCOPES } from "./oauth-scopes.js";
 import { SqliteOAuthStore } from "./oauth-store.js";
 import { createServer } from "./server.js";
 import { SqliteWorkspaceStore } from "./workspace-store.js";
@@ -103,11 +104,56 @@ try {
   const invalidReceiptRead = await firstRound.callTool({
     name: "read",
     arguments: {
-      receipt: `wctx3.${"A".repeat(43)}`,
+      receipt: `wctx4.${"A".repeat(43)}`,
       path: "payload.txt",
     },
   });
   assertToolRejected(invalidReceiptRead, /workspace_context_required/);
+  assert.equal(
+    (invalidReceiptRead.structuredContent as { error?: { recovery?: unknown } } | undefined)?.error?.recovery,
+    "open_workspace_full",
+  );
+  const staleConnectorRead = await firstRound.callTool({
+    name: "read",
+    arguments: {
+      workspaceId: "ws_cached_legacy_contract",
+      workspaceGeneration: 1,
+      path: "payload.txt",
+    },
+  });
+  assertToolRejected(staleConnectorRead, /workspace_context_required/);
+  assert.equal(
+    (staleConnectorRead.structuredContent as { error?: { recovery?: unknown } } | undefined)?.error?.recovery,
+    "open_workspace_full",
+  );
+
+  const receiptlessClient = await connectClient(
+    "receiptless-same-account",
+    oauthA.accessToken,
+    active.origin,
+    undefined,
+    false,
+  );
+  const receiptlessRead = await receiptlessClient.callTool({
+    name: "read",
+    arguments: { workspaceId: workspaceA, path: "payload.txt" },
+  });
+  assertToolRejected(receiptlessRead, /workspace_context_required/);
+  await closeClient(receiptlessClient);
+
+  const otherPrincipalReceiptlessClient = await connectClient(
+    "receiptless-other-account",
+    oauthB.accessToken,
+    active.origin,
+    undefined,
+    false,
+  );
+  const crossPrincipalReceiptlessRead = await otherPrincipalReceiptlessClient.callTool({
+    name: "read",
+    arguments: { workspaceId: workspaceA, path: "payload.txt" },
+  });
+  assertToolRejected(crossPrincipalReceiptlessRead, /workspace_context_required/);
+  await closeClient(otherPrincipalReceiptlessClient);
 
   const directArgv = await firstRound.callTool({
     name: "exec_command",
@@ -128,7 +174,11 @@ try {
   for (let run = 0; run < 2; run += 1) {
     const executed = await firstRound.callTool({
       name: "exec_command",
-      arguments: { workspaceId: workspaceA, cmd: "printf 'safe-run\\n' >> safe-runs.txt" },
+      arguments: {
+        workspaceId: workspaceA,
+        shell: true,
+        command: "printf 'safe-run\\n' >> safe-runs.txt",
+      },
     });
     assertToolSucceeded(executed);
     assert.match(JSON.stringify(executed.content), /Process exited \(code 0\)/);
@@ -142,7 +192,11 @@ try {
 
   assertToolSucceeded(await firstRound.callTool({
     name: "exec_command",
-    arguments: { workspaceId: workspaceA, cmd: "printf 'one\\n' > optimistic.txt" },
+    arguments: {
+      workspaceId: workspaceA,
+      shell: true,
+      command: "printf 'one\\n' > optimistic.txt",
+    },
   }));
   const optimisticRead = await firstRound.callTool({
     name: "read",
@@ -169,11 +223,7 @@ try {
   });
   assert.deepEqual(operationStatus.structuredContent, {
     ok: true,
-    state: "settled",
-    tool: "apply_patch",
-    workspaceGeneration: generationA,
     resultAvailable: true,
-    safeToRetry: false,
     workspace: { ref: workspaceA, generation: generationA },
     operation: {
       id: optimisticOperationId,
@@ -197,15 +247,18 @@ try {
     arguments: { operationId: "optimistic-stale" },
   });
   assert.equal(
-    (staleOperationStatus.structuredContent as { state?: unknown } | undefined)?.state,
-    "settled",
+    (staleOperationStatus.structuredContent as {
+      operation?: { phase?: unknown };
+    } | undefined)?.operation?.phase,
+    "committed",
   );
   assert.equal(await readFile(join(workspaceRoot, "optimistic.txt"), "utf8"), "two\n");
 
   const idempotentArguments = {
     workspaceId: workspaceA,
     operationId: "append-once",
-    cmd: "printf 'once\\n' >> idempotent.txt",
+    shell: true,
+    command: "printf 'once\\n' >> idempotent.txt",
   };
   const firstIdempotent = await firstRound.callTool({
     name: "exec_command",
@@ -234,7 +287,8 @@ try {
     name: "exec_command",
     arguments: {
       workspaceId: workspaceA,
-      cmd: `${JSON.stringify(process.execPath)} -e "process.stdin.on('data', d => require('fs').appendFileSync('stdin-once.txt', d)); setTimeout(() => process.exit(0), 300)"`,
+      shell: true,
+      command: `${JSON.stringify(process.execPath)} -e "process.stdin.on('data', d => require('fs').appendFileSync('stdin-once.txt', d)); setTimeout(() => process.exit(0), 300)"`,
       yieldTimeMs: 0,
     },
   });
@@ -267,14 +321,15 @@ try {
     arguments: {
       workspaceId: workspaceA,
       operationId: "append-once",
-      cmd: "printf 'twice\\n' >> idempotent.txt",
+      shell: true,
+      command: "printf 'twice\\n' >> idempotent.txt",
     },
   });
   assertToolRejected(conflictingOperation, /operation_id_conflict/);
 
   const nonzero = await firstRound.callTool({
     name: "exec_command",
-    arguments: { workspaceId: workspaceA, cmd: "exit 7" },
+    arguments: { workspaceId: workspaceA, shell: true, command: "exit 7" },
   });
   assert.notEqual(nonzero.isError, true);
   assert.equal((nonzero.structuredContent as { ok?: unknown }).ok, false);
@@ -291,7 +346,8 @@ try {
     name: "exec_command",
     arguments: {
       workspaceId: workspaceA,
-      cmd: "sudo sh -c 'printf policy-bypass > denied-marker.txt'",
+      shell: true,
+      command: "sudo sh -c 'printf policy-bypass > denied-marker.txt'",
     },
   });
   assert.equal(denied.isError, true);
@@ -313,7 +369,11 @@ try {
   assert.match(JSON.stringify(continuedRead.content), /chatgpt-flow-ready/);
   const continuedExec = await secondRound.callTool({
     name: "exec_command",
-    arguments: { workspaceId: workspaceA, cmd: "printf 'round-two\\n' >> conversation.txt" },
+    arguments: {
+      workspaceId: workspaceA,
+      shell: true,
+      command: "printf 'round-two\\n' >> conversation.txt",
+    },
   });
   assertToolSucceeded(continuedExec);
   await closeClient(secondRound);
@@ -329,7 +389,12 @@ try {
   });
   assertToolSucceeded(reopened);
   assert.equal(workspaceId(reopened), workspaceA);
-  assert.match(String((reopened.structuredContent as { receipt?: unknown } | undefined)?.receipt), /^wctx3\./);
+  assert.match(
+    String((reopened.structuredContent as {
+      continuation?: { receipt?: unknown };
+    } | undefined)?.continuation?.receipt),
+    /^wctx4\./,
+  );
   const newSessionRead = await newSession.callTool({
     name: "read",
     arguments: { workspaceId: workspaceA, path: "conversation.txt" },
@@ -338,7 +403,11 @@ try {
   assert.match(JSON.stringify(newSessionRead.content), /round-two/);
   const newSessionExec = await newSession.callTool({
     name: "exec_command",
-    arguments: { workspaceId: workspaceA, cmd: "printf 'new-session\\n' >> conversation.txt" },
+    arguments: {
+      workspaceId: workspaceA,
+      shell: true,
+      command: "printf 'new-session\\n' >> conversation.txt",
+    },
   });
   assertToolSucceeded(newSessionExec);
   await closeClient(newSession);
@@ -371,7 +440,8 @@ try {
     name: "exec_command",
     arguments: {
       workspaceId: projectOneWorkspaceId,
-      cmd: "git add conversation-state.txt && git commit -m 'Persist conversation state'",
+      shell: true,
+      command: "git add conversation-state.txt && git commit -m 'Persist conversation state'",
     },
   }));
   await closeClient(projectConversationOne);
@@ -506,7 +576,8 @@ try {
       name: "exec_command",
       arguments: {
         workspaceId: concurrentWorkspaceA,
-        cmd: `${node} -e "setTimeout(() => console.log('client-a-background'), 250)"`,
+        shell: true,
+        command: `${node} -e "setTimeout(() => console.log('client-a-background'), 250)"`,
         yieldTimeMs: 0,
       },
     }),
@@ -514,7 +585,8 @@ try {
       name: "exec_command",
       arguments: {
         workspaceId: workspaceB,
-        cmd: `${node} -e "setTimeout(() => console.log('client-b-background'), 250)"`,
+        shell: true,
+        command: `${node} -e "setTimeout(() => console.log('client-b-background'), 250)"`,
         yieldTimeMs: 0,
       },
     }),
@@ -581,7 +653,7 @@ try {
   assertToolRejected(coldRead, /workspace_context_required/);
   assert.equal(
     (coldRead.structuredContent as { error?: { recovery?: unknown } } | undefined)?.error?.recovery,
-    "resume_workspace",
+    "open_workspace_full",
   );
   const afterRestartList = await afterRestart.callTool({ name: "list_workspaces", arguments: {} });
   assertToolSucceeded(afterRestartList);
@@ -842,7 +914,7 @@ async function registerAndAuthorize(
     response_type: "code",
     client_id: clientId,
     redirect_uri: redirectUri,
-    scope: "devspace",
+    scope: DEFAULT_DEVSPACE_OAUTH_SCOPES.join(" "),
     code_challenge: challenge,
     code_challenge_method: "S256",
     resource,
@@ -907,7 +979,7 @@ async function refreshTokens(origin: URL, credentials: OAuthCredentials): Promis
       grant_type: "refresh_token",
       client_id: credentials.clientId,
       refresh_token: credentials.refreshToken,
-      scope: "devspace",
+      scope: DEFAULT_DEVSPACE_OAUTH_SCOPES.join(" "),
       resource,
     }),
   });
@@ -927,6 +999,7 @@ async function connectClient(
   accessToken: string,
   origin: URL,
   staleSessionId?: string,
+  trackWorkspaceReceipts = true,
 ): Promise<Client> {
   const client = new Client({ name, version: "1.0.0" });
   clients.add(client);
@@ -935,7 +1008,7 @@ async function connectClient(
   await client.connect(new StreamableHTTPClientTransport(new URL("/mcp", origin), {
     requestInit: { headers },
   }));
-  enableWorkspaceGenerationTracking(client);
+  if (trackWorkspaceReceipts) enableWorkspaceGenerationTracking(client);
   return client;
 }
 
@@ -991,9 +1064,10 @@ function enableWorkspaceGenerationTracking(client: Client): void {
     const result = await original(...callArgs);
     const structured = result.structuredContent as Record<string, unknown> | undefined;
     const workspace = structured?.workspace as Record<string, unknown> | undefined;
-    if (typeof workspace?.ref === "string" && typeof structured?.receipt === "string") {
-      trackedWorkspaceReceipts.set(workspace.ref, structured.receipt);
-      if (alias) trackedAliasReceipts.set(alias, structured.receipt);
+    const continuation = structured?.continuation as Record<string, unknown> | undefined;
+    if (typeof workspace?.ref === "string" && typeof continuation?.receipt === "string") {
+      trackedWorkspaceReceipts.set(workspace.ref, continuation.receipt);
+      if (alias) trackedAliasReceipts.set(alias, continuation.receipt);
     }
     return result;
   }) as Client["callTool"];

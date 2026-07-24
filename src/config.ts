@@ -3,7 +3,10 @@ import { isAbsolute, join, resolve } from "node:path";
 import { expandHomePath } from "./roots.js";
 import type { LoggingConfig, LogFormat, LogLevel } from "./logger.js";
 import type { OAuthConfig } from "./oauth-provider.js";
-import { DEFAULT_DEVSPACE_OAUTH_SCOPES } from "./oauth-scopes.js";
+import {
+  DEFAULT_DEVSPACE_OAUTH_SCOPES,
+  DEVSPACE_CAPABILITY_SCOPES,
+} from "./oauth-scopes.js";
 import { MAX_TIMER_MS, RESOURCE_LIMIT_MAXIMUMS } from "./resource-limits.js";
 import { normalizeProjectDocFallbackFilenames } from "./project-instructions.js";
 import {
@@ -154,6 +157,18 @@ function parseStringList(value: string | undefined, fallback: string[]): string[
     .filter(Boolean);
 
   return entries && entries.length > 0 ? entries : fallback;
+}
+
+function parseOAuthScopes(value: string | undefined): string[] {
+  const scopes = [...new Set(parseStringList(value, [...DEFAULT_DEVSPACE_OAUTH_SCOPES]))];
+  const invalid = scopes.filter(
+    (scope) => !DEVSPACE_CAPABILITY_SCOPES.includes(scope as never),
+  );
+  if (invalid.length > 0) {
+    throw new Error(`Invalid DEVSPACE_OAUTH_SCOPES: ${invalid.join(", ")}`);
+  }
+  if (scopes.length === 0) throw new Error("DEVSPACE_OAUTH_SCOPES must include at least one capability scope");
+  return scopes;
 }
 
 function parsePositiveInteger(
@@ -331,7 +346,7 @@ function parseOAuthConfig(env: NodeJS.ProcessEnv, ownerToken: string | undefined
       DEFAULT_OAUTH_REFRESH_TOKEN_TTL_SECONDS,
       "DEVSPACE_OAUTH_REFRESH_TOKEN_TTL_SECONDS",
     ),
-    scopes: parseStringList(env.DEVSPACE_OAUTH_SCOPES, [...DEFAULT_DEVSPACE_OAUTH_SCOPES]),
+    scopes: parseOAuthScopes(env.DEVSPACE_OAUTH_SCOPES),
     trustProxy: parseBoolean(env.DEVSPACE_TRUST_PROXY, "DEVSPACE_TRUST_PROXY"),
     allowedRedirectHosts: parseStringList(env.DEVSPACE_OAUTH_ALLOWED_REDIRECT_HOSTS, [
       "chatgpt.com",

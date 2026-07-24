@@ -14,35 +14,32 @@ export const workspaceSessions = sqliteTable(
   "workspace_sessions",
   {
     id: text("id").primaryKey(),
-    connectionPrincipalId: text("owner_client_id").notNull().default("__legacy_unowned__"),
-    alias: text("alias"),
+    connectionPrincipalId: text("connection_principal_id").notNull(),
+    alias: text("alias").notNull(),
     root: text("root").notNull(),
     canonicalRoot: text("canonical_root"),
     status: text("status", { enum: ["active", "closed", "revoked"] })
-      .notNull()
-      .default("active"),
-    mode: text("mode").notNull().default("checkout"),
+      .notNull(),
+    mode: text("mode").notNull(),
     sourceRoot: text("source_root"),
     baseRef: text("base_ref"),
     baseSha: text("base_sha"),
-    dirtySource: text("dirty_source").notNull().default("false"),
-    managed: text("managed").notNull().default("false"),
+    dirtySource: text("dirty_source").notNull(),
+    managed: text("managed").notNull(),
     writeAccess: text("write_access", { enum: ["read_only", "read_write"] })
-      .notNull()
-      .default("read_write"),
-    stateGeneration: integer("state_generation").notNull().default(1),
+      .notNull(),
+    stateGeneration: integer("state_generation").notNull(),
     createdAt: text("created_at").notNull(),
     lastUsedAt: text("last_used_at").notNull(),
   },
   (table) => [
     index("workspace_sessions_root_idx").on(table.root, table.lastUsedAt),
     index("workspace_sessions_status_idx").on(table.status, table.lastUsedAt),
-    index("workspace_sessions_owner_status_idx").on(table.connectionPrincipalId, table.status, table.lastUsedAt),
-    uniqueIndex("workspace_sessions_id_owner_uq").on(table.id, table.connectionPrincipalId),
-    uniqueIndex("workspace_sessions_owner_alias_uq")
-      .on(table.connectionPrincipalId, table.alias)
-      .where(sql`${table.alias} is not null`),
-    uniqueIndex("workspace_sessions_active_checkout_owner_canonical_root_uq")
+    index("workspace_sessions_principal_status_idx").on(table.connectionPrincipalId, table.status, table.lastUsedAt),
+    uniqueIndex("workspace_sessions_id_principal_uq").on(table.id, table.connectionPrincipalId),
+    uniqueIndex("workspace_sessions_principal_alias_uq")
+      .on(table.connectionPrincipalId, table.alias),
+    uniqueIndex("workspace_sessions_active_checkout_principal_canonical_root_uq")
       .on(table.connectionPrincipalId, table.canonicalRoot)
       .where(sql`${table.canonicalRoot} is not null and ${table.mode} = 'checkout' and ${table.status} = 'active'`),
     check(
@@ -60,7 +57,7 @@ export const workspaceSessions = sqliteTable(
 export const mutationOperations = sqliteTable(
   "mutation_operations",
   {
-    connectionPrincipalId: text("owner_client_id").notNull(),
+    connectionPrincipalId: text("connection_principal_id").notNull(),
     workspaceId: text("workspace_id").notNull(),
     tool: text("tool").notNull(),
     operationId: text("operation_id").notNull(),
@@ -202,7 +199,7 @@ export const oauthRevocationCleanupJobs = sqliteTable(
   "oauth_revocation_cleanup_jobs",
   {
     id: integer("id").primaryKey({ autoIncrement: true }),
-    connectionPrincipalId: text("owner_client_id").notNull(),
+    connectionPrincipalId: text("connection_principal_id").notNull(),
     workspaceId: text("workspace_id").notNull(),
     workspaceRoot: text("workspace_root").notNull(),
     workspaceMode: text("workspace_mode", { enum: ["checkout", "worktree"] }).notNull(),
@@ -221,7 +218,7 @@ export const oauthRevocationCleanupJobs = sqliteTable(
     completedAt: text("completed_at"),
   },
   (table) => [
-    uniqueIndex("oauth_revocation_cleanup_jobs_owner_workspace_uq")
+    uniqueIndex("oauth_revocation_cleanup_jobs_principal_workspace_uq")
       .on(table.connectionPrincipalId, table.workspaceId),
     index("oauth_revocation_cleanup_jobs_status_idx")
       .on(table.status, table.leaseExpiresAt, table.createdAt, table.id),
@@ -235,7 +232,7 @@ export const oauthRevocationDirtyWorktreeArtifacts = sqliteTable(
   "oauth_revocation_dirty_worktree_artifacts",
   {
     jobId: integer("job_id").primaryKey(),
-    connectionPrincipalId: text("owner_client_id").notNull(),
+    connectionPrincipalId: text("connection_principal_id").notNull(),
     workspaceId: text("workspace_id").notNull(),
     workspaceRoot: text("workspace_root").notNull(),
     sourceRoot: text("source_root"),

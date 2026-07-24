@@ -962,7 +962,7 @@ function workspaceToolRegistrar(
         ...toolInput
       } = input;
       record.inputSchema = {
-        receipt: z.string().regex(/^wctx3\.[A-Za-z0-9_-]{43}$/u),
+        receipt: z.string().regex(/^wctx4\.[A-Za-z0-9_-]{43}$/u),
         ...toolInput,
       };
     }
@@ -1680,19 +1680,20 @@ function sendCallToolErrorResult(
     binding?: WorkspaceContextReceiptBinding;
     receipt?: { receipt: string; expiresAt: number };
     operationId?: string;
+    recovery?: string;
   } = {},
 ): void {
   const structuredError = code
     ? structuredToolError({
         code,
         text: message,
-        recovery: code === "workspace_resume_required" ||
+        recovery: options.recovery ?? (code === "workspace_resume_required" ||
             code === "stale_workspace_generation" ||
             code === "workspace_context_required"
           ? "resume_workspace"
           : code === "workspace_context_incomplete"
             ? "get_workspace_context"
-          : "open_workspace",
+          : "open_workspace"),
       })
     : undefined;
   const structuredContent = structuredError
@@ -1878,9 +1879,6 @@ function correlationLogFields(
   oauthClientId?: string,
 ): Record<string, string | undefined> {
   return {
-    // Retained for existing log consumers; it hashes the OAuth registration
-    // when available, while connectionRef identifies the local principal.
-    clientIdHash: identifierHash(oauthClientId ?? connectionPrincipalId),
     oauthClientRef: oauthClientRef(oauthClientId),
     connectionRef: connectionRef(connectionPrincipalId),
     workspaceActivityRef: workspaceActivityRef(connectionPrincipalId, workspaceId),
@@ -2945,7 +2943,6 @@ function registerProcessTools(
         args: z.array(z.string().max(16_384)).max(1_024).optional(),
         shell: z.boolean().optional(),
         command: z.string().min(1).max(SHELL_COMMAND_MAX_CHARACTERS).optional(),
-        cmd: z.string().min(1).max(SHELL_COMMAND_MAX_CHARACTERS).optional(),
         stdin: z
           .string()
           .max(MAX_PROCESS_INPUT_BYTES)
@@ -2961,7 +2958,6 @@ function registerProcessTools(
         workingDirectory: z
           .string()
           .optional(),
-        cwd: z.string().optional(),
         environment: z.record(z.string(), z.string().max(65_536)).optional(),
         network: z.enum(["inherit", "deny"]).optional(),
         yieldTimeMs: z
@@ -2986,7 +2982,7 @@ function registerProcessTools(
       outputSchema: processOutputSchema(),
       ...toolWidgetDescriptorMeta(config, "shell"),
     },
-    async ({ workspaceId, workspaceGeneration, operationId, instructionToken, program, args, shell, command, cmd: legacyCmd, stdin, closeStdin, tty, columns, rows, workingDirectory, cwd: requestedCwd, environment, network, yieldTimeMs, timeoutMs, maxOutputTokens }) => {
+    async ({ workspaceId, workspaceGeneration, operationId, instructionToken, program, args, shell, command, stdin, closeStdin, tty, columns, rows, workingDirectory, environment, network, yieldTimeMs, timeoutMs, maxOutputTokens }) => {
       const startedAt = performance.now();
       const execute = async () => {
       const workspace = workspaces.getWorkspace(
@@ -3006,17 +3002,14 @@ function registerProcessTools(
       if (environmentViolation) {
         throw new PublicActionError("environment_invalid", environmentViolation);
       }
-      if (requestedCwd !== undefined && workingDirectory !== undefined) {
-        throw new PublicActionError("command_shape_invalid", "Provide cwd or legacy workingDirectory, not both.");
-      }
-      const effectiveWorkingDirectory = requestedCwd ?? workingDirectory;
+      const effectiveWorkingDirectory = workingDirectory;
       const direct = program !== undefined;
-      const shellCommand = command ?? legacyCmd;
+      const shellCommand = command;
       if (direct && (shell === true || shellCommand !== undefined)) {
         throw new PublicActionError("command_shape_invalid", "Use either program/args or shell=true with command, not both.");
       }
-      if (!direct && shellCommand === undefined) {
-        throw new PublicActionError("command_shape_invalid", "Provide program for direct execution or shell=true with command.");
+      if (!direct && (shell !== true || shellCommand === undefined)) {
+        throw new PublicActionError("command_shape_invalid", "Provide program/args or shell=true with command.");
       }
       if (command !== undefined && shell !== true) {
         throw new PublicActionError("explicit_shell_required", "Set shell=true when using command.");
@@ -3226,7 +3219,7 @@ function registerProcessTools(
         pending: pendingMutationOperations,
         key: { connectionPrincipalId, workspaceId, tool: toolNames.execCommand, operationId },
         workspaceGeneration,
-        request: { program, args, shell, command, legacyCmd, stdin, closeStdin, tty, columns, rows, workingDirectory, requestedCwd, environment, network, yieldTimeMs, timeoutMs, maxOutputTokens },
+        request: { program, args, shell, command, stdin, closeStdin, tty, columns, rows, workingDirectory, environment, network, yieldTimeMs, timeoutMs, maxOutputTokens },
         execute,
       });
     },
@@ -3470,11 +3463,7 @@ function createMcpServer(
       content: [textBlock(`Operation is ${status.state}.`)],
       structuredContent: {
         ok: true,
-        state: status.state,
-        tool: status.tool,
-        workspaceGeneration: status.workspaceGeneration,
         resultAvailable: status.resultAvailable,
-        safeToRetry: false,
         workspace: {
           ref: status.workspaceId,
           generation: status.workspaceGeneration,
@@ -5099,7 +5088,6 @@ export function createServer(configInput?: ServerConfig): RunningServer {
         path,
         status: res.statusCode,
         durationMs: Math.round(performance.now() - startedAt),
-        clientIdHash: res.locals.clientIdHash as string | undefined,
         oauthClientRef: res.locals.oauthClientRef as string | undefined,
         connectionRef: res.locals.connectionRef as string | undefined,
         workspaceActivityRef: (res.locals.correlation as RequestCorrelationState | undefined)?.workspaceActivityRef,
@@ -5236,7 +5224,6 @@ export function createServer(configInput?: ServerConfig): RunningServer {
       ? oauthProvider.principalForClient(oauthClientId)
       : undefined;
     if (oauthClientId) {
-      res.locals.clientIdHash = identifierHash(oauthClientId);
       res.locals.oauthClientRef = oauthClientRef(oauthClientId);
     }
     if (connectionPrincipalId) {
@@ -5487,18 +5474,33 @@ export function createServer(configInput?: ServerConfig): RunningServer {
           requiredCallScopes,
         ).length > 0;
       const receipt = lease ? toolCallWorkspaceReceipt(req.body) : undefined;
-      const resolvedWorkspaceReceipt = receipt ? contextReceipts.resolve(receipt) : undefined;
+      const resolvedWorkspaceReceipt = receipt
+        ? contextReceipts.resolve(receipt)
+        : undefined;
+      const effectiveReceipt = receipt;
       const workspaceBinding = resolvedWorkspaceReceipt?.binding;
       if (
         lease &&
         (!workspaceBinding || workspaceBinding.connectionPrincipalId !== connectionPrincipalId)
       ) {
+        logEvent(config.logging, "warn", "workspace_context_rejected", {
+          requestId,
+          ...correlationLogFields(connectionPrincipalId, undefined, oauthClientId),
+          tool: toolCallName(req.body),
+          reason: receipt ? "invalid_or_expired_receipt" : "missing_receipt",
+          hasReceipt: Boolean(receipt),
+          hasWorkspaceId: false,
+          hasWorkspaceGeneration: false,
+        });
         sendCallToolErrorResult(
           res,
-          "workspace_context_required: Call list_workspaces, then resume_workspace with contextMode=\"full\" to obtain a fresh receipt.",
+          "workspace_context_required: Call open_workspace on the approved project with contextMode=\"full\", then retry once with its continuation receipt. If ChatGPT does not expose the current receipt tools, refresh the connector tools first.",
           jsonRpcRequestId(req.body),
           "workspace_context_required",
-          { operationId: toolCallOperationId(req.body) },
+          {
+            operationId: toolCallOperationId(req.body),
+            recovery: "open_workspace_full",
+          },
         );
         return;
       }
@@ -5508,7 +5510,7 @@ export function createServer(configInput?: ServerConfig): RunningServer {
       ) {
         sendCallToolErrorResult(
           res,
-          "workspace_context_incomplete: Call get_workspace_context with this receipt and contextMode=\"full\", then retry once with the returned receipt.",
+          "workspace_context_incomplete: Call get_workspace_context with this receipt and contextMode=\"full\". If that tool is unavailable, call open_workspace on the approved project with contextMode=\"full\"; then retry once with the returned receipt.",
           jsonRpcRequestId(req.body),
           "workspace_context_incomplete",
           {
@@ -5517,6 +5519,7 @@ export function createServer(configInput?: ServerConfig): RunningServer {
               ? { receipt, expiresAt: resolvedWorkspaceReceipt.expiresAt }
               : undefined,
             operationId: toolCallOperationId(req.body),
+            recovery: "get_workspace_context_or_open_full",
           },
         );
         return;
@@ -5536,8 +5539,8 @@ export function createServer(configInput?: ServerConfig): RunningServer {
           requestId,
           correlation,
           workspaceBinding,
-          workspaceReceipt: resolvedWorkspaceReceipt && receipt
-            ? { receipt, expiresAt: resolvedWorkspaceReceipt.expiresAt }
+          workspaceReceipt: resolvedWorkspaceReceipt && effectiveReceipt
+            ? { receipt: effectiveReceipt, expiresAt: resolvedWorkspaceReceipt.expiresAt }
             : undefined,
         },
         () => transport.handleRequest(req, res, req.body),

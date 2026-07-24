@@ -265,11 +265,12 @@ OpenAI 目前把自定义 MCP 集成称为 **developer-mode app（开发者模�
 
 正常的调用流程是：
 
-1. ChatGPT 用本地项目路径和别名调用 `open_workspace`。默认只返回 metadata，
-   不把项目指令或 Skill 目录立即塞入上下文，同时返回短期 `receipt`。metadata
-   receipt 只能继续加载上下文或关闭/撤销 Workspace，不能直接读取、搜索、执行或修改文件。
-2. 模型用这个 `receipt` 调用 `get_workspace_context`，取得 v3 结构化项目指令、
-   Skill 目录和刷新后的 `receipt`。结果中的模型可见 `workspace` 会包含
+1. ChatGPT 用本地项目路径和别名调用 `open_workspace`。默认返回精简的 v4 metadata
+   continuation，不立即注入项目指令或 Skill 目录。metadata receipt 只能加载上下文或
+   关闭/撤销 Workspace，不能读取、搜索、执行或修改文件。
+2. 模型用 metadata receipt 调用 `get_workspace_context(contextMode: "full")`，取得
+   结构化项目指令、Skill 目录和新的 context-loaded receipt。结果中的模型可见
+   `workspace` 会包含
    `ref`、`alias`、不暴露本机路径的 `projectFingerprint` 和 generation；
    `continuation` 会包含 receipt、阶段、固定过期时间以及两类 revision。只有用当前 context-loaded receipt 刷新
    `get_workspace_context` 时，显式的 `contextMode: "retained"` 才会按已绑定的
@@ -305,7 +306,7 @@ OpenAI 目前把自定义 MCP 集成称为 **developer-mode app（开发者模�
 
 新建 checkout 默认只读。需要直接修改当前 checkout 时，明确使用
 `writeAccess: "read_write"`；更推荐使用 `mode: "worktree"` 获得隔离的可写工作区。
-旧版本已经持久化的 checkout 会保留原来的可写权限，避免升级时突然中断任务。
+从 1.x 迁移的 checkout 会把历史权限显式写入 v14 数据库；新 checkout 仍默认只读。
 
 不要让 ChatGPT 使用云端 Python 或 Code Interpreter 去检查本地路径。它们仍可
 用于与本地项目无关的计算和数据处理；本地项目操作应通过 DevSpace 完成。
@@ -327,18 +328,19 @@ DevSpace 看不到经过验证的 ChatGPT 账户 `sub`。动态 OAuth 注册本�
 
 DevSpace 支持 `workspace:read`、`workspace:write`、`process:execute`、
 `network:access`、`worktree:create` 和 `workspace:revoke`。授权页面会展示这些能力，
-工具执行前还会再次校验。旧的 `devspace` scope 继续作为“全部能力”兼容别名；新部署
-可以用 `DEVSPACE_OAUTH_SCOPES` 缩小可申请范围。
+工具执行前还会再次校验。2.0 不再接受模糊的 `devspace` 全权限 scope；
+`DEVSPACE_OAUTH_SCOPES` 只能包含上述六个能力中的非空子集。
 
 ### `AGENTS.md` 和 Skill
 
-首次 `open_workspace` 默认只返回 metadata；随后用返回的 receipt 调用
-`get_workspace_context`，DevSpace 才会返回 `instructions.items[]`。每项包含来源、
+首次 `open_workspace` 默认只返回 metadata。模型随后用 receipt 调用
+`get_workspace_context(contextMode: "full")` 取得 `instructions.items[]`。每项包含来源、
 信任级别、作用域、相对路径、内容哈希和正文，不再把 Markdown 标题与服务端提示拼在一起。
 仓库指令明确标记为 `repository_untrusted`，不能覆盖用户要求或 DevSpace 安全策略。
 需要用户级指令时，可在管理面板或
 `DEVSPACE_USER_INSTRUCTIONS_PATH` 中显式指定一个文件；默认不会读取
-`~/.codex/AGENTS.md`，`DEVSPACE_AGENT_DIR` 只用于兼容 Skill。full context 返回的根级
+`~/.codex/AGENTS.md`。可信个人 Skill 使用 `~/.agents/skills`，DevSpace 自己管理的
+Skill 使用 `~/.devspace/skills`，其他本机 allowlist 使用 `DEVSPACE_SKILL_PATHS`。full context 返回的根级
 指令会直接绑定并确认到该 receipt 的私有 context session，第一次在根目录修改或执行前
 不必再次发送。读取嵌套目录时只返回 `scopedInstructionsAvailable=true`；准备进入新的
 嵌套指令作用域修改或执行前，模型调用 `load_workspace_instructions` 获取增量结构化指令和
@@ -380,8 +382,8 @@ DevSpace 只提供一套稳定的 Codex 风格工具：`read`、`batch_read`、
 `exec_command` 优先使用 `program` + `args` 直接启动程序，参数不会经过 Shell
 重新解析。只有需要管道、重定向等 Shell 语法时才使用 `shell: true` + `command`；
 交互式 Shell 也必须走这一模式，不能用 `program: "bash"` 绕过逐次输入检查。
-旧 `cmd` 仍兼容。需要发送多行 Python、SQL 或 SSH 脚本时，模型可使用
-的结构化 `stdin` 字段，避免多层引号在远端解析失败。提供 `stdin` 后默认自动
+2.0 不再接受 `cmd` 或 `cwd` 别名；工作目录只使用 `workingDirectory`。需要发送多行
+Python、SQL 或 SSH 脚本时，模型可使用结构化 `stdin` 字段，避免多层引号在远端解析失败。提供 `stdin` 后默认自动
 关闭输入流；需要继续交互时可设 `closeStdin: false`，之后通过 `write_stdin`
 追加内容或关闭输入流。PTY 不模拟 Ctrl-D 作为 EOF。
 
@@ -398,9 +400,12 @@ write scope 或 operation ID。只有显式设置 `advanceCheckpoint: true` 时�
 结果正文到期后会被清除，但该 ID 的轻量去重记录会保留到 Workspace 记录删除；旧 ID
 不会在 24 小时后重新变成一次新操作。
 
-所有 Workspace 工具都要求当前上下文 `receipt`；统一注册层会在工具执行前解析它并校验
+所有 Workspace 工具都要求当前 v4 上下文 `receipt`；统一注册层会在工具执行前解析它并校验
 connection principal、OAuth capability、Workspace 代次、context phase 与私有 context session。metadata receipt
 只能升级上下文或执行关闭/撤销；读取、搜索、进程和修改工具必须使用 context-loaded receipt。
+2.0 不再从 `workspaceId` 或 generation 猜测最近 receipt；缺少
+`continuation.receipt` 的调用会在 handler 开始前失败。升级后必须在 ChatGPT 中 Refresh
+应用工具定义。
 receipt 还绑定签发时的 alias、项目指纹和两类上下文修订号，供恢复和缓存去重使用；
 receipt 缓存同时具有全局上限和单 principal 公平上限，使用只刷新 LRU 顺序，不延长固定
 期限。项目内文件变化仍由指令门禁、Skill 重载和文件版本锁分别检查。服务重启、principal
@@ -707,6 +712,34 @@ node dist/cli.js doctor
 </details>
 
 更多内容见[故障排查](./docs/gotchas.md)。
+
+## 从 1.x 升级到 2.0
+
+2.0 是一次明确的协议和数据库切换。升级前先在系统服务管理器中停止 DevSpace，
+然后复制整个 state directory（默认 `~/.local/share/devspace`）作为离线备份。
+不要只复制主数据库：process-output 元数据也会升级。
+
+首次启动 2.0 时：
+
+- 主 `devspace.sqlite` 会在临时文件中转换为唯一的 canonical v14 schema，完成
+  integrity/foreign-key 校验后再原子替换；原文件保留为
+  `devspace.sqlite.pre-v14.<timestamp>.bak`。
+- 历史 `devspace` Token scope 只在迁移时展开为六个明确能力；2.0 运行时不再
+  接受该 scope。
+- Workspace 会补齐 principal、alias、canonical root、write access 和 generation；
+  不存在的 checkout 会关闭，同 principal 的重复 active checkout 只保留一个。
+- mutation replay 会移除旧 receipt/continuation 快照；claimed cleanup job 会回到
+  可重试的 pending 状态。
+- `process-output/metadata.sqlite` 从 v2 事务迁到 v3，所有权列统一为
+  `connection_principal_id`。
+
+数据库迁移成功后，在 ChatGPT 的 DevSpace 应用设置中执行 **Refresh**。1.x 的
+`workspaceId`/generation、`cmd`/`cwd` 和 `devspace` scope 请求不会被兼容执行。
+
+需要回滚时，先停止 2.0，恢复升级前复制的**整个 state directory**，再安装并启动
+原 1.x 版本。只恢复主数据库备份不足以回滚 process-output v3。确认回滚服务可用后，
+再次刷新 ChatGPT 中的工具定义。
+
 
 ## 开发
 

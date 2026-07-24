@@ -8,6 +8,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { loadConfig } from "./config.js";
 import { internalDiagnosticsToken, internalRevocationToken } from "./internal-auth.js";
+import { DEFAULT_DEVSPACE_OAUTH_SCOPES } from "./oauth-scopes.js";
 import { createServer } from "./server.js";
 
 const root = await mkdtemp(join(tmpdir(), "devspace-oauth-http-test-"));
@@ -117,10 +118,12 @@ try {
     (openedWorkspace.structuredContent as { workspace?: { ref?: unknown } } | undefined)?.workspace?.ref ?? "",
   );
   const receipt = String(
-    (openedWorkspace.structuredContent as { receipt?: unknown } | undefined)?.receipt ?? "",
+    (openedWorkspace.structuredContent as {
+      continuation?: { receipt?: unknown };
+    } | undefined)?.continuation?.receipt ?? "",
   );
   assert.ok(workspaceId);
-  assert.match(receipt, /^wctx3\./);
+  assert.match(receipt, /^wctx4\./);
   const backgroundProcess = await mcpClient.callTool({
     name: "exec_command",
     arguments: {
@@ -212,7 +215,7 @@ function authorizationParams(
     response_type: "code",
     client_id: clientId,
     redirect_uri: redirectUri,
-    scope: "devspace",
+    scope: DEFAULT_DEVSPACE_OAUTH_SCOPES.join(" "),
     code_challenge: codeChallenge,
     code_challenge_method: "S256",
     resource: `${publicBaseUrl}/mcp`,

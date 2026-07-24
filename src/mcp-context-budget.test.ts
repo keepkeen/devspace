@@ -10,6 +10,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import Database from "better-sqlite3";
 import { loadConfig } from "./config.js";
+import { DEFAULT_DEVSPACE_OAUTH_SCOPES } from "./oauth-scopes.js";
 import { SqliteOAuthClientsStore, SqliteOAuthStore } from "./oauth-store.js";
 import { createServer } from "./server.js";
 
@@ -203,9 +204,14 @@ try {
   const resourcesList = await client.listResources();
   const openMetadata = await client.callTool({
     name: "open_workspace",
-    arguments: { path: workspaceRoot, alias: "context-budget", writeAccess: "read_write" },
+    arguments: {
+      path: workspaceRoot,
+      alias: "context-budget",
+      writeAccess: "read_write",
+      contextMode: "metadata",
+    },
   });
-  assert.equal((openMetadata.structuredContent as { schemaVersion?: unknown } | undefined)?.schemaVersion, 3);
+  assert.equal((openMetadata.structuredContent as { schemaVersion?: unknown } | undefined)?.schemaVersion, 4);
   const metadataWorkspace = (openMetadata.structuredContent as {
     workspace?: {
       ref?: unknown;
@@ -222,9 +228,11 @@ try {
   assert.equal(typeof metadataWorkspace?.generation, "number");
   assert.equal(metadataWorkspace?.writeAccess, "read_write");
   const metadataReceipt = String(
-    (openMetadata.structuredContent as { receipt?: unknown })?.receipt ?? "",
+    (openMetadata.structuredContent as {
+      continuation?: { receipt?: unknown };
+    })?.continuation?.receipt ?? "",
   );
-  assert.match(metadataReceipt, /^wctx3\./);
+  assert.match(metadataReceipt, /^wctx4\./);
   const metadataContinuation = (openMetadata.structuredContent as {
     continuation?: {
       receipt?: unknown;
@@ -291,7 +299,7 @@ try {
       code: "workspace_context_incomplete",
       retryable: true,
       safeToRetry: true,
-      recovery: "get_workspace_context",
+      recovery: "get_workspace_context_or_open_full",
       phase: "not_started",
       effectsKnown: true,
     },
@@ -343,6 +351,11 @@ try {
     arguments: { path: join(workspaceRoot, "readonly-project"), alias: "readonly" },
   });
   assert.equal(typeof (readonlyMetadata.structuredContent as { workspace?: { ref?: unknown } } | undefined)?.workspace?.ref, "string");
+  assert.equal(
+    (readonlyMetadata.structuredContent as { context?: { phase?: unknown } } | undefined)?.context?.phase,
+    "metadata",
+    "open_workspace without contextMode must return a metadata receipt",
+  );
   const readonlyOpen = await client.callTool({
     name: "get_workspace_context",
     arguments: { alias: "readonly", contextMode: "full" },
@@ -362,7 +375,7 @@ try {
   assert.notEqual(readonlyRead.isError, true);
   const readonlyExec = await client.callTool({
     name: "exec_command",
-    arguments: { workspaceId: readonlyWorkspaceId, cmd: "touch denied.txt" },
+    arguments: { workspaceId: readonlyWorkspaceId, shell: true, command: "touch denied.txt" },
   });
   assert.equal(readonlyExec.isError, true);
   assert.equal(
@@ -569,7 +582,7 @@ try {
   const staleWorkspaceResponseStart = httpResponses.length;
   const staleWorkspace = await client.callTool({
     name: "read",
-    arguments: { receipt: `wctx3.${"A".repeat(43)}`, path: "payload.txt" },
+    arguments: { receipt: `wctx4.${"A".repeat(43)}`, path: "payload.txt" },
   });
   const staleWorkspaceResponses = httpResponses.slice(staleWorkspaceResponseStart);
   assert.equal(staleWorkspace.isError, true);
@@ -769,7 +782,7 @@ try {
     name: "exec_command",
     arguments: {
       workspaceId,
-      cmd: `${JSON.stringify(process.execPath)} -e "process.stdin.pipe(process.stdout)"`,
+      shell: true, command: `${JSON.stringify(process.execPath)} -e "process.stdin.pipe(process.stdout)"`,
       stdin: `${processNeedle}\n`,
     },
   });
@@ -784,7 +797,7 @@ try {
     name: "exec_command",
     arguments: {
       workspaceId,
-      cmd: "bash",
+      shell: true, command: "bash",
       stdin: "cat <<'EOF'\ncd \"$TARGET\"\nEOF\n",
     },
   });
@@ -793,7 +806,7 @@ try {
   assert.match(toolText(heredocShellInput), /Process exited \(code 0\)/);
   const deniedCommand = await client.callTool({
     name: "exec_command",
-    arguments: { workspaceId, cmd: "sudo true" },
+    arguments: { workspaceId, shell: true, command: "sudo true" },
   });
   assert.equal(deniedCommand.isError, true);
   assert.match(toolText(deniedCommand), /^No command was executed\./);
@@ -876,7 +889,7 @@ try {
     name: "exec_command",
     arguments: {
       workspaceId,
-      cmd: `${JSON.stringify(process.execPath)} -e "setInterval(() => {}, 1000)"`,
+      shell: true, command: `${JSON.stringify(process.execPath)} -e "setInterval(() => {}, 1000)"`,
       timeoutMs: 50,
       yieldTimeMs: 2_000,
     },
@@ -892,7 +905,7 @@ try {
     name: "exec_command",
     arguments: {
       workspaceId,
-      cmd: `${JSON.stringify(process.execPath)} -e "process.stdout.write('active-status'); setTimeout(() => {}, 500)"`,
+      shell: true, command: `${JSON.stringify(process.execPath)} -e "process.stdout.write('active-status'); setTimeout(() => {}, 500)"`,
       yieldTimeMs: 100,
     },
   });
@@ -972,7 +985,7 @@ try {
 
   const overLimitCommand = await client.callTool({
     name: "exec_command",
-    arguments: { workspaceId, cmd: "echo should-not-run", timeoutMs: 1_001 },
+    arguments: { workspaceId, shell: true, command: "echo should-not-run", timeoutMs: 1_001 },
   });
   assert.equal(overLimitCommand.isError, true);
   assert.match(JSON.stringify(overLimitCommand.content), /1000|maximum|too_big/i);
@@ -981,7 +994,7 @@ try {
     name: "exec_command",
     arguments: {
       workspaceId,
-      cmd: `printf blocked > ${JSON.stringify(join(root, "outside.txt"))}`,
+      shell: true, command: `printf blocked > ${JSON.stringify(join(root, "outside.txt"))}`,
     },
   });
   assert.equal(outsideWrite.isError, true);
@@ -994,7 +1007,7 @@ try {
     name: "exec_command",
     arguments: {
       workspaceId,
-      cmd: `cat ${JSON.stringify(join(configDir, "internal.txt"))}`,
+      shell: true, command: `cat ${JSON.stringify(join(configDir, "internal.txt"))}`,
     },
   });
   assert.equal(protectedRead.isError, true);
@@ -1005,7 +1018,7 @@ try {
     name: "exec_command",
     arguments: {
       workspaceId,
-      cmd: "bash",
+      shell: true, command: "bash",
       stdin: `cat ${JSON.stringify(join(configDir, "internal.txt"))}\n`,
       closeStdin: true,
     },
@@ -1015,7 +1028,7 @@ try {
 
   const interactiveShell = await client.callTool({
     name: "exec_command",
-    arguments: { workspaceId, cmd: "bash", yieldTimeMs: 0 },
+    arguments: { workspaceId, shell: true, command: "bash", yieldTimeMs: 0 },
   });
   const interactiveSessionId = (interactiveShell.structuredContent as { sessionId?: unknown } | undefined)
     ?.sessionId;
@@ -1068,7 +1081,7 @@ try {
     arguments: {
       workspaceId,
       operationId: "nested-instruction-once",
-      cmd: "pwd",
+      shell: true, command: "pwd",
       workingDirectory: "nested",
     },
   });
@@ -1093,7 +1106,7 @@ try {
       workspaceId,
       instructionToken,
       operationId: "nested-instruction-once",
-      cmd: "pwd",
+      shell: true, command: "pwd",
       workingDirectory: "nested",
     },
   });
@@ -1105,7 +1118,7 @@ try {
       workspaceId,
       instructionToken,
       operationId: "nested-instruction-once",
-      cmd: "pwd",
+      shell: true, command: "pwd",
       workingDirectory: "nested",
     },
   });
@@ -1171,7 +1184,7 @@ try {
   const firstPatchContinuation = (strictPatch.structuredContent as {
     continuation?: { receipt?: unknown; expiresAt?: unknown };
   } | undefined)?.continuation;
-  assert.match(String(firstPatchContinuation?.receipt), /^wctx3\./u);
+  assert.match(String(firstPatchContinuation?.receipt), /^wctx4\./u);
   await new Promise((resolve) => setTimeout(resolve, 5));
   const refreshedPatchContext = await client.callTool({
     name: "get_workspace_context",
@@ -1306,7 +1319,7 @@ try {
       workspaceId,
       instructionToken: "instructions_missing_context_budget",
       operationId: "invalid-instruction-token-recovery",
-      cmd: "pwd",
+      shell: true, command: "pwd",
       workingDirectory: "nested",
     },
   });
@@ -1318,7 +1331,7 @@ try {
     arguments: {
       workspaceId,
       operationId: "invalid-instruction-token-recovery",
-      cmd: "pwd",
+      shell: true, command: "pwd",
       workingDirectory: "nested",
     },
   });
@@ -1332,7 +1345,7 @@ try {
     name: "exec_command",
     arguments: {
       workspaceId,
-      cmd: `${JSON.stringify(process.execPath)} -e "setTimeout(() => console.log('background-ok'), 50)"`,
+      shell: true, command: `${JSON.stringify(process.execPath)} -e "setTimeout(() => console.log('background-ok'), 50)"`,
       yieldTimeMs: 0,
     },
   });
@@ -1422,7 +1435,7 @@ try {
   );
   const dirtyPwd = await client.callTool({
     name: "exec_command",
-    arguments: { workspaceId: dirtyWorkspaceId, cmd: "pwd" },
+    arguments: { workspaceId: dirtyWorkspaceId, shell: true, command: "pwd" },
   });
   const dirtyWorkspaceRoot = toolText(dirtyPwd).split("\n")[0]?.trim() ?? "";
   assert.ok(dirtyWorkspaceRoot);
@@ -1430,7 +1443,7 @@ try {
     name: "exec_command",
     arguments: {
       workspaceId,
-      cmd: `cat ${JSON.stringify(join(dirtyWorkspaceRoot, "AGENTS.md"))}`,
+      shell: true, command: `cat ${JSON.stringify(join(dirtyWorkspaceRoot, "AGENTS.md"))}`,
     },
   });
   assert.equal(siblingManagedRead.isError, true);
@@ -1439,20 +1452,20 @@ try {
     name: "exec_command",
     arguments: {
       workspaceId: dirtyWorkspaceId,
-      cmd: `cat ${JSON.stringify(join(dirtyWorkspaceRoot, "AGENTS.md"))}`,
+      shell: true, command: `cat ${JSON.stringify(join(dirtyWorkspaceRoot, "AGENTS.md"))}`,
     },
   });
   assert.notEqual(managedRead.isError, true);
   const dirtyWrite = await client.callTool({
     name: "exec_command",
-    arguments: { workspaceId: dirtyWorkspaceId, cmd: "printf dirty > dirty.txt" },
+    arguments: { workspaceId: dirtyWorkspaceId, shell: true, command: "printf dirty > dirty.txt" },
   });
   assert.notEqual(dirtyWrite.isError, true);
   const dirtyBackground = await client.callTool({
     name: "exec_command",
     arguments: {
       workspaceId: dirtyWorkspaceId,
-      cmd: `${JSON.stringify(process.execPath)} -e "setInterval(() => {}, 1000)"`,
+      shell: true, command: `${JSON.stringify(process.execPath)} -e "setInterval(() => {}, 1000)"`,
       yieldTimeMs: 0,
     },
   });
@@ -1621,7 +1634,9 @@ try {
   });
   assert.equal(
     readOutputStructured.continuation?.receipt,
-    (openWorkspace.structuredContent as { receipt?: unknown } | undefined)?.receipt,
+    (openWorkspace.structuredContent as {
+      continuation?: { receipt?: unknown };
+    } | undefined)?.continuation?.receipt,
   );
   assert.equal(readOutputStructured.continuation?.phase, "context_loaded");
   assert.match(String(readOutputStructured.continuation?.expiresAt), /^\d{4}-\d{2}-\d{2}T/u);
@@ -1885,14 +1900,14 @@ function seedAccessToken(
       accessTokenHash: hashToken(accessToken),
       accessToken: {
         clientId: oauthClient.client_id,
-        scopes: ["devspace"],
+        scopes: [...DEFAULT_DEVSPACE_OAUTH_SCOPES],
         expiresAt,
         resource,
       },
       refreshTokenHash: hashToken("context-budget-test-refresh-token"),
       refreshToken: {
         clientId: oauthClient.client_id,
-        scopes: ["devspace"],
+        scopes: [...DEFAULT_DEVSPACE_OAUTH_SCOPES],
         expiresAt,
         resource,
       },
@@ -2016,10 +2031,11 @@ function enableWorkspaceGenerationTracking(client: Client): void {
     const result = await original(...callArgs);
     const structured = result.structuredContent as Record<string, unknown> | undefined;
     const workspace = structured?.workspace as Record<string, unknown> | undefined;
-    if (typeof workspace?.ref === "string" && typeof structured?.receipt === "string") {
-      receiptsByWorkspace.set(workspace.ref, structured.receipt);
+    const continuation = structured?.continuation as Record<string, unknown> | undefined;
+    if (typeof workspace?.ref === "string" && typeof continuation?.receipt === "string") {
+      receiptsByWorkspace.set(workspace.ref, continuation.receipt);
       const returnedAlias = typeof workspace.alias === "string" ? workspace.alias : alias;
-      if (returnedAlias) receiptsByAlias.set(returnedAlias, structured.receipt);
+      if (returnedAlias) receiptsByAlias.set(returnedAlias, continuation.receipt);
     }
     return result;
   }) as Client["callTool"];

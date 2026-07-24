@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { resolve } from "node:path";
 import { and, eq, gt, lt, or } from "drizzle-orm";
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
 import {
@@ -59,7 +60,7 @@ export class WorkspaceQuotaError extends Error {
 export interface WorkspaceSession {
   id: string;
   connectionPrincipalId: string;
-  alias?: string;
+  alias: string;
   root: string;
   canonicalRoot?: string;
   status: WorkspaceStatus;
@@ -69,8 +70,8 @@ export interface WorkspaceSession {
   baseSha?: string;
   dirtySource: boolean;
   managed: boolean;
-  writeAccess?: WorkspaceWriteAccess;
-  stateGeneration?: number;
+  writeAccess: WorkspaceWriteAccess;
+  stateGeneration: number;
   createdAt: string;
   lastUsedAt: string;
 }
@@ -183,7 +184,6 @@ export interface WorkspaceStore {
     stateGeneration?: number;
     maxActiveSessionsPerClient?: number;
   }): WorkspaceSession;
-  allocateSessionAlias?(id: string, connectionPrincipalId: string, alias?: string): string | undefined;
   getActiveSessionByAlias?(connectionPrincipalId: string, alias: string): WorkspaceSession | undefined;
   listActiveSessionSummaries?(connectionPrincipalId: string): ActiveWorkspaceSummary[];
   updateStateGeneration?(
@@ -295,7 +295,7 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
           connectionPrincipalId: session.connectionPrincipalId,
           alias: session.alias,
           root: session.root,
-          canonicalRoot: null,
+          canonicalRoot: session.mode === "checkout" ? resolve(session.root) : null,
           status: session.status,
           mode: session.mode,
           sourceRoot: session.sourceRoot ?? null,
@@ -338,7 +338,7 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
     const selectExisting = this.database.sqlite.prepare(`
       select
         id,
-        owner_client_id as connectionPrincipalId,
+        connection_principal_id as connectionPrincipalId,
         alias,
         root,
         canonical_root as canonicalRoot,
@@ -354,7 +354,7 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
         created_at as createdAt,
         last_used_at as lastUsedAt
       from workspace_sessions
-      where owner_client_id = @connectionPrincipalId
+      where connection_principal_id = @connectionPrincipalId
         and source_root = @sourceRoot
         and base_sha = @baseSha
         and mode = 'worktree'
@@ -365,7 +365,7 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
     `);
     const insertManaged = this.database.sqlite.prepare(`
       insert into workspace_sessions (
-        id, owner_client_id, alias, root, canonical_root, status, mode,
+        id, connection_principal_id, alias, root, canonical_root, status, mode,
         source_root, base_ref, base_sha, dirty_source, managed, write_access,
         state_generation, created_at, last_used_at
       ) values (
@@ -375,7 +375,7 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
       )
       returning
         id,
-        owner_client_id as connectionPrincipalId,
+        connection_principal_id as connectionPrincipalId,
         alias,
         root,
         canonical_root as canonicalRoot,
@@ -425,7 +425,7 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
     const selectCanonical = this.database.sqlite.prepare(`
       select
         id,
-        owner_client_id as connectionPrincipalId,
+        connection_principal_id as connectionPrincipalId,
         alias,
         root,
         canonical_root as canonicalRoot,
@@ -441,22 +441,11 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
         created_at as createdAt,
         last_used_at as lastUsedAt
       from workspace_sessions
-      where owner_client_id = @connectionPrincipalId
+      where connection_principal_id = @connectionPrincipalId
         and canonical_root = @canonicalRoot
         and mode = 'checkout'
         and status in ('active', 'closed')
       order by case status when 'active' then 0 else 1 end, last_used_at desc
-      limit 1
-    `);
-    const selectLegacy = this.database.sqlite.prepare(`
-      select id, alias, status
-      from workspace_sessions
-      where owner_client_id = @connectionPrincipalId
-        and root = @root
-        and canonical_root is null
-        and mode = 'checkout'
-        and status in ('active', 'closed')
-      order by last_used_at desc
       limit 1
     `);
     const updateExisting = this.database.sqlite.prepare(`
@@ -464,7 +453,6 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
       set root = @root,
           canonical_root = @canonicalRoot,
           status = 'active',
-          alias = coalesce(alias, @alias),
           write_access = case
             when @replaceWriteAccess = 1 then @writeAccess
             else write_access
@@ -477,7 +465,7 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
       where id = @existingId
       returning
         id,
-        owner_client_id as connectionPrincipalId,
+        connection_principal_id as connectionPrincipalId,
         alias,
         root,
         canonical_root as canonicalRoot,
@@ -495,17 +483,16 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
     `);
     const insertCheckout = this.database.sqlite.prepare(`
       insert into workspace_sessions (
-        id, owner_client_id, alias, root, canonical_root, status, mode, managed,
-        write_access, state_generation, created_at, last_used_at
+        id, connection_principal_id, alias, root, canonical_root, status, mode,
+        dirty_source, managed, write_access, state_generation, created_at, last_used_at
       ) values (
-        @id, @connectionPrincipalId, @alias, @root, @canonicalRoot, 'active', 'checkout', 'false',
-        @writeAccess, @stateGeneration, @now, @now
+        @id, @connectionPrincipalId, @alias, @root, @canonicalRoot, 'active', 'checkout',
+        'false', 'false', @writeAccess, @stateGeneration, @now, @now
       )
-      on conflict(owner_client_id, canonical_root)
+      on conflict(connection_principal_id, canonical_root)
         where canonical_root is not null and mode = 'checkout' and status = 'active'
       do update set
         root = excluded.root,
-        alias = coalesce(workspace_sessions.alias, excluded.alias),
         write_access = case
           when @replaceWriteAccess = 1 then excluded.write_access
           else workspace_sessions.write_access
@@ -517,11 +504,10 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
         end,
         last_used_at = excluded.last_used_at
       where @requestedAlias is null
-        or workspace_sessions.alias is null
         or workspace_sessions.alias = @requestedAlias
       returning
         id,
-        owner_client_id as connectionPrincipalId,
+        connection_principal_id as connectionPrincipalId,
         alias,
         root,
         canonical_root as canonicalRoot,
@@ -530,6 +516,7 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
         source_root as sourceRoot,
         base_ref as baseRef,
         base_sha as baseSha,
+        dirty_source as dirtySource,
         managed,
         write_access as writeAccess,
         state_generation as stateGeneration,
@@ -544,11 +531,7 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
       }): WorkspaceSessionRow => {
         const existing = selectCanonical.get(values) as WorkspaceSessionRow | undefined;
         if (existing) {
-          if (
-            values.requestedAlias !== null
-            && existing.alias !== null
-            && existing.alias !== values.requestedAlias
-          ) {
+          if (values.requestedAlias !== null && existing.alias !== values.requestedAlias) {
             return existing;
           }
           if (existing.status === "closed") {
@@ -560,51 +543,12 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
           }) as WorkspaceSessionRow;
         }
 
-        const legacy = selectLegacy.get(values) as
-          | Pick<WorkspaceSessionRow, "id" | "alias" | "status">
-          | undefined;
-        if (legacy) {
-          if (
-            values.requestedAlias !== null
-            && legacy.alias !== null
-            && legacy.alias !== values.requestedAlias
-          ) {
-            return this.database.sqlite.prepare(`
-              select
-                id,
-                owner_client_id as connectionPrincipalId,
-                alias,
-                root,
-                canonical_root as canonicalRoot,
-                status,
-                mode,
-                source_root as sourceRoot,
-                base_ref as baseRef,
-                base_sha as baseSha,
-                dirty_source as dirtySource,
-                managed,
-                write_access as writeAccess,
-                state_generation as stateGeneration,
-                created_at as createdAt,
-                last_used_at as lastUsedAt
-              from workspace_sessions
-              where id = @id
-            `).get(legacy) as WorkspaceSessionRow;
-          }
-          if (legacy.status === "closed") {
-            this.assertActiveSessionQuota(values.connectionPrincipalId, values.maxActiveSessionsPerClient);
-          }
-          return updateExisting.get({
-            ...values,
-            existingId: legacy.id,
-          }) as WorkspaceSessionRow;
-        }
-
         this.assertActiveSessionQuota(values.connectionPrincipalId, values.maxActiveSessionsPerClient);
-
         const inserted = insertCheckout.get(values) as WorkspaceSessionRow | undefined;
         if (inserted) return inserted;
-        return selectCanonical.get(values) as WorkspaceSessionRow;
+        const concurrent = selectCanonical.get(values) as WorkspaceSessionRow | undefined;
+        if (!concurrent) throw new Error("Concurrent checkout workspace creation did not return a Workspace.");
+        return concurrent;
       },
     );
     const row = getOrCreate.immediate({
@@ -663,16 +607,6 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
       .reverse();
   }
 
-  allocateSessionAlias(id: string, connectionPrincipalId: string, alias = generateWorkspaceAlias()): string | undefined {
-    const row = this.database.sqlite.prepare(`
-      update workspace_sessions
-      set alias = coalesce(alias, @alias)
-      where id = @id and owner_client_id = @connectionPrincipalId and status = 'active'
-      returning alias
-    `).get({ id, connectionPrincipalId, alias }) as { alias: string } | undefined;
-    return row?.alias;
-  }
-
   getActiveSessionByAlias(connectionPrincipalId: string, alias: string): WorkspaceSession | undefined {
     const row = this.database.db
       .select()
@@ -687,18 +621,6 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
   }
 
   listActiveSessionSummaries(connectionPrincipalId: string): ActiveWorkspaceSummary[] {
-    const allocateMissingAliases = this.database.sqlite.transaction(() => {
-      const rows = this.database.sqlite.prepare(`
-        select id
-        from workspace_sessions
-        where owner_client_id = ? and status = 'active' and alias is null
-      `).all(connectionPrincipalId) as Array<{ id: string }>;
-      for (const row of rows) {
-        this.allocateSessionAlias(row.id, connectionPrincipalId);
-      }
-    });
-    allocateMissingAliases.immediate();
-
     return this.database.db
       .select()
       .from(workspaceSessions)
@@ -740,7 +662,7 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
       update workspace_sessions
       set base_sha = ?, last_used_at = ?
       where id = ?
-        and owner_client_id = ?
+        and connection_principal_id = ?
         and status = 'active'
         and mode = 'worktree'
         and managed = 'true'
@@ -752,7 +674,7 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
     const row = this.database.sqlite.prepare(`
       update workspace_sessions
       set state_generation = state_generation + 1
-      where id = ? and owner_client_id = ? and status in ('active', 'closed')
+      where id = ? and connection_principal_id = ? and status in ('active', 'closed')
       returning state_generation as stateGeneration
     `).get(id, connectionPrincipalId) as { stateGeneration: number } | undefined;
     return row?.stateGeneration;
@@ -764,13 +686,13 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
         update workspace_sessions
         set state_generation = state_generation + 1
         where status = 'active'
-        returning id, owner_client_id as connectionPrincipalId, state_generation as stateGeneration
+        returning id, connection_principal_id as connectionPrincipalId, state_generation as stateGeneration
       `)
       : this.database.sqlite.prepare(`
         update workspace_sessions
         set state_generation = state_generation + 1
-        where status = 'active' and owner_client_id = ?
-        returning id, owner_client_id as connectionPrincipalId, state_generation as stateGeneration
+        where status = 'active' and connection_principal_id = ?
+        returning id, connection_principal_id as connectionPrincipalId, state_generation as stateGeneration
       `);
     const rows = (connectionPrincipalId === undefined
       ? statement.all()
@@ -784,7 +706,7 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
       set status = 'revoked',
           state_generation = state_generation + 1,
           last_used_at = ?
-      where id = ? and owner_client_id = ? and status in ('active', 'closed')
+      where id = ? and connection_principal_id = ? and status in ('active', 'closed')
       returning state_generation as stateGeneration
     `).get(new Date().toISOString(), id, connectionPrincipalId) as
       | { stateGeneration: number }
@@ -796,7 +718,7 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
     const rows = this.database.sqlite.prepare(`
       select
         id,
-        owner_client_id as connectionPrincipalId,
+        connection_principal_id as connectionPrincipalId,
         workspace_id as workspaceId,
         workspace_root as workspaceRoot,
         workspace_mode as workspaceMode,
@@ -844,7 +766,7 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
         )
       returning
         id,
-        owner_client_id as connectionPrincipalId,
+        connection_principal_id as connectionPrincipalId,
         workspace_id as workspaceId,
         workspace_root as workspaceRoot,
         workspace_mode as workspaceMode,
@@ -882,7 +804,7 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
       const job = this.database.sqlite.prepare(`
         select
           id,
-          owner_client_id as connectionPrincipalId,
+          connection_principal_id as connectionPrincipalId,
           workspace_id as workspaceId,
           workspace_root as workspaceRoot,
           workspace_mode as workspaceMode,
@@ -910,7 +832,7 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
         }
         this.database.sqlite.prepare(`
           insert into oauth_revocation_dirty_worktree_artifacts (
-            job_id, owner_client_id, workspace_id, workspace_root,
+            job_id, connection_principal_id, workspace_id, workspace_root,
             source_root, reason, recorded_at
           ) values (?, ?, ?, ?, ?, ?, ?)
           on conflict(job_id) do update set
@@ -929,6 +851,7 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
       const result = this.database.sqlite.prepare(`
         update oauth_revocation_cleanup_jobs
         set status = 'completed',
+            claim_token = null,
             lease_expires_at = null,
             last_error = null,
             updated_at = @now,
@@ -954,6 +877,7 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
     const result = this.database.sqlite.prepare(`
       update oauth_revocation_cleanup_jobs
       set status = 'failed',
+          claim_token = null,
           lease_expires_at = null,
           last_error = @error,
           updated_at = @now
@@ -968,7 +892,7 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
     const rows = this.database.sqlite.prepare(`
       select
         job_id as jobId,
-        owner_client_id as connectionPrincipalId,
+        connection_principal_id as connectionPrincipalId,
         workspace_id as workspaceId,
         workspace_root as workspaceRoot,
         source_root as sourceRoot,
@@ -1005,7 +929,7 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
             and not exists (
               select 1
               from oauth_revocation_cleanup_jobs as job
-              where job.owner_client_id = workspace.owner_client_id
+              where job.connection_principal_id = workspace.connection_principal_id
                 and job.workspace_id = workspace.id
                 and job.status != 'completed'
             )
@@ -1027,7 +951,7 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
       const closed = this.database.sqlite.prepare(`
         select 1
         from workspace_sessions
-        where id = ? and owner_client_id = ? and status = 'closed'
+        where id = ? and connection_principal_id = ? and status = 'closed'
       `).get(id, connectionPrincipalId);
       if (!closed) return undefined;
       this.assertActiveSessionQuota(connectionPrincipalId, maxActiveSessionsPerClient);
@@ -1036,7 +960,7 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
       set status = 'active',
           state_generation = state_generation + 1,
           last_used_at = ?
-      where id = ? and owner_client_id = ? and status = 'closed'
+      where id = ? and connection_principal_id = ? and status = 'closed'
       returning state_generation as stateGeneration
       `).get(new Date().toISOString(), id, connectionPrincipalId) as
         | { stateGeneration: number }
@@ -1078,7 +1002,7 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
       set status = 'closed',
           state_generation = state_generation + 1,
           last_used_at = ?
-      where id = ? and owner_client_id = ? and status = 'active'
+      where id = ? and connection_principal_id = ? and status = 'active'
     `).run(new Date().toISOString(), id, connectionPrincipalId);
     return result.changes > 0;
   }
@@ -1094,7 +1018,7 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
   countManagedWorktrees(): number {
     const row = this.database.sqlite
       .prepare(
-        "select count(*) as count from workspace_sessions where managed = 'true' and status = 'active' and owner_client_id != '__legacy_unowned__'",
+        "select count(*) as count from workspace_sessions where managed = 'true' and status = 'active'",
       )
       .get() as { count: number };
     return row.count;
@@ -1106,7 +1030,7 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
         .prepare("select count(*) as count from workspace_sessions where status = 'active'")
         .get()
       : this.database.sqlite
-        .prepare("select count(*) as count from workspace_sessions where status = 'active' and owner_client_id = ?")
+        .prepare("select count(*) as count from workspace_sessions where status = 'active' and connection_principal_id = ?")
         .get(connectionPrincipalId);
     return (row as { count: number }).count;
   }
@@ -1131,7 +1055,7 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
     const close = this.database.sqlite.prepare(
       `update workspace_sessions
        set status = 'closed', last_used_at = ?
-       where id = ? and owner_client_id = ? and status = 'active'`,
+       where id = ? and connection_principal_id = ? and status = 'active'`,
     );
     const closeAll = this.database.sqlite.transaction(
       (entries: Array<{ id: string; connectionPrincipalId: string }>) => entries.reduce(
@@ -1222,34 +1146,31 @@ function rowToWorkspaceSession(row: WorkspaceSessionRow): WorkspaceSession {
   return {
     id: row.id,
     connectionPrincipalId: row.connectionPrincipalId,
-    alias: row.alias ?? undefined,
+    alias: row.alias,
     root: row.root,
     canonicalRoot: row.canonicalRoot ?? undefined,
     status: row.status,
-    mode: row.mode === "worktree" ? "worktree" : "checkout",
+    mode: workspaceMode(row.mode),
     sourceRoot: row.sourceRoot ?? undefined,
     baseRef: row.baseRef ?? undefined,
     baseSha: row.baseSha ?? undefined,
     dirtySource: row.dirtySource === "true",
     managed: row.managed === "true",
-    writeAccess: row.writeAccess === "read_only" ? "read_only" : "read_write",
-    stateGeneration: row.stateGeneration,
+    writeAccess: workspaceWriteAccess(row.writeAccess),
+    stateGeneration: validateStateGeneration(row.stateGeneration),
     createdAt: row.createdAt,
     lastUsedAt: row.lastUsedAt,
   };
 }
 
 function rowToActiveWorkspaceSummary(row: WorkspaceSessionRow): ActiveWorkspaceSummary {
-  if (row.alias === null) {
-    throw new Error(`Active workspace ${row.id} does not have an alias.`);
-  }
   return {
     alias: row.alias,
-    mode: row.mode === "worktree" ? "worktree" : "checkout",
+    mode: workspaceMode(row.mode),
     managed: row.managed === "true",
     ...(row.managed === "true" ? { dirtySource: row.dirtySource === "true" } : {}),
-    writeAccess: row.writeAccess === "read_only" ? "read_only" : "read_write",
-    stateGeneration: row.stateGeneration,
+    writeAccess: workspaceWriteAccess(row.writeAccess),
+    stateGeneration: validateStateGeneration(row.stateGeneration),
     createdAt: row.createdAt,
     lastUsedAt: row.lastUsedAt,
   };
@@ -1299,6 +1220,16 @@ function validateStateGeneration(stateGeneration: number): number {
     throw new Error("Workspace state generation must be a positive integer.");
   }
   return stateGeneration;
+}
+
+function workspaceMode(value: string): WorkspaceMode {
+  if (value === "checkout" || value === "worktree") return value;
+  throw new Error(`Unsupported Workspace mode: ${value}`);
+}
+
+function workspaceWriteAccess(value: string): WorkspaceWriteAccess {
+  if (value === "read_only" || value === "read_write") return value;
+  throw new Error(`Unsupported Workspace write access: ${value}`);
 }
 
 function compareGenerationUpdates(

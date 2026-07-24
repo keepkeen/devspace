@@ -646,6 +646,7 @@ export class WorkspaceRegistry {
       (workspace): WorkspaceSession => ({
         id: workspace.id,
         connectionPrincipalId: workspace.connectionPrincipalId,
+        alias: workspace.alias,
         root: workspace.root,
         status: "active",
         mode: workspace.mode,
@@ -654,6 +655,8 @@ export class WorkspaceRegistry {
         baseSha: workspace.worktree?.baseSha,
         dirtySource: workspace.worktree?.dirtySource ?? false,
         managed: workspace.worktree?.managed ?? false,
+        writeAccess: workspace.writeAccess,
+        stateGeneration: workspace.stateGeneration,
         createdAt: new Date(workspace.lastUsedAt).toISOString(),
         lastUsedAt: new Date(workspace.lastUsedAt).toISOString(),
       }),
@@ -1727,24 +1730,20 @@ export class WorkspaceRegistry {
       }
       reused = session.id !== workspace.id;
       if (input.alias && session.alias !== input.alias) {
-        throw new WorkspaceAliasConflictError(session.alias ?? "the existing alias");
+        throw new WorkspaceAliasConflictError(session.alias);
       }
       const resident = this.workspaces.get(session.id);
       if (resident?.connectionPrincipalId === session.connectionPrincipalId) {
         resident.root = session.root;
-        resident.writeAccess = session.writeAccess ?? resident.writeAccess;
-        resident.stateGeneration = session.stateGeneration ?? resident.stateGeneration;
+        resident.writeAccess = session.writeAccess;
+        resident.stateGeneration = session.stateGeneration;
         return this.contextForWorkspace(resident, true);
       }
       workspace.id = session.id;
-      workspace.alias = session.alias ?? this.store.allocateSessionAlias?.(
-        session.id,
-        session.connectionPrincipalId,
-        workspace.alias,
-      ) ?? workspace.alias;
+      workspace.alias = session.alias;
       workspace.root = session.root;
-      workspace.writeAccess = session.writeAccess ?? workspace.writeAccess;
-      workspace.stateGeneration = session.stateGeneration ?? workspace.stateGeneration;
+      workspace.writeAccess = session.writeAccess;
+      workspace.stateGeneration = session.stateGeneration;
       if (reused && !this.workspaces.has(session.id)) {
         workspace.stateGeneration = this.store.bumpStateGeneration?.(
           session.id,
@@ -1776,7 +1775,7 @@ export class WorkspaceRegistry {
         maxActiveSessionsPerClient: this.config.resources.maxActiveWorkspacesPerClient,
       });
       if (session.id !== workspace.id) throw new ExistingManagedWorkspaceError(session);
-      workspace.alias = session.alias ?? workspace.alias;
+      workspace.alias = session.alias;
     } else {
       this.store?.createSession({
         id: workspace.id,
@@ -1830,16 +1829,7 @@ export class WorkspaceRegistry {
     lifecycle.activeOperations += 1;
     let published = false;
     try {
-      const alias = session.alias
-        ?? this.store?.allocateSessionAlias?.(
-          session.id,
-          session.connectionPrincipalId,
-          this.defaultWorkspaceAlias(
-            session.connectionPrincipalId,
-            session.sourceRoot ?? session.root,
-          ),
-        )
-        ?? `ws-${randomUUID()}`;
+      const alias = session.alias;
       let recovery: WorkspaceContext["recovery"];
       let recoveredWorktree: WorkspaceWorktree | undefined;
       let currentWorktreeHead: string | undefined;
@@ -1990,21 +1980,9 @@ export class WorkspaceRegistry {
     originalSession: WorkspaceSession,
     alias: string | undefined,
   ): Promise<WorkspaceContext> {
-    const session = originalSession.alias
-      ? originalSession
-      : {
-          ...originalSession,
-          alias: this.store?.allocateSessionAlias?.(
-            originalSession.id,
-            originalSession.connectionPrincipalId,
-            this.defaultWorkspaceAlias(
-              originalSession.connectionPrincipalId,
-              originalSession.sourceRoot ?? originalSession.root,
-            ),
-          ),
-        };
+    const session = originalSession;
     if (alias && session.alias !== alias) {
-      throw new WorkspaceAliasConflictError(session.alias ?? "the existing alias");
+      throw new WorkspaceAliasConflictError(session.alias);
     }
     const resident = this.workspaces.get(session.id);
     if (resident?.connectionPrincipalId === session.connectionPrincipalId) {
@@ -2017,17 +1995,10 @@ export class WorkspaceRegistry {
     connectionPrincipalId: string,
     sourceRoot: string,
   ): WorkspaceSession[] {
-    const sessions = (this.store?.findActiveManagedSessionsBySource?.(
+    const sessions = this.store?.findActiveManagedSessionsBySource?.(
       connectionPrincipalId,
       sourceRoot,
-    ) ?? []).map((session) => session.alias ? session : {
-      ...session,
-      alias: this.store?.allocateSessionAlias?.(
-        session.id,
-        connectionPrincipalId,
-        this.defaultWorkspaceAlias(connectionPrincipalId, sourceRoot),
-      ),
-    });
+    ) ?? [];
     const byId = new Map(sessions.map((session) => [session.id, session]));
     for (const workspace of this.workspaces.values()) {
       if (

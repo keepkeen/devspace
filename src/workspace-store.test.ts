@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
-import { databasePath } from "./db/client.js";
+import { databasePath, openDatabase } from "./db/client.js";
 import { SqliteWorkspaceStore } from "./workspace-store.js";
 
 const root = await mkdtemp(join(tmpdir(), "devspace-workspace-store-test-"));
@@ -55,45 +55,54 @@ try {
 
   const migratedStore = new SqliteWorkspaceStore(legacyStateDir);
   try {
-    const migrated = migratedStore.getSession("legacy-ws", "legacy-client");
-    assert.equal(migrated?.alias, undefined);
-    assert.equal(migrated?.writeAccess, "read_write");
-    assert.equal(migrated?.stateGeneration, 1);
-
-    const summaries = migratedStore.listActiveSessionSummaries("legacy-client");
-    assert.equal(summaries.length, 1);
-    assert.match(summaries[0]!.alias, /^ws-[0-9a-f-]{36}$/);
-    assert.equal("root" in summaries[0]!, false);
-    assert.equal("id" in summaries[0]!, false);
     assert.equal(
-      migratedStore.getActiveSessionByAlias("legacy-client", summaries[0]!.alias)?.id,
-      "legacy-ws",
+      migratedStore.getSession("legacy-ws", "legacy-client"),
+      undefined,
+      "a missing checkout path is migrated to closed instead of remaining active",
     );
+    assert.deepEqual(migratedStore.listActiveSessionSummaries("legacy-client"), []);
   } finally {
     migratedStore.close();
   }
 
   const migratedDatabase = new Database(databasePath(legacyStateDir));
   try {
-    assert.equal(
-      (migratedDatabase.prepare(
-        "select count(*) as count from devspace_schema_migrations where version = 9",
-      ).get() as { count: number }).count,
-      1,
+    assert.deepEqual(
+      migratedDatabase.prepare(
+        "select version, name from devspace_schema_migrations order by version",
+      ).all(),
+      [{ version: 14, name: "canonical-state-v14" }],
     );
     const workspaceColumns = migratedDatabase.prepare("pragma table_info(workspace_sessions)")
       .all() as Array<{ name: string }>;
     assert.equal(workspaceColumns.some((column) => column.name === "dirty_source"), true);
-    assert.equal(
-      migratedDatabase.prepare(
-        "select dirty_source from workspace_sessions where id = 'legacy-ws'",
-      ).pluck().get(),
-      "false",
+    assert.equal(workspaceColumns.some((column) => column.name === "connection_principal_id"), true);
+    assert.equal(workspaceColumns.some((column) => column.name === "owner_client_id"), false);
+    assert.deepEqual(
+      migratedDatabase.prepare(`
+        select
+          connection_principal_id as connectionPrincipalId,
+          alias,
+          status,
+          dirty_source as dirtySource,
+          write_access as writeAccess,
+          state_generation as stateGeneration
+        from workspace_sessions
+        where id = 'legacy-ws'
+      `).get(),
+      {
+        connectionPrincipalId: "legacy-client",
+        alias: "legacy",
+        status: "closed",
+        dirtySource: "false",
+        writeAccess: "read_write",
+        stateGeneration: 1,
+      },
     );
     const operationColumns = migratedDatabase.prepare("pragma table_info(mutation_operations)")
       .all() as Array<{ name: string; pk: number }>;
     assert.deepEqual(operationColumns.map((column) => column.name), [
-      "owner_client_id",
+      "connection_principal_id",
       "workspace_id",
       "tool",
       "operation_id",
@@ -107,7 +116,7 @@ try {
     ]);
     assert.deepEqual(
       operationColumns.filter((column) => column.pk > 0).map((column) => column.name),
-      ["owner_client_id", "operation_id"],
+      ["connection_principal_id", "operation_id"],
     );
     assert.throws(
       () => migratedDatabase.prepare(
@@ -119,7 +128,7 @@ try {
       () => migratedDatabase.prepare(
         "update workspace_sessions set status = 'unknown' where id = 'legacy-ws'",
       ).run(),
-      /invalid workspace session status/,
+      /CHECK constraint failed/,
     );
     migratedDatabase.prepare(
       "update workspace_sessions set status = 'revoked' where id = 'legacy-ws'",
@@ -135,6 +144,15 @@ try {
   }
 
   const stateDir = join(root, "state");
+  seedConnectionPrincipals(stateDir, [
+    "client-a",
+    "client-alias-guarded",
+    "client-b",
+    "client-fields",
+    "client-fields-other",
+    "client-managed",
+    "client-generation",
+  ]);
   const first = new SqliteWorkspaceStore(stateDir);
   const second = new SqliteWorkspaceStore(stateDir);
   try {
@@ -382,7 +400,6 @@ try {
     assert.notEqual(isolatedManaged.id, managed.id);
     assert.equal(first.countManagedWorktrees(), 2);
 
-    assert.equal(first.allocateSessionAlias("ws-fields", "client-fields", "changed"), "devspace");
     assert.equal(first.updateStateGeneration("ws-fields", "wrong-client", 8), false);
     assert.equal(first.updateStateGeneration("ws-fields", "client-fields", 8), true);
     assert.equal(first.getSession("ws-fields", "client-fields")?.stateGeneration, 8);
@@ -465,4 +482,18 @@ try {
   }
 } finally {
   await rm(root, { recursive: true, force: true });
+}
+
+function seedConnectionPrincipals(stateDir: string, principalIds: readonly string[]): void {
+  const database = openDatabase(stateDir);
+  try {
+    const timestamp = new Date(0).toISOString();
+    const insert = database.sqlite.prepare(`
+      insert into connection_principals (principal_id, created_at, last_used_at, revoked_at)
+      values (?, ?, ?, null)
+    `);
+    for (const principalId of principalIds) insert.run(principalId, timestamp, timestamp);
+  } finally {
+    database.close();
+  }
 }

@@ -551,8 +551,8 @@ assert.equal(workspaceOperationId({
 }), undefined);
 assert.equal(toolCallWorkspaceReceipt({
   method: "tools/call",
-  params: { name: "read", arguments: { receipt: `wctx3.${"A".repeat(43)}` } },
-}), `wctx3.${"A".repeat(43)}`);
+  params: { name: "read", arguments: { receipt: `wctx4.${"A".repeat(43)}` } },
+}), `wctx4.${"A".repeat(43)}`);
 assert.equal(toolCallOperationId({
   method: "tools/call",
   params: { name: "exec_command", arguments: { operationId: "operation-17" } },
@@ -563,21 +563,21 @@ assert.equal(toolCallOperationId({
 }), undefined);
 assert.equal(workspaceToolRootLockMode({
   method: "tools/call",
-  params: { name: "read", arguments: { receipt: `wctx3.${"A".repeat(43)}` } },
+  params: { name: "read", arguments: { receipt: `wctx4.${"A".repeat(43)}` } },
 }), "read");
 assert.equal(workspaceToolRootLockMode({
   method: "tools/call",
-  params: { name: "apply_patch", arguments: { receipt: `wctx3.${"A".repeat(43)}` } },
+  params: { name: "apply_patch", arguments: { receipt: `wctx4.${"A".repeat(43)}` } },
 }), "write");
 assert.equal(workspaceToolRootLockMode({
   method: "tools/call",
-  params: { name: "write_stdin", arguments: { receipt: `wctx3.${"A".repeat(43)}`, sessionId: 1 } },
+  params: { name: "write_stdin", arguments: { receipt: `wctx4.${"A".repeat(43)}`, sessionId: 1 } },
 }), "read");
 assert.equal(workspaceToolRootLockMode({
   method: "tools/call",
   params: {
     name: "write_stdin",
-    arguments: { receipt: `wctx3.${"A".repeat(43)}`, sessionId: 1, chars: "input" },
+    arguments: { receipt: `wctx4.${"A".repeat(43)}`, sessionId: 1, chars: "input" },
   },
 }), "write");
 assert.deepEqual(requiredOAuthScopesForTool("read"), ["workspace:read"]);

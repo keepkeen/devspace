@@ -275,7 +275,7 @@ The expected workflow is:
    metadata receipt can only load context or close/revoke the Workspace; it
    cannot read, inspect, execute, or modify local files.
 2. It passes that receipt to `get_workspace_context` with
-   `contextMode: "full"` to receive the v3 structured instructions, Skill
+   `contextMode: "full"` to receive the v4 structured instructions, Skill
    catalog, and a refreshed context-loaded receipt. The model-visible
    `workspace` contains `ref`, `alias`, a path-safe `projectFingerprint`, and
    generation; `continuation` contains the receipt, phase, fixed expiry, and
@@ -349,18 +349,20 @@ parallel work.
 DevSpace supports `workspace:read`, `workspace:write`, `process:execute`,
 `network:access`, `worktree:create`, and `workspace:revoke`. The approval page
 shows these capabilities and every tool checks them again before execution.
-The legacy `devspace` scope remains a compatibility alias for all capabilities;
-new deployments can restrict the requestable set with `DEVSPACE_OAUTH_SCOPES`.
+Version 2.0 no longer accepts the ambiguous full-access `devspace` scope.
+`DEVSPACE_OAUTH_SCOPES` must be a non-empty subset of the six capabilities above.
 
 ### `AGENTS.md` and Skills
 
-The initial `open_workspace` call returns metadata by default. After
-`get_workspace_context(receipt, full)`, DevSpace returns structured
+The initial `open_workspace` call returns metadata by default. ChatGPT then
+calls `get_workspace_context(receipt, full)` before ordinary Workspace tools.
+Full context returns structured
 `instructions.items[]` records with source, scope, relative path, hash, trust,
 and content. One user-level file may be explicitly
 selected in the Admin panel or with `DEVSPACE_USER_INSTRUCTIONS_PATH`. DevSpace does not
-implicitly read `~/.codex/AGENTS.md`; `DEVSPACE_AGENT_DIR` is only a Skill
-compatibility root. The root chain returned by full context is acknowledged for
+implicitly read `~/.codex/AGENTS.md`. Trusted personal Skills live under
+`~/.agents/skills`, DevSpace-managed Skills live under `~/.devspace/skills`,
+and other local allowlists use `DEVSPACE_SKILL_PATHS`. The root chain returned by full context is acknowledged for
 that receipt's private context session, so it is not sent a second time before
 the first root-scoped mutation. Reads only advertise
 `scopedInstructionsAvailable=true`. Before entering a newly instructed nested
@@ -413,7 +415,9 @@ stale ChatGPT tool-schema confusion.
 
 `exec_command` prefers direct `program` plus `args`, preserving argument
 boundaries without shell parsing. Use `shell: true` plus `command` only for
-shell syntax; legacy `cmd` remains compatible. For multiline Python, SQL, or SSH scripts, the model can use the structured
+shell syntax. Version 2.0 no longer accepts the `cmd` or `cwd` aliases; use
+`workingDirectory` for a relative working directory. For multiline Python,
+SQL, or SSH scripts, the model can use the structured
 `stdin` field on `exec_command` instead of fragile nested quoting. Stdin
 closes by default after an initial payload; set `closeStdin: false` to continue
 through `write_stdin`, which can append data or close the stream. PTY sessions
@@ -434,12 +438,15 @@ from a command that never started.
 `get_operation_status(operationId)` checks retained state without executing or
 repeating the stored result body.
 
-Every Workspace-scoped tool requires the current v3 `receipt`. The unified
+Every Workspace-scoped tool requires the current v4 `receipt`. The unified
 registration layer validates the connection principal, OAuth capabilities,
 generation, context phase, and private
 context-session binding before the handler starts. Metadata receipts can only
 promote context or close/revoke the Workspace. Receipt storage has both global
 and per-principal limits; use refreshes LRU recency but not the fixed deadline.
+Version 2.0 never guesses a recent receipt from `workspaceId` or generation.
+A call without `continuation.receipt` fails before the handler starts. Refresh
+the DevSpace app tools in ChatGPT after upgrading.
 Restarts, principal relink/revoke, Owner-credential or root-authority changes,
 and close/reopen cycles stale old receipts. Reapproving the same client with
 the same principal and authority does not. `read` returns `contentHash` and
@@ -770,6 +777,40 @@ node dist/cli.js doctor
 </details>
 
 More cases are documented in [Troubleshooting Gotchas](./docs/gotchas.md).
+
+## Upgrade from 1.x to 2.0
+
+Version 2.0 is an explicit protocol and database cutover. Stop DevSpace through
+your OS service manager, then copy the entire state directory (default
+`~/.local/share/devspace`) as an offline backup. Do not copy only the main
+database because process-output metadata is upgraded too.
+
+On the first 2.0 startup:
+
+- `devspace.sqlite` is converted in a temporary file to the single canonical
+  v14 schema, checked for integrity and foreign-key violations, and atomically
+  swapped into place. The original remains as
+  `devspace.sqlite.pre-v14.<timestamp>.bak`.
+- Historical `devspace` token scopes are expanded to the six explicit
+  capabilities during migration only; the 2.0 runtime no longer accepts that
+  scope.
+- Workspaces gain canonical principals, aliases, roots, write access, and
+  generations. Missing checkouts are closed and duplicate active checkouts for
+  one principal/root are reduced to one.
+- Mutation replay bodies lose stale receipt/continuation snapshots, and claimed
+  cleanup jobs return to a retryable pending state.
+- `process-output/metadata.sqlite` moves transactionally from v2 to v3 and
+  uses `connection_principal_id` as its ownership column.
+
+After migration, choose **Refresh** in the ChatGPT DevSpace app settings. The
+removed 1.x `workspaceId`/generation, `cmd`/`cwd`, and `devspace` scope
+requests are not executed by 2.0.
+
+To roll back, stop 2.0, restore the **entire pre-upgrade state directory**, then
+install and start the original 1.x release. Restoring only the main database is
+not sufficient because 1.x cannot read process-output v3. Refresh the ChatGPT
+tool definitions again after the rollback service is healthy.
+
 
 ## Development
 

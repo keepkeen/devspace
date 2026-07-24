@@ -31,7 +31,7 @@ const binding: WorkspaceContextReceiptBinding = {
 
 const issued = receipts.issue(binding);
 const receipt = issued.receipt;
-assert.match(receipt, /^wctx3\.[A-Za-z0-9_-]{43}$/);
+assert.match(receipt, /^wctx4\.[A-Za-z0-9_-]{43}$/);
 assert.equal(issued.expiresAt, issuedAt + 6 * 60 * 60 * 1_000);
 assert.equal(receipts.verify(receipt, binding), true);
 const resolved = receipts.resolve(receipt);
@@ -77,7 +77,7 @@ assert.equal(
 );
 const alteredReceipt = `${receipt.slice(0, -1)}${receipt.endsWith("A") ? "B" : "A"}`;
 assert.equal(receipts.verify(alteredReceipt, binding), false);
-assert.equal(receipts.verify("wctx3.not-a-receipt", binding), false);
+assert.equal(receipts.verify("wctx4.not-a-receipt", binding), false);
 assert.equal(receipts.verify("x".repeat(10_000), binding), false);
 assert.equal(receipts.verify(receipt, { ...binding, connectionPrincipalId: "x".repeat(1_025) }), false);
 assert.doesNotMatch(receipt, /owner|workspace|instruction|skill|secret/);
@@ -242,11 +242,10 @@ assert.deepEqual(serialized, {
       instructionRevision: input.instructions.revision,
       skillRevision: input.skills.revision,
     },
-    receipt,
   },
 });
 assert.equal(
-  receipts.verify(serialized.structuredContent.receipt, binding),
+  receipts.verify(serialized.structuredContent.continuation.receipt, binding),
   true,
 );
 assert.deepEqual(Object.keys(serialized.structuredContent), [
@@ -256,7 +255,6 @@ assert.deepEqual(Object.keys(serialized.structuredContent), [
   "instructions",
   "skills",
   "continuation",
-  "receipt",
 ]);
 
 const exceptional = serializeWorkspaceContext({
@@ -296,7 +294,10 @@ const metadata = serializeWorkspaceContext({
 }, receipts);
 assert.equal(metadata.content[0].text, WORKSPACE_METADATA_TEXT);
 assert.deepEqual(metadata.structuredContent.context, { phase: "metadata" });
-assert.deepEqual(receipts.resolve(metadata.structuredContent.receipt)?.binding.phase, "metadata");
+assert.deepEqual(
+  receipts.resolve(metadata.structuredContent.continuation.receipt)?.binding.phase,
+  "metadata",
+);
 
 assert.throws(
   () => serializeWorkspaceContext({

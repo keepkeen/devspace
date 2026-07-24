@@ -96,7 +96,7 @@ DevSpace uses a single-user OAuth approval flow.
 | --- | --- |
 | `DEVSPACE_OAUTH_ACCESS_TOKEN_TTL_SECONDS` | `3600` |
 | `DEVSPACE_OAUTH_REFRESH_TOKEN_TTL_SECONDS` | `2592000` |
-| `DEVSPACE_OAUTH_SCOPES` | `devspace,workspace:read,workspace:write,process:execute,network:access,worktree:create,workspace:revoke` |
+| `DEVSPACE_OAUTH_SCOPES` | `workspace:read,workspace:write,process:execute,network:access,worktree:create,workspace:revoke` |
 | `DEVSPACE_OAUTH_ALLOWED_REDIRECT_HOSTS` | `chatgpt.com,localhost,127.0.0.1` |
 
 MCP clients discover metadata from:
@@ -155,7 +155,6 @@ The granular scopes mean:
 | `network:access` | Permit executed processes to inherit host network access. |
 | `worktree:create` | Create managed Git worktrees. |
 | `workspace:revoke` | Close or revoke Workspace authority. |
-| `devspace` | Legacy compatibility alias for all capabilities above. |
 
 The OAuth approval page displays the requested capabilities, and every tool
 checks its required combination immediately before execution.
@@ -234,9 +233,11 @@ Full workspace context computes a stable `sha256-v1:` `instructionRevision`
 from the ordered initial instruction paths and contents. It independently
 computes `skillRevision` over the full discovered Skill set. Revision hints are
 honored only when the caller explicitly selects `contextMode: "retained"` and
-still retains the corresponding bodies. `contextMode: "full"` ignores hints;
-the default metadata response from `open_workspace` contains no instruction or
-Skill bodies. It does contain a short-lived context receipt used by later tools.
+still retains the corresponding bodies. `contextMode: "full"` ignores hints.
+`open_workspace` returns metadata by default so a host can select a project
+without injecting repository context. That metadata receipt must be promoted
+through `get_workspace_context` with `contextMode: "full"` before ordinary
+Workspace tools can run.
 
 Full context represents instructions as structured `instructions.items[]`
 records and returns `instructions.acknowledged=true` after binding the root
@@ -272,32 +273,15 @@ two calls when necessary.
 global limit. `yieldTimeMs` only controls how long the tool waits before
 returning a process session.
 
-## Legacy Instruction Scan Settings
-
-| Variable | Default |
-| --- | ---: |
-| `DEVSPACE_INSTRUCTION_SCAN_MAX_DEPTH` | `32` |
-| `DEVSPACE_INSTRUCTION_SCAN_MAX_ENTRIES` | `100000` |
-| `DEVSPACE_INSTRUCTION_SCAN_DEADLINE_MS` | `5000` |
-
-These variables remain accepted for configuration compatibility but are no
-longer used for a recursive workspace scan. Full context loading returns
-`instructionScan.lazy=true`, loads only explicit user/root instructions, and
-discovers cached nested instructions when later tools enter their directory
-scope.
-
 ## Fixed Tool Surface
 
 DevSpace exposes one Codex-style surface: `open_workspace`, `list_workspaces`,
 `resume_workspace`, `get_workspace_context`, `load_workspace_instructions`,
 `get_operation_status`, `close_workspace`, `revoke_workspace`, `read`,
 `batch_read`, `batch_inspect`, optional `list_skills`/`load_skill`,
-`apply_patch`, `exec_command`, `write_stdin`, and `read_process_output`. The legacy
-`toolMode`, `DEVSPACE_TOOL_MODE`, and `DEVSPACE_MINIMAL_TOOLS` settings are
-ignored so an old configuration file can still start without changing the
-model-facing protocol.
+`apply_patch`, `exec_command`, `write_stdin`, and `read_process_output`.
 
-Every Workspace-scoped call requires the current v3 context `receipt`. The
+Every Workspace-scoped call requires the current v4 context `receipt`. The
 receipt binds the OAuth connection, Workspace ID, alias, project fingerprint,
 and generation, a private
 context session, context phase, both context revisions at issuance, and server
@@ -318,7 +302,8 @@ aliases.
 Commands run without a PTY by default. Prefer `program` plus `args` for direct
 execution; argument boundaries reach `spawn`/PTY unchanged. Use `shell: true`
 plus `command` for shell syntax and interactive shells; direct argv shells are
-rejected so `write_stdin` cannot bypass command checks. Legacy `cmd` remains accepted. Set `tty: true` on
+rejected so `write_stdin` cannot bypass command checks. Version 2.0 accepts no
+`cmd` or `cwd` aliases; use `workingDirectory`. Set `tty: true` on
 `exec_command` for interactive terminal programs. PTY support uses the optional
 `node-pty` dependency; `write_stdin` can send input, poll output, and resize PTY
 sessions.
@@ -520,8 +505,7 @@ Structured request and tool logs use four correlation levels:
 - `workspaceActivityRef` (`act_…`) identifies one principal + `workspaceId`
   activity, so conversations working on different projects can be separated.
 
-`clientIdHash` remains as a compatibility alias for existing log consumers and
-hashes the dynamic OAuth registration. None of these references is a verified
+None of these references is a verified
 ChatGPT account or conversation ID: ChatGPT's
 remote MCP contract does not provide those claims to DevSpace. A removed and
 re-added connector receives a new `oauthClientRef`; it also receives a new

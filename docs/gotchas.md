@@ -160,32 +160,24 @@ Enter that code once on the new approval page. Do not paste it into ChatGPT.
 Without this explicit link, reopening the project creates isolated connection
 state.
 
-## Unknown `workspaceId`
+## Missing Or Stale Workspace Receipt
 
-`workspaceId` values are scoped to the local connection principal that opened
-them. Normal MCP transport reconnects do not invalidate them. Refreshing or
-reauthorizing the same registered client with the same principal and authority
-does not advance its Workspace generation. Principal relink/revoke,
-Owner/root-authority changes, lifecycle transitions, and backend restart still
-invalidate affected receipts. A new dynamic registration remains unassigned;
-its first successful approval creates another principal that cannot see former
-aliases unless the owner explicitly uses a reconnect code. Before opening the
-project again, always call `list_workspaces`;
-creating a replacement worktree can strand the original task.
+Version 2.0 Workspace tools require the current v4 `continuation.receipt`. A
+raw `workspaceId`, a generation number, or an expired receipt is never used to
+guess authority. The call fails before the handler starts with
+`workspace_context_required` or `workspace_context_incomplete`.
 
-In a new conversation on the same OAuth connection, call `list_workspaces` and
-then `resume_workspace` with exactly one returned alias or `workspaceRef` and
-`contextMode="full"`; the host path does not need to be repeated. The opaque
-`projectFingerprint` helps distinguish same-named projects. After a backend restart or resident-cache eviction, directly
-using an old ID returns `workspace_resume_required`. Resume by alias before any
-file or process operation, or use the listed workspaceRef when alias retention
-is uncertain. The response returns the same durable ID with a
-newer `workspaceGeneration` only after instructions, Skills, profiles, and
-review checkpoints are hydrated.
+For the first use of a host path, call `open_workspace`. Its default metadata
+receipt must be promoted with `get_workspace_context(contextMode="full")`. In
+a later conversation or after a backend restart, call `list_workspaces`, select
+the intended alias or `workspaceRef`, and call `resume_workspace` with
+`contextMode="full"`. Refresh the DevSpace app tools in ChatGPT after upgrading
+from 1.x so the host sends receipts instead of the removed handle fields.
 
-Every later Workspace tool must include that generation. If policy, credential
-epoch, or lifecycle state changes, `stale_workspace_generation` instructs the
-client to list/resume rather than guessing whether an old handle is safe.
+Normal stateless MCP transport reconnects do not invalidate the persisted
+Workspace. Principal relink/revoke, Owner or root-authority changes, lifecycle
+transitions, receipt expiry, and backend restart do invalidate receipts.
+Reauthorizing the same registered client with unchanged authority does not.
 
 ## Managed Worktree Is Missing Or Platform Closed The Session
 
@@ -209,13 +201,14 @@ several exist, `workspace_selection_required` returns their aliases. Resume the
 correct alias or explicitly use `forceNew=true`; do not enter a loop of creating
 new branches to replace an inaccessible one.
 
-`open_workspace` is for the first use of a host path. Its default metadata mode
-returns a visible Workspace reference but only a metadata-phase receipt; call
-`get_workspace_context` with that receipt and `contextMode="full"` before work.
-Every later scoped result echoes `workspace` and `continuation`, but ordinary
-tools do not renew the receipt's fixed expiry. Revision hints
-are only a cache optimization in explicit `retained` mode and do not prove that
-a new model conversation remembers the bodies.
+`open_workspace` is for the first use of a host path. It returns metadata by
+default; call `get_workspace_context` with that receipt and
+`contextMode="full"` before work. Every later scoped result echoes
+`workspace` and `continuation`, but ordinary tools do not renew the receipt's
+fixed expiry. Revision hints are only a cache optimization in explicit
+`retained` mode and do not prove that a new model conversation remembers the
+bodies. Version 2.0 does not accept the removed `workspaceId`/generation
+request shape.
 
 ChatGPT OAuth clients use stateless MCP POST requests, so an old transport
 session header does not invalidate or consume the workspace. Non-ChatGPT MCP
@@ -241,7 +234,7 @@ Common combinations are:
 - command execution: add `process:execute network:access`
 - close/revoke: add `workspace:revoke`
 
-The legacy `devspace` scope grants all capabilities for backward compatibility.
+Version 2.0 accepts only the six explicit capability scopes.
 
 ## Workspace Path Rejected
 

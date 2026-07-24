@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { loadConfig } from "./config.js";
+import { DEFAULT_DEVSPACE_OAUTH_SCOPES } from "./oauth-scopes.js";
 import { SqliteOAuthClientsStore, SqliteOAuthStore } from "./oauth-store.js";
 import { createServer, isChatGptOAuthClient } from "./server.js";
 
@@ -87,10 +88,12 @@ try {
   );
   assert.ok(workspaceId);
   let receipt = String(
-    (opened.structuredContent as { receipt?: unknown } | undefined)?.receipt ?? "",
+    (opened.structuredContent as {
+      continuation?: { receipt?: unknown };
+    } | undefined)?.continuation?.receipt ?? "",
   );
   const firstContextReceipt = receipt;
-  assert.match(receipt, /^wctx3\./);
+  assert.match(receipt, /^wctx4\./);
   const instructionRevision = String(
     (opened.structuredContent as { instructions?: { revision?: unknown } } | undefined)?.instructions?.revision ?? "",
   );
@@ -157,7 +160,7 @@ try {
 
   const heldCommand = firstChatGpt.callTool({
     name: "exec_command",
-    arguments: { receipt, cmd: "sleep 0.25", yieldTimeMs: 1_000 },
+    arguments: { receipt, shell: true, command: "sleep 0.25", yieldTimeMs: 1_000 },
   });
   await delay(50);
   const overCapacity = await rawMcpPost(origin, chatGptToken, "concurrent-chatgpt-session");
@@ -183,20 +186,20 @@ try {
     arguments: { alias: "transport", contextMode: "full" },
   });
   const freshStructured = freshConversationOpen.structuredContent as {
-    receipt?: unknown;
+    continuation?: { receipt?: unknown };
     instructions?: { items?: unknown[] };
   } | undefined;
   assert.ok((freshStructured?.instructions?.items?.length ?? 0) > 0);
-  receipt = String(freshStructured?.receipt ?? "");
-  assert.match(receipt, /^wctx3\./);
+  receipt = String(freshStructured?.continuation?.receipt ?? "");
+  assert.match(receipt, /^wctx4\./);
   const resumedMutationWithoutReload = await secondChatGpt.callTool({
     name: "exec_command",
-    arguments: { receipt, cmd: "pwd" },
+    arguments: { receipt, shell: true, command: "pwd" },
   });
   assert.notEqual(resumedMutationWithoutReload.isError, true);
   const originalContextStillAcknowledged = await secondChatGpt.callTool({
     name: "exec_command",
-    arguments: { receipt: firstContextReceipt, cmd: "pwd" },
+    arguments: { receipt: firstContextReceipt, shell: true, command: "pwd" },
   });
   assert.notEqual(
     originalContextStillAcknowledged.isError,
@@ -208,7 +211,7 @@ try {
     arguments: {
       receipt,
       instructionToken: firstContextNestedToken,
-      cmd: "pwd",
+      shell: true, command: "pwd",
       workingDirectory: "nested",
     },
   });
@@ -223,7 +226,7 @@ try {
     arguments: {
       receipt: firstContextReceipt,
       instructionToken: firstContextNestedToken,
-      cmd: "pwd",
+      shell: true, command: "pwd",
       workingDirectory: "nested",
     },
   });
@@ -350,9 +353,9 @@ function seedClient(accessToken: string, redirectUri: string, name: string): voi
     const expiresAt = Math.floor(Date.now() / 1_000) + 3_600;
     store.saveTokenPair({
       accessTokenHash: hashToken(accessToken),
-      accessToken: { clientId: client.client_id, scopes: ["devspace"], expiresAt, resource },
+      accessToken: { clientId: client.client_id, scopes: [...DEFAULT_DEVSPACE_OAUTH_SCOPES], expiresAt, resource },
       refreshTokenHash: hashToken(`${accessToken}-refresh`),
-      refreshToken: { clientId: client.client_id, scopes: ["devspace"], expiresAt, resource },
+      refreshToken: { clientId: client.client_id, scopes: [...DEFAULT_DEVSPACE_OAUTH_SCOPES], expiresAt, resource },
     });
   } finally {
     store.close();

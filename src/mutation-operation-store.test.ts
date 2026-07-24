@@ -251,7 +251,7 @@ function testOversizedResultTombstone(stateDir: string): void {
       const row = database.sqlite
         .prepare(
           `select request_hash, state, result_json from mutation_operations
-           where owner_client_id = ? and workspace_id = ? and tool = ? and operation_id = ?`,
+           where connection_principal_id = ? and workspace_id = ? and tool = ? and operation_id = ?`,
         )
         .get(key.connectionPrincipalId, key.workspaceId, key.tool, key.operationId);
       assert.deepEqual(row, { request_hash: "hash", state: "settled", result_json: null });
@@ -391,12 +391,12 @@ function testDuplicateMigration(stateDir: string): void {
       Array<{ name: string; pk: number }>;
     assert.deepEqual(
       primaryKey.filter((column) => column.pk > 0).map((column) => column.name),
-      ["owner_client_id", "operation_id"],
+      ["connection_principal_id", "operation_id"],
     );
     migrated.sqlite.prepare("delete from workspace_sessions where id = 'workspace-old'").run();
     assert.equal(
       (migrated.sqlite.prepare(
-        "select count(*) as count from mutation_operations where owner_client_id = 'owner-a' and operation_id = 'shared'",
+        "select count(*) as count from mutation_operations where connection_principal_id = 'owner-a' and operation_id = 'shared'",
       ).get() as { count: number }).count,
       0,
     );
@@ -418,18 +418,30 @@ function operationKey(overrides: Partial<MutationOperationKey> = {}): MutationOp
 function prepareStateDir(stateDir: string): void {
   const database = openDatabase(stateDir);
   try {
+    const timestamp = new Date(0).toISOString();
+    const insertPrincipal = database.sqlite.prepare(`
+      insert into connection_principals (principal_id, created_at, last_used_at, revoked_at)
+      values (?, ?, ?, null)
+    `);
+    insertPrincipal.run("owner-a", timestamp, timestamp);
+    insertPrincipal.run("owner-b", timestamp, timestamp);
     const insert = database.sqlite.prepare(
       `insert into workspace_sessions (
-        id, owner_client_id, root, status, mode, managed, created_at, last_used_at
-      ) values (?, ?, ?, 'active', 'existing', 'false', ?, ?)`,
+        id, connection_principal_id, alias, root, canonical_root, status, mode,
+        dirty_source, managed, write_access, state_generation, created_at, last_used_at
+      ) values (?, ?, ?, ?, ?, 'active', 'checkout', 'false', 'false', 'read_write', 1, ?, ?)`,
     );
-    const timestamp = new Date(0).toISOString();
-    insert.run("workspace-a", "owner-a", join(stateDir, "workspace-a"), timestamp, timestamp);
-    insert.run("workspace-b", "owner-a", join(stateDir, "workspace-b"), timestamp, timestamp);
+    const workspaceA = join(stateDir, "workspace-a");
+    const workspaceB = join(stateDir, "workspace-b");
+    const workspaceOwnerB = join(stateDir, "workspace-owner-b");
+    insert.run("workspace-a", "owner-a", "workspace-a", workspaceA, workspaceA, timestamp, timestamp);
+    insert.run("workspace-b", "owner-a", "workspace-b", workspaceB, workspaceB, timestamp, timestamp);
     insert.run(
       "workspace-owner-b",
       "owner-b",
-      join(stateDir, "workspace-owner-b"),
+      "workspace-owner-b",
+      workspaceOwnerB,
+      workspaceOwnerB,
       timestamp,
       timestamp,
     );

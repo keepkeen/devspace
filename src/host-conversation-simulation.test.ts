@@ -9,6 +9,7 @@ import { promisify } from "node:util";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { loadConfig } from "./config.js";
+import { DEFAULT_DEVSPACE_OAUTH_SCOPES } from "./oauth-scopes.js";
 import { createServer } from "./server.js";
 
 // "Account" in this simulation means an independent dynamic OAuth
@@ -602,7 +603,6 @@ interface StageMetric {
   workspaceBytes: number;
   contextBytes: number;
   removableContextBytes: number;
-  compatibilityReceiptBytes: number;
 }
 
 async function initializeProject(
@@ -730,7 +730,7 @@ async function authorizeExisting(
     response_type: "code",
     client_id: credentials.clientId,
     redirect_uri: credentials.redirectUri,
-    scope: "devspace",
+    scope: DEFAULT_DEVSPACE_OAUTH_SCOPES.join(" "),
     code_challenge: challenge,
     code_challenge_method: "S256",
     resource,
@@ -845,8 +845,6 @@ async function callAndRecord(
   const structured = structuredRecord(result);
   const withoutContext = { ...structured };
   delete withoutContext.context;
-  const withoutCompatibilityReceipt = { ...structured };
-  delete withoutCompatibilityReceipt.receipt;
   stageMetrics.push({
     conversation,
     stage,
@@ -859,9 +857,6 @@ async function callAndRecord(
     contextBytes: byteLength(structured.context ?? {}),
     removableContextBytes: structured.continuation && structured.context
       ? byteLength(structured) - byteLength(withoutContext)
-      : 0,
-    compatibilityReceiptBytes: structured.receipt
-      ? byteLength(structured) - byteLength(withoutCompatibilityReceipt)
       : 0,
   });
   if (!stage.startsWith("reject-")) {
@@ -939,9 +934,9 @@ function currentReceipt(result: Awaited<ReturnType<Client["callTool"]>>): string
       !Array.isArray(structured.continuation)
     ? structured.continuation as Record<string, unknown>
     : undefined;
-  const value = continuation?.receipt ?? structured.receipt;
+  const value = continuation?.receipt;
   assert.equal(typeof value, "string");
-  assert.match(String(value), /^wctx3\./u);
+  assert.match(String(value), /^wctx4\./u);
   return String(value);
 }
 
@@ -979,10 +974,6 @@ function envelopeReport(): Record<string, number> {
     averageContextBytes: average(continuationMetrics.map((metric) => metric.contextBytes)),
     removableContextBytes: stageMetrics.reduce(
       (total, metric) => total + metric.removableContextBytes,
-      0,
-    ),
-    compatibilityReceiptBytes: stageMetrics.reduce(
-      (total, metric) => total + metric.compatibilityReceiptBytes,
       0,
     ),
   };

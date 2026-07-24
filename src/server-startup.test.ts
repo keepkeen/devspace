@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "./config.js";
+import { openDatabase } from "./db/client.js";
 import { MutationOperationStore } from "./mutation-operation-store.js";
 import { createServer } from "./server.js";
 import { SqliteWorkspaceStore } from "./workspace-store.js";
@@ -29,6 +30,16 @@ try {
   });
   active = createServer(config);
 
+  const identityDatabase = openDatabase(stateDir);
+  try {
+    const now = new Date(0).toISOString();
+    identityDatabase.sqlite.prepare(`
+      insert into connection_principals (principal_id, created_at, last_used_at, revoked_at)
+      values (?, ?, ?, null)
+    `).run("owner-a", now, now);
+  } finally {
+    identityDatabase.close();
+  }
   workspaceStore = new SqliteWorkspaceStore(stateDir);
   workspaceStore.createSession({
     id: "workspace-a",

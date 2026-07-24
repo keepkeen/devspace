@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { openDatabase } from "./db/client.js";
 import { createServer } from "./server.js";
 import { writeDevspaceConfig } from "./user-config.js";
 import { SqliteWorkspaceStore } from "./workspace-store.js";
@@ -32,6 +33,16 @@ writeDevspaceConfig({
   worktreeRoot: join(testRoot, "worktrees"),
   publicBaseUrl: "http://127.0.0.1:7676",
 }, process.env);
+const identityDatabase = openDatabase(stateDir);
+try {
+  const now = new Date(0).toISOString();
+  identityDatabase.sqlite.prepare(`
+    insert into connection_principals (principal_id, created_at, last_used_at, revoked_at)
+    values (?, ?, ?, null)
+  `).run("startup-client", now, now);
+} finally {
+  identityDatabase.close();
+}
 const staleStore = new SqliteWorkspaceStore(stateDir);
 staleStore.createSession({
   id: "ws_stale_startup_root",

@@ -26,7 +26,7 @@ const oauthConfig = {
   ownerToken: "test-owner-token-that-is-long-enough",
   accessTokenTtlSeconds: 3600,
   refreshTokenTtlSeconds: 2592000,
-  scopes: ["devspace"],
+  scopes: [...DEFAULT_DEVSPACE_OAUTH_SCOPES],
   allowedRedirectHosts: ["chatgpt.com"],
 };
 const mcpUrl = new URL("https://agent.example.com/mcp");
@@ -76,7 +76,7 @@ async function testAuditFailuresAreBestEffort(stateDir: string): Promise<void> {
     await provider.authorize(client, {
       redirectUri,
       codeChallenge: "challenge",
-      scopes: ["devspace"],
+      scopes: [...DEFAULT_DEVSPACE_OAUTH_SCOPES],
       resource: mcpUrl,
     }, approval.response);
     assert.equal((approval.response as unknown as { statusCode: number }).statusCode, 302);
@@ -91,7 +91,7 @@ async function testAuditFailuresAreBestEffort(stateDir: string): Promise<void> {
     await provider.authorize(client, {
       redirectUri,
       codeChallenge: "same-boundary-challenge",
-      scopes: ["devspace"],
+      scopes: [...DEFAULT_DEVSPACE_OAUTH_SCOPES],
       resource: mcpUrl,
     }, repeatedApproval.response);
     assert.equal((repeatedApproval.response as unknown as { statusCode: number }).statusCode, 302);
@@ -107,7 +107,7 @@ async function testAuditFailuresAreBestEffort(stateDir: string): Promise<void> {
       params: {
         redirectUri,
         codeChallenge: "challenge",
-        scopes: ["devspace"],
+        scopes: [...DEFAULT_DEVSPACE_OAUTH_SCOPES],
         resource: mcpUrl,
       },
       expiresAtMs: Date.now() + 60_000,
@@ -117,7 +117,7 @@ async function testAuditFailuresAreBestEffort(stateDir: string): Promise<void> {
     const refreshed = await provider.exchangeRefreshToken(
       client,
       issued.refresh_token,
-      ["devspace"],
+      [...DEFAULT_DEVSPACE_OAUTH_SCOPES],
       mcpUrl,
     );
     assert.ok(refreshed.access_token);
@@ -177,7 +177,7 @@ async function testAuthorizationThrottling(stateDir: string): Promise<void> {
   const params = {
     redirectUri,
     codeChallenge: "challenge",
-    scopes: ["devspace"],
+    scopes: [...DEFAULT_DEVSPACE_OAUTH_SCOPES],
     resource: mcpUrl,
   };
   try {
@@ -240,28 +240,14 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
     const migrations = database.sqlite
       .prepare("select version, name from devspace_schema_migrations order by version")
       .all();
-    assert.deepEqual(migrations, [
-      { version: 1, name: "workspace-state" },
-      { version: 2, name: "oauth-state" },
-      { version: 3, name: "local-agent-sessions" },
-      { version: 4, name: "workspace-oauth-ownership" },
-      { version: 5, name: "workspace-checkout-reuse" },
-      { version: 6, name: "oauth-owner-credential" },
-      { version: 7, name: "workspace-resume-idempotency" },
-      { version: 8, name: "workspace-generation-operation-identity" },
-      { version: 9, name: "workspace-worktree-source-state" },
-      { version: 10, name: "oauth-revocation-cleanup" },
-      { version: 11, name: "connection-principals" },
-      { version: 12, name: "oauth-authorization-limits" },
-      { version: 13, name: "connection-principal-approval-lifecycle" },
-    ]);
+    assert.deepEqual(migrations, [{ version: 14, name: "canonical-state-v14" }]);
   } finally {
     database.close();
   }
 
   const simulatedOldLifecycle = openDatabase(stateDir);
   simulatedOldLifecycle.sqlite.prepare(
-    "delete from devspace_schema_migrations where version = 13",
+    "delete from devspace_schema_migrations where version = 14",
   ).run();
   simulatedOldLifecycle.sqlite.exec(`
     drop trigger if exists oauth_clients_principal_insert_check;
@@ -306,7 +292,7 @@ function testPersistenceAndTokenHashing(stateDir: string): void {
   assert.throws(
     () => firstStore.saveAccessToken("unapproved-token", {
       clientId: client.client_id,
-      scopes: ["devspace"],
+      scopes: [...DEFAULT_DEVSPACE_OAUTH_SCOPES],
       expiresAt: Math.floor(Date.now() / 1000) + 3600,
     }),
     /before the registration has an active connection principal/,
@@ -319,14 +305,14 @@ function testPersistenceAndTokenHashing(stateDir: string): void {
     accessTokenHash: hashToken(accessToken),
     accessToken: {
       clientId: client.client_id,
-      scopes: ["devspace"],
+      scopes: [...DEFAULT_DEVSPACE_OAUTH_SCOPES],
       expiresAt: Math.floor(Date.now() / 1000) + 3600,
       resource: mcpUrl.href,
     },
     refreshTokenHash: hashToken(refreshToken),
     refreshToken: {
       clientId: client.client_id,
-      scopes: ["devspace"],
+      scopes: [...DEFAULT_DEVSPACE_OAUTH_SCOPES],
       expiresAt: Math.floor(Date.now() / 1000) + 2592000,
       resource: mcpUrl.href,
     },
@@ -435,12 +421,12 @@ function testConnectionPrincipalReconnect(stateDir: string): void {
     const assignedPrincipal = oauth.ensurePrincipalForClient(assigned.client_id);
     oauth.saveAccessToken("pre-relink-access", {
       clientId: assigned.client_id,
-      scopes: ["devspace"],
+      scopes: [...DEFAULT_DEVSPACE_OAUTH_SCOPES],
       expiresAt: Math.floor(Date.now() / 1_000) + 3_600,
     });
     oauth.saveRefreshToken("pre-relink-refresh", {
       clientId: assigned.client_id,
-      scopes: ["devspace"],
+      scopes: [...DEFAULT_DEVSPACE_OAUTH_SCOPES],
       expiresAt: Math.floor(Date.now() / 1_000) + 3_600,
     });
     const assignedCode = oauth.issueReconnectCode(firstPrincipal, 60_000);
@@ -537,9 +523,9 @@ function testExpiredTokenCleanup(stateDir: string): void {
   const expiredAt = Math.floor(Date.now() / 1000) - 1;
   store.saveTokenPair({
     accessTokenHash: "expired-access-hash",
-    accessToken: { clientId: client.client_id, scopes: ["devspace"], expiresAt: expiredAt },
+    accessToken: { clientId: client.client_id, scopes: [...DEFAULT_DEVSPACE_OAUTH_SCOPES], expiresAt: expiredAt },
     refreshTokenHash: "expired-refresh-hash",
-    refreshToken: { clientId: client.client_id, scopes: ["devspace"], expiresAt: expiredAt },
+    refreshToken: { clientId: client.client_id, scopes: [...DEFAULT_DEVSPACE_OAUTH_SCOPES], expiresAt: expiredAt },
   });
   assert.deepEqual(store.diagnosticSnapshot(expiredAt + 1), {
     clients: 1,
@@ -722,7 +708,7 @@ function testDurableWorkspaceRevocationCleanup(stateDir: string): void {
       claimToken: finalClaim!.claimToken!,
       retainedDirtyWorktreeReason: "worktree has uncommitted changes",
       now: 1_105,
-    }), true);
+    }), false);
 
     const checkoutJob = restarted.listRevocationCleanupJobs().find(
       ({ workspaceId }) => workspaceId === "revoked-checkout",
@@ -786,13 +772,34 @@ function testDurableWorkspaceRevocationCleanup(stateDir: string): void {
 }
 
 function testOrphanedWorkspaceReconciliation(stateDir: string): void {
+  const principalId = "revoked-orphan-principal";
+  const database = openDatabase(stateDir);
+  try {
+    const now = new Date(0).toISOString();
+    database.sqlite.prepare(`
+      insert into connection_principals (principal_id, created_at, last_used_at, revoked_at)
+      values (?, ?, ?, null)
+    `).run(principalId, now, now);
+  } finally {
+    database.close();
+  }
   const workspaces = new SqliteWorkspaceStore(stateDir);
   workspaces.createSession({
     id: "orphaned-workspace",
-    connectionPrincipalId: "devspace-missing-oauth-client",
+    connectionPrincipalId: principalId,
     root: "/workspace/orphaned",
   });
   workspaces.close();
+  const revoke = openDatabase(stateDir);
+  try {
+    revoke.sqlite.prepare(`
+      update connection_principals
+      set revoked_at = ?, last_used_at = ?
+      where principal_id = ?
+    `).run(new Date(1).toISOString(), new Date(1).toISOString(), principalId);
+  } finally {
+    revoke.close();
+  }
 
   const oauth = new SqliteOAuthStore(stateDir);
   try {
@@ -807,7 +814,7 @@ function testOrphanedWorkspaceReconciliation(stateDir: string): void {
       restored.listRevocationCleanupJobs().map(({ workspaceId, status }) => ({ workspaceId, status })),
       [{ workspaceId: "orphaned-workspace", status: "pending" }],
     );
-    assert.equal(restored.getSession("orphaned-workspace", "devspace-missing-oauth-client"), undefined);
+    assert.equal(restored.getSession("orphaned-workspace", principalId), undefined);
   } finally {
     restored.close();
   }
@@ -823,7 +830,7 @@ async function testAuthorizationResponseHardening(stateDir: string): Promise<voi
   const params = {
     redirectUri,
     codeChallenge: "challenge",
-    scopes: ["devspace"],
+    scopes: [...DEFAULT_DEVSPACE_OAUTH_SCOPES],
     resource: mcpUrl,
   };
 
@@ -867,7 +874,7 @@ function testTransactionalTokenRotation(stateDir: string): void {
     const expiresAt = Math.floor(Date.now() / 1000) + 3600;
     store.saveRefreshToken("old-refresh-hash", {
       clientId: client.client_id,
-      scopes: ["devspace"],
+      scopes: [...DEFAULT_DEVSPACE_OAUTH_SCOPES],
       expiresAt,
     });
 
@@ -875,9 +882,9 @@ function testTransactionalTokenRotation(stateDir: string): void {
       store.saveTokenPair(
         {
           accessTokenHash: "new-access-hash",
-          accessToken: { clientId: client.client_id, scopes: ["devspace"], expiresAt },
+          accessToken: { clientId: client.client_id, scopes: [...DEFAULT_DEVSPACE_OAUTH_SCOPES], expiresAt },
           refreshTokenHash: "new-refresh-hash",
-          refreshToken: { clientId: client.client_id, scopes: ["devspace"], expiresAt },
+          refreshToken: { clientId: client.client_id, scopes: [...DEFAULT_DEVSPACE_OAUTH_SCOPES], expiresAt },
         },
         "old-refresh-hash",
       ),
@@ -891,9 +898,9 @@ function testTransactionalTokenRotation(stateDir: string): void {
       store.saveTokenPair(
         {
           accessTokenHash: "losing-access-hash",
-          accessToken: { clientId: client.client_id, scopes: ["devspace"], expiresAt },
+          accessToken: { clientId: client.client_id, scopes: [...DEFAULT_DEVSPACE_OAUTH_SCOPES], expiresAt },
           refreshTokenHash: "losing-refresh-hash",
-          refreshToken: { clientId: client.client_id, scopes: ["devspace"], expiresAt },
+          refreshToken: { clientId: client.client_id, scopes: [...DEFAULT_DEVSPACE_OAUTH_SCOPES], expiresAt },
         },
         "old-refresh-hash",
       ),
@@ -920,7 +927,7 @@ async function testProviderRestartRotationAndRevocation(stateDir: string): Promi
     params: {
       redirectUri,
       codeChallenge: "challenge",
-      scopes: ["devspace"],
+      scopes: [...DEFAULT_DEVSPACE_OAUTH_SCOPES],
       resource: mcpUrl,
     },
     expiresAtMs: Date.now() + 60_000,
@@ -943,14 +950,14 @@ async function testProviderRestartRotationAndRevocation(stateDir: string): Promi
     const refreshed = await secondProvider.exchangeRefreshToken(
       client,
       issued.refresh_token,
-      ["devspace"],
+      [...DEFAULT_DEVSPACE_OAUTH_SCOPES],
       mcpUrl,
     );
     assert.ok(refreshed.refresh_token);
     assert.notEqual(refreshed.access_token, issued.access_token);
 
     await assert.rejects(
-      secondProvider.exchangeRefreshToken(client, issued.refresh_token, ["devspace"], mcpUrl),
+      secondProvider.exchangeRefreshToken(client, issued.refresh_token, [...DEFAULT_DEVSPACE_OAUTH_SCOPES], mcpUrl),
       InvalidGrantError,
     );
 
@@ -959,7 +966,7 @@ async function testProviderRestartRotationAndRevocation(stateDir: string): Promi
 
     await secondProvider.revokeToken(client, { token: refreshed.refresh_token });
     await assert.rejects(
-      secondProvider.exchangeRefreshToken(client, refreshed.refresh_token, ["devspace"], mcpUrl),
+      secondProvider.exchangeRefreshToken(client, refreshed.refresh_token, [...DEFAULT_DEVSPACE_OAUTH_SCOPES], mcpUrl),
       InvalidGrantError,
     );
   } finally {
@@ -974,7 +981,7 @@ async function testOwnerCredentialChangeAndRevokeAll(stateDir: string): Promise<
   const code = "owner-change-code";
   firstProvider["codes"].set(code, {
     clientId: client.client_id,
-    params: { redirectUri, codeChallenge: "challenge", scopes: ["devspace"], resource: mcpUrl },
+    params: { redirectUri, codeChallenge: "challenge", scopes: [...DEFAULT_DEVSPACE_OAUTH_SCOPES], resource: mcpUrl },
     expiresAtMs: Date.now() + 60_000,
   });
   const tokens = await firstProvider.exchangeAuthorizationCode(client, code, undefined, redirectUri, mcpUrl);
@@ -1001,7 +1008,7 @@ async function testOwnerCredentialChangeAndRevokeAll(stateDir: string): Promise<
   const replacementCode = "replacement-code";
   firstProvider["codes"].set(replacementCode, {
     clientId: replacement.client_id,
-    params: { redirectUri, codeChallenge: "challenge", scopes: ["devspace"], resource: mcpUrl },
+    params: { redirectUri, codeChallenge: "challenge", scopes: [...DEFAULT_DEVSPACE_OAUTH_SCOPES], resource: mcpUrl },
     expiresAtMs: Date.now() + 60_000,
   });
   const replacementTokens = await firstProvider.exchangeAuthorizationCode(

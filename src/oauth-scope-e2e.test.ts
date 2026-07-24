@@ -28,7 +28,6 @@ const tokens = {
   sharedNoNetwork: "oauth-scope-shared-no-network-token",
   sharedNoRead: "oauth-scope-shared-no-read-token",
   full: "oauth-scope-full-token",
-  legacy: "oauth-scope-legacy-token",
 };
 const execFileAsync = promisify(execFile);
 
@@ -67,10 +66,9 @@ seedToken(tokens.processNoNetwork, [
   "process:execute",
 ]);
 seedToken(tokens.full, [...DEVSPACE_CAPABILITY_SCOPES]);
-seedToken(tokens.legacy, ["devspace"]);
 seedSharedPrincipalTokens();
 
-assert.equal(oauthScopeAllows(["devspace"], "workspace:revoke"), true);
+assert.equal(oauthScopeAllows(["devspace"], "workspace:revoke"), false);
 assert.equal(oauthScopeAllows(["workspace:read"], "workspace:write"), false);
 assert.deepEqual(requiredOAuthScopesForTool("exec_command"), [
   "workspace:read",
@@ -305,7 +303,7 @@ try {
     },
   }));
 
-  for (const [name, token] of [["scope-full", tokens.full], ["scope-legacy", tokens.legacy]] as const) {
+  for (const [name, token] of [["scope-full", tokens.full]] as const) {
     const client = await connect(name, token);
     const opened = await client.callTool({
       name: "open_workspace",
@@ -427,7 +425,9 @@ async function connect(name: string, accessToken: string): Promise<Client> {
 }
 
 function receipt(result: Awaited<ReturnType<Client["callTool"]>>): string {
-  const value = (result.structuredContent as { receipt?: unknown } | undefined)?.receipt;
+  const value = (result.structuredContent as {
+    continuation?: { receipt?: unknown };
+  } | undefined)?.continuation?.receipt;
   assert.equal(typeof value, "string");
   return String(value);
 }

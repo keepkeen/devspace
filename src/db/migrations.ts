@@ -1,633 +1,1035 @@
-import type Database from "better-sqlite3";
+import { randomUUID } from "node:crypto";
+import {
+  chmodSync,
+  closeSync,
+  existsSync,
+  fsyncSync,
+  openSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  statSync,
+} from "node:fs";
+import { basename, dirname, resolve } from "node:path";
+import Database from "better-sqlite3";
+import {
+  createCanonicalSchema,
+  CURRENT_DATABASE_SCHEMA_VERSION,
+  validateCanonicalDatabase,
+} from "./canonical-schema.js";
+import { DEVSPACE_CAPABILITY_SCOPES } from "../oauth-scopes.js";
 
-interface Migration {
-  version: number;
-  name: string;
-  up(sqlite: Database.Database): void;
+const LEGACY_UNOWNED_PRINCIPAL = "__legacy_unowned__";
+const LEGACY_FULL_SCOPE = "devspace";
+
+type Row = Record<string, unknown>;
+
+interface NormalizedPrincipal {
+  principalId: string;
+  createdAt: string;
+  lastUsedAt: string;
+  revokedAt: string | null;
 }
 
-const migrations: Migration[] = [
-  {
-    version: 1,
-    name: "workspace-state",
-    up: migrateWorkspaceState,
-  },
-  {
-    version: 2,
-    name: "oauth-state",
-    up: migrateOAuthState,
-  },
-  {
-    version: 3,
-    name: "local-agent-sessions",
-    up: migrateLocalAgentSessions,
-  },
-  {
-    version: 4,
-    name: "workspace-oauth-ownership",
-    up: migrateWorkspaceOwnership,
-  },
-  {
-    version: 5,
-    name: "workspace-checkout-reuse",
-    up: migrateWorkspaceCheckoutReuse,
-  },
-  {
-    version: 6,
-    name: "oauth-owner-credential",
-    up: migrateOAuthOwnerCredential,
-  },
-  {
-    version: 7,
-    name: "workspace-resume-idempotency",
-    up: migrateWorkspaceResumeIdempotency,
-  },
-  {
-    version: 8,
-    name: "workspace-generation-operation-identity",
-    up: migrateWorkspaceGenerationOperationIdentity,
-  },
-  {
-    version: 9,
-    name: "workspace-worktree-source-state",
-    up: migrateWorkspaceWorktreeSourceState,
-  },
-  {
-    version: 10,
-    name: "oauth-revocation-cleanup",
-    up: migrateOAuthRevocationCleanup,
-  },
-  {
-    version: 11,
-    name: "connection-principals",
-    up: migrateConnectionPrincipals,
-  },
-  {
-    version: 12,
-    name: "oauth-authorization-limits",
-    up: migrateOAuthAuthorizationLimits,
-  },
-  {
-    version: 13,
-    name: "connection-principal-approval-lifecycle",
-    up: migrateConnectionPrincipalApprovalLifecycle,
-  },
-];
+interface NormalizedOAuthClient {
+  clientId: string;
+  principalId: string | null;
+  clientJson: string;
+  issuedAt: number;
+}
 
-export function migrateDatabase(sqlite: Database.Database): void {
-  const migrate = sqlite.transaction(() => {
-    sqlite.exec(`
-      create table if not exists devspace_schema_migrations (
-        version integer primary key,
-        name text not null,
-        applied_at text not null
+interface NormalizedWorkspace {
+  id: string;
+  connectionPrincipalId: string;
+  alias: string;
+  root: string;
+  canonicalRoot: string | null;
+  status: "active" | "closed" | "revoked";
+  mode: "checkout" | "worktree";
+  sourceRoot: string | null;
+  baseRef: string | null;
+  baseSha: string | null;
+  dirtySource: "true" | "false";
+  managed: "true" | "false";
+  writeAccess: "read_only" | "read_write";
+  stateGeneration: number;
+  createdAt: string;
+  lastUsedAt: string;
+}
+
+interface NormalizedOperation {
+  connectionPrincipalId: string;
+  workspaceId: string;
+  tool: string;
+  operationId: string;
+  workspaceGeneration: number;
+  requestHash: string;
+  state: "pending" | "settled" | "outcome_unknown";
+  resultJson: string | null;
+  createdAt: string;
+  updatedAt: string;
+  expiresAt: string;
+}
+
+export interface DatabasePreparationResult {
+  migrated: boolean;
+  sourceVersion: number;
+  backupPath?: string;
+}
+
+export function prepareDatabaseFile(path: string): DatabasePreparationResult {
+  if (!existsSync(path)) return { migrated: false, sourceVersion: 0 };
+
+  const source = new Database(path);
+  let sourceVersion = 0;
+  try {
+    source.pragma("busy_timeout = 5000");
+    source.pragma("foreign_keys = ON");
+    source.pragma("wal_checkpoint(TRUNCATE)");
+    sourceVersion = databaseSchemaVersion(source);
+    if (sourceVersion > CURRENT_DATABASE_SCHEMA_VERSION) {
+      throw new Error(
+        `Database schema version ${sourceVersion} is newer than this DevSpace version supports (${CURRENT_DATABASE_SCHEMA_VERSION}).`,
       );
-    `);
-
-    const applied = new Set(
-      (
-        sqlite.prepare("select version from devspace_schema_migrations").all() as Array<{
-          version: number;
-        }>
-      ).map((row) => row.version),
-    );
-    const recordMigration = sqlite.prepare(
-      "insert into devspace_schema_migrations (version, name, applied_at) values (?, ?, ?)",
-    );
-
-    for (const migration of migrations) {
-      if (applied.has(migration.version)) continue;
-      migration.up(sqlite);
-      recordMigration.run(migration.version, migration.name, new Date().toISOString());
     }
-  });
-
-  migrate.immediate();
-}
-
-function migrateWorkspaceState(sqlite: Database.Database): void {
-  sqlite.exec(`
-    create table if not exists workspace_sessions (
-      id text primary key,
-      root text not null,
-      status text not null default 'active',
-      mode text not null default 'checkout',
-      source_root text,
-      base_ref text,
-      base_sha text,
-      dirty_source text not null default 'false',
-      managed text not null default 'false',
-      created_at text not null,
-      last_used_at text not null
-    );
-
-    create index if not exists workspace_sessions_root_idx
-      on workspace_sessions(root, last_used_at desc);
-
-    create index if not exists workspace_sessions_status_idx
-      on workspace_sessions(status, last_used_at desc);
-
-    create table if not exists loaded_agent_files (
-      workspace_session_id text not null,
-      path text not null,
-      content_hash text not null,
-      content text not null,
-      loaded_at text not null,
-      last_seen_at text not null,
-      primary key (workspace_session_id, path),
-      foreign key (workspace_session_id)
-        references workspace_sessions(id)
-        on delete cascade
-    );
-
-    create index if not exists loaded_agent_files_path_idx
-      on loaded_agent_files(path);
-  `);
-
-  addColumnIfMissing(sqlite, "workspace_sessions", "mode", "text not null default 'checkout'");
-  addColumnIfMissing(sqlite, "workspace_sessions", "source_root", "text");
-  addColumnIfMissing(sqlite, "workspace_sessions", "base_ref", "text");
-  addColumnIfMissing(sqlite, "workspace_sessions", "base_sha", "text");
-  addColumnIfMissing(sqlite, "workspace_sessions", "dirty_source", "text not null default 'false'");
-  addColumnIfMissing(sqlite, "workspace_sessions", "managed", "text not null default 'false'");
-}
-
-function migrateOAuthState(sqlite: Database.Database): void {
-  sqlite.exec(`
-    create table if not exists oauth_clients (
-      client_id text primary key,
-      client_json text not null,
-      issued_at integer not null
-    );
-
-    create index if not exists oauth_clients_issued_at_idx
-      on oauth_clients(issued_at desc);
-
-    create table if not exists oauth_access_tokens (
-      token_hash text primary key,
-      client_id text not null,
-      scopes_json text not null,
-      expires_at integer not null,
-      resource text,
-      foreign key (client_id) references oauth_clients(client_id) on delete cascade
-    );
-
-    create index if not exists oauth_access_tokens_client_id_idx
-      on oauth_access_tokens(client_id);
-
-    create index if not exists oauth_access_tokens_expires_at_idx
-      on oauth_access_tokens(expires_at);
-
-    create table if not exists oauth_refresh_tokens (
-      token_hash text primary key,
-      client_id text not null,
-      scopes_json text not null,
-      expires_at integer not null,
-      resource text,
-      foreign key (client_id) references oauth_clients(client_id) on delete cascade
-    );
-
-    create index if not exists oauth_refresh_tokens_client_id_idx
-      on oauth_refresh_tokens(client_id);
-
-    create index if not exists oauth_refresh_tokens_expires_at_idx
-      on oauth_refresh_tokens(expires_at);
-  `);
-}
-
-function migrateLocalAgentSessions(sqlite: Database.Database): void {
-  sqlite.exec(`
-    create table if not exists local_agent_sessions (
-      id text primary key,
-      workspace_id text,
-      workspace_root text not null,
-      profile_name text not null,
-      provider text not null,
-      model text,
-      thinking text,
-      provider_session_id text,
-      status text not null,
-      latest_response text,
-      error text,
-      created_at text not null,
-      updated_at text not null
-    );
-
-    create index if not exists local_agent_sessions_workspace_id_idx
-      on local_agent_sessions(workspace_id, updated_at desc);
-
-    create index if not exists local_agent_sessions_workspace_root_idx
-      on local_agent_sessions(workspace_root, updated_at desc);
-
-    create index if not exists local_agent_sessions_provider_session_id_idx
-      on local_agent_sessions(provider_session_id);
-  `);
-
-  addColumnIfMissing(sqlite, "local_agent_sessions", "thinking", "text");
-}
-
-function migrateWorkspaceOwnership(sqlite: Database.Database): void {
-  addColumnIfMissing(
-    sqlite,
-    "workspace_sessions",
-    "owner_client_id",
-    "text not null default '__legacy_unowned__'",
-  );
-  sqlite.exec(`
-    create index if not exists workspace_sessions_owner_status_idx
-      on workspace_sessions(owner_client_id, status, last_used_at desc);
-  `);
-}
-
-function migrateWorkspaceCheckoutReuse(sqlite: Database.Database): void {
-  // Keep existing rows nullable so duplicate legacy checkout sessions remain
-  // intact. New sessions populate canonical_root and participate in the index.
-  addColumnIfMissing(sqlite, "workspace_sessions", "canonical_root", "text");
-  sqlite.exec(`
-    create unique index if not exists workspace_sessions_active_checkout_owner_canonical_root_uq
-      on workspace_sessions(owner_client_id, canonical_root)
-      where canonical_root is not null and mode = 'checkout' and status = 'active';
-  `);
-}
-
-function migrateOAuthOwnerCredential(sqlite: Database.Database): void {
-  sqlite.exec(`
-    create table if not exists oauth_owner_credential (
-      id integer primary key check (id = 1),
-      salt text not null,
-      verifier text not null,
-      updated_at text not null
-    );
-  `);
-}
-
-function migrateWorkspaceResumeIdempotency(sqlite: Database.Database): void {
-  // Existing sessions receive the compatibility access level and initial
-  // generation, while aliases remain nullable until first resumed/listed.
-  addColumnIfMissing(sqlite, "workspace_sessions", "alias", "text");
-  addColumnIfMissing(
-    sqlite,
-    "workspace_sessions",
-    "write_access",
-    "text not null default 'read_write' check (write_access in ('read_only', 'read_write'))",
-  );
-  addColumnIfMissing(
-    sqlite,
-    "workspace_sessions",
-    "state_generation",
-    "integer not null default 1 check (state_generation >= 1)",
-  );
-
-  sqlite.exec(`
-    create unique index if not exists workspace_sessions_owner_alias_uq
-      on workspace_sessions(owner_client_id, alias)
-      where alias is not null;
-
-    create trigger if not exists workspace_sessions_alias_immutable
-      before update of alias on workspace_sessions
-      when old.alias is not null and new.alias is not old.alias
-      begin
-        select raise(abort, 'workspace session alias is immutable');
-      end;
-
-    create table if not exists mutation_operations (
-      owner_client_id text not null,
-      workspace_id text not null,
-      tool text not null,
-      operation_id text not null,
-      request_hash text not null,
-      state text not null check (state in ('pending', 'settled', 'outcome_unknown')),
-      result_json text,
-      created_at text not null,
-      updated_at text not null,
-      expires_at text not null,
-      primary key (owner_client_id, workspace_id, tool, operation_id),
-      foreign key (workspace_id) references workspace_sessions(id) on delete cascade
-    );
-
-    create index if not exists mutation_operations_expires_at_idx
-      on mutation_operations(expires_at);
-  `);
-}
-
-function migrateWorkspaceGenerationOperationIdentity(sqlite: Database.Database): void {
-  const invalidStatus = sqlite.prepare(`
-    select status
-    from workspace_sessions
-    where status not in ('active', 'closed', 'revoked')
-    order by status
-    limit 1
-  `).get() as { status: string } | undefined;
-  if (invalidStatus) {
-    throw new Error(
-      `Cannot formalize workspace session statuses: unsupported status ${JSON.stringify(invalidStatus.status)}.`,
-    );
+    if (sourceVersion === CURRENT_DATABASE_SCHEMA_VERSION) {
+      validateCanonicalDatabase(source);
+      return { migrated: false, sourceVersion };
+    }
+    if (sourceVersion === 0 && userTableNames(source).length === 0) {
+      return { migrated: false, sourceVersion };
+    }
+  } finally {
+    source.close();
   }
 
-  sqlite.exec(`
-    create unique index if not exists workspace_sessions_id_owner_uq
-      on workspace_sessions(id, owner_client_id);
+  const temporaryPath = `${path}.v14-migrating-${process.pid}-${randomUUID()}`;
+  const backupPath = uniqueBackupPath(path);
+  let sourceDatabase: Database.Database | undefined;
+  let targetDatabase: Database.Database | undefined;
+  try {
+    sourceDatabase = new Database(path, { readonly: true, fileMustExist: true });
+    sourceDatabase.pragma("busy_timeout = 5000");
+    sourceDatabase.pragma("foreign_keys = ON");
 
-    create trigger if not exists workspace_sessions_status_insert_check
-      before insert on workspace_sessions
-      when new.status not in ('active', 'closed', 'revoked')
-      begin
-        select raise(abort, 'invalid workspace session status');
-      end;
+    targetDatabase = new Database(temporaryPath);
+    targetDatabase.pragma("journal_mode = DELETE");
+    targetDatabase.pragma("synchronous = FULL");
+    targetDatabase.pragma("foreign_keys = ON");
 
-    create trigger if not exists workspace_sessions_status_update_check
-      before update of status on workspace_sessions
-      when new.status not in ('active', 'closed', 'revoked')
-      begin
-        select raise(abort, 'invalid workspace session status');
-      end;
+    const migrate = targetDatabase.transaction(() => {
+      createCanonicalSchema(targetDatabase!);
+      migrateLegacyData(sourceDatabase!, targetDatabase!, sourceVersion);
+    });
+    migrate.immediate();
+    validateCanonicalDatabase(targetDatabase);
+    targetDatabase.close();
+    targetDatabase = undefined;
+    sourceDatabase.close();
+    sourceDatabase = undefined;
+    chmodSync(temporaryPath, 0o600);
 
-    create trigger if not exists workspace_sessions_revoked_terminal
-      before update of status on workspace_sessions
-      when old.status = 'revoked' and new.status != 'revoked'
-      begin
-        select raise(abort, 'revoked workspace session is terminal');
-      end;
-
-    create table mutation_operations_v8 (
-      owner_client_id text not null,
-      workspace_id text not null,
-      tool text not null,
-      operation_id text not null,
-      workspace_generation integer not null check (workspace_generation >= 1),
-      request_hash text not null,
-      state text not null check (state in ('pending', 'settled', 'outcome_unknown')),
-      result_json text,
-      created_at text not null,
-      updated_at text not null,
-      expires_at text not null,
-      primary key (owner_client_id, operation_id),
-      foreign key (workspace_id, owner_client_id)
-        references workspace_sessions(id, owner_client_id)
-        on delete cascade
-    );
-
-    insert into mutation_operations_v8 (
-      owner_client_id, workspace_id, tool, operation_id, workspace_generation,
-      request_hash, state, result_json, created_at, updated_at, expires_at
-    )
-    select
-      owner_client_id, workspace_id, tool, operation_id, workspace_generation,
-      request_hash, state, result_json, created_at, updated_at, expires_at
-    from (
-      select
-        operation.owner_client_id,
-        operation.workspace_id,
-        operation.tool,
-        operation.operation_id,
-        workspace.state_generation as workspace_generation,
-        operation.request_hash,
-        operation.state,
-        operation.result_json,
-        operation.created_at,
-        operation.updated_at,
-        operation.expires_at,
-        row_number() over (
-          partition by operation.owner_client_id, operation.operation_id
-          order by
-            case
-              when operation.state = 'settled' and operation.result_json is not null then 3
-              when operation.state = 'settled' then 2
-              when operation.state = 'outcome_unknown' then 1
-              else 0
-            end desc,
-            operation.updated_at desc,
-            operation.created_at desc,
-            operation.rowid desc
-        ) as preference_rank
-      from mutation_operations as operation
-      inner join workspace_sessions as workspace
-        on workspace.id = operation.workspace_id
-       and workspace.owner_client_id = operation.owner_client_id
-    ) as ranked
-    where preference_rank = 1;
-
-    drop table mutation_operations;
-    alter table mutation_operations_v8 rename to mutation_operations;
-
-    create index mutation_operations_expires_at_idx
-      on mutation_operations(expires_at);
-  `);
+    removeSqliteSidecars(path);
+    renameSync(path, backupPath);
+    try {
+      renameSync(temporaryPath, path);
+    } catch (error) {
+      renameSync(backupPath, path);
+      throw error;
+    }
+    chmodSync(path, 0o600);
+    fsyncDirectory(dirname(path));
+    return { migrated: true, sourceVersion, backupPath };
+  } catch (error) {
+    try {
+      targetDatabase?.close();
+    } catch {
+      // Preserve the migration error.
+    }
+    try {
+      sourceDatabase?.close();
+    } catch {
+      // Preserve the migration error.
+    }
+    rmSync(temporaryPath, { force: true });
+    removeSqliteSidecars(temporaryPath);
+    throw error;
+  }
 }
 
-function migrateWorkspaceWorktreeSourceState(sqlite: Database.Database): void {
-  addColumnIfMissing(
-    sqlite,
-    "workspace_sessions",
-    "dirty_source",
-    "text not null default 'false'",
+export function migrateDatabase(sqlite: Database.Database): void {
+  const version = databaseSchemaVersion(sqlite);
+  if (version === 0 && userTableNames(sqlite).length === 0) {
+    const create = sqlite.transaction(() => createCanonicalSchema(sqlite));
+    create.immediate();
+  } else if (version !== CURRENT_DATABASE_SCHEMA_VERSION) {
+    throw new Error(
+      `Database schema ${version || "legacy"} must be upgraded before opening.`,
+    );
+  }
+  validateCanonicalDatabase(sqlite);
+}
+
+function migrateLegacyData(
+  source: Database.Database,
+  target: Database.Database,
+  sourceVersion: number,
+): void {
+  const now = new Date().toISOString();
+  const principalMap = normalizePrincipals(source, now);
+  const clients = normalizeOAuthClients(source, sourceVersion, principalMap, now);
+  const clientPrincipalMap = new Map(
+    clients
+      .filter((client): client is NormalizedOAuthClient & { principalId: string } => Boolean(client.principalId))
+      .map((client) => [client.clientId, client.principalId]),
+  );
+  const legacyOwner = resolveLegacyOwner(principalMap, clients);
+  const workspaces = normalizeWorkspaces(
+    source,
+    sourceVersion,
+    principalMap,
+    clientPrincipalMap,
+    legacyOwner,
+    now,
+  );
+  normalizeDuplicateCheckouts(workspaces);
+
+  insertPrincipals(target, principalMap.values());
+  insertOAuthClients(target, clients, principalMap);
+  insertWorkspaces(target, workspaces);
+  insertLoadedAgentFiles(source, target, new Set(workspaces.map((workspace) => workspace.id)));
+  insertMutationOperations(
+    target,
+    normalizeMutationOperations(source, workspaces, sourceVersion, clientPrincipalMap, legacyOwner),
+  );
+  insertOAuthOwnerCredential(source, target);
+  insertOAuthTokens(source, target, "oauth_access_tokens", clients, principalMap);
+  insertOAuthTokens(source, target, "oauth_refresh_tokens", clients, principalMap);
+  insertReconnectCodes(source, target, principalMap);
+  insertAuthorizationLimits(source, target);
+  insertCleanupJobs(source, target, sourceVersion, clientPrincipalMap, legacyOwner);
+  insertDirtyArtifacts(source, target, sourceVersion, clientPrincipalMap, legacyOwner);
+  insertLocalAgentSessions(source, target);
+}
+
+function normalizePrincipals(
+  source: Database.Database,
+  now: string,
+): Map<string, NormalizedPrincipal> {
+  const principals = new Map<string, NormalizedPrincipal>();
+  for (const row of tableRows(source, "connection_principals")) {
+    const principalId = requiredString(row, "principal_id");
+    mergePrincipal(principals, {
+      principalId,
+      createdAt: optionalString(row, "created_at") ?? now,
+      lastUsedAt: optionalString(row, "last_used_at") ?? now,
+      revokedAt: nullableString(row, "revoked_at"),
+    });
+  }
+  return principals;
+}
+
+function normalizeOAuthClients(
+  source: Database.Database,
+  sourceVersion: number,
+  principals: Map<string, NormalizedPrincipal>,
+  now: string,
+): NormalizedOAuthClient[] {
+  const hasPrincipalColumn = tableColumns(source, "oauth_clients").has("principal_id");
+  return tableRows(source, "oauth_clients").map((row) => {
+    const clientId = requiredString(row, "client_id");
+    let principalId = hasPrincipalColumn ? nullableString(row, "principal_id") : clientId;
+    if (!principalId && sourceVersion < 13) principalId = clientId;
+    if (principalId) {
+      const existing = principals.get(principalId);
+      if (!existing) {
+        mergePrincipal(principals, {
+          principalId,
+          createdAt: now,
+          lastUsedAt: now,
+          revokedAt: null,
+        });
+      } else if (existing.revokedAt) {
+        principalId = null;
+      }
+    }
+    return {
+      clientId,
+      principalId,
+      clientJson: requiredString(row, "client_json"),
+      issuedAt: nonNegativeInteger(row.issued_at, 0),
+    };
+  });
+}
+
+function resolveLegacyOwner(
+  principals: Map<string, NormalizedPrincipal>,
+  clients: readonly NormalizedOAuthClient[],
+): string | undefined {
+  const active = [...principals.values()]
+    .filter((principal) => principal.revokedAt === null)
+    .map((principal) => principal.principalId)
+    .sort();
+  if (active.length === 1) return active[0];
+  if (active.length > 1) return undefined;
+
+  const clientPrincipals = [...new Set(
+    clients.map((client) => client.principalId).filter((value): value is string => Boolean(value)),
+  )];
+  return clientPrincipals.length === 1 ? clientPrincipals[0] : undefined;
+}
+
+function normalizeWorkspaces(
+  source: Database.Database,
+  sourceVersion: number,
+  principals: Map<string, NormalizedPrincipal>,
+  clientPrincipalMap: ReadonlyMap<string, string>,
+  legacyOwner: string | undefined,
+  now: string,
+): NormalizedWorkspace[] {
+  const columns = tableColumns(source, "workspace_sessions");
+  const ownerColumn = columns.has("connection_principal_id")
+    ? "connection_principal_id"
+    : columns.has("owner_client_id")
+      ? "owner_client_id"
+      : undefined;
+  const raw = tableRows(source, "workspace_sessions").map((row): Omit<NormalizedWorkspace, "alias"> & {
+    requestedAlias?: string;
+  } => {
+    const id = requiredString(row, "id");
+    const root = requiredString(row, "root");
+    const mode = enumValue(row.mode, ["checkout", "worktree"] as const, "checkout");
+    let status = enumValue(row.status, ["active", "closed", "revoked"] as const, "active");
+    const rawOwner = ownerColumn ? optionalString(row, ownerColumn) : LEGACY_UNOWNED_PRINCIPAL;
+    const connectionPrincipalId = canonicalPrincipalId(
+      rawOwner,
+      sourceVersion,
+      principals,
+      clientPrincipalMap,
+      legacyOwner,
+      now,
+      `workspace ${id}`,
+    );
+    const canonical = mode === "checkout" ? canonicalWorkspaceRoot(root) : { path: null, available: true };
+    if (mode === "checkout" && status === "active" && !canonical.available) status = "closed";
+    const writeAccess = mode === "worktree"
+      ? "read_write"
+      : enumValue(row.write_access, ["read_only", "read_write"] as const, "read_write");
+    return {
+      id,
+      connectionPrincipalId,
+      requestedAlias: optionalString(row, "alias"),
+      root,
+      canonicalRoot: canonical.path,
+      status,
+      mode,
+      sourceRoot: nullableString(row, "source_root"),
+      baseRef: nullableString(row, "base_ref"),
+      baseSha: nullableString(row, "base_sha"),
+      dirtySource: booleanText(row.dirty_source, "false"),
+      managed: booleanText(row.managed, mode === "worktree" ? "true" : "false"),
+      writeAccess,
+      stateGeneration: positiveInteger(row.state_generation, 1),
+      createdAt: optionalString(row, "created_at") ?? now,
+      lastUsedAt: optionalString(row, "last_used_at") ?? now,
+    };
+  });
+
+  const groups = new Map<string, typeof raw>();
+  for (const workspace of raw) {
+    const group = groups.get(workspace.connectionPrincipalId) ?? [];
+    group.push(workspace);
+    groups.set(workspace.connectionPrincipalId, group);
+  }
+
+  const normalized: NormalizedWorkspace[] = [];
+  for (const group of groups.values()) {
+    const used = new Set<string>();
+    group.sort((left, right) =>
+      Number(Boolean(right.requestedAlias && validAlias(right.requestedAlias))) -
+        Number(Boolean(left.requestedAlias && validAlias(left.requestedAlias))) ||
+      workspaceStatusRank(left.status) - workspaceStatusRank(right.status) ||
+      right.lastUsedAt.localeCompare(left.lastUsedAt) ||
+      left.id.localeCompare(right.id));
+    for (const workspace of group) {
+      const candidate = workspace.requestedAlias && validAlias(workspace.requestedAlias)
+        ? workspace.requestedAlias.trim()
+        : derivedWorkspaceAlias(workspace);
+      normalized.push({
+        ...workspace,
+        alias: uniqueAlias(candidate, used),
+      });
+    }
+  }
+  return normalized;
+}
+
+function normalizeDuplicateCheckouts(workspaces: NormalizedWorkspace[]): void {
+  const groups = new Map<string, NormalizedWorkspace[]>();
+  for (const workspace of workspaces) {
+    if (
+      workspace.status !== "active" ||
+      workspace.mode !== "checkout" ||
+      workspace.canonicalRoot === null
+    ) continue;
+    const key = `${workspace.connectionPrincipalId}\0${workspace.canonicalRoot}`;
+    const group = groups.get(key) ?? [];
+    group.push(workspace);
+    groups.set(key, group);
+  }
+  for (const group of groups.values()) {
+    if (group.length < 2) continue;
+    group.sort((left, right) =>
+      right.lastUsedAt.localeCompare(left.lastUsedAt) || left.id.localeCompare(right.id));
+    for (const duplicate of group.slice(1)) duplicate.status = "closed";
+  }
+}
+
+function insertPrincipals(
+  target: Database.Database,
+  principals: Iterable<NormalizedPrincipal>,
+): void {
+  const insert = target.prepare(`
+    insert into connection_principals (
+      principal_id, created_at, last_used_at, revoked_at
+    ) values (?, ?, ?, ?)
+  `);
+  for (const principal of principals) {
+    insert.run(principal.principalId, principal.createdAt, principal.lastUsedAt, principal.revokedAt);
+  }
+}
+
+function insertOAuthClients(
+  target: Database.Database,
+  clients: readonly NormalizedOAuthClient[],
+  principals: ReadonlyMap<string, NormalizedPrincipal>,
+): void {
+  const insert = target.prepare(`
+    insert into oauth_clients (client_id, principal_id, client_json, issued_at)
+    values (?, ?, ?, ?)
+  `);
+  for (const client of clients) {
+    const principalId = client.principalId && !principals.get(client.principalId)?.revokedAt
+      ? client.principalId
+      : null;
+    insert.run(client.clientId, principalId, client.clientJson, client.issuedAt);
+  }
+}
+
+function insertWorkspaces(target: Database.Database, workspaces: readonly NormalizedWorkspace[]): void {
+  const insert = target.prepare(`
+    insert into workspace_sessions (
+      id, connection_principal_id, alias, root, canonical_root, status, mode,
+      source_root, base_ref, base_sha, dirty_source, managed, write_access,
+      state_generation, created_at, last_used_at
+    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  for (const workspace of workspaces) {
+    insert.run(
+      workspace.id,
+      workspace.connectionPrincipalId,
+      workspace.alias,
+      workspace.root,
+      workspace.canonicalRoot,
+      workspace.status,
+      workspace.mode,
+      workspace.sourceRoot,
+      workspace.baseRef,
+      workspace.baseSha,
+      workspace.dirtySource,
+      workspace.managed,
+      workspace.writeAccess,
+      workspace.stateGeneration,
+      workspace.createdAt,
+      workspace.lastUsedAt,
+    );
+  }
+}
+
+function insertLoadedAgentFiles(
+  source: Database.Database,
+  target: Database.Database,
+  workspaceIds: ReadonlySet<string>,
+): void {
+  const insert = target.prepare(`
+    insert or replace into loaded_agent_files (
+      workspace_session_id, path, content_hash, content, loaded_at, last_seen_at
+    ) values (?, ?, ?, ?, ?, ?)
+  `);
+  for (const row of tableRows(source, "loaded_agent_files")) {
+    const workspaceId = optionalString(row, "workspace_session_id");
+    if (!workspaceId || !workspaceIds.has(workspaceId)) continue;
+    insert.run(
+      workspaceId,
+      requiredString(row, "path"),
+      requiredString(row, "content_hash"),
+      requiredString(row, "content"),
+      requiredString(row, "loaded_at"),
+      requiredString(row, "last_seen_at"),
+    );
+  }
+}
+
+function normalizeMutationOperations(
+  source: Database.Database,
+  workspaces: readonly NormalizedWorkspace[],
+  sourceVersion: number,
+  clientPrincipalMap: ReadonlyMap<string, string>,
+  legacyOwner: string | undefined,
+): NormalizedOperation[] {
+  const workspaceById = new Map(workspaces.map((workspace) => [workspace.id, workspace]));
+  const columns = tableColumns(source, "mutation_operations");
+  const ownerColumn = columns.has("connection_principal_id")
+    ? "connection_principal_id"
+    : "owner_client_id";
+  const candidates = new Map<string, Array<NormalizedOperation & { rowId: number }>>();
+  for (const row of tableRows(source, "mutation_operations", true)) {
+    const workspaceId = optionalString(row, "workspace_id");
+    const operationId = optionalString(row, "operation_id");
+    if (!workspaceId || !operationId) continue;
+    const workspace = workspaceById.get(workspaceId);
+    if (!workspace) continue;
+    let principalId: string;
+    try {
+      principalId = canonicalPrincipalId(
+        optionalString(row, ownerColumn),
+        sourceVersion,
+        new Map([[workspace.connectionPrincipalId, {
+          principalId: workspace.connectionPrincipalId,
+          createdAt: workspace.createdAt,
+          lastUsedAt: workspace.lastUsedAt,
+          revokedAt: null,
+        }]]),
+        clientPrincipalMap,
+        legacyOwner,
+        workspace.createdAt,
+        `operation ${operationId}`,
+      );
+    } catch {
+      continue;
+    }
+    if (principalId !== workspace.connectionPrincipalId) continue;
+    const state = enumValue(
+      row.state,
+      ["pending", "settled", "outcome_unknown"] as const,
+      "outcome_unknown",
+    );
+    const operation: NormalizedOperation & { rowId: number } = {
+      connectionPrincipalId: principalId,
+      workspaceId,
+      tool: optionalString(row, "tool") ?? "unknown",
+      operationId,
+      workspaceGeneration: positiveInteger(row.workspace_generation, workspace.stateGeneration),
+      requestHash: optionalString(row, "request_hash") ?? "unavailable",
+      state,
+      resultJson: normalizeMutationResult(nullableString(row, "result_json")),
+      createdAt: optionalString(row, "created_at") ?? workspace.createdAt,
+      updatedAt: optionalString(row, "updated_at") ?? workspace.lastUsedAt,
+      expiresAt: optionalString(row, "expires_at") ?? workspace.lastUsedAt,
+      rowId: nonNegativeInteger(row.__rowid, 0),
+    };
+    const key = `${principalId}\0${operationId}`;
+    const group = candidates.get(key) ?? [];
+    group.push(operation);
+    candidates.set(key, group);
+  }
+
+  return [...candidates.values()].map((group) => {
+    group.sort((left, right) =>
+      operationPreference(right) - operationPreference(left) ||
+      right.updatedAt.localeCompare(left.updatedAt) ||
+      right.createdAt.localeCompare(left.createdAt) ||
+      right.rowId - left.rowId);
+    const { rowId: _rowId, ...selected } = group[0]!;
+    return selected;
+  });
+}
+
+function insertMutationOperations(
+  target: Database.Database,
+  operations: readonly NormalizedOperation[],
+): void {
+  const insert = target.prepare(`
+    insert into mutation_operations (
+      connection_principal_id, workspace_id, tool, operation_id,
+      workspace_generation, request_hash, state, result_json,
+      created_at, updated_at, expires_at
+    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  for (const operation of operations) {
+    insert.run(
+      operation.connectionPrincipalId,
+      operation.workspaceId,
+      operation.tool,
+      operation.operationId,
+      operation.workspaceGeneration,
+      operation.requestHash,
+      operation.state,
+      operation.resultJson,
+      operation.createdAt,
+      operation.updatedAt,
+      operation.expiresAt,
+    );
+  }
+}
+
+function insertOAuthOwnerCredential(source: Database.Database, target: Database.Database): void {
+  const insert = target.prepare(`
+    insert into oauth_owner_credential (id, salt, verifier, updated_at)
+    values (?, ?, ?, ?)
+  `);
+  for (const row of tableRows(source, "oauth_owner_credential")) {
+    if (nonNegativeInteger(row.id, 0) !== 1) continue;
+    insert.run(1, requiredString(row, "salt"), requiredString(row, "verifier"), requiredString(row, "updated_at"));
+  }
+}
+
+function insertOAuthTokens(
+  source: Database.Database,
+  target: Database.Database,
+  table: "oauth_access_tokens" | "oauth_refresh_tokens",
+  clients: readonly NormalizedOAuthClient[],
+  principals: ReadonlyMap<string, NormalizedPrincipal>,
+): void {
+  const clientById = new Map(clients.map((client) => [client.clientId, client]));
+  const insert = target.prepare(`
+    insert into ${table} (token_hash, client_id, scopes_json, expires_at, resource)
+    values (?, ?, ?, ?, ?)
+  `);
+  for (const row of tableRows(source, table)) {
+    const clientId = optionalString(row, "client_id");
+    const client = clientId ? clientById.get(clientId) : undefined;
+    if (!client?.principalId || principals.get(client.principalId)?.revokedAt) continue;
+    const scopes = normalizeOAuthScopes(nullableString(row, "scopes_json"));
+    if (!scopes) continue;
+    insert.run(
+      requiredString(row, "token_hash"),
+      clientId,
+      JSON.stringify(scopes),
+      nonNegativeInteger(row.expires_at, 0),
+      nullableString(row, "resource"),
+    );
+  }
+}
+
+function insertReconnectCodes(
+  source: Database.Database,
+  target: Database.Database,
+  principals: ReadonlyMap<string, NormalizedPrincipal>,
+): void {
+  const insert = target.prepare(`
+    insert into oauth_principal_reconnect_codes (
+      code_hash, principal_id, created_at, expires_at
+    ) values (?, ?, ?, ?)
+  `);
+  for (const row of tableRows(source, "oauth_principal_reconnect_codes")) {
+    const principalId = optionalString(row, "principal_id");
+    if (!principalId || !principals.has(principalId) || principals.get(principalId)?.revokedAt) continue;
+    insert.run(
+      requiredString(row, "code_hash"),
+      principalId,
+      nonNegativeInteger(row.created_at, 0),
+      nonNegativeInteger(row.expires_at, 0),
+    );
+  }
+}
+
+function insertAuthorizationLimits(source: Database.Database, target: Database.Database): void {
+  const insert = target.prepare(`
+    insert into oauth_authorization_limits (
+      key_hash, scope, tokens, updated_at, failure_streak, blocked_until, expires_at
+    ) values (?, ?, ?, ?, ?, ?, ?)
+  `);
+  for (const row of tableRows(source, "oauth_authorization_limits")) {
+    const scope = enumValue(row.scope, ["session", "client", "ip", "global"] as const, undefined);
+    if (!scope) continue;
+    insert.run(
+      requiredString(row, "key_hash"),
+      scope,
+      nonNegativeInteger(row.tokens, 0),
+      nonNegativeInteger(row.updated_at, 0),
+      nonNegativeInteger(row.failure_streak, 0),
+      nonNegativeInteger(row.blocked_until, 0),
+      nonNegativeInteger(row.expires_at, 0),
+    );
+  }
+}
+
+function insertCleanupJobs(
+  source: Database.Database,
+  target: Database.Database,
+  sourceVersion: number,
+  clientPrincipalMap: ReadonlyMap<string, string>,
+  legacyOwner: string | undefined,
+): void {
+  const insert = target.prepare(`
+    insert into oauth_revocation_cleanup_jobs (
+      id, connection_principal_id, workspace_id, workspace_root, workspace_mode,
+      source_root, managed, dirty_source, status, claim_token, lease_expires_at,
+      attempts, last_error, created_at, updated_at, completed_at
+    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const used = new Set<string>();
+  for (const row of tableRows(source, "oauth_revocation_cleanup_jobs")) {
+    const workspaceId = optionalString(row, "workspace_id");
+    if (!workspaceId) continue;
+    const principalId = canonicalHistoricalPrincipalId(
+      row,
+      sourceVersion,
+      clientPrincipalMap,
+      legacyOwner,
+    );
+    if (!principalId) continue;
+    const uniqueKey = `${principalId}\0${workspaceId}`;
+    if (used.has(uniqueKey)) continue;
+    used.add(uniqueKey);
+    const originalStatus = enumValue(
+      row.status,
+      ["pending", "claimed", "failed", "completed"] as const,
+      "pending",
+    );
+    const status = originalStatus === "claimed" ? "pending" : originalStatus;
+    const completedAt = status === "completed"
+      ? optionalString(row, "completed_at") ?? optionalString(row, "updated_at") ?? new Date().toISOString()
+      : null;
+    insert.run(
+      positiveInteger(row.id, undefined),
+      principalId,
+      workspaceId,
+      requiredString(row, "workspace_root"),
+      enumValue(row.workspace_mode, ["checkout", "worktree"] as const, "checkout"),
+      nullableString(row, "source_root"),
+      booleanText(row.managed, "false"),
+      booleanText(row.dirty_source, "false"),
+      status,
+      null,
+      null,
+      nonNegativeInteger(row.attempts, 0),
+      nullableString(row, "last_error"),
+      requiredString(row, "created_at"),
+      requiredString(row, "updated_at"),
+      completedAt,
+    );
+  }
+}
+
+function insertDirtyArtifacts(
+  source: Database.Database,
+  target: Database.Database,
+  sourceVersion: number,
+  clientPrincipalMap: ReadonlyMap<string, string>,
+  legacyOwner: string | undefined,
+): void {
+  const insert = target.prepare(`
+    insert into oauth_revocation_dirty_worktree_artifacts (
+      job_id, connection_principal_id, workspace_id, workspace_root,
+      source_root, reason, recorded_at
+    ) values (?, ?, ?, ?, ?, ?, ?)
+  `);
+  for (const row of tableRows(source, "oauth_revocation_dirty_worktree_artifacts")) {
+    const principalId = canonicalHistoricalPrincipalId(
+      row,
+      sourceVersion,
+      clientPrincipalMap,
+      legacyOwner,
+    );
+    if (!principalId) continue;
+    insert.run(
+      positiveInteger(row.job_id, undefined),
+      principalId,
+      requiredString(row, "workspace_id"),
+      requiredString(row, "workspace_root"),
+      nullableString(row, "source_root"),
+      requiredString(row, "reason"),
+      requiredString(row, "recorded_at"),
+    );
+  }
+}
+
+function insertLocalAgentSessions(source: Database.Database, target: Database.Database): void {
+  const columns = tableColumns(source, "local_agent_sessions");
+  const insert = target.prepare(`
+    insert into local_agent_sessions (
+      id, workspace_id, workspace_root, profile_name, provider, model, thinking,
+      provider_session_id, status, latest_response, error, created_at, updated_at
+    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  for (const row of tableRows(source, "local_agent_sessions")) {
+    insert.run(
+      requiredString(row, "id"),
+      nullableString(row, "workspace_id"),
+      requiredString(row, "workspace_root"),
+      requiredString(row, "profile_name"),
+      requiredString(row, "provider"),
+      nullableString(row, "model"),
+      columns.has("thinking") ? nullableString(row, "thinking") : null,
+      nullableString(row, "provider_session_id"),
+      requiredString(row, "status"),
+      nullableString(row, "latest_response"),
+      nullableString(row, "error"),
+      requiredString(row, "created_at"),
+      requiredString(row, "updated_at"),
+    );
+  }
+}
+
+function canonicalHistoricalPrincipalId(
+  row: Row,
+  sourceVersion: number,
+  clientPrincipalMap: ReadonlyMap<string, string>,
+  legacyOwner: string | undefined,
+): string | undefined {
+  const raw = optionalString(row, "connection_principal_id") ?? optionalString(row, "owner_client_id");
+  if (!raw || raw === LEGACY_UNOWNED_PRINCIPAL) return legacyOwner;
+  return sourceVersion < 11 ? clientPrincipalMap.get(raw) ?? raw : raw;
+}
+
+function canonicalPrincipalId(
+  raw: string | undefined,
+  sourceVersion: number,
+  principals: Map<string, NormalizedPrincipal>,
+  clientPrincipalMap: ReadonlyMap<string, string>,
+  legacyOwner: string | undefined,
+  now: string,
+  subject: string,
+): string {
+  if (!raw || raw === LEGACY_UNOWNED_PRINCIPAL) {
+    if (!legacyOwner) {
+      const candidates = [...principals.values()]
+        .filter((principal) => principal.revokedAt === null)
+        .map((principal) => principal.principalId)
+        .sort();
+      throw new Error(
+        `Cannot assign ${subject}: legacy ownership is ambiguous across ${candidates.length} active connection principals` +
+        `${candidates.length > 0 ? ` (${candidates.join(", ")})` : "."}`,
+      );
+    }
+    return legacyOwner;
+  }
+  const principalId = sourceVersion < 11 ? clientPrincipalMap.get(raw) ?? raw : raw;
+  if (!principals.has(principalId)) {
+    mergePrincipal(principals, {
+      principalId,
+      createdAt: now,
+      lastUsedAt: now,
+      revokedAt: null,
+    });
+  }
+  return principalId;
+}
+
+function mergePrincipal(
+  principals: Map<string, NormalizedPrincipal>,
+  candidate: NormalizedPrincipal,
+): void {
+  const existing = principals.get(candidate.principalId);
+  if (!existing) {
+    principals.set(candidate.principalId, candidate);
+    return;
+  }
+  existing.createdAt = existing.createdAt <= candidate.createdAt ? existing.createdAt : candidate.createdAt;
+  existing.lastUsedAt = existing.lastUsedAt >= candidate.lastUsedAt ? existing.lastUsedAt : candidate.lastUsedAt;
+  if (!existing.revokedAt && candidate.revokedAt) existing.revokedAt = candidate.revokedAt;
+}
+
+function canonicalWorkspaceRoot(path: string): { path: string; available: boolean } {
+  try {
+    const canonical = realpathSync(path);
+    return { path: canonical, available: statSync(canonical).isDirectory() };
+  } catch {
+    return { path: resolve(path), available: false };
+  }
+}
+
+function derivedWorkspaceAlias(
+  workspace: Omit<NormalizedWorkspace, "alias"> & { requestedAlias?: string },
+): string {
+  const identity = workspace.sourceRoot ?? workspace.root;
+  const name = basename(resolve(identity));
+  const sanitized = name
+    .normalize("NFKD")
+    .replace(/[^A-Za-z0-9._-]+/gu, "-")
+    .replace(/^[^A-Za-z0-9]+/u, "")
+    .replace(/[-._]+$/u, "")
+    .slice(0, 64);
+  return validAlias(sanitized) ? sanitized : `workspace-${workspace.id.replace(/[^A-Za-z0-9]/gu, "").slice(0, 12) || "restored"}`;
+}
+
+function uniqueAlias(candidate: string, used: Set<string>): string {
+  if (!used.has(candidate)) {
+    used.add(candidate);
+    return candidate;
+  }
+  for (let suffix = 2; suffix < 100_000; suffix += 1) {
+    const marker = `-${suffix}`;
+    const next = `${candidate.slice(0, 64 - marker.length)}${marker}`;
+    if (used.has(next)) continue;
+    used.add(next);
+    return next;
+  }
+  throw new Error(`Unable to allocate a unique Workspace alias for ${candidate}.`);
+}
+
+function validAlias(value: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u.test(value.trim());
+}
+
+function workspaceStatusRank(status: NormalizedWorkspace["status"]): number {
+  return status === "active" ? 0 : status === "closed" ? 1 : 2;
+}
+
+function operationPreference(operation: NormalizedOperation): number {
+  if (operation.state === "settled" && operation.resultJson !== null) return 3;
+  if (operation.state === "settled") return 2;
+  if (operation.state === "outcome_unknown") return 1;
+  return 0;
+}
+
+function normalizeMutationResult(value: string | null): string | null {
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    const record = parsed as Record<string, unknown>;
+    if (record.structuredContent && typeof record.structuredContent === "object" && !Array.isArray(record.structuredContent)) {
+      const structured = { ...(record.structuredContent as Record<string, unknown>) };
+      delete structured.receipt;
+      delete structured.workspaceGeneration;
+      delete structured.safeToRetry;
+      if (structured.continuation && typeof structured.continuation === "object") {
+        delete structured.continuation;
+      }
+      record.structuredContent = structured;
+    }
+    return JSON.stringify(record);
+  } catch {
+    return null;
+  }
+}
+
+function normalizeOAuthScopes(value: string | null): string[] | undefined {
+  if (!value) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    return undefined;
+  }
+  if (!Array.isArray(parsed) || parsed.some((scope) => typeof scope !== "string")) return undefined;
+  const requested = new Set(parsed as string[]);
+  const unknown = [...requested].filter(
+    (scope) => scope !== LEGACY_FULL_SCOPE && !DEVSPACE_CAPABILITY_SCOPES.includes(scope as never),
+  );
+  if (unknown.length > 0) return undefined;
+  if (requested.has(LEGACY_FULL_SCOPE)) {
+    for (const scope of DEVSPACE_CAPABILITY_SCOPES) requested.add(scope);
+    requested.delete(LEGACY_FULL_SCOPE);
+  }
+  const scopes = DEVSPACE_CAPABILITY_SCOPES.filter((scope) => requested.has(scope));
+  return scopes.length > 0 ? scopes : undefined;
+}
+
+function tableRows(source: Database.Database, table: string, includeRowId = false): Row[] {
+  if (!tableExists(source, table)) return [];
+  const prefix = includeRowId ? "rowid as __rowid, " : "";
+  return source.prepare(`select ${prefix}* from ${quotedIdentifier(table)}`).all() as Row[];
+}
+
+function tableExists(source: Database.Database, table: string): boolean {
+  return Boolean(source.prepare(`
+    select 1
+    from sqlite_master
+    where type = 'table' and name = ?
+  `).get(table));
+}
+
+function tableColumns(source: Database.Database, table: string): Set<string> {
+  if (!tableExists(source, table)) return new Set();
+  return new Set(
+    (source.prepare(`pragma table_info(${quotedIdentifier(table)})`).all() as Array<{ name: string }>)
+      .map((column) => column.name),
   );
 }
 
-function migrateOAuthRevocationCleanup(sqlite: Database.Database): void {
-  sqlite.exec(`
-    create table if not exists oauth_revocation_cleanup_jobs (
-      id integer primary key autoincrement,
-      owner_client_id text not null,
-      workspace_id text not null,
-      workspace_root text not null,
-      workspace_mode text not null check (workspace_mode in ('checkout', 'worktree')),
-      source_root text,
-      managed text not null check (managed in ('true', 'false')),
-      dirty_source text not null check (dirty_source in ('true', 'false')),
-      status text not null default 'pending'
-        check (status in ('pending', 'claimed', 'failed', 'completed')),
-      claim_token text,
-      lease_expires_at text,
-      attempts integer not null default 0 check (attempts >= 0),
-      last_error text,
-      created_at text not null,
-      updated_at text not null,
-      completed_at text,
-      unique (owner_client_id, workspace_id),
-      check (
-        (status = 'claimed' and claim_token is not null and lease_expires_at is not null)
-        or (status != 'claimed' and lease_expires_at is null)
-      ),
-      check (
-        (status = 'completed' and completed_at is not null)
-        or (status != 'completed' and completed_at is null)
-      )
-    );
-
-    create index if not exists oauth_revocation_cleanup_jobs_status_idx
-      on oauth_revocation_cleanup_jobs(status, lease_expires_at, created_at, id);
-
-    create index if not exists oauth_revocation_cleanup_jobs_completed_idx
-      on oauth_revocation_cleanup_jobs(completed_at, id)
-      where status = 'completed';
-
-    create table if not exists oauth_revocation_dirty_worktree_artifacts (
-      job_id integer primary key,
-      owner_client_id text not null,
-      workspace_id text not null,
-      workspace_root text not null,
-      source_root text,
-      reason text not null,
-      recorded_at text not null
-    );
-
-    create index if not exists oauth_revocation_dirty_worktree_artifacts_recorded_idx
-      on oauth_revocation_dirty_worktree_artifacts(recorded_at, job_id);
-  `);
+function userTableNames(source: Database.Database): string[] {
+  return (source.prepare(`
+    select name
+    from sqlite_master
+    where type = 'table'
+      and name not like 'sqlite_%'
+      and name != 'devspace_schema_migrations'
+    order by name
+  `).all() as Array<{ name: string }>).map((row) => row.name);
 }
 
-function migrateConnectionPrincipals(sqlite: Database.Database): void {
-  sqlite.exec(`
-    create table if not exists connection_principals (
-      principal_id text primary key,
-      created_at text not null,
-      last_used_at text not null,
-      revoked_at text
-    );
-
-    create index if not exists connection_principals_last_used_idx
-      on connection_principals(last_used_at);
-
-    create table if not exists oauth_principal_reconnect_codes (
-      code_hash text primary key,
-      principal_id text not null,
-      created_at integer not null,
-      expires_at integer not null,
-      foreign key (principal_id)
-        references connection_principals(principal_id)
-        on delete cascade
-    );
-
-    create index if not exists oauth_principal_reconnect_codes_principal_idx
-      on oauth_principal_reconnect_codes(principal_id);
-
-    create index if not exists oauth_principal_reconnect_codes_expires_idx
-      on oauth_principal_reconnect_codes(expires_at);
-  `);
-
-  addColumnIfMissing(sqlite, "oauth_clients", "principal_id", "text");
-  const now = new Date().toISOString();
-  sqlite.prepare(`
-    insert into connection_principals (principal_id, created_at, last_used_at, revoked_at)
-    select client_id, @now, @now, null
-    from oauth_clients
-    where principal_id is null
-    on conflict(principal_id) do nothing
-  `).run({ now });
-  sqlite.prepare(`
-    update oauth_clients
-    set principal_id = client_id
-    where principal_id is null
-  `).run();
-
-  sqlite.exec(`
-    create index if not exists oauth_clients_principal_id_idx
-      on oauth_clients(principal_id);
-
-    create trigger if not exists oauth_clients_principal_insert_check
-      before insert on oauth_clients
-      when new.principal_id is not null
-        and not exists (
-          select 1 from connection_principals
-          where principal_id = new.principal_id and revoked_at is null
-        )
-      begin
-        select raise(abort, 'invalid connection principal');
-      end;
-
-    create trigger if not exists oauth_clients_principal_update_check
-      before update of principal_id on oauth_clients
-      when new.principal_id is not null
-        and not exists (
-          select 1 from connection_principals
-          where principal_id = new.principal_id and revoked_at is null
-        )
-      begin
-        select raise(abort, 'invalid connection principal');
-      end;
-
-    create trigger if not exists connection_principals_delete_check
-      before delete on connection_principals
-      when exists (
-        select 1 from oauth_clients where principal_id = old.principal_id
-      )
-      or exists (
-        select 1 from workspace_sessions where owner_client_id = old.principal_id
-      )
-      begin
-        select raise(abort, 'connection principal still has retained state');
-      end;
-  `);
+function databaseSchemaVersion(source: Database.Database): number {
+  if (!tableExists(source, "devspace_schema_migrations")) return 0;
+  const row = source
+    .prepare("select max(version) as version from devspace_schema_migrations")
+    .get() as { version: number | null };
+  return row.version ?? 0;
 }
 
-function migrateOAuthAuthorizationLimits(sqlite: Database.Database): void {
-  sqlite.exec(`
-    create table if not exists oauth_authorization_limits (
-      key_hash text primary key,
-      scope text not null check (scope in ('session', 'client', 'ip', 'global')),
-      tokens integer not null check (tokens >= 0),
-      updated_at integer not null,
-      failure_streak integer not null check (failure_streak >= 0),
-      blocked_until integer not null,
-      expires_at integer not null
-    );
-
-    create index if not exists oauth_authorization_limits_expires_idx
-      on oauth_authorization_limits(expires_at);
-  `);
+function requiredString(row: Row, key: string): string {
+  const value = optionalString(row, key);
+  if (!value) throw new Error(`Legacy database field ${key} is missing or empty.`);
+  return value;
 }
 
-function migrateConnectionPrincipalApprovalLifecycle(sqlite: Database.Database): void {
-  sqlite.exec(`
-    drop trigger if exists oauth_clients_principal_insert_check;
-    drop trigger if exists oauth_clients_principal_update_check;
-    drop trigger if exists connection_principals_delete_check;
-
-    create trigger oauth_clients_principal_insert_check
-      before insert on oauth_clients
-      when new.principal_id is not null
-        and not exists (
-          select 1 from connection_principals
-          where principal_id = new.principal_id and revoked_at is null
-        )
-      begin
-        select raise(abort, 'invalid connection principal');
-      end;
-
-    create trigger oauth_clients_principal_update_check
-      before update of principal_id on oauth_clients
-      when new.principal_id is not null
-        and not exists (
-          select 1 from connection_principals
-          where principal_id = new.principal_id and revoked_at is null
-        )
-      begin
-        select raise(abort, 'invalid connection principal');
-      end;
-
-    create trigger connection_principals_delete_check
-      before delete on connection_principals
-      when exists (
-        select 1 from oauth_clients where principal_id = old.principal_id
-      )
-      or exists (
-        select 1 from workspace_sessions where owner_client_id = old.principal_id
-      )
-      begin
-        select raise(abort, 'connection principal still has retained state');
-      end;
-  `);
+function optionalString(row: Row, key: string): string | undefined {
+  const value = row[key];
+  return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
-function addColumnIfMissing(
-  sqlite: Database.Database,
-  table: "workspace_sessions" | "local_agent_sessions" | "oauth_clients",
-  column: string,
-  definition: string,
-): void {
-  const columns = sqlite.prepare(`pragma table_info(${table})`).all() as Array<{ name: string }>;
-  if (columns.some((existingColumn) => existingColumn.name === column)) return;
+function nullableString(row: Row, key: string): string | null {
+  return optionalString(row, key) ?? null;
+}
 
-  sqlite.exec(`alter table ${table} add column ${column} ${definition}`);
+function positiveInteger(value: unknown, fallback: number | undefined): number {
+  if (typeof value === "number" && Number.isSafeInteger(value) && value > 0) return value;
+  if (fallback !== undefined) return fallback;
+  throw new Error("Legacy database contains a missing or invalid positive integer.");
+}
+
+function nonNegativeInteger(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : fallback;
+}
+
+function booleanText(value: unknown, fallback: "true" | "false"): "true" | "false" {
+  if (value === true || value === 1 || value === "true") return "true";
+  if (value === false || value === 0 || value === "false") return "false";
+  return fallback;
+}
+
+function enumValue<const T extends readonly string[], F extends T[number] | undefined>(
+  value: unknown,
+  values: T,
+  fallback: F,
+): T[number] | F {
+  return typeof value === "string" && values.includes(value) ? value as T[number] : fallback;
+}
+
+function quotedIdentifier(value: string): string {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(value)) throw new Error(`Unsafe SQL identifier: ${value}`);
+  return `"${value}"`;
+}
+
+function uniqueBackupPath(path: string): string {
+  const timestamp = new Date().toISOString().replace(/[:.]/gu, "-");
+  const candidate = `${path}.pre-v14.${timestamp}.bak`;
+  return existsSync(candidate) ? `${candidate}.${randomUUID()}` : candidate;
+}
+
+function removeSqliteSidecars(path: string): void {
+  rmSync(`${path}-wal`, { force: true });
+  rmSync(`${path}-shm`, { force: true });
+}
+
+function fsyncDirectory(path: string): void {
+  const descriptor = openSync(path, "r");
+  try {
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
 }

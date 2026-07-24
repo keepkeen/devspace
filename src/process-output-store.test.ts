@@ -4,6 +4,7 @@ import {
   chmodSync,
   existsSync,
   lstatSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   renameSync,
@@ -32,6 +33,7 @@ assert.equal(new ProcessOutputNotFoundError().code, "process_output_not_found");
 
 try {
   testPermissionsAndOwnership(join(root, "permissions"));
+  testVersionTwoOwnershipMigration(join(root, "version-two-migration"));
   testWriterLock(join(root, "writer-lock"));
   testPagingReplayAndUtf8(join(root, "paging"));
   testFileQuotaAndDrops(join(root, "file-quota"));
@@ -51,6 +53,71 @@ try {
   testCloseFailures(join(root, "close-failures"));
 } finally {
   rmSync(root, { recursive: true, force: true });
+}
+
+function testVersionTwoOwnershipMigration(stateDir: string): void {
+  const outputDir = join(stateDir, "process-output");
+  mkdirSync(outputDir, { recursive: true, mode: 0o700 });
+  const outputId = "00000000-0000-4000-8000-000000000001";
+  writeFileSync(logPath(stateDir, outputId), "legacy output", { mode: 0o600 });
+  const fileStats = lstatSync(logPath(stateDir, outputId), { bigint: true });
+  const database = new Database(join(outputDir, "metadata.sqlite"));
+  try {
+    database.exec(`
+      create table process_outputs (
+        output_id text primary key,
+        owner_client_id text not null,
+        workspace_id text not null,
+        status text not null,
+        created_at integer not null,
+        updated_at integer not null,
+        completed_at integer,
+        total_bytes integer not null,
+        stored_bytes integer not null,
+        dropped_bytes integer not null,
+        file_dev text not null,
+        file_ino text not null
+      ) without rowid;
+      create table process_output_usage (
+        id integer primary key,
+        outputs integer not null,
+        active_outputs integer not null,
+        completed_outputs integer not null,
+        total_bytes integer not null,
+        stored_bytes integer not null,
+        dropped_bytes integer not null
+      );
+      create table process_output_deletions (
+        output_id text primary key references process_outputs(output_id) on delete cascade
+      ) without rowid;
+      pragma user_version = 2;
+    `);
+    database.prepare(`
+      insert into process_outputs values (?, ?, ?, 'completed', 1, 2, 2, 13, 13, 0, ?, ?)
+    `).run(outputId, "legacy-owner", "legacy-workspace", fileStats.dev.toString(), fileStats.ino.toString());
+    database.prepare("insert into process_output_usage values (1, 1, 0, 1, 13, 13, 0)").run();
+  } finally {
+    database.close();
+  }
+
+  const migrated = createStore(stateDir, { now: () => 2 });
+  try {
+    assert.equal(
+      migrated.read("legacy-owner", "legacy-workspace", outputId, { offset: 0, limit: 100 }).content,
+      "legacy output",
+    );
+  } finally {
+    migrated.close();
+  }
+  const migratedDatabase = new Database(join(outputDir, "metadata.sqlite"), { readonly: true });
+  try {
+    assert.equal(migratedDatabase.pragma("user_version", { simple: true }), 3);
+    const columns = migratedDatabase.prepare("pragma table_info(process_outputs)").all() as Array<{ name: string }>;
+    assert.equal(columns.some((column) => column.name === "connection_principal_id"), true);
+    assert.equal(columns.some((column) => column.name === "owner_client_id"), false);
+  } finally {
+    migratedDatabase.close();
+  }
 }
 
 function testPermissionsAndOwnership(stateDir: string): void {

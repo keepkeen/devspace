@@ -16,15 +16,13 @@ connection-scoped alias:
 }
 ```
 
-`open_workspace` defaults to `contextMode: "metadata"`. It returns a compact v3
-context and a receipt with a six-hour maximum lifetime, without instruction or
-Skill bodies. A metadata receipt can only refresh context or close/revoke the
-Workspace; it cannot read, inspect, execute, or modify local files. Before work,
-pass it to `get_workspace_context`:
+`open_workspace` defaults to `contextMode: "metadata"`. Its receipt can only
+refresh context or close/revoke the Workspace. Promote it before work with
+`get_workspace_context`:
 
 ```json
 {
-  "receipt": "wctx3.…",
+  "receipt": "wctx4.…",
   "contextMode": "full"
 }
 ```
@@ -84,6 +82,13 @@ alias as the project continuity key. After a platform disconnect, a later-day
 turn, or a new browser transport, call `list_workspaces` and resume that alias;
 do not infer that a missing receipt means a new worktree is needed.
 
+If a cached ChatGPT tool schema sends only `workspaceId`, DevSpace temporarily
+maps it to a recent full context for the exact principal and Workspace. The
+idle window is 15 minutes and cannot survive a server restart or exceed the
+receipt's fixed expiry. A supplied generation must match. This fallback keeps a
+known Workspace usable but is not a trusted conversation identity; current
+schemas should pass `continuation.receipt`.
+
 If a managed worktree path is missing, its alias stays listed with
 `hydrationStatus="recovery_required"`. Resume attempts to reconstruct the same
 Workspace ID and path, preferring Git's retained worktree HEAD and otherwise
@@ -107,7 +112,7 @@ Do not call `close_workspace` as a normal end-of-turn or end-of-conversation
 step. Call it only after the user explicitly asks to close or release the
 workspace.
 
-`contextMode: "full"` is the safe default for resume/context calls and ignores
+`contextMode: "full"` is the default for open/resume/context calls and ignores
 revision hints. `retained` is accepted only by `get_workspace_context` while
 refreshing the exact current context-loaded receipt. The caller may then pass
 `instructionRevision` as `knownInstructionRevision` and `skillRevision` as
@@ -118,11 +123,12 @@ receipts, new conversations, and context-compacted callers must use `full`.
 bodies.
 
 After a backend restart, an old receipt fails with
-`workspace_context_required`. Resume by alias or workspaceRef with full context. Cold hydration
+`workspace_context_required`. Resume by alias/workspaceRef, or reopen the known
+approved path, with full context. Cold hydration
 advances the Workspace generation and reloads agent profiles, Skills, root
 instructions, and durable review checkpoints before issuing the new receipt.
 
-The normal text result is intentionally one sentence. The v3 structured result
+The normal text result is intentionally one sentence. The v4 structured result
 is the authoritative context:
 
 ```json
@@ -146,13 +152,12 @@ is the authoritative context:
   },
   "skills": { "revision": "sha256-v1:…", "count": 3, "included": true, "items": [] },
   "continuation": {
-    "receipt": "wctx3.…",
+    "receipt": "wctx4.…",
     "phase": "context_loaded",
     "expiresAt": "2026-07-25T01:00:00.000Z",
     "instructionRevision": "sha256-v1:…",
     "skillRevision": "sha256-v1:…"
-  },
-  "receipt": "wctx3.…"
+  }
 }
 ```
 
@@ -434,7 +439,7 @@ mutation adds one durable operation envelope:
     "generation": 3
   },
   "continuation": {
-    "receipt": "wctx3.…",
+    "receipt": "wctx4.…",
     "phase": "context_loaded",
     "expiresAt": "2026-07-25T01:00:00.000Z",
     "instructionRevision": "sha256-v1:…",
@@ -466,7 +471,7 @@ same registered client with the same authority does not.
 
 OAuth authorization can be restricted to `workspace:read`, `workspace:write`,
 `process:execute`, `network:access`, `worktree:create`, and
-`workspace:revoke`. The legacy `devspace` scope grants all six for compatibility.
+`workspace:revoke`.
 `open_workspace` adds conditional checks: a writable checkout needs
 `workspace:write`, while worktree mode also needs `worktree:create`.
 `exec_command` requires write, process, and network capability. Mutating
@@ -558,12 +563,13 @@ ignore `_meta`; structured batch consumers must read `items[]` rather than the
 removed aggregate field. This layout reduces prompt and transport overhead
 without changing workspace, process, or paging semantics.
 
-The legacy `write`, `edit`, `bash`, `grep`, `glob`, and `ls` tools are not
+The removed `write`, `edit`, `bash`, `grep`, `glob`, and `ls` tools are not
 registered. Prefer `exec_command` with `program` and `args`; DevSpace passes
 them directly to the process launcher without shell serialization. Use
 `shell=true` with `command` when shell syntax or an interactive shell is
 required; direct argv shells such as `program="bash"` are rejected so later
-stdin remains inspectable. Legacy `cmd` remains accepted. `network="deny"` fails closed because this runtime does not
+stdin remains inspectable. Version 2.0 accepts neither `cmd` nor `cwd`.
+`network="deny"` fails closed because this runtime does not
 claim per-process network isolation without an OS sandbox.
 
 `exec_command` returns a process session ID when a command is still
@@ -597,10 +603,6 @@ An exceptional text warning reports bytes that exceeded the final durable disk
 quota and cannot be recovered. Completed output uses its
 own TTL and remains available after the short-lived process session is removed
 or after the backend restarts.
-
-Legacy `toolMode`, `DEVSPACE_TOOL_MODE`, and `DEVSPACE_MINIMAL_TOOLS` values are
-ignored. This preserves startup compatibility with old configuration files
-without changing the model-facing tool names between turns.
 
 ## Show Changes
 

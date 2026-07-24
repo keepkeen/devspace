@@ -11,6 +11,7 @@ const tests = [
   "src/allowed-roots-hot-reload.test.ts",
   "src/request-barrier.test.ts",
   "src/mutation-operation-store.test.ts",
+  "src/db/migrations.test.ts",
   "src/config.test.ts",
   "src/admin-config.test.ts",
   "src/admin-runtime.test.ts",

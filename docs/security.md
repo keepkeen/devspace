@@ -100,8 +100,7 @@ uncommitted files.
 
 ## OAuth Capabilities
 
-The legacy `devspace` scope grants the complete historical authority. Granular
-deployments may instead use:
+Version 2.0 uses only these explicit scopes:
 
 - `workspace:read`
 - `workspace:write`
