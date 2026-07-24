@@ -95,7 +95,7 @@ try {
     DEVSPACE_CONFIG_DIR: join(root, ".devspace-home"),
     DEVSPACE_ALLOWED_ROOTS: root,
     DEVSPACE_WORKTREE_ROOT: join(root, ".devspace", "worktrees"),
-    DEVSPACE_AGENT_DIR: agentDir,
+    DEVSPACE_SKILL_PATHS: join(agentDir, "skills"),
     DEVSPACE_USER_INSTRUCTIONS_PATH: userInstructionsPath,
     DEVSPACE_SUBAGENTS: "1",
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
@@ -242,7 +242,6 @@ try {
     DEVSPACE_CONFIG_DIR: join(root, ".skill-revision-config"),
     DEVSPACE_ALLOWED_ROOTS: root,
     DEVSPACE_SKILL_PATHS: revisionSkillDir,
-    DEVSPACE_AGENT_DIR: join(root, ".skill-revision-agent"),
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
     PORT: "1",
   });
@@ -668,7 +667,6 @@ try {
   const fallbackConfig = loadConfig({
     DEVSPACE_CONFIG_DIR: join(root, ".fallback-config"),
     DEVSPACE_ALLOWED_ROOTS: root,
-    DEVSPACE_AGENT_DIR: agentDir,
     DEVSPACE_PROJECT_DOC_FALLBACK_FILENAMES: "TEAM_GUIDE.md",
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
     PORT: "1",
@@ -733,7 +731,6 @@ try {
   const emptyGlobalConfig = loadConfig({
     DEVSPACE_CONFIG_DIR: join(root, ".empty-global-config"),
     DEVSPACE_ALLOWED_ROOTS: root,
-    DEVSPACE_AGENT_DIR: emptyGlobalAgentDir,
     DEVSPACE_USER_INSTRUCTIONS_PATH: join(emptyGlobalAgentDir, "AGENTS.md"),
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
     PORT: "1",
@@ -772,7 +769,6 @@ try {
   const budgetConfig = loadConfig({
     DEVSPACE_CONFIG_DIR: join(root, ".budget-config"),
     DEVSPACE_ALLOWED_ROOTS: root,
-    DEVSPACE_AGENT_DIR: budgetAgentDir,
     DEVSPACE_USER_INSTRUCTIONS_PATH: join(budgetAgentDir, "AGENTS.md"),
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
     PORT: "1",
@@ -1008,37 +1004,6 @@ try {
       ],
     );
 
-    const unsafeAgentDir = join(root, ".pi", "unsafe-agent");
-    await mkdir(unsafeAgentDir, { recursive: true });
-    await writeFile(join(outsideRoot, "secret.txt"), "outside secret\n");
-    await symlink(join(outsideRoot, "secret.txt"), join(unsafeAgentDir, "AGENTS.md"));
-    const unsafeConfig = loadConfig({
-      DEVSPACE_CONFIG_DIR: join(root, ".devspace-unsafe-home"),
-      DEVSPACE_ALLOWED_ROOTS: root,
-      DEVSPACE_WORKTREE_ROOT: join(root, ".devspace", "unsafe-worktrees"),
-      DEVSPACE_AGENT_DIR: unsafeAgentDir,
-      DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
-      PORT: "1",
-    });
-    const unsafeWorkspace = await new WorkspaceRegistry(unsafeConfig).openWorkspace(connectionPrincipalId, root);
-    assert.deepEqual(
-      unsafeWorkspace.agentsFiles.map((file) => file.content),
-      ["root instructions\n"],
-    );
-
-    const skillOnlyAgentDirProject = join(root, "skill-only-agent-dir-project");
-    await mkdir(skillOnlyAgentDirProject);
-    const skillOnlyAgentDirConfig = loadConfig({
-      DEVSPACE_CONFIG_DIR: join(root, ".skill-only-agent-dir-home"),
-      DEVSPACE_ALLOWED_ROOTS: root,
-      DEVSPACE_AGENT_DIR: agentDir,
-      DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
-      PORT: "1",
-    });
-    const skillOnlyAgentDirOpen = await new WorkspaceRegistry(skillOnlyAgentDirConfig)
-      .openWorkspace(connectionPrincipalId, skillOnlyAgentDirProject);
-    assert.deepEqual(skillOnlyAgentDirOpen.agentsFiles, []);
-
     const missingInstructionsConfig = loadConfig({
       DEVSPACE_CONFIG_DIR: join(root, ".missing-user-instructions-home"),
       DEVSPACE_ALLOWED_ROOTS: root,
@@ -1156,7 +1121,6 @@ try {
     DEVSPACE_CONFIG_DIR: join(root, ".devspace-capped-home"),
     DEVSPACE_ALLOWED_ROOTS: root,
     DEVSPACE_WORKTREE_ROOT: join(root, ".devspace", "capped-worktrees"),
-    DEVSPACE_AGENT_DIR: agentDir,
     DEVSPACE_MAX_MANAGED_WORKTREES: "1",
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
     PORT: "1",
@@ -1538,7 +1502,6 @@ try {
     DEVSPACE_CONFIG_DIR: join(root, ".managed-expiry-home"),
     DEVSPACE_ALLOWED_ROOTS: root,
     DEVSPACE_WORKTREE_ROOT: join(root, ".devspace", "expiry-worktrees"),
-    DEVSPACE_AGENT_DIR: agentDir,
     DEVSPACE_MAX_RESIDENT_WORKSPACES: "1",
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
     PORT: "1",
@@ -1730,7 +1693,6 @@ try {
     const aliasConfig = loadConfig({
       DEVSPACE_ALLOWED_ROOTS: aliasRoot,
       DEVSPACE_WORKTREE_ROOT: join(aliasRoot, ".devspace", "alias-worktrees"),
-      DEVSPACE_AGENT_DIR: agentDir,
       DEVSPACE_USER_INSTRUCTIONS_PATH: userInstructionsPath,
       DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
       PORT: "1",

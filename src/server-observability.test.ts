@@ -82,13 +82,6 @@ const catalogSkills: Skill[] = Array.from({ length: 80 }, (_, index) => ({
   sourceRoot: "/tmp/catalog",
   allowImplicitInvocation: index !== 1,
   disableModelInvocation: index === 1,
-  sourceInfo: {
-    path: `/tmp/catalog/scope-${index}/SKILL.md`,
-    source: index % 2 === 0 ? "repo" : "user",
-    scope: index % 2 === 0 ? "project" : "user",
-    origin: "top-level",
-    baseDir: "/tmp/catalog",
-  },
 }));
 const boundedCatalog = buildWorkspaceSkillCatalog(
   catalogSkills,

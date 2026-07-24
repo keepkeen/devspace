@@ -349,8 +349,7 @@ function runConfigCommand(args: string[]): void {
   const files = loadDevspaceFiles();
 
   if (!subcommand || subcommand === "get") {
-    const { toolMode: _ignoredToolMode, ...config } = files.config;
-    console.log(JSON.stringify(config, null, 2));
+    console.log(JSON.stringify(files.config, null, 2));
     return;
   }
 

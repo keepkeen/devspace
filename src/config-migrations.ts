@@ -1,4 +1,4 @@
-export const CURRENT_CONFIG_SCHEMA_VERSION = 1 as const;
+export const CURRENT_CONFIG_SCHEMA_VERSION = 2 as const;
 
 export interface ConfigMigrationResult {
   config: Record<string, unknown>;
@@ -25,6 +25,7 @@ export function migrateConfigDocument(input: unknown): ConfigMigrationResult {
   let version = fromVersion as number;
   while (version < CURRENT_CONFIG_SCHEMA_VERSION) {
     if (version === 0) config = migrateVersionZero(config);
+    if (version === 1) config = migrateVersionOne(config);
     version += 1;
   }
 
@@ -45,6 +46,20 @@ function migrateVersionZero(config: Record<string, unknown>): Record<string, unk
     migrated.projectDocFallbackFilenames = migrated.project_doc_fallback_filenames;
   }
   delete migrated.project_doc_fallback_filenames;
+  return migrated;
+}
+
+function migrateVersionOne(config: Record<string, unknown>): Record<string, unknown> {
+  const migrated: Record<string, unknown> = { ...config, schemaVersion: 2 };
+  if (
+    migrated.projectDocFallbackFilenames === undefined &&
+    Array.isArray(migrated.project_doc_fallback_filenames)
+  ) {
+    migrated.projectDocFallbackFilenames = migrated.project_doc_fallback_filenames;
+  }
+  delete migrated.project_doc_fallback_filenames;
+  delete migrated.toolMode;
+  delete migrated.agentDir;
   return migrated;
 }
 

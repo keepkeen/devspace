@@ -43,7 +43,6 @@ try {
     DEVSPACE_PUBLIC_BASE_URL: publicBaseUrl,
     DEVSPACE_OAUTH_OWNER_TOKEN: ownerPassword,
     DEVSPACE_ADMIN_SKILLS_DIR: join(root, "admin-skills"),
-    DEVSPACE_AGENT_DIR: join(root, "agent"),
     DEVSPACE_SUBAGENTS: "0",
     DEVSPACE_WIDGETS: "changes",
     DEVSPACE_LOG_LEVEL: "silent",

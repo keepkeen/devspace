@@ -96,7 +96,7 @@ for (const multibyteOutput of ["🙂".repeat(200), "中文".repeat(200)]) {
 }
 
 const manager = new ProcessSessionManager({
-  maxBufferCharacters: 1_024,
+  maxBufferBytes: 1_024,
   completedSessionTtlMs: 1_000,
 });
 const connectionPrincipalId = "client-a";
@@ -983,7 +983,7 @@ const durableStore = new ProcessOutputStore({
   completedTtlMs: 60_000,
 });
 const durableManager = new ProcessSessionManager({
-  maxBufferCharacters: 1_000,
+  maxBufferBytes: 1_000,
   outputStore: durableStore,
 });
 let durableOutputId = "";

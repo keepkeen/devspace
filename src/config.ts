@@ -38,12 +38,6 @@ export interface ResourceLimitsConfig {
   maxManagedWorktrees: number;
 }
 
-export interface InstructionScanConfig {
-  maxDepth: number;
-  maxEntries: number;
-  deadlineMs: number;
-}
-
 export interface ServerConfig {
   host: string;
   port: number;
@@ -61,12 +55,10 @@ export interface ServerConfig {
   devspaceSkillsDir: string;
   devspaceAgentsDir: string;
   subagents: boolean;
-  agentDir: string;
   userInstructionsPath: string | null;
   projectDocFallbackFilenames: string[];
   logging: LoggingConfig;
   resources: ResourceLimitsConfig;
-  instructionScan: InstructionScanConfig;
 }
 
 function parsePort(value: string | number | undefined): number {
@@ -307,14 +299,6 @@ function assertResourceLimits(resources: ResourceLimitsConfig): void {
   }
 }
 
-function parseInstructionScan(env: NodeJS.ProcessEnv): InstructionScanConfig {
-  return {
-    maxDepth: parsePositiveInteger(env.DEVSPACE_INSTRUCTION_SCAN_MAX_DEPTH, 32, "DEVSPACE_INSTRUCTION_SCAN_MAX_DEPTH", 256),
-    maxEntries: parsePositiveInteger(env.DEVSPACE_INSTRUCTION_SCAN_MAX_ENTRIES, 100_000, "DEVSPACE_INSTRUCTION_SCAN_MAX_ENTRIES", 1_000_000),
-    deadlineMs: parsePositiveInteger(env.DEVSPACE_INSTRUCTION_SCAN_DEADLINE_MS, 5_000, "DEVSPACE_INSTRUCTION_SCAN_DEADLINE_MS", MAX_TIMER_MS),
-  };
-}
-
 function parseWidgetMode(value: string | undefined, configuredMode?: WidgetMode): WidgetMode {
   if (!value) return configuredMode ?? "full";
   if (value === "full") return "full";
@@ -363,10 +347,6 @@ function defaultStateDir(): string {
 
 function defaultWorktreeRoot(): string {
   return join(homedir(), ".devspace", "worktrees");
-}
-
-function defaultAgentDir(): string {
-  return join(homedir(), ".codex");
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
@@ -418,18 +398,15 @@ export function loadConfigForAdmin(env: NodeJS.ProcessEnv = process.env): Server
       env.DEVSPACE_SUBAGENTS === undefined
         ? files.config.subagents === true
         : parseBoolean(env.DEVSPACE_SUBAGENTS, "DEVSPACE_SUBAGENTS"),
-    agentDir: resolve(expandHomePath(env.DEVSPACE_AGENT_DIR ?? files.config.agentDir ?? defaultAgentDir())),
     userInstructionsPath: parseOptionalPath(
       env.DEVSPACE_USER_INSTRUCTIONS_PATH ?? files.config.userInstructionsPath,
     ),
     projectDocFallbackFilenames: parseProjectDocFallbackFilenames(
       env.DEVSPACE_PROJECT_DOC_FALLBACK_FILENAMES ??
-        files.config.projectDocFallbackFilenames ??
-        files.config.project_doc_fallback_filenames,
+        files.config.projectDocFallbackFilenames,
     ),
     logging: parseLoggingConfig(env),
     resources: parseResourceLimits(env, files.config.resources),
-    instructionScan: parseInstructionScan(env),
   };
 }
 

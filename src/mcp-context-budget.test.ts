@@ -17,7 +17,6 @@ const root = await mkdtemp(join(tmpdir(), "devspace-context-budget-"));
 const workspaceRoot = join(root, "workspace");
 const stateDir = join(root, "state");
 const configDir = join(root, "config");
-const agentDir = join(root, "agent");
 const worktreeRoot = join(root, "worktrees");
 const publicBaseUrl = "http://127.0.0.1:7676";
 const accessToken = "context-budget-test-access-token";
@@ -35,7 +34,6 @@ const execFileAsync = promisify(execFile);
 await Promise.all([
   mkdir(workspaceRoot, { recursive: true }),
   mkdir(configDir, { recursive: true }),
-  mkdir(agentDir, { recursive: true }),
   mkdir(worktreeRoot, { recursive: true }),
   mkdir(join(workspaceRoot, "nested"), { recursive: true }),
   mkdir(join(workspaceRoot, "read-scope"), { recursive: true }),
@@ -73,7 +71,6 @@ const configEnvironment = {
   DEVSPACE_PUBLIC_BASE_URL: publicBaseUrl,
   DEVSPACE_STATE_DIR: stateDir,
   DEVSPACE_WORKTREE_ROOT: worktreeRoot,
-  DEVSPACE_AGENT_DIR: agentDir,
   DEVSPACE_OAUTH_OWNER_TOKEN: "context-budget-owner-token-long-enough",
   DEVSPACE_MAX_COMMAND_RUNTIME_SECONDS: "1",
   DEVSPACE_MAX_MANAGED_WORKTREES: "1",
@@ -1798,21 +1795,6 @@ try {
   assert.equal((execCommand.structuredContent as { result?: unknown } | undefined)?.result, undefined);
   assert.equal((execCommand._meta as { tool?: unknown } | undefined)?.tool, "exec_command");
   assert.equal((readProcessOutput.structuredContent as { content?: unknown } | undefined)?.content, undefined);
-
-  const legacyModeStateDir = join(root, "state-legacy-mode");
-  const legacyModeConfig = loadConfig({
-    ...configEnvironment,
-    DEVSPACE_STATE_DIR: legacyModeStateDir,
-    DEVSPACE_TOOL_MODE: "full",
-  });
-  seedAccessToken(legacyModeConfig, legacyModeStateDir);
-  const legacyModeDiscovery = await measureDiscovery(legacyModeConfig);
-  assert.deepEqual(
-    Object.keys(legacyModeDiscovery.perTool).sort(),
-    Object.keys(measurements.toolsList.perTool).sort(),
-    "legacy DEVSPACE_TOOL_MODE must not alter the fixed tool surface",
-  );
-  assert.equal("bash" in legacyModeDiscovery.perTool, false);
 
   const skillsOffStateDir = join(root, "state-skills-off");
   const skillsOffConfig = loadConfig({

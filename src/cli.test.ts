@@ -27,7 +27,6 @@ writeFileSync(
   JSON.stringify({
     allowedRoots: [process.cwd()],
     publicBaseUrl: "https://devspace.example.com",
-    toolMode: "codex",
   }),
 );
 execFileSync(
@@ -40,10 +39,10 @@ execFileSync(
 );
 const updatedConfig = JSON.parse(
   readFileSync(join(configCommandDir, "config.json"), "utf8"),
-) as { allowedRoots: string[]; publicBaseUrl: string; toolMode: string };
-assert.equal(updatedConfig.toolMode, "codex");
+) as { allowedRoots: string[]; publicBaseUrl: string | null; schemaVersion: number };
 assert.deepEqual(updatedConfig.allowedRoots, [process.cwd()]);
 assert.equal(updatedConfig.publicBaseUrl, null);
+assert.equal(updatedConfig.schemaVersion, 2);
 const visibleConfig = JSON.parse(execFileSync(
   "node",
   ["--import", "tsx", "src/cli.ts", "config", "get"],
@@ -52,19 +51,7 @@ const visibleConfig = JSON.parse(execFileSync(
     env: { ...process.env, DEVSPACE_CONFIG_DIR: configCommandDir },
   },
 ));
-assert.equal("toolMode" in visibleConfig, false);
-assert.throws(
-  () => execFileSync(
-    "node",
-    ["--import", "tsx", "src/cli.ts", "config", "set", "toolMode", "full"],
-    {
-      encoding: "utf8",
-      env: { ...process.env, DEVSPACE_CONFIG_DIR: configCommandDir },
-      stdio: "pipe",
-    },
-  ),
-  /Command failed/,
-);
+assert.equal(visibleConfig.schemaVersion, 2);
 rmSync(configCommandDir, { recursive: true, force: true });
 
 const authRoot = mkdtempSync(join(tmpdir(), "devspace-cli-auth-test-"));

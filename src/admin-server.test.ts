@@ -121,7 +121,6 @@ writeFileSync(join(configDir, "config.json"), JSON.stringify({
   port: mcpAddress.port,
   allowedRoots: [allowedRoot],
   publicBaseUrl: "https://display-user:display-password@devspace.example.test",
-  toolMode: "codex",
   widgets: "full",
 }));
 
@@ -190,7 +189,6 @@ try {
   const config = configEnvelope.config;
   assert.deepEqual(config.allowedRoots, [allowedRoot]);
   assert.equal(config.userInstructionsPath, null);
-  assert.equal("toolMode" in config, false);
   assert.equal(config.widgets, "off");
   assert.deepEqual(configEnvelope.overrides, ["widgets"]);
   assert.equal(typeof configEnvelope.revision, "string");
@@ -322,7 +320,6 @@ try {
   const bundle = await request(url, { path: "/api/diagnostics/bundle", headers: { cookie } });
   assert.equal(bundle.status, 200);
   assert.match(String(bundle.headers["content-disposition"]), /attachment/);
-  assert.equal("toolMode" in JSON.parse(bundle.body).config, false);
   assert.doesNotMatch(bundle.body, /must-be-redacted|999/);
 
   const revoke = await request(url, {

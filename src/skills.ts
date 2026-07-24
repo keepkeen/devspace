@@ -28,10 +28,9 @@ export type SkillSource =
   | "admin"
   | "bundled"
   | "devspace"
-  | "agent-dir"
   | "explicit";
 
-export type SkillScope = "repo" | "user" | "admin" | "bundled" | "compatibility";
+export type SkillScope = "repo" | "user" | "admin" | "bundled" | "devspace" | "explicit";
 
 export interface SkillRoot {
   path: string;
@@ -58,14 +57,6 @@ export interface Skill {
   allowImplicitInvocation: boolean;
   disableModelInvocation: boolean;
   openai?: Record<string, unknown>;
-  /** Pi-compatible provenance retained while downstream integrations migrate. */
-  sourceInfo: {
-    path: string;
-    source: string;
-    scope: "user" | "project" | "temporary";
-    origin: "top-level";
-    baseDir: string;
-  };
 }
 
 export interface SkillDiagnostic {
@@ -169,14 +160,13 @@ export function effectiveSkillSources(config: ServerConfig, workspaceRoot: strin
     ...config.skillPaths.map((path) => ({
       path,
       source: "explicit" as const,
-      scope: "compatibility" as const,
+      scope: "explicit" as const,
     })),
     ...repositorySkillRoots(workspaceRoot, config.allowedRoots),
     { path: join(homedir(), ".agents", "skills"), source: "user", scope: "user" },
     { path: config.adminSkillsDir, source: "admin", scope: "admin" },
     { path: bundledSkillsDir(), source: "bundled", scope: "bundled" },
-    { path: config.devspaceSkillsDir, source: "devspace", scope: "compatibility" },
-    { path: join(config.agentDir, "skills"), source: "agent-dir", scope: "compatibility" },
+    { path: config.devspaceSkillsDir, source: "devspace", scope: "devspace" },
   ];
 
   const seen = new Set<string>();
@@ -190,13 +180,6 @@ export function effectiveSkillSources(config: ServerConfig, workspaceRoot: strin
       seen.add(candidate.path);
       return true;
     });
-}
-
-/** Compatibility view for callers that only need the existing roots. */
-export function effectiveSkillPaths(config: ServerConfig, workspaceRoot: string): string[] {
-  return effectiveSkillSources(config, workspaceRoot)
-    .map((source) => source.path)
-    .filter((path) => existsSync(path));
 }
 
 class DiagnosticCollector {
@@ -458,13 +441,6 @@ function loadSkill(
     allowImplicitInvocation,
     disableModelInvocation: !allowImplicitInvocation,
     openai: openai.metadata,
-    sourceInfo: {
-      path: canonicalFile,
-      source: source.source,
-      scope: source.scope === "repo" ? "project" : "user",
-      origin: "top-level",
-      baseDir: sourceRoot,
-    },
   };
 }
 

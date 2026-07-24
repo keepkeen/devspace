@@ -4,7 +4,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig, type ServerConfig } from "./config.js";
 import {
-  effectiveSkillPaths,
   effectiveSkillSources,
   formatPathForPrompt,
   loadWorkspaceSkills,
@@ -47,7 +46,6 @@ function makeConfig(
   return loadConfig({
     DEVSPACE_CONFIG_DIR: join(root, "config"),
     DEVSPACE_ALLOWED_ROOTS: workspaceRoot,
-    DEVSPACE_AGENT_DIR: join(root, "agent"),
     DEVSPACE_ADMIN_SKILLS_DIR: join(root, "admin-skills"),
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
     PORT: "1",
@@ -78,8 +76,7 @@ try {
   );
   await writeSkill(join(root, ".agents", "skills", "user"), "user", "User copy.");
   await writeSkill(join(root, "admin-skills", "admin"), "admin", "Admin copy.");
-  await writeSkill(join(root, "config", "skills", "devspace"), "devspace", "DevSpace compatibility copy.");
-  await writeSkill(join(root, "agent", "skills", "agent"), "agent", "Agent directory compatibility copy.");
+  await writeSkill(join(root, "config", "skills", "devspace"), "devspace", "DevSpace-managed copy.");
   await writeSkill(join(workspaceRoot, "relative-skills", "explicit"), "shared", "Explicit copy.");
 
   const config = makeConfig(repositoryRoot, { DEVSPACE_SKILL_PATHS: "relative-skills" });
@@ -87,7 +84,7 @@ try {
   assert.deepEqual(
     sources.slice(0, 6).map(({ source, scope }) => ({ source, scope })),
     [
-      { source: "explicit", scope: "compatibility" },
+      { source: "explicit", scope: "explicit" },
       { source: "repo", scope: "repo" },
       { source: "repo", scope: "repo" },
       { source: "repo", scope: "repo" },
@@ -98,7 +95,7 @@ try {
   assert.equal(sources[0]?.path, join(workspaceRoot, "relative-skills"));
   assert.equal(resolveSkillPath("relative-skills", workspaceRoot), join(workspaceRoot, "relative-skills"));
   assert.equal(resolveSkillInputPath("relative-skills/explicit/SKILL.md", workspaceRoot), join(workspaceRoot, "relative-skills", "explicit", "SKILL.md"));
-  assert.equal(effectiveSkillPaths(config, workspaceRoot).includes(join(root, "admin-skills")), true);
+  assert.equal(sources.some((source) => source.path === join(root, "admin-skills")), true);
 
   const nestedAllowlistResult = loadWorkspaceSkills(
     makeConfig(workspaceRoot),
@@ -126,7 +123,7 @@ try {
     loaded.skills.filter((skill) => skill.scope === "repo").map((skill) => skill.description),
     ["Repository root copy.", "Package copy.", "Workspace copy."],
   );
-  for (const expected of ["user", "admin", "devspace", "agent"]) {
+  for (const expected of ["user", "admin", "devspace"]) {
     assert.equal(loaded.skills.some((skill) => skill.name === expected), true);
   }
   const duplicates = loaded.skills.filter((skill) => skill.name === "shared");

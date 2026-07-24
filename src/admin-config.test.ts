@@ -29,7 +29,6 @@ writeFileSync(join(configDir, "auth.json"), JSON.stringify({
 }));
 writeFileSync(join(configDir, "config.json"), JSON.stringify({
   allowedRoots: [rootA],
-  toolMode: "minimal",
   widgets: "changes",
   publicBaseUrl: "https://example.test",
   futureSetting: { preserve: true },
@@ -39,10 +38,9 @@ chmodSync(join(configDir, "config.json"), 0o644);
 
 const env = { DEVSPACE_CONFIG_DIR: configDir };
 const initial = loadAdminConfig(env);
-assert.equal(JSON.parse(readFileSync(join(configDir, "config.json"), "utf8")).schemaVersion, 1);
+assert.equal(JSON.parse(readFileSync(join(configDir, "config.json"), "utf8")).schemaVersion, 2);
 assert.equal(existsSync(join(configDir, "config.json.backup-v0")), true);
 assert.equal(JSON.parse(readFileSync(join(configDir, "config.json.backup-v0"), "utf8")).schemaVersion, undefined);
-assert.equal("toolMode" in initial, false);
 assert.equal(initial.widgets, "changes");
 assert.deepEqual(initial.projectDocFallbackFilenames, []);
 assert.equal(initial.userInstructionsPath, null);
@@ -87,19 +85,11 @@ assert.equal(persisted.resources.maxProcessOutputStorageBytes, 4_194_304);
 assert.equal(persisted.resources.completedProcessOutputTtlMs, 120_000);
 assert.deepEqual(persisted.projectDocFallbackFilenames, ["TEAM_GUIDE.md"]);
 assert.equal(persisted.userInstructionsPath, realpathSync(userInstructionsPath));
-assert.equal(persisted.toolMode, "minimal");
 const unchangedSave = saveAdminConfig(next, env);
 assert.equal(unchangedSave.restartRequired, false);
 assert.equal(unchangedSave.rootsChanged, false);
 
-assert.equal(
-  loadAdminConfig({ ...env, DEVSPACE_TOOL_MODE: "full", DEVSPACE_WIDGETS: "off" }).widgets,
-  "off",
-);
-assert.equal(
-  "toolMode" in loadAdminConfig({ ...env, DEVSPACE_TOOL_MODE: "full", DEVSPACE_MINIMAL_TOOLS: "1" }),
-  false,
-);
+assert.equal(loadAdminConfig({ ...env, DEVSPACE_WIDGETS: "off" }).widgets, "off");
 assert.equal(
   loadAdminConfig({ ...env, DEVSPACE_MAX_MCP_SESSIONS: "7" }).resources.maxMcpSessions,
   7,
@@ -116,7 +106,6 @@ assert.equal(loadAdminConfig(outputOverrideEnv).resources.completedProcessOutput
 assert.deepEqual(
   adminConfigOverridePaths({
     ...env,
-    DEVSPACE_TOOL_MODE: "full",
     DEVSPACE_WIDGETS: "off",
     DEVSPACE_MAX_MCP_SESSIONS: "7",
     DEVSPACE_MAX_PROCESS_OUTPUT_FILE_BYTES: "1048576",

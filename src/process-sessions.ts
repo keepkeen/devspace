@@ -160,8 +160,6 @@ interface ProcessSession {
 
 export interface ProcessSessionManagerOptions {
   maxBufferBytes?: number;
-  /** @deprecated Use maxBufferBytes. Kept for internal callers during migration. */
-  maxBufferCharacters?: number;
   completedSessionTtlMs?: number;
   maxSessions?: number;
   maxSessionsPerClient?: number;
@@ -552,7 +550,7 @@ export class ProcessSessionManager {
   private readonly closingWorkspaces = new Set<string>();
 
   constructor(options: ProcessSessionManagerOptions = {}) {
-    this.maxBufferBytes = options.maxBufferBytes ?? options.maxBufferCharacters ?? DEFAULT_BUFFER_BYTES;
+    this.maxBufferBytes = options.maxBufferBytes ?? DEFAULT_BUFFER_BYTES;
     this.completedSessionTtlMs = options.completedSessionTtlMs ?? COMPLETED_SESSION_TTL_MS;
     this.maxSessions = options.maxSessions ?? Number.POSITIVE_INFINITY;
     this.maxSessionsPerClient = options.maxSessionsPerClient ?? Number.POSITIVE_INFINITY;
