@@ -118,20 +118,28 @@ fresh connector registration to an earlier principal, generate
 `devspace auth reconnect-code <principal-id>` and enter the one-time short-lived
 code on the OAuth approval page. Relinking is rejected after the fresh source
 principal has retained Workspace state, and any tokens issued before the
-relink are revoked. Reauthorizing the same registered client preserves its
-principal but advances active Workspace generations, so conversations must
-resume them.
+relink are revoked. Reauthorizing the same registered client with the same
+principal and authority preserves active Workspace generations and receipts.
+Only a real authority-boundary change such as principal creation/relink,
+revocation, Owner-credential rotation, root authority change, or Workspace
+write-access change advances the affected generation.
 
 ChatGPT does not provide a trusted conversation identifier. A Workspace alias
 is therefore the durable conversation-to-project key. Multiple conversations
 under one principal may retain different aliases; after a disconnect, later-day
-turn, or new transport, each conversation should list and resume its own alias.
+turn, or new transport, each conversation should list and resume its own saved
+entry by alias or workspaceRef.
 Do not create a replacement managed worktree merely because an old receipt or
 MCP session disappeared.
+`list_workspaces` also returns a persistent `workspaceRef` and an opaque
+HMAC-based `projectFingerprint`; `resume_workspace` accepts exactly one alias or
+workspaceRef, while the fingerprint distinguishes same-named projects without
+exposing their absolute roots.
 
 Managed Workspace records remain active when their worktree directory is
 missing. `list_workspaces` reports `recovery_required`, and
-`resume_workspace(alias, contextMode="full")` attempts to recreate the original
+`resume_workspace` with either the alias or workspaceRef and
+`contextMode="full"` attempts to recreate the original
 path under the same Workspace ID. DevSpace prefers the latest commit retained
 in Git's worktree metadata, falling back to the saved base commit. If the
 physical directory and its uncommitted files were lost, recovery reports
@@ -290,16 +298,22 @@ ignored so an old configuration file can still start without changing the
 model-facing protocol.
 
 Every Workspace-scoped call requires the current v3 context `receipt`. The
-receipt binds the OAuth connection, Workspace ID and generation, a private
+receipt binds the OAuth connection, Workspace ID, alias, project fingerprint,
+and generation, a private
 context session, context phase, both context revisions at issuance, and server
 process generation. A metadata receipt may only call `get_workspace_context`,
 `close_workspace`, or `revoke_workspace`; read, inspection, process, and mutation
 tools require a context-loaded receipt. The unified registration layer validates
 ownership, integrity, phase, and generation before the tool handler starts.
 Each context session owns its instruction acknowledgements, so resuming a new
-conversation cannot clear another valid receipt's state. A successful OAuth authorization
-advances active generations; a restart invalidates receipts without deleting
-resumable aliases.
+conversation cannot clear another valid receipt's state. Every scoped result
+exposes model-visible `workspace` and `continuation` fields with the current
+receipt and fixed `expiresAt`; ordinary tools echo them without renewing the
+deadline, while explicit context load/refresh renews it. Receipt storage is
+bounded globally and per principal, and LRU access does not slide expiry. A
+same-authority OAuth reapproval leaves generations intact; authority-boundary
+changes and a restart invalidate affected receipts without deleting resumable
+aliases.
 
 Commands run without a PTY by default. Prefer `program` plus `args` for direct
 execution; argument boundaries reach `spawn`/PTY unchanged. Use `shell: true`
@@ -347,8 +361,10 @@ worktree for the recommended writable flow, or explicitly request
 intended. Existing persisted checkout sessions retain their previous writable
 authority during migration.
 
-`apply_patch`, `exec_command`, `close_workspace`, `revoke_workspace`, and
-`show_changes` require an `operationId` of at most 128 characters. A
+`apply_patch`, `exec_command`, `close_workspace`, and `revoke_workspace`
+require an `operationId` of at most 128 characters. `show_changes` is a
+read-only preview by default and does not move its checkpoint; only
+`advanceCheckpoint: true` requires `workspace:write` and an `operationId`. A
 `write_stdin` call also requires one whenever it sends input, closes stdin, or
 resizes a process; polling alone does not. The ID is unique within the current
 connection principal, and its record stores the Workspace, generation, and
@@ -360,7 +376,9 @@ instead report `commandExecuted: true`, `status: "exited"`, and the exit code.
 `get_operation_status` returns state and result availability without returning
 the stored body. Expired replay bodies are cleared while their operation-ID
 tombstones remain until Workspace deletion, so an old ID cannot execute again.
-Reads expose `contentHash` and decimal-string `mtimeNs`;
+Reads expose `contentHash` and decimal-string `mtimeNs`. `batch_read` uses the
+same before/after stability check and returns those versions with each file's
+content, offset, and optional next offset/truncation marker;
 `apply_patch` defaults to strict preconditions and requires an `ifMatch` entry
 for every touched path before its first write. Use the latest read version for
 an existing path and explicit `null` for a path expected not to exist. Missing
@@ -369,8 +387,9 @@ bypass.
 
 Workspace operations also use a fair process-local read/write lock keyed by the
 canonical physical root. Reads and inspections may share the read side.
-`apply_patch`, `exec_command`, mutating `write_stdin`, `show_changes`, close,
-and revoke use the write side, including when different principals opened the
+The default `show_changes` preview also uses the read side. `apply_patch`,
+`exec_command`, mutating `write_stdin`, explicit review-checkpoint advancement,
+close, and revoke use the write side, including when different principals opened the
 same checkout. The DevSpace process-output writer lease permits only one server
 process for a state directory, so this lock is global within the supported
 single-server deployment. Separate DevSpace instances using different state
@@ -438,11 +457,19 @@ Legacy project paths such as `.pi/skills` can be added through `DEVSPACE_SKILL_P
 
 Each manifest requires non-empty string `name` and `description` frontmatter.
 Duplicate names are retained and distinguished by stable ID, path, source, and
-scope. Optional `agents/openai.yaml` is supported; set
-`policy.allow_implicit_invocation: false` to require an explicit user request.
+scope. Repository Skills are always marked `repository_untrusted` and require
+explicit loading; repository `agents/openai.yaml` cannot grant them implicit
+invocation. User/admin/bundled and explicitly configured local Skill roots may
+use their local `agents/openai.yaml` policy. To locally allowlist one repository
+Skill, add its exact directory or `SKILL.md` path to `DEVSPACE_SKILL_PATHS`;
+explicit local sources take precedence over automatic repository discovery and
+the same manifest is still loaded only once.
 The full-context Skill catalog is limited to 8,000 serialized UTF-8 bytes.
-ChatGPT web loads a selected manifest of at most 64 KiB with `load_skill`; only
-a complete, successful load opens access to that Skill's support files.
+Catalog descriptions are single-line, control/HTML/code-block sanitized, and
+bounded before serialization. ChatGPT web loads a selected manifest of at most
+64 KiB with `load_skill`; the result separates fixed server text from
+structured source/trust metadata and `skill.content`. Only a complete,
+successful load opens access to that Skill's support files.
 
 Example:
 

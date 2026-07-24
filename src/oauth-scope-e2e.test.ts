@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { loadConfig } from "./config.js";
@@ -28,9 +30,22 @@ const tokens = {
   full: "oauth-scope-full-token",
   legacy: "oauth-scope-legacy-token",
 };
+const execFileAsync = promisify(execFile);
 
 await mkdir(workspaceRoot, { recursive: true });
 await writeFile(join(workspaceRoot, "payload.txt"), "scope-ready\n");
+await execFileAsync("git", ["init", "-q"], { cwd: workspaceRoot });
+await execFileAsync("git", ["add", "."], { cwd: workspaceRoot });
+await execFileAsync(
+  "git",
+  [
+    "-c", "user.name=DevSpace Test",
+    "-c", "user.email=devspace@example.invalid",
+    "-c", "commit.gpgsign=false",
+    "commit", "-qm", "fixture",
+  ],
+  { cwd: workspaceRoot },
+);
 
 const config = loadConfig({
   DEVSPACE_CONFIG_DIR: join(root, "config"),
@@ -39,6 +54,7 @@ const config = loadConfig({
   DEVSPACE_ALLOWED_HOSTS: "*",
   DEVSPACE_PUBLIC_BASE_URL: publicBaseUrl,
   DEVSPACE_OAUTH_OWNER_TOKEN: "oauth-scope-test-owner-token-long-enough",
+  DEVSPACE_WIDGETS: "changes",
   DEVSPACE_LOG_LEVEL: "silent",
   PORT: "1",
 });
@@ -80,6 +96,25 @@ try {
     name: "read",
     arguments: { receipt: readReceipt, path: "payload.txt" },
   }));
+  const readOnlyChangePreview = await readClient.callTool({
+    name: "show_changes",
+    arguments: { receipt: readReceipt },
+  });
+  assertSucceeded(readOnlyChangePreview);
+  assert.equal(
+    (readOnlyChangePreview.structuredContent as {
+      effects?: { reviewCheckpoint?: { advanced?: unknown } };
+    } | undefined)?.effects?.reviewCheckpoint?.advanced,
+    false,
+  );
+  assertScopeDenied(await readClient.callTool({
+    name: "show_changes",
+    arguments: {
+      receipt: readReceipt,
+      advanceCheckpoint: true,
+      operationId: "read-scope-review-advance",
+    },
+  }), "workspace:write");
   assertScopeDenied(await readClient.callTool({
     name: "apply_patch",
     arguments: {
@@ -127,6 +162,32 @@ try {
       patch: "*** Begin Patch\n*** Add File: write-ok.txt\n+ok\n*** End Patch",
     },
   }));
+  const writePreview = await writeClient.callTool({
+    name: "show_changes",
+    arguments: { receipt: writeReceipt },
+  });
+  assertSucceeded(writePreview);
+  assert.equal(
+    (writePreview.structuredContent as {
+      effects?: { reviewCheckpoint?: { advanced?: unknown } };
+    } | undefined)?.effects?.reviewCheckpoint?.advanced,
+    false,
+  );
+  const writeAdvance = await writeClient.callTool({
+    name: "show_changes",
+    arguments: {
+      receipt: writeReceipt,
+      advanceCheckpoint: true,
+      operationId: "write-scope-review-advance",
+    },
+  });
+  assertSucceeded(writeAdvance);
+  assert.equal(
+    (writeAdvance.structuredContent as {
+      effects?: { reviewCheckpoint?: { advanced?: unknown } };
+    } | undefined)?.effects?.reviewCheckpoint?.advanced,
+    true,
+  );
   assertScopeDenied(await writeClient.callTool({
     name: "exec_command",
     arguments: {

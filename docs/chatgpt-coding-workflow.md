@@ -30,13 +30,19 @@ pass it to `get_workspace_context`:
 ```
 
 The result contains structured instruction and Skill sections plus a refreshed
-receipt. Pass the current receipt to later Workspace-scoped tools. It binds the
+receipt. Its model-visible `workspace` includes `ref`, `alias`, an opaque
+`projectFingerprint`, and generation. `continuation` includes the receipt,
+phase, fixed `expiresAt`, and both revisions. Pass the current receipt to later
+Workspace-scoped tools. Every scoped result echoes the same visible workspace
+and continuation; ordinary tools do not issue a new receipt or extend its
+deadline. It binds the
 local connection principal, Workspace identity and generation, a private context session,
 instruction revision, Skill revision, context phase, and current server process;
 callers do not repeat host paths or internal IDs.
 
 In a new conversation, do not resend or guess the host path. Call
-`list_workspaces`, select the intended alias, then call:
+`list_workspaces`, select the intended entry, then call `resume_workspace` with
+exactly one of its alias or persistent workspaceRef:
 
 ```json
 {
@@ -51,6 +57,8 @@ until its first successful Owner approval, which creates a separate principal
 by default and cannot use earlier aliases. DevSpace does not receive a verified
 ChatGPT account subject, so this is connection-level isolation rather than an
 account identity claim. Resume returns a fresh receipt.
+The listed `projectFingerprint` is HMAC-derived and helps distinguish
+same-named projects without exposing their absolute host paths.
 
 To deliberately recover aliases after deleting and re-adding a connector, run
 these commands locally:
@@ -110,7 +118,7 @@ receipts, new conversations, and context-compacted callers must use `full`.
 bodies.
 
 After a backend restart, an old receipt fails with
-`workspace_context_required`. Resume by alias with full context. Cold hydration
+`workspace_context_required`. Resume by alias or workspaceRef with full context. Cold hydration
 advances the Workspace generation and reloads agent profiles, Skills, root
 instructions, and durable review checkpoints before issuing the new receipt.
 
@@ -123,6 +131,8 @@ is the authoritative context:
   "context": { "phase": "context_loaded" },
   "workspace": {
     "ref": "ws_…",
+    "alias": "my-project",
+    "projectFingerprint": "proj_…",
     "generation": 5,
     "mode": "worktree",
     "writeAccess": "read_write"
@@ -135,6 +145,13 @@ is the authoritative context:
     "items": []
   },
   "skills": { "revision": "sha256-v1:…", "count": 3, "included": true, "items": [] },
+  "continuation": {
+    "receipt": "wctx3.…",
+    "phase": "context_loaded",
+    "expiresAt": "2026-07-25T01:00:00.000Z",
+    "instructionRevision": "sha256-v1:…",
+    "skillRevision": "sha256-v1:…"
+  },
   "receipt": "wctx3.…"
 }
 ```
@@ -293,10 +310,15 @@ Repository ancestors above the most specific matching allowed root are never
 scanned or exposed.
 
 Every `SKILL.md` must start with valid YAML frontmatter containing non-empty
-string `name` and `description` values. Optional `agents/openai.yaml` metadata
-is loaded; `policy.allow_implicit_invocation: false` keeps the Skill available
-for an explicit user request but prevents the model from selecting it
-implicitly. Skills with the same name are all retained with distinct stable
+string `name` and `description` values. Repository Skills are always exposed as
+`repository_untrusted` and `explicitOnly`; repository `agents/openai.yaml`
+cannot grant itself implicit invocation. User/admin/bundled and explicitly
+configured local roots may use their locally trusted metadata policy. Adding
+an exact repository Skill directory or `SKILL.md` path to
+`DEVSPACE_SKILL_PATHS` is the local allowlist mechanism; that explicit source
+takes precedence over automatic repository discovery without duplicating the
+manifest. Skills
+with the same name are all retained with distinct stable
 `skillId`, path, source, and scope values.
 Invalid, oversized, or escaping OpenAI metadata fails closed by disabling
 implicit invocation while leaving explicit user selection available.
@@ -315,8 +337,9 @@ Legacy project paths such as `.pi/skills` can be added through `DEVSPACE_SKILL_P
 
 Full workspace context returns a deterministic Skill catalog capped at 8,000 UTF-8 bytes
 serialized characters and reports how many entries were omitted. Descriptions
-are shortened before whole same-name groups are omitted. Common entries contain
-only selection data; duplicate names additionally receive a privacy-safe
+are converted to a bounded single line and stripped of control characters,
+HTML tags, and fenced code blocks before whole same-name groups are omitted.
+Every entry includes source/trust selection data; duplicate names additionally receive a privacy-safe
 logical path and scope. An exact user-provided Skill name can still be passed
 to `load_skill` even if its catalog entry was omitted.
 
@@ -327,7 +350,8 @@ also accepted when it identifies one Skill; duplicate names require `skillId`.
 This is DevSpace's explicit replacement for Codex's `$skill` and `/skills`
 surfaces. Direct and batch reads cannot bypass `load_skill`; activation and
 manifest access go through it so the discovery-time hash can be checked.
-After loading, `load_skill` returns a virtual root such as
+After loading, `load_skill` keeps the fixed text separate from structured
+`skill.content` and returns source, trust, manifest hash, scope, and a virtual root such as
 `skill://<skillId>/`. The model can read `references/`, `scripts/`, and other
 support files with paths such as
 `skill://<skillId>/references/example.md`, without receiving the host's
@@ -400,9 +424,21 @@ mutation adds one durable operation envelope:
 ```json
 {
   "ok": true,
-  "workspace": { "ref": "ws_…", "generation": 3 },
+  "workspace": {
+    "ref": "ws_…",
+    "alias": "my-project",
+    "projectFingerprint": "proj_…",
+    "generation": 3
+  },
   "context": {
     "phase": "context_loaded",
+    "instructionRevision": "sha256-v1:…",
+    "skillRevision": "sha256-v1:…"
+  },
+  "continuation": {
+    "receipt": "wctx3.…",
+    "phase": "context_loaded",
+    "expiresAt": "2026-07-25T01:00:00.000Z",
     "instructionRevision": "sha256-v1:…",
     "skillRevision": "sha256-v1:…"
   },
@@ -424,9 +460,11 @@ are limited to context promotion and lifecycle operations. Full/retained
 receipts carry the context revisions of the delivered snapshot and their own
 instruction acknowledgement state; instruction gates, Skill reload checks, and
 file versions handle later project changes without forcing a new receipt after
-every edit. Cold hydration, allowed-root changes,
-credential-epoch changes, close/reopen transitions, and server restart make an
-old receipt unusable.
+every edit. The cache is bounded globally and per principal; receipt use only
+refreshes LRU recency and never slides the fixed expiry. Cold hydration,
+principal relink/revoke, Owner/root authority changes, close/reopen
+transitions, and server restart make an old receipt unusable. Reapproving the
+same registered client with the same authority does not.
 
 OAuth authorization can be restricted to `workspace:read`, `workspace:write`,
 `process:execute`, `network:access`, `worktree:create`, and
@@ -437,8 +475,10 @@ OAuth authorization can be restricted to `workspace:read`, `workspace:write`,
 `write_stdin` additionally requires workspace write authority; polling requires
 only process authority.
 
-`apply_patch`, `exec_command`, `close_workspace`, `revoke_workspace`, and
-`show_changes` require an `operationId`. Mutating `write_stdin` requires one;
+`apply_patch`, `exec_command`, `close_workspace`, and `revoke_workspace`
+require an `operationId`. `show_changes` is a read-only preview by default;
+only `advanceCheckpoint: true` requires write scope and an operation ID.
+Mutating `write_stdin` requires one;
 pure polling does not. Use a new ID for each intended mutation. If an HTTP
 response is lost, retry the identical call with the same ID: DevSpace replays
 the stored result instead of applying the mutation twice. Reusing an ID with
@@ -454,8 +494,9 @@ mutation merely because 24 hours elapsed.
 
 Within one DevSpace instance, all Workspace-scoped calls are coordinated by a
 fair read/write lock keyed by the canonical physical root. Inspection calls may
-share the read lock. Patches, commands, mutating process input, review
-checkpoint updates, close, and revoke use the write side. The key is the root,
+share the read lock, including the default `show_changes` preview. Patches,
+commands, mutating process input, explicit review-checkpoint advancement,
+close, and revoke use the write side. The key is the root,
 not the Workspace ID, so two principals opening the same checkout cannot submit
 those MCP calls concurrently. The lease ends when the tool call returns, so a
 long-running dev server does not block later reads or edits. A returned process
@@ -468,20 +509,26 @@ structured result says `ok=false`, `status="exited"`,
 `error` and never claims `commandExecuted=true`.
 
 Large model-visible text has one canonical location. DevSpace does not mirror
-file contents, Skill manifests, or process output between MCP `content` and
-`structuredContent`:
+file contents or process output between MCP `content` and `structuredContent`:
 
-- `read` and `load_skill` return their body only in text `content`. Successful
-  reads add `contentHash` and exact decimal-string `mtimeNs` as structured
+- `read` returns its body only in text `content`. Successful reads add
+  `contentHash` and exact decimal-string `mtimeNs` as structured
   metadata. `apply_patch` requires an `ifMatch` entry for every touched path by
   default: use the latest version for an existing path and `null` for a path
   expected not to exist. Missing preconditions are rejected before execution;
   no blind-write bypass is exposed.
-- `batch_read` and `batch_inspect` return a short text completion summary and
-  keep ordered results in `structuredContent.items[]` as optional `ref`, `ok`,
+- `load_skill` returns one fixed trust-boundary sentence in text and the
+  manifest in structured `skill.content` together with source, trust,
+  manifest hash, scope, and virtual resource root.
+- `batch_read` and `batch_inspect` return a short text completion summary.
+  Successful `batch_read.items[]` contain optional `ref`, workspace-relative
+  `path`, `content`, `contentHash`, exact `mtimeNs`, `offset`, and optional
+  `nextOffset`/`truncated`; failures use `error`. Batch read shares the same
+  before/after stability check as `read`, so its versions can be passed directly
+  to `apply_patch.ifMatch`. `batch_inspect.items[]` keep optional `ref`, `ok`,
   `result`, and exceptional `truncated=true`. Top-level `status`, `succeeded`,
-  and `failed` make partial completion explicit. Host paths and operations are
-  not echoed, and there is no aggregate `result`.
+  and `failed` make partial completion explicit. Absolute host paths are not
+  echoed, and there is no aggregate `result`.
 - `exec_command` and `write_stdin` return the current inline output in
   text `content`. Structured data contains process semantics and actionable or
   exceptional fields: `ok`, `status`, `commandExecuted`, active `sessionId`,
@@ -492,7 +539,8 @@ file contents, Skill manifests, or process output between MCP `content` and
   `status=unknown` means completion cannot be proved, so verify side effects
   before rerunning.
 - `close_workspace`, `apply_patch`, and `show_changes` return one concise text
-  result. Their detailed presentation data is UI-only `_meta`.
+  result. Their detailed presentation data is UI-only `_meta`. Every scoped
+  result also includes visible `workspace`, `context`, and `continuation`.
 
 Mutating and lifecycle tools also return machine-readable `effects`. Each
 effect states its evidence confidence: `observed` for versions and lifecycle
@@ -565,10 +613,12 @@ and shell tools. The aggregate `show_changes` tool is not exposed by default.
 Use `DEVSPACE_WIDGETS=off` to disable widget UI, or `DEVSPACE_WIDGETS=changes`
 to expose the aggregate show-changes flow.
 
-When `show_changes` is exposed, models should call it exactly once after the
-final file modification in any turn that changes files. The tool requires the
-current receipt; DevSpace automatically compares against the last shown
-checkpoint and advances that checkpoint after rendering the aggregate diff.
+When `show_changes` is exposed, its default call is a read-only preview against
+the last acknowledged checkpoint. It requires only the current receipt, does
+not need an operation ID, and does not advance the checkpoint, so repeated
+previews show the same delta. Set `advanceCheckpoint: true` only when the model
+intentionally acknowledges that view; that form requires `workspace:write` and
+an `operationId`, is idempotently recorded, and advances the checkpoint once.
 
 ## Shell Use
 

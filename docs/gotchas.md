@@ -163,19 +163,23 @@ state.
 ## Unknown `workspaceId`
 
 `workspaceId` values are scoped to the local connection principal that opened
-them. Normal MCP transport reconnects do not invalidate them. If ChatGPT
-refreshes or re-authorizes the same registered client, resume the Workspace
-after the generation change. A new dynamic registration remains unassigned;
+them. Normal MCP transport reconnects do not invalidate them. Refreshing or
+reauthorizing the same registered client with the same principal and authority
+does not advance its Workspace generation. Principal relink/revoke,
+Owner/root-authority changes, lifecycle transitions, and backend restart still
+invalidate affected receipts. A new dynamic registration remains unassigned;
 its first successful approval creates another principal that cannot see former
 aliases unless the owner explicitly uses a reconnect code. Before opening the
 project again, always call `list_workspaces`;
 creating a replacement worktree can strand the original task.
 
 In a new conversation on the same OAuth connection, call `list_workspaces` and
-then `resume_workspace(alias, contextMode="full")`; the host path does not need
-to be repeated. After a backend restart or resident-cache eviction, directly
+then `resume_workspace` with exactly one returned alias or `workspaceRef` and
+`contextMode="full"`; the host path does not need to be repeated. The opaque
+`projectFingerprint` helps distinguish same-named projects. After a backend restart or resident-cache eviction, directly
 using an old ID returns `workspace_resume_required`. Resume by alias before any
-file or process operation. The response returns the same durable ID with a
+file or process operation, or use the listed workspaceRef when alias retention
+is uncertain. The response returns the same durable ID with a
 newer `workspaceGeneration` only after instructions, Skills, profiles, and
 review checkpoints are hydrated.
 
@@ -206,8 +210,10 @@ correct alias or explicitly use `forceNew=true`; do not enter a loop of creating
 new branches to replace an inaccessible one.
 
 `open_workspace` is for the first use of a host path. Its default metadata mode
-does not return an operational `workspaceId`; call
-`get_workspace_context(alias, contextMode="full")` before work. Revision hints
+returns a visible Workspace reference but only a metadata-phase receipt; call
+`get_workspace_context` with that receipt and `contextMode="full"` before work.
+Every later scoped result echoes `workspace` and `continuation`, but ordinary
+tools do not renew the receipt's fixed expiry. Revision hints
 are only a cache optimization in explicit `retained` mode and do not prove that
 a new model conversation remembers the bodies.
 
@@ -354,18 +360,27 @@ The aggregate `show_changes` tool is only exposed with
 `DEVSPACE_WIDGETS=changes`. Plain MCP clients may ignore ChatGPT Apps widget
 metadata and only show text results.
 
+The default `show_changes` call is a read-only preview and does not advance the
+review checkpoint. Repeat it freely with the current receipt. Set
+`advanceCheckpoint: true` only to acknowledge the displayed delta; that form
+requires `workspace:write` and an `operationId`.
+
 ## A Batch Tool Shows Only a Summary
 
 `batch_read` and `batch_inspect` intentionally keep their independent payloads
 in `structuredContent.items[]`. Text `content` contains only a short completion
 summary. Give inputs short `ref` values when order alone is fragile; results
 echo refs and report top-level `completed`, `partial`, or `failed` plus counts.
-Host paths/operations and the former aggregate `result` are not emitted.
+Successful `batch_read` items contain workspace-relative path, content,
+contentHash, mtimeNs, offset, and optional paging/truncation metadata; failures
+contain `error`. `batch_inspect` items retain the compact `result` form. Absolute
+host paths/operations and the former aggregate result are not emitted.
 Update clients or adapters that only display text content, or use single-item
 tools when structured results are unavailable.
 
 Other heavy results also have one canonical model-visible location: single
-read, Skill, and process bodies are in text `content`, while only actionable
+file and process bodies are in text `content`, while Skill bodies are in
+structured `skill.content` with source/trust metadata and only actionable
 process handles and paging fields remain structured. Do not fall back to
 `_meta.card.payload.content`; `_meta` is optional widget presentation and may be
 absent. For durable output, display the page from `read_process_output` text

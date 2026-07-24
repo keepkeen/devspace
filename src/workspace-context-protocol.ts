@@ -16,12 +16,15 @@ const MAX_RECEIPT_KEY_BYTES = 64;
 const MAX_RECEIPT_FIELD_BYTES = 1_024;
 const DEFAULT_MAX_RECEIPTS = 4_096;
 const MAX_RECEIPTS = 65_536;
+const DEFAULT_MAX_RECEIPTS_PER_PRINCIPAL = 128;
 const DEFAULT_RECEIPT_TTL_MS = 6 * 60 * 60 * 1_000;
 const MAX_RECEIPT_TTL_MS = 24 * 60 * 60 * 1_000;
 
 export interface WorkspaceContextReceiptBinding {
   connectionPrincipalId: string;
   workspaceId: string;
+  alias: string;
+  projectFingerprint: string;
   contextSessionId: string;
   generation: number;
   instructionRevision: string;
@@ -29,12 +32,22 @@ export interface WorkspaceContextReceiptBinding {
   phase: WorkspaceContextPhase;
 }
 
+export interface WorkspaceContextReceipt {
+  receipt: string;
+  expiresAt: number;
+}
+
+export interface ResolvedWorkspaceContextReceipt {
+  binding: WorkspaceContextReceiptBinding;
+  expiresAt: number;
+}
+
 export type WorkspaceContextPhase = "metadata" | "context_loaded";
 
 export interface WorkspaceContextReceiptManager {
-  issue(binding: WorkspaceContextReceiptBinding): string;
+  issue(binding: WorkspaceContextReceiptBinding): WorkspaceContextReceipt;
   verify(receipt: string, binding: WorkspaceContextReceiptBinding): boolean;
-  resolve(receipt: string): WorkspaceContextReceiptBinding | undefined;
+  resolve(receipt: string): ResolvedWorkspaceContextReceipt | undefined;
 }
 
 export type WorkspaceContextInstructionSource = "repository" | "user" | "admin" | "bundled";
@@ -62,6 +75,8 @@ export interface WorkspaceContextSkillItem {
   skillId: string;
   name: string;
   description: string;
+  source: WorkspaceContextInstructionSource;
+  trust: WorkspaceContextInstructionTrust;
   path?: string;
   scope?: string;
   explicitOnly?: true;
@@ -74,6 +89,8 @@ export interface WorkspaceContextProtocolInput {
   phase: WorkspaceContextPhase;
   workspace: {
     ref: string;
+    alias: string;
+    projectFingerprint: string;
     generation: number;
     mode: WorkspaceMode;
     writeAccess: WorkspaceWriteAccess;
@@ -111,6 +128,14 @@ export interface WorkspaceContextProtocolResult {
       "revision" | "complete" | "included" | "acknowledged" | "items"
     >;
     skills: Pick<WorkspaceContextProtocolInput["skills"], "revision" | "count" | "included" | "items">;
+    continuation: {
+      receipt: string;
+      phase: WorkspaceContextPhase;
+      expiresAt: string;
+      instructionRevision: string;
+      skillRevision: string;
+    };
+    /** Kept for compatibility with clients using the original v3 field. */
     receipt: string;
     diagnostics?: WorkspaceContextDiagnostics;
   };
@@ -120,22 +145,77 @@ export function createWorkspaceContextReceiptManager(options: {
   key?: Uint8Array;
   processGeneration?: string;
   maxReceipts?: number;
+  maxReceiptsPerPrincipal?: number;
   ttlMs?: number;
   now?: () => number;
 } = {}): WorkspaceContextReceiptManager {
   const key = options.key === undefined ? randomBytes(RECEIPT_BYTES) : validateKey(options.key);
   const processGeneration = options.processGeneration ?? randomBytes(16).toString("base64url");
   const maxReceipts = options.maxReceipts ?? DEFAULT_MAX_RECEIPTS;
+  const maxReceiptsPerPrincipal = options.maxReceiptsPerPrincipal ??
+    Math.min(DEFAULT_MAX_RECEIPTS_PER_PRINCIPAL, maxReceipts);
   const ttlMs = options.ttlMs ?? DEFAULT_RECEIPT_TTL_MS;
   const now = options.now ?? Date.now;
   assertBoundedString("processGeneration", processGeneration);
   if (!Number.isSafeInteger(maxReceipts) || maxReceipts < 1 || maxReceipts > MAX_RECEIPTS) {
     throw new RangeError(`maxReceipts must be an integer from 1 to ${MAX_RECEIPTS}.`);
   }
+  if (
+    !Number.isSafeInteger(maxReceiptsPerPrincipal) ||
+    maxReceiptsPerPrincipal < 1 ||
+    maxReceiptsPerPrincipal > maxReceipts
+  ) {
+    throw new RangeError("maxReceiptsPerPrincipal must be an integer from 1 to maxReceipts.");
+  }
   if (!Number.isSafeInteger(ttlMs) || ttlMs < 1 || ttlMs > MAX_RECEIPT_TTL_MS) {
     throw new RangeError(`ttlMs must be an integer from 1 to ${MAX_RECEIPT_TTL_MS}.`);
   }
   const issued = new Map<string, { binding: WorkspaceContextReceiptBinding; expiresAt: number }>();
+  const issuedByPrincipal = new Map<string, Map<string, true>>();
+
+  const removeReceipt = (receipt: string): void => {
+    const entry = issued.get(receipt);
+    if (!entry) return;
+    issued.delete(receipt);
+    const principalReceipts = issuedByPrincipal.get(entry.binding.connectionPrincipalId);
+    principalReceipts?.delete(receipt);
+    if (principalReceipts?.size === 0) {
+      issuedByPrincipal.delete(entry.binding.connectionPrincipalId);
+    }
+  };
+
+  const touchReceipt = (
+    receipt: string,
+    entry: { binding: WorkspaceContextReceiptBinding; expiresAt: number },
+  ): void => {
+    issued.delete(receipt);
+    issued.set(receipt, entry);
+    const principalId = entry.binding.connectionPrincipalId;
+    const principalReceipts = issuedByPrincipal.get(principalId) ?? new Map<string, true>();
+    principalReceipts.delete(receipt);
+    principalReceipts.set(receipt, true);
+    issuedByPrincipal.set(principalId, principalReceipts);
+  };
+
+  const enforceLimits = (principalId: string): void => {
+    const principalReceipts = issuedByPrincipal.get(principalId);
+    while ((principalReceipts?.size ?? 0) > maxReceiptsPerPrincipal) {
+      const oldest = principalReceipts?.keys().next().value as string | undefined;
+      if (!oldest) break;
+      removeReceipt(oldest);
+    }
+    while (issued.size > maxReceipts) {
+      const oldest = issued.keys().next().value as string | undefined;
+      if (!oldest) break;
+      removeReceipt(oldest);
+    }
+  };
+
+  const cleanupExpiredReceipts = (currentTime: number): void => {
+    for (const [receipt, entry] of issued) {
+      if (entry.expiresAt <= currentTime) removeReceipt(receipt);
+    }
+  };
 
   const digest = (binding: WorkspaceContextReceiptBinding): Buffer => {
     assertReceiptBinding(binding);
@@ -144,6 +224,8 @@ export function createWorkspaceContextReceiptManager(options: {
     updateFramed(hmac, processGeneration);
     updateFramed(hmac, binding.connectionPrincipalId);
     updateFramed(hmac, binding.workspaceId);
+    updateFramed(hmac, binding.alias);
+    updateFramed(hmac, binding.projectFingerprint);
     updateFramed(hmac, binding.contextSessionId);
     updateFramed(hmac, String(binding.generation));
     updateFramed(hmac, binding.instructionRevision);
@@ -171,19 +253,18 @@ export function createWorkspaceContextReceiptManager(options: {
   return {
     issue(binding) {
       const receipt = `${RECEIPT_PREFIX}${digest(binding).toString("base64url")}`;
-      issued.delete(receipt);
-      issued.set(receipt, { binding: { ...binding }, expiresAt: now() + ttlMs });
-      while (issued.size > maxReceipts) {
-        const oldest = issued.keys().next().value as string | undefined;
-        if (oldest === undefined) break;
-        issued.delete(oldest);
-      }
-      return receipt;
+      const issuedAt = now();
+      cleanupExpiredReceipts(issuedAt);
+      removeReceipt(receipt);
+      const entry = { binding: { ...binding }, expiresAt: issuedAt + ttlMs };
+      touchReceipt(receipt, entry);
+      enforceLimits(binding.connectionPrincipalId);
+      return { receipt, expiresAt: entry.expiresAt };
     },
     verify(receipt, binding) {
       const entry = issued.get(receipt);
       if (!entry || entry.expiresAt <= now()) {
-        if (entry) issued.delete(receipt);
+        if (entry) removeReceipt(receipt);
         return false;
       }
       return signatureMatches(receipt, binding);
@@ -191,13 +272,12 @@ export function createWorkspaceContextReceiptManager(options: {
     resolve(receipt) {
       const entry = issued.get(receipt);
       if (!entry || entry.expiresAt <= now()) {
-        if (entry) issued.delete(receipt);
+        if (entry) removeReceipt(receipt);
         return undefined;
       }
       if (!signatureMatches(receipt, entry.binding)) return undefined;
-      issued.delete(receipt);
-      issued.set(receipt, entry);
-      return { ...entry.binding };
+      touchReceipt(receipt, entry);
+      return { binding: { ...entry.binding }, expiresAt: entry.expiresAt };
     },
   };
 }
@@ -246,9 +326,11 @@ export function serializeWorkspaceContext(
         }
       : {}),
   };
-  const receipt = receipts.issue({
+  const issuedReceipt = receipts.issue({
     connectionPrincipalId: input.connectionPrincipalId,
     workspaceId: input.workspaceId,
+    alias: input.workspace.alias,
+    projectFingerprint: input.workspace.projectFingerprint,
     contextSessionId: input.contextSessionId,
     generation: input.workspace.generation,
     instructionRevision: input.instructions.revision,
@@ -278,7 +360,14 @@ export function serializeWorkspaceContext(
         included: input.skills.included,
         items: input.skills.items,
       },
-      receipt,
+      continuation: {
+        receipt: issuedReceipt.receipt,
+        phase: input.phase,
+        expiresAt: new Date(issuedReceipt.expiresAt).toISOString(),
+        instructionRevision: input.instructions.revision,
+        skillRevision: input.skills.revision,
+      },
+      receipt: issuedReceipt.receipt,
       ...(Object.keys(diagnostics).length > 0 ? { diagnostics } : {}),
     },
   };
@@ -297,6 +386,8 @@ function validateKey(key: Uint8Array): Buffer {
 function assertReceiptBinding(binding: WorkspaceContextReceiptBinding): void {
   assertBoundedString("connectionPrincipalId", binding.connectionPrincipalId);
   assertBoundedString("workspaceId", binding.workspaceId);
+  assertBoundedString("alias", binding.alias);
+  assertBoundedString("projectFingerprint", binding.projectFingerprint);
   assertBoundedString("contextSessionId", binding.contextSessionId);
   assertPositiveSafeInteger("generation", binding.generation);
   assertBoundedString("instructionRevision", binding.instructionRevision);

@@ -49,6 +49,11 @@ export interface OAuthAuditEvent {
   clientId: string;
 }
 
+export interface OAuthAuthorizationBoundaryChange {
+  connectionPrincipalId: string;
+  reason: "principal_created" | "principal_relinked";
+}
+
 interface AuthorizationCodeRecord {
   clientId: string;
   params: AuthorizationParams;
@@ -298,7 +303,9 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     resourceServerUrl: URL,
     stateDir: string,
     private readonly onAuditEvent?: (event: OAuthAuditEvent) => void,
-    private readonly onAuthorizationEpochChanged?: (connectionPrincipalId: string) => void,
+    private readonly onAuthorizationBoundaryChanged?: (
+      change: OAuthAuthorizationBoundaryChange,
+    ) => void,
   ) {
     this.resourceServerUrl = resourceUrlFromServerUrl(resourceServerUrl);
     this.oauthStore = new SqliteOAuthStore(stateDir);
@@ -382,11 +389,15 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     );
     const reconnectCode = String(res.req.body?.reconnect_code ?? "").trim();
     let connectionPrincipalId: string;
+    let boundaryChangeReason: OAuthAuthorizationBoundaryChange["reason"] | undefined;
     if (reconnectCode) {
       try {
         const linked = this.oauthStore.consumeReconnectCode(reconnectCode, client.client_id);
         connectionPrincipalId = linked.targetPrincipalId;
-        if (linked.changed) this.emitAudit("oauth_principal_linked", client.client_id);
+        if (linked.changed) {
+          boundaryChangeReason = "principal_relinked";
+          this.emitAudit("oauth_principal_linked", client.client_id);
+        }
       } catch (error) {
         if (!(error instanceof PrincipalReconnectError)) throw error;
         res.status(400).setHeader("Content-Type", "text/html; charset=utf-8");
@@ -402,10 +413,17 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
         return;
       }
     } else {
-      connectionPrincipalId = this.oauthStore.ensurePrincipalForClient(client.client_id);
+      const assignment = this.oauthStore.ensurePrincipalAssignmentForClient(client.client_id);
+      connectionPrincipalId = assignment.principalId;
+      if (assignment.created) boundaryChangeReason = "principal_created";
     }
     this.oauthStore.touchPrincipal(connectionPrincipalId);
-    this.onAuthorizationEpochChanged?.(connectionPrincipalId);
+    if (boundaryChangeReason) {
+      this.onAuthorizationBoundaryChanged?.({
+        connectionPrincipalId,
+        reason: boundaryChangeReason,
+      });
+    }
     this.emitAudit("oauth_authorization_succeeded", client.client_id);
 
     const code = `code-${randomUUID()}`;

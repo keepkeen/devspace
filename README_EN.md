@@ -275,11 +275,17 @@ The expected workflow is:
    cannot read, inspect, execute, or modify local files.
 2. It passes that receipt to `get_workspace_context` with
    `contextMode: "full"` to receive the v3 structured instructions, Skill
-   catalog, and a refreshed context-loaded receipt. Revision-based suppression
+   catalog, and a refreshed context-loaded receipt. The model-visible
+   `workspace` contains `ref`, `alias`, a path-safe `projectFingerprint`, and
+   generation; `continuation` contains the receipt, phase, fixed expiry, and
+   both revisions. Revision-based suppression
    is allowed only when `get_workspace_context(retained)` refreshes that exact
    current context-loaded receipt. Open, resume, new conversations, and
    compacted contexts must use `full`.
 3. ChatGPT passes the current receipt to reads, searches, edits, and commands.
+   Every Workspace-scoped result echoes the same visible `workspace` and
+   `continuation`. Ordinary tools neither issue a new receipt nor extend its
+   deadline; only explicit context load or refresh renews that fixed expiry.
    The receipt binds the local connection principal, Workspace and generation,
    context phase, a private context session, and both context revisions.
 4. Each ChatGPT tool call may use a fresh stateless HTTP transport. Continuity
@@ -287,8 +293,10 @@ The expected workflow is:
    session headers do not interrupt the workspace. The same authorized client
    can reopen and reuse the same workspace in later conversations. A new
    conversation calls
-   `list_workspaces`, then `resume_workspace(alias, full)`, without resending an
-   absolute host path.
+   `list_workspaces`, then `resume_workspace` with exactly one returned alias or
+   persistent `workspaceRef`, without resending an absolute host path.
+   `list_workspaces` also returns a stable `projectFingerprint` for separating
+   same-named projects without exposing host paths.
    A deleted and re-added ChatGPT app receives a new dynamic OAuth registration
    and creates a new connection principal on its first successful approval, so
    it cannot see old aliases. To
@@ -327,8 +335,9 @@ one-time reconnect code.
 
 Two principals can still open the same physical checkout. Within one DevSpace
 instance, normalized-root read/write locks allow concurrent inspection but put
-patches, commands, writable process input, review checkpoints, close, and revoke
-through one write queue. The lock covers the MCP call, not the entire lifetime
+patches, commands, writable process input, explicit review-checkpoint
+advancement, close, and revoke through one write queue. The default change
+preview shares the read side. The lock covers the MCP call, not the entire lifetime
 of a returned background process. Later process effects remain explicitly
 `unknown`, and strict `ifMatch` preconditions prevent silent patch overwrites.
 Close and revoke stop tracked processes. Prefer separate Git worktrees for
@@ -377,6 +386,13 @@ It can then read references, scripts, and other support files through paths
 such as `skill://<skillId>/references/example.md` without receiving the host's
 absolute Skill path. Duplicate names are preserved and distinguished by
 `skillId`, a privacy-safe logical path, and scope.
+Repository Skills are always `repository_untrusted` and `explicitOnly`; a
+repository's own `agents/openai.yaml` cannot grant itself implicit invocation.
+`load_skill` returns provenance and the manifest body in structured
+`skill.content`, while its fixed text only states the trust boundary.
+To locally trust one repository Skill, add its exact directory or `SKILL.md`
+path to `DEVSPACE_SKILL_PATHS`; that local allowlist takes precedence over
+automatic repository discovery without loading the manifest twice.
 See the detailed
 [ChatGPT coding workflow](./docs/chatgpt-coding-workflow.md).
 
@@ -398,8 +414,11 @@ closes by default after an initial payload; set `closeStdin: false` to continue
 through `write_stdin`, which can append data or close the stream. PTY sessions
 do not emulate EOF with Ctrl-D.
 
-`apply_patch`, `exec_command`, `close_workspace`, `revoke_workspace`, and
-`show_changes` require an `operationId`. `write_stdin` also requires one when it
+`apply_patch`, `exec_command`, `close_workspace`, and `revoke_workspace`
+require an `operationId`. `show_changes` is a read-only preview by default: it
+does not advance the checkpoint and needs neither write scope nor an operation
+ID. Only `advanceCheckpoint: true` requires `operationId` and
+`workspace:write`. `write_stdin` also requires one when it
 sends input, closes stdin, or resizes a terminal; polling alone does not. Use a
 fresh ID for a new operation and reuse it only after a lost network response;
 DevSpace replays the stored result instead of executing twice. Failures expose
@@ -414,15 +433,19 @@ Every Workspace-scoped tool requires the current v3 `receipt`. The unified
 registration layer validates the connection principal, OAuth capabilities,
 generation, context phase, and private
 context-session binding before the handler starts. Metadata receipts can only
-promote context or close/revoke the Workspace. Restarts, OAuth
-reauthorization, allowed-root changes, and close/reopen cycles stale old
-receipts. `read` returns `contentHash` and exact string `mtimeNs`. By default,
+promote context or close/revoke the Workspace. Receipt storage has both global
+and per-principal limits; use refreshes LRU recency but not the fixed deadline.
+Restarts, principal relink/revoke, Owner-credential or root-authority changes,
+and close/reopen cycles stale old receipts. Reapproving the same client with
+the same principal and authority does not. `read` returns `contentHash` and
+exact string `mtimeNs`. By default,
 `apply_patch` requires an `ifMatch` entry for every touched path: use the latest
 read version for an existing path and explicit `null` for a path expected not
 to exist. A patch with any missing path precondition is rejected before it
 starts.
 
-Workspace-scoped results use a common `workspace` and `context` envelope.
+Workspace-scoped results use a common `workspace`, `context`, and
+`continuation` envelope.
 Mutations add `operation` with `not_started`, `committed`, or
 `outcome_unknown`, plus retry and effect-knowledge semantics. Effects identify
 their evidence as `observed`, `declared`, or `unknown` rather than claiming a
@@ -440,13 +463,18 @@ When several independent files or searches are already known, `batch_read` and
 and results explicitly report `completed`, `partial`, or `failed` with counts.
 DevSpace does not force batching when
 the next file depends on the result of the previous search.
+Successful `batch_read.items[]` include `path`, `content`, `contentHash`, exact
+`mtimeNs`, `offset`, and optional `nextOffset`/`truncated`. Batch and single-file
+reads share the same before/after stability check, so these versions can be
+used directly as `apply_patch.ifMatch` preconditions.
 
 DevSpace keeps each large model-visible payload in one place so the same file
 or command output does not consume context in both `content` and
-`structuredContent`. Reads and Skill loads put body text only in `content`;
-process structures emit only actionable handles or exceptional state. Batch
-tools keep `ref/ok/result` entries in `structuredContent.items[]` without
-echoing host paths, and there is no aggregate `result`. `_meta` is
+`structuredContent`. Reads put file text only in `content`; Skill bodies live
+in structured `skill.content` with source/trust metadata. Process structures
+emit only actionable handles or exceptional state. `batch_read` uses the
+versioned file records above, while `batch_inspect` keeps `ref/ok/result`
+entries; neither echoes absolute host paths or an aggregate `result`. `_meta` is
 optional ChatGPT component data and can be
 ignored by ordinary MCP clients. Clients that consumed the old duplicate
 fields must follow these result locations; see the
@@ -468,7 +496,8 @@ in SQLite and is not tied to one HTTP connection.
 
 If the server restarts, ChatGPT may open a fresh MCP transport. Existing
 checkout workspaces remain available, but old receipts are invalid: call
-`list_workspaces`, then `resume_workspace(alias, full)` for a fresh receipt.
+`list_workspaces`, then `resume_workspace` with an alias or `workspaceRef` and
+`contextMode: "full"` for a fresh receipt.
 
 <details>
 <summary><strong>Shadowrocket or another TUN proxy</strong></summary>

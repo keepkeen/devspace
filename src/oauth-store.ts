@@ -87,6 +87,11 @@ export interface PrincipalLinkResult {
   changed: boolean;
 }
 
+export interface PrincipalAssignmentResult {
+  principalId: string;
+  created: boolean;
+}
+
 export class PrincipalReconnectError extends Error {
   constructor(
     readonly code:
@@ -215,6 +220,10 @@ export class SqliteOAuthStore {
   }
 
   ensurePrincipalForClient(clientId: string): string {
+    return this.ensurePrincipalAssignmentForClient(clientId).principalId;
+  }
+
+  ensurePrincipalAssignmentForClient(clientId: string): PrincipalAssignmentResult {
     const ensure = this.database.sqlite.transaction(() => {
       const client = this.database.sqlite.prepare(`
         select principal_id as principalId
@@ -229,7 +238,7 @@ export class SqliteOAuthStore {
           where principal_id = ? and revoked_at is null
         `).get(client.principalId);
         if (!active) throw new InvalidRequestError("OAuth client has no active connection principal");
-        return client.principalId;
+        return { principalId: client.principalId, created: false };
       }
 
       const principalId = `principal-${randomUUID()}`;
@@ -244,7 +253,7 @@ export class SqliteOAuthStore {
         set principal_id = ?
         where client_id = ? and principal_id is null
       `).run(principalId, clientId);
-      return principalId;
+      return { principalId, created: true };
     });
     return ensure.immediate();
   }

@@ -203,9 +203,10 @@ Do not retry a mutation unless `safeToRetry` is explicitly true.
 
 Within one DevSpace server, Workspace-scoped calls use a fair read/write lock
 keyed by the canonical physical root rather than only by Workspace ID. Reads and
-inspection can proceed together. Patches, commands, mutating `write_stdin`,
-review-checkpoint updates, close, and revoke are serialized even when different
-principals opened the same checkout.
+inspection, including the default `show_changes` preview, can proceed together.
+Patches, commands, mutating `write_stdin`, explicit review-checkpoint
+advancement, close, and revoke are serialized even when different principals
+opened the same checkout.
 
 The write lease covers each MCP command or process-input call, not the entire
 lifetime of a returned background or interactive process. This avoids a dev

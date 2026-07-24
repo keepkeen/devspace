@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import { realpathSync, statSync, type Stats } from "node:fs";
 import type {
   ActiveWorkspaceSummary,
@@ -156,7 +156,9 @@ export interface OpenWorkspaceInput {
 }
 
 export interface WorkspaceSummary {
+  workspaceRef: string;
   alias: string;
+  projectFingerprint: string;
   displayPath: string;
   mode: WorkspaceMode;
   managed: boolean;
@@ -478,10 +480,16 @@ export class WorkspaceRegistry {
         : session
           ? this.workspaceRootAllowed(session.root, session.mode, session.sourceRoot)
           : true;
+      const identityRoot = resident?.sourceRoot ?? resident?.root ?? session?.sourceRoot ?? session?.root;
+      if (!identityRoot) throw new Error(`Workspace summary is missing its persisted root: ${summary.alias}`);
+      const workspaceRef = resident?.id ?? session?.id;
+      if (!workspaceRef) throw new Error(`Workspace summary is missing its reference: ${summary.alias}`);
       return {
+        workspaceRef,
         alias: summary.alias,
+        projectFingerprint: this.projectFingerprintForRoot(identityRoot),
         displayPath: formatWorkspaceDisplayPath(
-          resident?.sourceRoot ?? resident?.root ?? session?.sourceRoot ?? session?.root,
+          identityRoot,
         ),
         mode: summary.mode,
         managed: summary.managed,
@@ -507,6 +515,22 @@ export class WorkspaceRegistry {
       .find((candidate) => candidate.alias === normalizedAlias);
     if (!summary) throw new UnknownWorkspaceAliasError();
     return summary;
+  }
+
+  projectFingerprint(workspace: Workspace): string {
+    return this.projectFingerprintForRoot(workspace.sourceRoot ?? workspace.root);
+  }
+
+  async resumeWorkspaceByReference(
+    connectionPrincipalId: string,
+    workspaceRef: string,
+  ): Promise<WorkspaceContext> {
+    const resident = this.workspaces.get(workspaceRef);
+    const alias = resident?.connectionPrincipalId === connectionPrincipalId
+      ? resident.alias
+      : this.store?.getSession(workspaceRef, connectionPrincipalId)?.alias;
+    if (!alias) throw new UnknownWorkspaceAliasError();
+    return this.resumeWorkspace(connectionPrincipalId, alias);
   }
 
   activeSessionsSnapshot(): WorkspaceSession[] {
@@ -2077,6 +2101,15 @@ export class WorkspaceRegistry {
       skills: result.skills,
       skillDiagnostics: result.diagnostics,
     };
+  }
+
+  private projectFingerprintForRoot(root: string): string {
+    const digest = createHmac("sha256", this.config.oauth.ownerToken)
+      .update("devspace:project-fingerprint:v1\0", "utf8")
+      .update(root, "utf8")
+      .digest("base64url")
+      .slice(0, 22);
+    return `proj_${digest}`;
   }
 
   private assertWorkspaceRootAllowed(root: string, mode: WorkspaceMode, sourceRoot: string | undefined): string {

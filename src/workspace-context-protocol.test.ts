@@ -11,10 +11,17 @@ import {
 
 const key = Buffer.alloc(32, 0x5a);
 const processGeneration = "process-generation-a";
-const receipts = createWorkspaceContextReceiptManager({ key, processGeneration });
+const issuedAt = 1_000_000;
+const receipts = createWorkspaceContextReceiptManager({
+  key,
+  processGeneration,
+  now: () => issuedAt,
+});
 const binding: WorkspaceContextReceiptBinding = {
   connectionPrincipalId: "principal-secret-17",
   workspaceId: "workspace-opaque-ref",
+  alias: "project-a",
+  projectFingerprint: "proj_stable-project-a",
   contextSessionId: "wctxs_context-session-a",
   generation: 7,
   instructionRevision: "instruction-revision-a",
@@ -22,14 +29,20 @@ const binding: WorkspaceContextReceiptBinding = {
   phase: "context_loaded",
 };
 
-const receipt = receipts.issue(binding);
+const issued = receipts.issue(binding);
+const receipt = issued.receipt;
 assert.match(receipt, /^wctx3\.[A-Za-z0-9_-]{43}$/);
+assert.equal(issued.expiresAt, issuedAt + 6 * 60 * 60 * 1_000);
 assert.equal(receipts.verify(receipt, binding), true);
 const resolved = receipts.resolve(receipt);
-assert.deepEqual(resolved, binding);
+assert.deepEqual(resolved, { binding, expiresAt: issued.expiresAt });
 assert.ok(resolved);
-resolved.workspaceId = "mutated-copy";
-assert.deepEqual(receipts.resolve(receipt), binding, "resolve must not expose mutable registry state");
+resolved.binding.workspaceId = "mutated-copy";
+assert.deepEqual(
+  receipts.resolve(receipt),
+  { binding, expiresAt: issued.expiresAt },
+  "resolve must not expose mutable registry state",
+);
 const equivalentManager = createWorkspaceContextReceiptManager({ key, processGeneration });
 assert.equal(
   equivalentManager.verify(receipt, binding),
@@ -40,6 +53,8 @@ assert.equal(equivalentManager.resolve(receipt), undefined, "only locally issued
 for (const changed of [
   { ...binding, connectionPrincipalId: "different-principal" },
   { ...binding, workspaceId: "different-workspace" },
+  { ...binding, alias: "different-alias" },
+  { ...binding, projectFingerprint: "proj_different" },
   { ...binding, contextSessionId: "wctxs_context-session-b" },
   { ...binding, generation: binding.generation + 1 },
   { ...binding, instructionRevision: "instruction-revision-b" },
@@ -78,18 +93,43 @@ assert.throws(
   () => createWorkspaceContextReceiptManager({ maxReceipts: 0 }),
   /maxReceipts must be an integer from 1 to 65536/,
 );
+assert.throws(
+  () => createWorkspaceContextReceiptManager({ maxReceipts: 2, maxReceiptsPerPrincipal: 3 }),
+  /maxReceiptsPerPrincipal must be an integer from 1 to maxReceipts/,
+);
 
 const boundedReceipts = createWorkspaceContextReceiptManager({ key, processGeneration, maxReceipts: 2 });
 const firstBinding = { ...binding, workspaceId: "workspace-1" };
 const secondBinding = { ...binding, workspaceId: "workspace-2" };
 const thirdBinding = { ...binding, workspaceId: "workspace-3" };
-const firstReceipt = boundedReceipts.issue(firstBinding);
-const secondReceipt = boundedReceipts.issue(secondBinding);
-assert.deepEqual(boundedReceipts.resolve(firstReceipt), firstBinding, "resolve refreshes LRU recency");
-const thirdReceipt = boundedReceipts.issue(thirdBinding);
+const firstReceipt = boundedReceipts.issue(firstBinding).receipt;
+const secondReceipt = boundedReceipts.issue(secondBinding).receipt;
+assert.deepEqual(
+  boundedReceipts.resolve(firstReceipt)?.binding,
+  firstBinding,
+  "resolve refreshes LRU recency",
+);
+const thirdReceipt = boundedReceipts.issue(thirdBinding).receipt;
 assert.equal(boundedReceipts.resolve(secondReceipt), undefined, "the least-recent receipt is evicted");
-assert.deepEqual(boundedReceipts.resolve(firstReceipt), firstBinding);
-assert.deepEqual(boundedReceipts.resolve(thirdReceipt), thirdBinding);
+assert.deepEqual(boundedReceipts.resolve(firstReceipt)?.binding, firstBinding);
+assert.deepEqual(boundedReceipts.resolve(thirdReceipt)?.binding, thirdBinding);
+
+const fairReceipts = createWorkspaceContextReceiptManager({
+  key,
+  processGeneration,
+  maxReceipts: 4,
+  maxReceiptsPerPrincipal: 2,
+});
+const principalA1 = fairReceipts.issue({ ...binding, workspaceId: "a-1" }).receipt;
+const principalB1 = fairReceipts.issue({
+  ...binding,
+  connectionPrincipalId: "principal-b",
+  workspaceId: "b-1",
+}).receipt;
+fairReceipts.issue({ ...binding, workspaceId: "a-2" });
+fairReceipts.issue({ ...binding, workspaceId: "a-3" });
+assert.equal(fairReceipts.resolve(principalA1), undefined, "one principal cannot exceed its share");
+assert.ok(fairReceipts.resolve(principalB1), "another principal's receipt must remain available");
 
 let clock = 1_000;
 const expiringReceipts = createWorkspaceContextReceiptManager({
@@ -98,11 +138,42 @@ const expiringReceipts = createWorkspaceContextReceiptManager({
   ttlMs: 50,
   now: () => clock,
 });
-const expiringReceipt = expiringReceipts.issue(binding);
+const expiringReceipt = expiringReceipts.issue(binding).receipt;
 clock = 1_049;
-assert.deepEqual(expiringReceipts.resolve(expiringReceipt), binding);
+assert.deepEqual(expiringReceipts.resolve(expiringReceipt)?.binding, binding);
 clock = 1_050;
 assert.equal(expiringReceipts.resolve(expiringReceipt), undefined, "receipt expires at its fixed deadline");
+
+clock = 0;
+const expiryFairReceipts = createWorkspaceContextReceiptManager({
+  key,
+  processGeneration,
+  maxReceipts: 2,
+  maxReceiptsPerPrincipal: 2,
+  ttlMs: 10,
+  now: () => clock,
+});
+const expiresFirst = expiryFairReceipts.issue({
+  ...binding,
+  workspaceId: "expires-first",
+}).receipt;
+clock = 5;
+const remainsLive = expiryFairReceipts.issue({
+  ...binding,
+  workspaceId: "remains-live",
+}).receipt;
+clock = 9;
+assert.ok(
+  expiryFairReceipts.resolve(expiresFirst),
+  "resolution refreshes LRU recency without renewing the fixed deadline",
+);
+clock = 11;
+expiryFairReceipts.issue({ ...binding, workspaceId: "new-receipt" });
+assert.equal(expiryFairReceipts.resolve(expiresFirst), undefined);
+assert.ok(
+  expiryFairReceipts.resolve(remainsLive),
+  "expired recent receipts must be removed before they can evict a live receipt",
+);
 
 const input: WorkspaceContextProtocolInput = {
   connectionPrincipalId: binding.connectionPrincipalId,
@@ -111,6 +182,8 @@ const input: WorkspaceContextProtocolInput = {
   phase: "context_loaded",
   workspace: {
     ref: binding.workspaceId,
+    alias: binding.alias,
+    projectFingerprint: binding.projectFingerprint,
     generation: binding.generation,
     mode: "checkout",
     writeAccess: "read_write",
@@ -137,6 +210,8 @@ const input: WorkspaceContextProtocolInput = {
       skillId: "skill-1",
       name: "testing",
       description: "Run focused tests.",
+      source: "repository",
+      trust: "repository_untrusted",
     }],
   },
 };
@@ -160,6 +235,13 @@ assert.deepEqual(serialized, {
       included: true,
       items: input.skills.items,
     },
+    continuation: {
+      receipt,
+      phase: "context_loaded",
+      expiresAt: new Date(issued.expiresAt).toISOString(),
+      instructionRevision: input.instructions.revision,
+      skillRevision: input.skills.revision,
+    },
     receipt,
   },
 });
@@ -173,6 +255,7 @@ assert.deepEqual(Object.keys(serialized.structuredContent), [
   "workspace",
   "instructions",
   "skills",
+  "continuation",
   "receipt",
 ]);
 
@@ -213,7 +296,7 @@ const metadata = serializeWorkspaceContext({
 }, receipts);
 assert.equal(metadata.content[0].text, WORKSPACE_METADATA_TEXT);
 assert.deepEqual(metadata.structuredContent.context, { phase: "metadata" });
-assert.deepEqual(receipts.resolve(metadata.structuredContent.receipt)?.phase, "metadata");
+assert.deepEqual(receipts.resolve(metadata.structuredContent.receipt)?.binding.phase, "metadata");
 
 assert.throws(
   () => serializeWorkspaceContext({

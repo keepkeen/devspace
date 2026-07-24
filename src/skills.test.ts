@@ -71,6 +71,11 @@ try {
     "shared",
     "Workspace copy.",
   );
+  await mkdir(join(workspaceRoot, ".agents", "skills", "workspace", "agents"), { recursive: true });
+  await writeFile(
+    join(workspaceRoot, ".agents", "skills", "workspace", "agents", "openai.yaml"),
+    "policy:\n  allow_implicit_invocation: true\n",
+  );
   await writeSkill(join(root, ".agents", "skills", "user"), "user", "User copy.");
   await writeSkill(join(root, "admin-skills", "admin"), "admin", "Admin copy.");
   await writeSkill(join(root, "config", "skills", "devspace"), "devspace", "DevSpace compatibility copy.");
@@ -82,15 +87,15 @@ try {
   assert.deepEqual(
     sources.slice(0, 6).map(({ source, scope }) => ({ source, scope })),
     [
+      { source: "explicit", scope: "compatibility" },
       { source: "repo", scope: "repo" },
       { source: "repo", scope: "repo" },
       { source: "repo", scope: "repo" },
       { source: "user", scope: "user" },
       { source: "admin", scope: "admin" },
-      { source: "bundled", scope: "bundled" },
     ],
   );
-  assert.equal(sources.at(-1)?.path, join(workspaceRoot, "relative-skills"));
+  assert.equal(sources[0]?.path, join(workspaceRoot, "relative-skills"));
   assert.equal(resolveSkillPath("relative-skills", workspaceRoot), join(workspaceRoot, "relative-skills"));
   assert.equal(resolveSkillInputPath("relative-skills/explicit/SKILL.md", workspaceRoot), join(workspaceRoot, "relative-skills", "explicit", "SKILL.md"));
   assert.equal(effectiveSkillPaths(config, workspaceRoot).includes(join(root, "admin-skills")), true);
@@ -129,7 +134,7 @@ try {
   assert.equal(new Set(duplicates.map((skill) => skill.skillId)).size, 3);
   assert.deepEqual(
     duplicates.map((skill) => skill.source),
-    ["repo", "repo", "explicit"],
+    ["explicit", "repo", "repo"],
   );
   assert.deepEqual(
     loadWorkspaceSkills(config, workspaceRoot).skills.map((skill) => skill.skillId),
@@ -139,6 +144,27 @@ try {
 
   const workspaceSkill = loaded.skills.find((skill) => skill.filePath === workspaceManifest);
   assert.ok(workspaceSkill);
+  assert.equal(
+    workspaceSkill.allowImplicitInvocation,
+    false,
+    "repository metadata cannot grant itself implicit model invocation",
+  );
+  assert.equal(loaded.skills.find((skill) => skill.name === "user")?.allowImplicitInvocation, true);
+  assert.equal(loaded.skills.find((skill) => skill.name === "admin")?.allowImplicitInvocation, true);
+
+  const allowlistedRepositorySkill = loadWorkspaceSkills(
+    makeConfig(repositoryRoot, {
+      DEVSPACE_SKILL_PATHS: ".agents/skills/workspace",
+    }),
+    workspaceRoot,
+  ).skills.filter((skill) => skill.filePath === workspaceManifest);
+  assert.equal(allowlistedRepositorySkill.length, 1, "an allowlisted repository Skill is not duplicated");
+  assert.equal(allowlistedRepositorySkill[0]?.source, "explicit");
+  assert.equal(
+    allowlistedRepositorySkill[0]?.allowImplicitInvocation,
+    true,
+    "local DEVSPACE_SKILL_PATHS configuration can explicitly trust a repository Skill",
+  );
   assert.match(formatPathForPrompt(workspaceSkill.filePath), /^~\//);
   assert.equal(
     resolveSkillReadPath(

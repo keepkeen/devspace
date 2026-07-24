@@ -1429,6 +1429,13 @@ try {
     ["rev-parse", "HEAD"],
     { cwd: persistentWorktree.workspace.root },
   )).stdout.trim();
+  const persistentWorktreeSummary = persistentRegistry.listWorkspaces(connectionPrincipalId)
+    .find((summary) => summary.alias === persistentWorktree.workspace.alias);
+  assert.equal(persistentWorktreeSummary?.workspaceRef, persistentWorktree.workspace.id);
+  assert.match(
+    persistentWorktreeSummary?.projectFingerprint ?? "",
+    /^proj_[A-Za-z0-9_-]{22}$/u,
+  );
 
   const activeSnapshot = persistentRegistry.activeSessionsSnapshot();
   assert.equal(activeSnapshot.some((session) => session.id === persistentWorkspace.workspace.id), true);
@@ -1472,9 +1479,22 @@ try {
     (summary) => summary.alias === worktreeAlias,
   );
   assert.equal(coldSummary?.hydrationStatus, "requires_resume");
+  assert.equal(coldSummary?.workspaceRef, persistentWorktree.workspace.id);
+  assert.equal(
+    coldSummary?.projectFingerprint,
+    persistentWorktreeSummary?.projectFingerprint,
+    "project fingerprints must remain stable across server restarts",
+  );
   assert.equal(coldSummary?.displayPath, `…/${basename(gitRoot)}`);
   assert.equal(coldSummary?.displayPath.includes("~"), false);
-  const resumedWorktree = await restoredRegistry.resumeWorkspace(connectionPrincipalId, worktreeAlias);
+  await assert.rejects(
+    restoredRegistry.resumeWorkspaceByReference("client-b", coldSummary!.workspaceRef),
+    /workspace alias is unavailable/,
+  );
+  const resumedWorktree = await restoredRegistry.resumeWorkspaceByReference(
+    connectionPrincipalId,
+    coldSummary!.workspaceRef,
+  );
   const restoredWorktree = resumedWorktree.workspace;
   assert.equal(restoredWorktree.mode, "worktree");
   assert.equal(restoredWorktree.sourceRoot, await realpath(gitRoot));

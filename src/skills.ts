@@ -162,17 +162,21 @@ export function resolveSkillPath(path: string, workspaceRoot: string): string {
 
 export function effectiveSkillSources(config: ServerConfig, workspaceRoot: string): SkillRoot[] {
   const candidates: SkillRoot[] = [
+    // Explicit local configuration is the allowlist mechanism for a
+    // repository Skill that the owner has intentionally promoted. Keep these
+    // roots before automatic repository discovery so the trusted source wins
+    // when both resolve to the same Skill directory.
+    ...config.skillPaths.map((path) => ({
+      path,
+      source: "explicit" as const,
+      scope: "compatibility" as const,
+    })),
     ...repositorySkillRoots(workspaceRoot, config.allowedRoots),
     { path: join(homedir(), ".agents", "skills"), source: "user", scope: "user" },
     { path: config.adminSkillsDir, source: "admin", scope: "admin" },
     { path: bundledSkillsDir(), source: "bundled", scope: "bundled" },
     { path: config.devspaceSkillsDir, source: "devspace", scope: "compatibility" },
     { path: join(config.agentDir, "skills"), source: "agent-dir", scope: "compatibility" },
-    ...config.skillPaths.map((path) => ({
-      path,
-      source: "explicit" as const,
-      scope: "compatibility" as const,
-    })),
   ];
 
   const seen = new Set<string>();
@@ -435,7 +439,11 @@ function loadSkill(
       return source.path;
     }
   })();
-  const allowImplicitInvocation = openai.allowImplicitInvocation && legacyDisable !== true;
+  // Repository content is untrusted and cannot grant itself implicit model
+  // invocation through either a missing or permissive openai.yaml policy.
+  const allowImplicitInvocation = source.source !== "repo" &&
+    openai.allowImplicitInvocation &&
+    legacyDisable !== true;
   return {
     skillId: `skill_${createHash("sha256").update(canonicalFile).digest("hex")}`,
     manifestHash: createHash("sha256").update(manifest.contents).digest("hex"),
@@ -594,7 +602,11 @@ export function loadWorkspaceSkills(config: ServerConfig, workspaceRoot: string)
     visitDirectory(source.path, source, canonicalRoot, 0, false);
   }
 
-  return { skills, diagnostics: diagnostics.finish() };
+  const uniqueSkills = new Map<string, Skill>();
+  for (const skill of skills) {
+    if (!uniqueSkills.has(skill.filePath)) uniqueSkills.set(skill.filePath, skill);
+  }
+  return { skills: [...uniqueSkills.values()], diagnostics: diagnostics.finish() };
 }
 
 /** Resolves model-provided paths against the opened workspace, never process.cwd(). */

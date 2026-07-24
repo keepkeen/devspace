@@ -54,13 +54,16 @@ try {
 }
 
 async function testAuditFailuresAreBestEffort(stateDir: string): Promise<void> {
-  const authorizationEpochs: string[] = [];
+  const authorizationBoundaryChanges: Array<{
+    connectionPrincipalId: string;
+    reason: string;
+  }> = [];
   const provider = new SingleUserOAuthProvider(
     oauthConfig,
     mcpUrl,
     stateDir,
     () => { throw new Error("audit sink unavailable"); },
-    (connectionPrincipalId) => authorizationEpochs.push(connectionPrincipalId),
+    (change) => authorizationBoundaryChanges.push(change),
   );
   try {
     const client = await provider.clientsStore.registerClient?.({
@@ -77,7 +80,26 @@ async function testAuditFailuresAreBestEffort(stateDir: string): Promise<void> {
       resource: mcpUrl,
     }, approval.response);
     assert.equal((approval.response as unknown as { statusCode: number }).statusCode, 302);
-    assert.deepEqual(authorizationEpochs, [provider.principalForClient(client.client_id)]);
+    assert.deepEqual(authorizationBoundaryChanges, [{
+      connectionPrincipalId: provider.principalForClient(client.client_id),
+      reason: "principal_created",
+    }]);
+
+    const repeatedApproval = fakeAuthorizationResponse("POST", {
+      owner_token: oauthConfig.ownerToken,
+    });
+    await provider.authorize(client, {
+      redirectUri,
+      codeChallenge: "same-boundary-challenge",
+      scopes: ["devspace"],
+      resource: mcpUrl,
+    }, repeatedApproval.response);
+    assert.equal((repeatedApproval.response as unknown as { statusCode: number }).statusCode, 302);
+    assert.equal(
+      authorizationBoundaryChanges.length,
+      1,
+      "reauthorizing the same principal and scopes must not invalidate active workspace receipts",
+    );
 
     const code = "audit-code";
     provider["codes"].set(code, {

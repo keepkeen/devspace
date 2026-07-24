@@ -268,17 +268,24 @@ OpenAI 目前把自定义 MCP 集成称为 **developer-mode app（开发者模�
    不把项目指令或 Skill 目录立即塞入上下文，同时返回短期 `receipt`。metadata
    receipt 只能继续加载上下文或关闭/撤销 Workspace，不能直接读取、搜索、执行或修改文件。
 2. 模型用这个 `receipt` 调用 `get_workspace_context`，取得 v3 结构化项目指令、
-   Skill 目录和刷新后的 `receipt`。只有用当前 context-loaded receipt 刷新
+   Skill 目录和刷新后的 `receipt`。结果中的模型可见 `workspace` 会包含
+   `ref`、`alias`、不暴露本机路径的 `projectFingerprint` 和 generation；
+   `continuation` 会包含 receipt、阶段、固定过期时间以及两类 revision。只有用当前 context-loaded receipt 刷新
    `get_workspace_context` 时，显式的 `contextMode: "retained"` 才会按已绑定的
    revision 跳过正文；打开、恢复、新对话和上下文压缩后必须使用 `full`。
-3. 后续读取、搜索、编辑和命令调用只传当前 `receipt`。它已经绑定本机
+3. 后续读取、搜索、编辑和命令调用只传当前 `receipt`。每个 Workspace-scoped
+   结果都会在模型可见的 `structuredContent` 中回显同一个 `workspace` 和
+   `continuation`，普通工具不会自行签发或续期 receipt；只有显式加载/刷新上下文
+   才更新其固定到期时间。receipt 已经绑定本机
    connection principal、Workspace、代次、上下文阶段、私有 context session 及两类
    上下文修订号，模型不需要在每次调用里重复绝对路径或内部 ID。
 4. ChatGPT 的每次工具调用都可以使用新的无状态 HTTP 传输；真正需要复用的是
    Workspace 的持久化记录，不是 MCP transport session。传输重连或旧 MCP session
    header 不会中断 workspace。
-   新对话不需要再次发送绝对路径：先调用 `list_workspaces`，再通过
-   `resume_workspace(alias, full)` 恢复并取得新 `receipt`。服务重启后旧 receipt 会失效，
+   新对话不需要再次发送绝对路径：先调用 `list_workspaces`，再通过 alias 或持久化的
+   `workspaceRef` 调用 `resume_workspace`（二选一）恢复并取得新 `receipt`。
+   `list_workspaces` 还返回稳定的 `projectFingerprint`，用于区分同名项目而不泄露主机路径。
+   服务重启后旧 receipt 会失效，
    但 alias 和 Workspace 记录仍可恢复。
    如果你删除并重新添加 ChatGPT 应用，新的动态 OAuth 注册会在首次成功授权时建立新的
    connection principal，因此看不到旧 alias。需要明确恢复旧连接时，先在本机运行
@@ -310,8 +317,8 @@ DevSpace 看不到经过验证的 ChatGPT 账户 `sub`。动态 OAuth 注册本�
 只有输入本机生成的一次性 reconnect code，新的注册才会显式绑定到旧 principal。
 
 两个 principal 即使资源彼此不可见，仍可打开同一个物理 checkout。本 DevSpace
-实例会按规范化根目录让读取共享锁、让补丁、命令、可写进程输入、变更 checkpoint、
-关闭和撤销进入同一写队列。锁只覆盖 MCP 工具调用本身；返回的后台进程可以继续产生
+实例会按规范化根目录让读取和默认变更预览共享锁，让补丁、命令、可写进程输入、
+显式 checkpoint 推进、关闭和撤销进入同一写队列。锁只覆盖 MCP 工具调用本身；返回的后台进程可以继续产生
 无法完整观测的副作用，因此结果会标记为 `unknown`，后续补丁仍依赖 `ifMatch` 防止
 静默覆盖。关闭和撤销会先终止受跟踪进程。并行工作仍优先使用独立 Git worktree。
 
@@ -352,6 +359,11 @@ DevSpace 也会告诉 ChatGPT 当前可用的本地 Skill；`list_skills` 支持
 `skill://<skillId>/references/example.md` 读取 reference、script 等支持文件，
 无需向模型暴露本机 Skill 绝对路径。详细规则见
 [ChatGPT 编码工作流](./docs/chatgpt-coding-workflow.md)。
+仓库来源 Skill 始终标记为 `repository_untrusted` 并默认 `explicitOnly=true`；仓库自己的
+`agents/openai.yaml` 不能为自身开启隐式调用。`load_skill` 把正文放入结构化
+`skill.content`，固定文本只说明来源和信任边界，避免把服务端话术与不可信正文混在一起。
+如需本机显式信任某一个仓库 Skill，可把它的精确目录或 `SKILL.md` 路径加入
+`DEVSPACE_SKILL_PATHS`；该本机 allowlist 优先于自动仓库发现，同时不会重复加载同一清单。
 
 ### 固定工具协议
 
@@ -370,8 +382,10 @@ DevSpace 只提供一套稳定的 Codex 风格工具：`read`、`batch_read`、
 关闭输入流；需要继续交互时可设 `closeStdin: false`，之后通过 `write_stdin`
 追加内容或关闭输入流。PTY 不模拟 Ctrl-D 作为 EOF。
 
-`apply_patch`、`exec_command`、`close_workspace`、`revoke_workspace` 和
-`show_changes` 必须提供 `operationId`；`write_stdin` 在发送输入、关闭 stdin 或调整终端
+`apply_patch`、`exec_command`、`close_workspace` 和 `revoke_workspace`
+必须提供 `operationId`；`show_changes` 默认是只读预览，不推进 checkpoint，也不需要
+write scope 或 operation ID。只有显式设置 `advanceCheckpoint: true` 时才需要
+`operationId` 和 `workspace:write`。`write_stdin` 在发送输入、关闭 stdin 或调整终端
 尺寸时也必须提供，纯轮询不需要。每次新操作使用新 ID；网络响应丢失时用同一 ID 重试，
 服务端会重放已保存结果而不会再次执行。所有失败均返回结构化 `error.code`、
 `retryable`、`safeToRetry`、`recovery`、`phase` 和 `effectsKnown`。命令非零退出不是
@@ -384,14 +398,17 @@ DevSpace 只提供一套稳定的 Codex 风格工具：`read`、`batch_read`、
 所有 Workspace 工具都要求当前上下文 `receipt`；统一注册层会在工具执行前解析它并校验
 connection principal、OAuth capability、Workspace 代次、context phase 与私有 context session。metadata receipt
 只能升级上下文或执行关闭/撤销；读取、搜索、进程和修改工具必须使用 context-loaded receipt。
-receipt 还绑定签发时的两类上下文修订号，供恢复和缓存去重使用；项目内文件变化仍由指令
-门禁、Skill 重载和文件版本锁分别检查。服务重启、OAuth 重新授权、授权根变更和
+receipt 还绑定签发时的 alias、项目指纹和两类上下文修订号，供恢复和缓存去重使用；
+receipt 缓存同时具有全局上限和单 principal 公平上限，使用只刷新 LRU 顺序，不延长固定
+期限。项目内文件变化仍由指令门禁、Skill 重载和文件版本锁分别检查。服务重启、principal
+relink/revoke、Owner 凭据或授权根等真实权限边界变更以及
 关闭/重新打开会使旧 receipt 失效，此时用 alias 恢复并获取新的 receipt。`read` 返回
 `contentHash` 和精确字符串形式的
 `mtimeNs`。`apply_patch` 默认要求每个 touched path 都有 `ifMatch`：已有文件使用最新读取
 版本，预期不存在的新路径显式传 `null`。缺少任一路径的前置条件时，补丁不会开始执行。
 
-写入、命令、进程交互、变更展示、关闭和撤销操作还会返回统一的 `workspace`、`context`、
+所有 Workspace-scoped 工具都会返回统一的 `workspace`、`context` 和 `continuation`。
+写入、命令、可写进程交互、显式推进的变更 checkpoint、关闭和撤销还会返回
 `operation` 和 `effects`。operation 明确给出 `not_started`、`committed` 或
 `outcome_unknown`，以及是否可安全重试和副作用是否已知。每项 effect 还标记证据可信度：
 DevSpace 直接测得的版本或生命周期状态为 `observed`，策略声明为 `declared`，任意进程可能
@@ -406,12 +423,16 @@ DevSpace 直接测得的版本或生命周期状态为 `observed`，策略声明
 `batch_inspect` 可以减少 MCP 往返。输入可携带短 `ref`，输出会回显 `ref` 并明确给出
 `completed`、`partial` 或 `failed` 以及成功/失败数量。如果下一个目标依赖上一次搜索结果，模型
 仍应按顺序检查，而不是强行批量处理。
+`batch_read.items[]` 的成功项直接包含 `path`、`content`、`contentHash`、精确
+`mtimeNs`、`offset`、可选 `nextOffset`/`truncated`；它与单文件 `read` 共用读前/读后
+稳定性校验，因此版本可直接用于后续 `apply_patch.ifMatch`。
 
 DevSpace 对较大的工具结果只保留一份模型可见正文，避免同一文件或命令输出在
-`content` 和 `structuredContent` 中重复占用上下文。单项读取和 Skill 加载只在
-`content` 返回正文；进程结构化结果只在需要时返回 `sessionId`、`outputId` 或异常
-状态；批量工具在 `structuredContent.items[]` 保留 `ref/ok/result`，不回显本机路径或
-拼接后的聚合 `result`。`_meta` 只承载可选的
+`content` 和 `structuredContent` 中重复占用上下文。单项文件读取只在 `content`
+返回正文；Skill 正文位于带来源/信任字段的结构化 `skill.content`；
+进程结构化结果只在需要时返回 `sessionId`、`outputId` 或异常状态；`batch_read` 使用上述
+版本化文件项，`batch_inspect` 保留 `ref/ok/result`，两者都不返回主机绝对路径或拼接后的
+聚合 `result`。`_meta` 只承载可选的
 ChatGPT 组件信息，普通 MCP 客户端可以忽略。依赖旧重复字段的客户端需要按上述
 归属读取结果；详细契约见[ChatGPT 编码工作流](./docs/chatgpt-coding-workflow.md)。
 单个 `SKILL.md` 的加载上限为 64 KiB。
@@ -430,7 +451,7 @@ DevSpace 服务  +  HTTPS Tunnel
 
 服务重启后，ChatGPT 可能创建新的 MCP 传输会话。已持久化的 checkout
 workspace 不会丢失，但旧 receipt 会失效；模型应先 `list_workspaces`，再用
-别名调用 `resume_workspace(alias, full)` 取得新 receipt。
+alias 或 `workspaceRef` 调用 `resume_workspace` 并使用 `contextMode: "full"` 取得新 receipt。
 
 <details>
 <summary><strong>小火箭或其他 TUN 代理</strong></summary>
