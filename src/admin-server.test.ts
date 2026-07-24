@@ -295,7 +295,7 @@ try {
   assert.equal(status.status, 200);
   const statusBody = JSON.parse(status.body);
   assert.equal(statusBody.admin.ready, true);
-  assert.equal(statusBody.admin.version, "2.0.0");
+  assert.equal(statusBody.admin.version, "2.0.1");
   assert.equal(typeof statusBody.admin.startedAt, "string");
   assert.equal(statusBody.mcp.ready, true);
   assert.equal(statusBody.mcp.status, 200);

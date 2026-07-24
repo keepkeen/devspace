@@ -164,7 +164,13 @@ try {
     },
   });
   assertToolSucceeded(directArgv);
-  assert.match(JSON.stringify(directArgv.content), /literal \* \$HOME ; &&/);
+  assert.match(processOutputText(directArgv), /literal \* \$HOME ; &&/);
+  const directOutput = (directArgv.structuredContent as {
+    outputId?: unknown;
+    output?: { outputId?: unknown };
+  } | undefined);
+  assert.equal(typeof directOutput?.outputId, "string");
+  assert.equal(directOutput?.output?.outputId, directOutput?.outputId);
   const unavailableNetworkDeny = await firstRound.callTool({
     name: "exec_command",
     arguments: { workspaceId: workspaceA, program: "true", network: "deny" },
@@ -622,8 +628,8 @@ try {
   ]);
   assertToolSucceeded(finishedA);
   assertToolSucceeded(finishedB);
-  assert.match(JSON.stringify(finishedA.content), /client-a-background/);
-  assert.match(JSON.stringify(finishedB.content), /client-b-background/);
+  assert.match(processOutputText(finishedA), /client-a-background/);
+  assert.match(processOutputText(finishedB), /client-b-background/);
   const revokedB = await concurrentB.callTool({
     name: "revoke_workspace",
     arguments: { workspaceId: workspaceB },
@@ -1089,6 +1095,14 @@ function processSessionId(result: Awaited<ReturnType<Client["callTool"]>>): numb
   const id = (result.structuredContent as { sessionId?: unknown } | undefined)?.sessionId;
   assert.equal(typeof id, "number");
   return Number(id);
+}
+
+function processOutputText(result: Awaited<ReturnType<Client["callTool"]>>): string {
+  const text = (result.structuredContent as {
+    output?: { text?: unknown };
+  } | undefined)?.output?.text;
+  assert.equal(typeof text, "string");
+  return String(text);
 }
 
 function assertToolSucceeded(result: Awaited<ReturnType<Client["callTool"]>>): void {

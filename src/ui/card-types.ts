@@ -64,11 +64,33 @@ export interface ToolResultCard<TTool extends ToolName = DisplayToolName> {
   truncated?: boolean;
   instructions?: string;
   outputId?: string;
+  output?: ProcessOutput;
+  page?: ProcessOutputPage;
   offset?: number;
   nextOffset?: number;
   eof?: boolean;
   totalBytes?: number;
   storedBytes?: number;
+  droppedBytes?: number;
+}
+
+export interface ProcessOutput {
+  stream?: "combined";
+  text?: string;
+  truncated?: boolean;
+  originalTokenCount?: number;
+  omittedBytes?: number;
+  outputId?: string;
+  droppedBytes?: number;
+}
+
+export interface ProcessOutputPage {
+  stream?: "combined";
+  text?: string;
+  offset?: number;
+  nextOffset?: number;
+  eof?: boolean;
+  status?: "active" | "unknown";
   droppedBytes?: number;
 }
 
@@ -183,7 +205,22 @@ export function toolResultText(card: AnyToolResultCard): string {
     if (structuredText) return structuredText;
   }
 
-  return contentText(card.content) || payloadText(card.payload);
+  const fallbackText = contentText(card.content) || payloadText(card.payload);
+  if (isShellTool(card.tool) && typeof card.output?.text === "string") {
+    if (!card.output.text) return fallbackText;
+    return fallbackText
+      ? `${card.output.text.replace(/\n$/u, "")}\n${fallbackText}`
+      : card.output.text;
+  }
+
+  if (card.tool === "read_process_output" && typeof card.page?.text === "string") {
+    if (!card.page.text) return fallbackText;
+    return fallbackText
+      ? `${card.page.text.replace(/\n$/u, "")}\n${fallbackText}`
+      : card.page.text;
+  }
+
+  return fallbackText;
 }
 
 export function workspacePayloadText(card: AnyToolResultCard): string {

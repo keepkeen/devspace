@@ -484,8 +484,10 @@ used directly as `apply_patch.ifMatch` preconditions.
 DevSpace keeps each large model-visible payload in one place so the same file
 or command output does not consume context in both `content` and
 `structuredContent`. Reads put file text only in `content`; Skill bodies live
-in structured `skill.content` with source/trust metadata. Process structures
-emit only actionable handles or exceptional state. `batch_read` uses the
+in structured `skill.content` with source/trust metadata. Commands and process
+polls put combined stdout/stderr in `structuredContent.output.text`, retained
+pages in `structuredContent.page.text`, and only a concise status sentence in
+`content`. `batch_read` uses the
 versioned file records above, while `batch_inspect` keeps `ref/ok/result`
 entries; neither echoes absolute host paths or an aggregate `result`. `_meta` is
 optional ChatGPT component data and can be
@@ -656,7 +658,7 @@ The comparison is against upstream commit
 | Idempotent mutations | Writes, commands, mutating process input, lifecycle changes, and checkpoint advancement use durable operation IDs. Lost responses replay results without executing twice, while unknown outcomes are never rerun automatically. |
 | Simpler change review | `show_changes` is a read-only preview by default, requiring neither write scope nor an operation ID and leaving its checkpoint unchanged. Only explicit `advanceCheckpoint` becomes an idempotent write. |
 | Command and process boundaries | Normal builds, tests, Git, package commands, and project-local cleanup remain usable. Writes outside the Workspace, root deletion, protected state, `sudo`, and remote-content pipe-to-shell are blocked. Child processes inherit a minimal environment, and background processes do not hold a lifetime Workspace lock. |
-| Process output | Commands have hard runtime limits, termination grace, and resource quotas. Large output is retained under an owned `outputId` and paged; ownership binds both principal and Workspace. |
+| Process output | Command text is model-visible in structured `output.text`, retained page text is in `page.text`, and an `outputId` is returned whenever durable output exists. Commands also have hard runtime limits, termination grace, and resource quotas; ownership binds both principal and Workspace. |
 | Instruction gates | User/root/nested instructions return as structured source/trust/scope/hash/revision records. Root instructions are acknowledged per private context session; new subtree rules load explicitly before mutation. The full effective chain is capped at 32 KiB. |
 | Skill trust boundary | Repository Skills are always `repository_untrusted` and explicit-only by default and cannot self-enable implicit invocation. Catalog descriptions strip controls, HTML, and code blocks, while untrusted bodies stay separate from fixed server text. |
 | Same-root coordination | A fair lock keyed by canonical physical root permits concurrent reads and serializes MCP write calls. Long-running development servers do not hold a lifetime global lease; strict file versions prevent silent overwrite. |

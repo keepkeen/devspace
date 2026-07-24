@@ -15,6 +15,7 @@ import {
   processInputPolicyViolation,
   processEnvironmentViolation,
   processCallSucceeded,
+  processContentSummary,
   processModelState,
   processResult,
   requiredOAuthScopesForToolCall,
@@ -143,6 +144,48 @@ assert.match(recoverableProcessResult, /read_process_output/);
 assert.doesNotMatch(recoverableProcessResult, /outputId=output-test-id/);
 assert.equal(recoverableProcessResult.match(/truncated/g)?.length, 1);
 assert.equal(recoverableProcessResult.match(/^\[/gm)?.length, 1);
+const recoverableProcessState = processModelState({
+  output: "head\ntail\n",
+  outputTruncated: true,
+  running: false,
+  exitCode: 0,
+  wallTimeMs: 100,
+  originalTokenCount: 50_000,
+  outputOmittedBytes: 100_000,
+  outputId: "output-test-id",
+  totalOutputBytes: 200_000,
+  storedOutputBytes: 200_000,
+  droppedBytes: 0,
+  timedOut: false,
+  stdinClosed: true,
+});
+assert.equal(recoverableProcessState.outputId, "output-test-id");
+assert.deepEqual(recoverableProcessState.output, {
+  stream: "combined",
+  text: "head\ntail\n",
+  truncated: true,
+  originalTokenCount: 50_000,
+  omittedBytes: 100_000,
+  outputId: "output-test-id",
+});
+const recoverableProcessSummary = processContentSummary({
+  output: "head\ntail\n",
+  outputTruncated: true,
+  running: false,
+  exitCode: 0,
+  wallTimeMs: 100,
+  originalTokenCount: 50_000,
+  outputOmittedBytes: 100_000,
+  outputId: "output-test-id",
+  totalOutputBytes: 200_000,
+  storedOutputBytes: 200_000,
+  droppedBytes: 0,
+  timedOut: false,
+  stdinClosed: true,
+});
+assert.match(recoverableProcessSummary, /structuredContent\.output/);
+assert.match(recoverableProcessSummary, /structuredContent\.output\.outputId/);
+assert.doesNotMatch(recoverableProcessSummary, /head|tail|output-test-id/);
 const failedProcessSnapshot = {
   output: "ModuleNotFoundError: No module named 'numpy'",
   outputTruncated: false,
@@ -227,6 +270,8 @@ const failedStorageState = processModelState({
   stdinClosed: true,
 });
 assert.equal("outputId" in failedStorageState, false);
+assert.equal("outputId" in failedStorageState.output, false);
+assert.equal(failedStorageState.output.text, "head\ntail");
 assert.doesNotMatch(processResult({
   output: "head\ntail",
   outputTruncated: true,

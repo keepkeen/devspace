@@ -2553,6 +2553,33 @@ export function processResult(snapshot: ProcessSnapshot): string {
     : `${status}${truncationNote}${durableNote}`;
 }
 
+export function processContentSummary(snapshot: ProcessSnapshot): string {
+  const status = snapshot.running
+    ? "Process running." +
+      (snapshot.stdinClosed ? " Stdin is closed." : "")
+    : snapshot.signal
+      ? `Process exited (signal ${snapshot.signal}).`
+      : `Process exited (code ${snapshot.exitCode ?? "unknown"}).`;
+  const outputNote = snapshot.output
+    ? " Combined output is available in structuredContent.output."
+    : " No combined output was produced.";
+  const timeoutNote = snapshot.timedOut
+    ? " Process exceeded its runtime limit."
+    : "";
+  const recoverableOutputId = snapshot.outputStorageError ? undefined : snapshot.outputId;
+  const truncationNote = snapshot.outputTruncated
+    ? recoverableOutputId
+      ? " Inline output is truncated; use read_process_output with structuredContent.output.outputId."
+      : " Inline output is truncated."
+    : "";
+  const durableNote = snapshot.droppedBytes > 0
+    ? ` ${snapshot.droppedBytes} durable byte(s) were irrecoverably dropped.`
+    : snapshot.outputStorageError
+      ? " Durable output is unavailable."
+      : "";
+  return `${status}${outputNote}${timeoutNote}${truncationNote}${durableNote}`;
+}
+
 export function processCallSucceeded(snapshot: ProcessSnapshot): boolean {
   return snapshot.running || (
     snapshot.exitCode === 0 &&
@@ -2567,6 +2594,7 @@ export function processModelState(snapshot: ProcessSnapshot) {
     snapshot.signal !== undefined ||
     (snapshot.exitCode !== undefined && snapshot.exitCode !== 0)
   );
+  const recoverableOutputId = snapshot.outputStorageError ? undefined : snapshot.outputId;
   return {
     ok: !failed,
     status: snapshot.running ? "running" as const : "exited" as const,
@@ -2574,9 +2602,18 @@ export function processModelState(snapshot: ProcessSnapshot) {
     ...(snapshot.running && snapshot.sessionId !== undefined
       ? { sessionId: snapshot.sessionId }
       : {}),
-    ...(snapshot.outputId && !snapshot.outputStorageError && (snapshot.running || snapshot.outputTruncated)
-      ? { outputId: snapshot.outputId }
+    ...(recoverableOutputId
+      ? { outputId: recoverableOutputId }
       : {}),
+    output: {
+      stream: "combined" as const,
+      text: snapshot.output,
+      truncated: snapshot.outputTruncated,
+      originalTokenCount: snapshot.originalTokenCount,
+      omittedBytes: snapshot.outputOmittedBytes,
+      ...(recoverableOutputId ? { outputId: recoverableOutputId } : {}),
+      ...(snapshot.droppedBytes > 0 ? { droppedBytes: snapshot.droppedBytes } : {}),
+    },
     ...(!snapshot.running && snapshot.exitCode !== undefined && snapshot.exitCode !== 0
       ? { exitCode: snapshot.exitCode }
       : {}),
@@ -2593,6 +2630,7 @@ function processOutputSchema(extra: z.ZodRawShape = {}) {
     commandExecuted: z.literal(true).optional(),
     sessionId: z.number().optional(),
     outputId: z.string().optional(),
+    output: z.unknown().optional(),
     exitCode: z.number().int().optional(),
     signal: z.string().optional(),
     timedOut: z.literal(true).optional(),
@@ -2612,7 +2650,7 @@ function processToolResponse(
   summary: Record<string, unknown>,
   effects?: ToolEffects,
 ) {
-  const result = processResult(snapshot);
+  const result = processContentSummary(snapshot);
   const content = [textBlock(result)];
   const outputSummary = textSummary(snapshot.output ? [textBlock(snapshot.output)] : []);
   const structuredContent = {
@@ -2665,7 +2703,7 @@ function registerWriteStdinTool(
         use: "polling or interacting with a live process.",
         avoid: "starting a replacement command.",
         requires: "receipt and sessionId; operationId when sending input, closing stdin, or resizing.",
-        returns: "process state and input effects.",
+        returns: "process state, structured combined output, and input effects.",
       }),
       inputSchema: {
         ...workspaceHandleInputSchema,
@@ -2858,6 +2896,7 @@ function registerReadProcessOutputTool(
         nextOffset: z.number().int().nonnegative().optional(),
         eof: z.literal(true).optional(),
         status: z.enum(["active", "unknown"]).optional(),
+        page: z.unknown().optional(),
       }),
       ...toolWidgetDescriptorMeta(config, "shell"),
       annotations: { readOnlyHint: true, openWorldHint: false },
@@ -2879,9 +2918,15 @@ function registerReadProcessOutputTool(
           ? "[completion unknown; verify side effects before rerun]"
           : undefined,
       ].filter((value): value is string => Boolean(value));
-      const result = [page.content || (!notes.length ? "No retained output." : undefined), ...notes]
+      const result = [
+        page.content
+          ? `Read ${Buffer.byteLength(page.content, "utf8")} retained byte(s). Combined output is available in structuredContent.page.`
+          : "No retained output is available at this offset.",
+        ...notes,
+      ]
         .filter((value): value is string => Boolean(value))
         .join("\n");
+      const terminalEof = page.eof && status !== "active";
       logToolCall(config, {
         tool: toolNames.readProcessOutput,
         workspaceId,
@@ -2907,8 +2952,17 @@ function registerReadProcessOutputTool(
         structuredContent: {
           ok: true,
           ...(!page.eof || status === "active" ? { nextOffset: page.nextOffset } : {}),
-          ...(page.eof && status !== "active" ? { eof: true as const } : {}),
+          ...(terminalEof ? { eof: true as const } : {}),
           ...(status === "active" || status === "unknown" ? { status } : {}),
+          page: {
+            stream: "combined" as const,
+            text: page.content,
+            offset: page.offset,
+            nextOffset: page.nextOffset,
+            eof: terminalEof,
+            ...(status === "active" || status === "unknown" ? { status } : {}),
+            ...(page.droppedBytes > 0 ? { droppedBytes: page.droppedBytes } : {}),
+          },
         },
       };
     },
@@ -2933,7 +2987,7 @@ function registerProcessTools(
         use: "running a workspace command; prefer program+args.",
         avoid: "shell mode without shell syntax.",
         requires: "writable receipt; operationId for retry.",
-        returns: "process state and effect limits.",
+        returns: "process state, structured combined output, and effect limits.",
       }),
       inputSchema: {
         ...workspaceHandleInputSchema,

@@ -532,13 +532,19 @@ file contents or process output between MCP `content` and `structuredContent`:
   `result`, and exceptional `truncated=true`. Top-level `status`, `succeeded`,
   and `failed` make partial completion explicit. Absolute host paths are not
   echoed, and there is no aggregate `result`.
-- `exec_command` and `write_stdin` return the current inline output in
-  text `content`. Structured data contains process semantics and actionable or
-  exceptional fields: `ok`, `status`, `commandExecuted`, active `sessionId`,
-  recoverable `outputId`, nonzero `exitCode`, `signal`, and `timedOut=true`.
-- `read_process_output` returns the requested UTF-8 page in text `content` and
-  keeps only `nextOffset`, terminal `eof=true`, and exceptional/nonterminal
-  `status` in `structuredContent`. Absence of `status` means completed;
+- `exec_command` and `write_stdin` return a concise status sentence in text
+  `content`. The exact current combined stdout/stderr is model-visible once at
+  `structuredContent.output.text`, together with `stream="combined"`,
+  `truncated`, approximate `originalTokenCount`, `omittedBytes`, optional
+  `droppedBytes`, and a durable `outputId` whenever retained output exists.
+  Top-level process semantics remain available: `ok`, `status`,
+  `commandExecuted`, active `sessionId`, `outputId`, nonzero `exitCode`,
+  `signal`, and `timedOut=true`.
+- `read_process_output` returns a concise text summary and puts the requested
+  UTF-8 body in `structuredContent.page.text` with `stream="combined"`, exact
+  `offset`/`nextOffset`, terminal `eof`, and optional status/drop metadata.
+  Top-level `nextOffset`, terminal `eof=true`, and exceptional/nonterminal
+  `status` remain for compact routing. Absence of `status` means completed;
   `status=unknown` means completion cannot be proved, so verify side effects
   before rerunning.
 - `close_workspace`, `apply_patch`, and `show_changes` return one concise text
@@ -557,11 +563,12 @@ boundary. Review, close, and revoke tools report their own checkpoint or
 Workspace effects using the same top-level field.
 
 `_meta` is reserved for optional widget presentation and is not a source of
-model-visible state or body text. Widgets read the top-level result instead of
-requiring a duplicate `_meta.card.payload.content`. Plain MCP clients may
-ignore `_meta`; structured batch consumers must read `items[]` rather than the
-removed aggregate field. This layout reduces prompt and transport overhead
-without changing workspace, process, or paging semantics.
+model-visible state or body text. Widgets read the top-level result, including
+structured process output/pages, instead of requiring a duplicate
+`_meta.card.payload.content`. Plain MCP clients may ignore `_meta`; structured
+batch consumers must read `items[]` rather than the removed aggregate field.
+This layout reduces prompt and transport overhead without changing workspace,
+process, or paging semantics.
 
 The removed `write`, `edit`, `bash`, `grep`, `glob`, and `ls` tools are not
 registered. Prefer `exec_command` with `program` and `args`; DevSpace passes
@@ -589,14 +596,15 @@ cleanup commands are allowed, including recursive removal of `dist`,
 outside paths, and unresolved dynamic targets remains blocked. This is an
 accident guardrail, not an OS sandbox.
 
-`maxOutputTokens` limits only the current inline process response and defaults
-to 10,000 tokens. Short output is returned in full; long output keeps a
-head/tail summary inside a 1 MiB UTF-8 in-memory content cap. When durable
-storage is available, an active process or truncated inline result returns an
-opaque `outputId` whose retained UTF-8 bytes can be replayed with
+`maxOutputTokens` limits only the current structured inline process output and
+defaults to 10,000 tokens. Short output is returned in full; long output keeps
+a head/tail summary inside a 1 MiB UTF-8 in-memory cap. When durable storage is
+available, every process that produced retained output returns an opaque
+`outputId`; its retained UTF-8 bytes can be replayed with
 `read_process_output(receipt, outputId, offset, limit)`.
-The page body is in text `content`; structured paging metadata deliberately
-does not repeat it. Use the returned `nextOffset` for the next page. Output
+The page body is in structured `page.text`; text `content` contains only a
+short status/diagnostic sentence. Use the returned `nextOffset` for the next
+page. Output
 ownership is checked against both the connection principal and workspace; no local log
 path is exposed.
 An exceptional text warning reports bytes that exceeded the final durable disk

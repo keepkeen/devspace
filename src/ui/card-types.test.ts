@@ -86,16 +86,36 @@ assert.equal(
 );
 
 const processCard = toolResultCard({
-  content: [{ type: "text", text: "test output\n[process exited with code 0]" }],
-  structuredContent: {},
+  content: [{ type: "text", text: "Process exited (code 0). Combined output is available in structuredContent.output." }],
+  structuredContent: {
+    output: {
+      stream: "combined",
+      text: "test output\n",
+      truncated: false,
+      originalTokenCount: 3,
+      omittedBytes: 0,
+      outputId: "output-1",
+    },
+  },
   _meta: {
     tool: "exec_command",
     card: { outputId: "output-1", summary: { command: "npm test", exitCode: 0 } },
   },
 });
 assert.ok(processCard);
-assert.equal(toolResultText(processCard), "test output\n[process exited with code 0]");
+assert.equal(
+  toolResultText(processCard),
+  "test output\nProcess exited (code 0). Combined output is available in structuredContent.output.",
+);
 assert.equal(processCard.outputId, "output-1");
+
+const legacyProcessCard = toolResultCard({
+  content: [{ type: "text", text: "legacy output\nProcess exited (code 0)." }],
+  structuredContent: {},
+  _meta: { tool: "exec_command", card: { summary: { exitCode: 0 } } },
+});
+assert.ok(legacyProcessCard);
+assert.equal(toolResultText(legacyProcessCard), "legacy output\nProcess exited (code 0).");
 
 const patchCard = toolResultCard({
   content: [{ type: "text", text: "Applied patch." }],
@@ -145,8 +165,19 @@ assert.ok(closeCard);
 assert.equal(toolResultText(closeCard), "Workspace closed.");
 
 const retainedOutputCard = toolResultCard({
-  content: [{ type: "text", text: "page body" }],
-  structuredContent: { nextOffset: 9, status: "active" },
+  content: [{ type: "text", text: "Read 9 retained byte(s). Combined output is available in structuredContent.page." }],
+  structuredContent: {
+    nextOffset: 9,
+    status: "active",
+    page: {
+      stream: "combined",
+      text: "page body",
+      offset: 0,
+      nextOffset: 9,
+      eof: false,
+      status: "active",
+    },
+  },
   _meta: {
     tool: "read_process_output",
     card: { outputId: "output-2", storedBytes: 20, totalBytes: 20 },
@@ -156,6 +187,10 @@ assert.ok(retainedOutputCard);
 assert.equal(retainedOutputCard.outputId, "output-2");
 assert.equal(retainedOutputCard.storedBytes, 20);
 assert.equal(retainedOutputCard.nextOffset, 9);
+assert.equal(
+  toolResultText(retainedOutputCard),
+  "page body\nRead 9 retained byte(s). Combined output is available in structuredContent.page.",
+);
 
 const repeatedWorkspaceCard = toolResultCard({
   content: [{ type: "text", text: "Workspace context unchanged." }],

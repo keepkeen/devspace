@@ -138,7 +138,12 @@ try {
   const readProcessOutputSchema = JSON.stringify(toolsByName.get("read_process_output")?.outputSchema);
   assert.match(readProcessOutputSchema, /unknown/);
   assert.match(readProcessOutputSchema, /active/);
+  assert.match(readProcessOutputSchema, /page/);
   assert.doesNotMatch(readProcessOutputSchema, /completed|storedBytes|totalBytes|outputId/);
+  const execToolOutputSchema = JSON.stringify(toolsByName.get("exec_command")?.outputSchema);
+  assert.match(execToolOutputSchema, /output/);
+  const stdinToolOutputSchema = JSON.stringify(toolsByName.get("write_stdin")?.outputSchema);
+  assert.match(stdinToolOutputSchema, /output/);
   const readOutputSchema = JSON.stringify(toolsByName.get("read")?.outputSchema);
   assert.match(readOutputSchema, /contentHash/);
   assert.match(readOutputSchema, /mtimeNs/);
@@ -793,6 +798,8 @@ try {
     (execCommand.structuredContent as { effects?: { process?: { action?: unknown } } })?.effects?.process?.action,
     "start",
   );
+  assert.match(processOutputText(execCommand), new RegExp(processNeedle));
+  assert.doesNotMatch(toolText(execCommand), new RegExp(processNeedle));
   const heredocShellInput = await client.callTool({
     name: "exec_command",
     arguments: {
@@ -802,7 +809,7 @@ try {
     },
   });
   assert.notEqual(heredocShellInput.isError, true);
-  assert.match(toolText(heredocShellInput), /cd "\$TARGET"/);
+  assert.match(processOutputText(heredocShellInput), /cd "\$TARGET"/);
   assert.match(toolText(heredocShellInput), /Process exited \(code 0\)/);
   const deniedCommand = await client.callTool({
     name: "exec_command",
@@ -923,6 +930,7 @@ try {
     initialActiveKeys,
     [
       "commandExecuted", "continuation", "effects", "ok", "operation",
+      "output",
       ...(
         typeof (activeCommand.structuredContent as { outputId?: unknown } | undefined)?.outputId === "string"
           ? ["outputId"]
@@ -955,9 +963,10 @@ try {
   );
   assert.deepEqual(
     Object.keys((activeProcessOutput.structuredContent ?? {}) as Record<string, unknown>).sort(),
-    ["continuation", "nextOffset", "ok", "status", "workspace"],
+    ["continuation", "nextOffset", "ok", "page", "status", "workspace"],
   );
-  assert.match(toolText(activeProcessOutput), /active-status/s);
+  assert.match(processOutputPageText(activeProcessOutput), /active-status/s);
+  assert.doesNotMatch(toolText(activeProcessOutput), /active-status/s);
   assert.doesNotMatch(toolText(activeProcessOutput), /current end|poll offset|more: offset/i);
   await client.callTool({
     name: "write_stdin",
@@ -1111,7 +1120,7 @@ try {
     },
   });
   assert.notEqual(nestedRetry.isError, true);
-  assert.match(JSON.stringify(nestedRetry.content), /nested/);
+  assert.match(processOutputText(nestedRetry), /nested/);
   const nestedReplay = await client.callTool({
     name: "exec_command",
     arguments: {
@@ -1356,7 +1365,7 @@ try {
     name: "write_stdin",
     arguments: { workspaceId, sessionId: backgroundSessionId, yieldTimeMs: 1_000 },
   });
-  assert.match(JSON.stringify(backgroundResult.content), /background-ok/);
+  assert.match(processOutputText(backgroundResult), /background-ok/);
   const dirtyWorkspace = await client.callTool({
     name: "open_workspace",
     arguments: { path: workspaceRoot, mode: "worktree", contextMode: "full" },
@@ -1437,7 +1446,7 @@ try {
     name: "exec_command",
     arguments: { workspaceId: dirtyWorkspaceId, shell: true, command: "pwd" },
   });
-  const dirtyWorkspaceRoot = toolText(dirtyPwd).split("\n")[0]?.trim() ?? "";
+  const dirtyWorkspaceRoot = processOutputText(dirtyPwd).split("\n")[0]?.trim() ?? "";
   assert.ok(dirtyWorkspaceRoot);
   const siblingManagedRead = await client.callTool({
     name: "exec_command",
@@ -1609,6 +1618,13 @@ try {
   const readOutputStructured = readProcessOutput.structuredContent as {
     ok?: unknown;
     eof?: unknown;
+    page?: {
+      stream?: unknown;
+      text?: unknown;
+      offset?: unknown;
+      nextOffset?: unknown;
+      eof?: unknown;
+    };
     workspace?: Record<string, unknown>;
     continuation?: {
       receipt?: unknown;
@@ -1620,6 +1636,11 @@ try {
   };
   assert.equal(readOutputStructured.ok, true);
   assert.equal(readOutputStructured.eof, true);
+  assert.equal(readOutputStructured.page?.stream, "combined");
+  assert.match(String(readOutputStructured.page?.text), /active-status/);
+  assert.equal(readOutputStructured.page?.offset, 0);
+  assert.equal(typeof readOutputStructured.page?.nextOffset, "number");
+  assert.equal(readOutputStructured.page?.eof, true);
   assert.deepEqual(readOutputStructured.workspace, {
     ref: workspaceId,
     alias: (openWorkspace.structuredContent as {
@@ -1640,7 +1661,8 @@ try {
   );
   assert.equal(readOutputStructured.continuation?.phase, "context_loaded");
   assert.match(String(readOutputStructured.continuation?.expiresAt), /^\d{4}-\d{2}-\d{2}T/u);
-  assert.match(toolText(readProcessOutput), /active-status/);
+  assert.match(processOutputPageText(readProcessOutput), /active-status/);
+  assert.doesNotMatch(toolText(readProcessOutput), /active-status/);
   assert.doesNotMatch(toolText(readProcessOutput), /completed|retained end|outputId/);
 
   const outputDatabase = new Database(join(stateDir, "process-output", "metadata.sqlite"));
@@ -1808,8 +1830,10 @@ try {
   );
   assert.equal((loadSkill._meta as { tool?: unknown } | undefined)?.tool, "load_skill");
   assert.equal((execCommand.structuredContent as { result?: unknown } | undefined)?.result, undefined);
+  assert.match(processOutputText(execCommand), new RegExp(processNeedle));
   assert.equal((execCommand._meta as { tool?: unknown } | undefined)?.tool, "exec_command");
   assert.equal((readProcessOutput.structuredContent as { content?: unknown } | undefined)?.content, undefined);
+  assert.match(processOutputPageText(readProcessOutput), /active-status/);
 
   const skillsOffStateDir = join(root, "state-skills-off");
   const skillsOffConfig = loadConfig({
@@ -1957,6 +1981,32 @@ function toolText(response: unknown): string {
   return textBlocks(response)
     .map((block) => block.text)
     .join("\n");
+}
+
+function processOutputText(response: unknown): string {
+  const structuredContent = response && typeof response === "object"
+    ? (response as { structuredContent?: unknown }).structuredContent
+    : undefined;
+  if (!structuredContent || typeof structuredContent !== "object" || Array.isArray(structuredContent)) {
+    return "";
+  }
+  const output = (structuredContent as { output?: unknown }).output;
+  if (!output || typeof output !== "object" || Array.isArray(output)) return "";
+  const text = (output as { text?: unknown }).text;
+  return typeof text === "string" ? text : "";
+}
+
+function processOutputPageText(response: unknown): string {
+  const structuredContent = response && typeof response === "object"
+    ? (response as { structuredContent?: unknown }).structuredContent
+    : undefined;
+  if (!structuredContent || typeof structuredContent !== "object" || Array.isArray(structuredContent)) {
+    return "";
+  }
+  const page = (structuredContent as { page?: unknown }).page;
+  if (!page || typeof page !== "object" || Array.isArray(page)) return "";
+  const text = (page as { text?: unknown }).text;
+  return typeof text === "string" ? text : "";
 }
 
 function assertFirst512Lifecycle(instructions: string): void {

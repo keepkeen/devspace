@@ -440,7 +440,9 @@ DevSpace 直接测得的版本或生命周期状态为 `observed`，策略声明
 DevSpace 对较大的工具结果只保留一份模型可见正文，避免同一文件或命令输出在
 `content` 和 `structuredContent` 中重复占用上下文。单项文件读取只在 `content`
 返回正文；Skill 正文位于带来源/信任字段的结构化 `skill.content`；
-进程结构化结果只在需要时返回 `sessionId`、`outputId` 或异常状态；`batch_read` 使用上述
+命令和进程轮询把合并后的 stdout/stderr 放在
+`structuredContent.output.text`，分页读取放在
+`structuredContent.page.text`，而 `content` 只返回简短状态说明；`batch_read` 使用上述
 版本化文件项，`batch_inspect` 保留 `ref/ok/result`，两者都不返回主机绝对路径或拼接后的
 聚合 `result`。`_meta` 只承载可选的
 ChatGPT 组件信息，普通 MCP 客户端可以忽略。依赖旧重复字段的客户端需要按上述
@@ -593,7 +595,7 @@ DEVSPACE_LAUNCHD_SERVICE_LABEL=com.waishnav.devspace node dist/cli.js admin
 | 幂等 mutation | 写入、命令、可写进程输入、生命周期和 checkpoint 推进使用持久 operation ID。响应丢失时可重放结果，不会重复执行；未知结果不会自动重跑。 |
 | 变更预览做减法 | `show_changes` 默认是只读预览，不要求 write scope 或 operation ID，也不推进 checkpoint；只有显式 `advanceCheckpoint` 才成为幂等写操作。 |
 | 命令与进程边界 | 普通 build/test/Git/package 命令和项目内清理可正常执行；Workspace 外写入、根目录删除、受保护状态、`sudo` 和远程内容 pipe-to-shell 被阻止。子进程只继承最小安全环境，后台进程不长期锁死 Workspace。 |
-| 进程输出 | 命令有硬超时、终止宽限和资源配额；大输出按 `outputId` 持久保存并分页读取，所有权同时绑定 principal 和 Workspace。 |
+| 进程输出 | 命令正文位于模型可见的结构化 `output.text`，分页正文位于 `page.text`；有持久输出时始终返回 `outputId`。命令还有硬超时、终止宽限和资源配额，输出所有权同时绑定 principal 和 Workspace。 |
 | 指令门禁 | 用户/根/嵌套指令以结构化来源、trust、scope、hash 和 revision 返回。根指令按私有 context session 确认，进入新目录修改前显式加载增量规则，全链限制为 32 KiB。 |
 | Skill 信任边界 | Repository Skill 永远是 `repository_untrusted`、默认 explicit-only，不能通过自身 metadata 提权；catalog description 会清洗控制字符/HTML/代码块，正文与固定服务端文本分离。 |
 | 同根并发协调 | 规范化物理根上的公平读写锁允许并行读取并串行化 MCP 写调用；长期 dev server 不持有生命周期级全局锁，严格文件版本防止静默覆盖。 |
