@@ -464,7 +464,9 @@ use their local `agents/openai.yaml` policy. To locally allowlist one repository
 Skill, add its exact directory or `SKILL.md` path to `DEVSPACE_SKILL_PATHS`;
 explicit local sources take precedence over automatic repository discovery and
 the same manifest is still loaded only once.
-The full-context Skill catalog is limited to 8,000 serialized UTF-8 bytes.
+Explicit-only Skills are excluded from automatic full context and remain
+discoverable through an explicit `list_skills` query. The implicit-invocation
+full-context Skill catalog is limited to 8,000 serialized UTF-8 bytes.
 Catalog descriptions are single-line, control/HTML/code-block sanitized, and
 bounded before serialization. ChatGPT web loads a selected manifest of at most
 64 KiB with `load_skill`; the result separates fixed server text from

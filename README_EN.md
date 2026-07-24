@@ -390,6 +390,10 @@ Repository Skills are always `repository_untrusted` and `explicitOnly`; a
 repository's own `agents/openai.yaml` cannot grant itself implicit invocation.
 `load_skill` returns provenance and the manifest body in structured
 `skill.content`, while its fixed text only states the trust boundary.
+Explicit-only Skills are omitted from the automatic full-context catalog. When
+the user explicitly names one, the model calls `list_skills` with that exact
+query to obtain its sanitized description and `skillId`, then calls
+`load_skill`.
 To locally trust one repository Skill, add its exact directory or `SKILL.md`
 path to `DEVSPACE_SKILL_PATHS`; that local allowlist takes precedence over
 automatic repository discovery without loading the manifest twice.
@@ -444,8 +448,9 @@ read version for an existing path and explicit `null` for a path expected not
 to exist. A patch with any missing path precondition is rejected before it
 starts.
 
-Workspace-scoped results use a common `workspace`, `context`, and
-`continuation` envelope.
+Workspace-scoped results use a common `workspace` and `continuation` envelope.
+Only context-loading results retain a separate `context.phase`, avoiding a
+second copy of both revisions on every ordinary tool result.
 Mutations add `operation` with `not_started`, `committed`, or
 `outcome_unknown`, plus retry and effect-knowledge semantics. Effects identify
 their evidence as `observed`, `declared`, or `unknown` rather than claiming a

@@ -6,6 +6,14 @@ structured fields. That does **not** prove that a particular ChatGPT host build
 preserves the same state across conversations, connector replacement, or a
 lost HTTP response.
 
+`src/host-conversation-simulation.test.ts` runs the complete server-side journey:
+OAuth discovery/registration/approval, first context load, explicit Repository
+Skill discovery and loading, reads/mutations/processes, a later turn, a copied
+conversation branch, a fresh conversation resuming by `workspaceRef`, and two
+independent OAuth principals opening different and identical physical projects.
+Its reported byte metrics measure model-visible MCP payloads, not a verified
+ChatGPT account identity or undocumented host retention behavior.
+
 Run this matrix after changing the OAuth contract, receipt schema, mutation
 envelope, or tool descriptions. Record the exact ChatGPT build/date, DevSpace
 commit, operating system, tunnel, and result. Do not restart the backend during

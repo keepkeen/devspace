@@ -335,16 +335,19 @@ before use.
 
 Legacy project paths such as `.pi/skills` can be added through `DEVSPACE_SKILL_PATHS` when needed.
 
-Full workspace context returns a deterministic Skill catalog capped at 8,000 UTF-8 bytes
-serialized characters and reports how many entries were omitted. Descriptions
+Full workspace context returns only implicit-invocation Skills in a deterministic
+catalog capped at 8,000 UTF-8 bytes serialized characters and reports how many
+eligible entries were omitted. Explicit-only Skills do not appear there; after
+an explicit user request, call `list_skills` with the exact name or query.
+Descriptions
 are converted to a bounded single line and stripped of control characters,
 HTML tags, and fenced code blocks before whole same-name groups are omitted.
 Every entry includes source/trust selection data; duplicate names additionally receive a privacy-safe
 logical path and scope. An exact user-provided Skill name can still be passed
 to `load_skill` even if its catalog entry was omitted.
 
-For ChatGPT web, the model should call `load_skill` with the advertised
-`skillId` before following a Skill. The tool atomically reads the complete
+For ChatGPT web, the model should call `load_skill` with an advertised or
+explicitly queried `skillId` before following a Skill. The tool atomically reads the complete
 `SKILL.md` (maximum 64 KiB) and only then activates access to support files. An exact `name` is
 also accepted when it identifies one Skill; duplicate names require `skillId`.
 This is DevSpace's explicit replacement for Codex's `$skill` and `/skills`
@@ -418,7 +421,7 @@ prose:
 }
 ```
 
-Workspace-scoped results also expose the current Workspace and context. A
+Workspace-scoped results also expose the current Workspace and continuation. A
 mutation adds one durable operation envelope:
 
 ```json
@@ -429,11 +432,6 @@ mutation adds one durable operation envelope:
     "alias": "my-project",
     "projectFingerprint": "proj_…",
     "generation": 3
-  },
-  "context": {
-    "phase": "context_loaded",
-    "instructionRevision": "sha256-v1:…",
-    "skillRevision": "sha256-v1:…"
   },
   "continuation": {
     "receipt": "wctx3.…",
@@ -540,7 +538,8 @@ file contents or process output between MCP `content` and `structuredContent`:
   before rerunning.
 - `close_workspace`, `apply_patch`, and `show_changes` return one concise text
   result. Their detailed presentation data is UI-only `_meta`. Every scoped
-  result also includes visible `workspace`, `context`, and `continuation`.
+  result also includes visible `workspace` and `continuation`; context-loading
+  tools alone retain a separate `context.phase`.
 
 Mutating and lifecycle tools also return machine-readable `effects`. Each
 effect states its evidence confidence: `observed` for versions and lifecycle

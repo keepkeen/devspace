@@ -585,12 +585,7 @@ function attachWorkspaceEnvelope(
       projectFingerprint: binding.projectFingerprint,
       generation: binding.generation,
     },
-    context: {
-      phase: binding.phase,
-      instructionRevision: binding.instructionRevision,
-      skillRevision: binding.skillRevision,
-      ...(existingContext ?? {}),
-    },
+    ...(existingContext ? { context: existingContext } : {}),
     ...(currentReceipt || existingContinuation
       ? {
           continuation: {
@@ -1307,6 +1302,10 @@ export interface WorkspaceSkillCatalog {
   bytes: number;
 }
 
+interface WorkspaceSkillCatalogOptions {
+  includeExplicitOnly?: boolean;
+}
+
 function workspaceInstructionRecord(
   file: Pick<ApplicableAgentsFile, "path" | "content">,
   workspaceRoot: string,
@@ -1368,11 +1367,15 @@ function serializedBytes(value: unknown): number {
 export function buildWorkspaceSkillCatalog(
   skills: readonly Skill[],
   maximumBytes = MAX_SKILL_CATALOG_BYTES,
+  options: WorkspaceSkillCatalogOptions = {},
 ): WorkspaceSkillCatalog {
+  const catalogSkills = options.includeExplicitOnly
+    ? skills
+    : skills.filter((skill) => skill.allowImplicitInvocation);
   const entries: WorkspaceSkillCatalogEntry[] = [];
   let truncated = false;
   const groups = new Map<string, Skill[]>();
-  for (const skill of skills) {
+  for (const skill of catalogSkills) {
     const group = groups.get(skill.name) ?? [];
     group.push(skill);
     groups.set(skill.name, group);
@@ -1422,8 +1425,8 @@ export function buildWorkspaceSkillCatalog(
 
   return {
     skills: entries,
-    totalSkills: skills.length,
-    omittedSkills: skills.length - entries.length,
+    totalSkills: catalogSkills.length,
+    omittedSkills: catalogSkills.length - entries.length,
     truncated,
     bytes: serializedBytes(entries),
   };
@@ -1703,11 +1706,6 @@ function sendCallToolErrorResult(
                 alias: options.binding.alias,
                 projectFingerprint: options.binding.projectFingerprint,
                 generation: options.binding.generation,
-              },
-              context: {
-                phase: options.binding.phase,
-                instructionRevision: options.binding.instructionRevision,
-                skillRevision: options.binding.skillRevision,
               },
               ...(options.receipt
                 ? {
@@ -3733,7 +3731,11 @@ function createMcpServer(
           "The Skill catalog or query changed; restart the listing without a cursor.",
         );
       }
-      const allEntries = buildWorkspaceSkillCatalog(workspace.skills, Number.MAX_SAFE_INTEGER)
+      const allEntries = buildWorkspaceSkillCatalog(
+        workspace.skills,
+        Number.MAX_SAFE_INTEGER,
+        { includeExplicitOnly: true },
+      )
         .skills
         .filter((entry) => {
           if (!normalizedQuery) return true;

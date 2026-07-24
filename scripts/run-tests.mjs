@@ -34,6 +34,7 @@ const tests = [
   "src/mcp-sessions.test.ts",
   "src/mcp-transport-mode.test.ts",
   "src/chatgpt-flow-e2e.test.ts",
+  "src/host-conversation-simulation.test.ts",
   "src/server-observability.test.ts",
   "src/server-startup.test.ts",
   "src/mcp-context-budget.test.ts",

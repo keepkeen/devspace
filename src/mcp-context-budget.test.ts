@@ -387,9 +387,25 @@ try {
     false,
   );
   await rm(readonlyPreviewPath);
-  const advertisedSkill = (openWorkspace.structuredContent as {
+  const automaticRepositorySkill = (openWorkspace.structuredContent as {
     skills?: { items?: Array<Record<string, unknown> & { skillId?: unknown; name?: unknown }> };
   } | undefined)?.skills?.items?.find((skill) => skill.name === "context-budget");
+  assert.equal(
+    automaticRepositorySkill,
+    undefined,
+    "explicit-only Repository Skills must not be advertised in automatic full context",
+  );
+  const listedSkills = await client.callTool({
+    name: "list_skills",
+    arguments: { workspaceId, query: "context-budget", limit: 10 },
+  });
+  assert.equal(
+    (listedSkills.structuredContent as { total?: unknown } | undefined)?.total,
+    1,
+  );
+  const advertisedSkill = (listedSkills.structuredContent as {
+    skills?: Array<Record<string, unknown> & { skillId?: unknown; name?: unknown }>;
+  } | undefined)?.skills?.[0];
   assert.ok(advertisedSkill?.skillId);
   const unloadedSkillRead = await client.callTool({
     name: "read",
@@ -470,7 +486,18 @@ try {
     (instructionsOnlySuppressed.structuredContent as { instructions?: { items?: unknown } } | undefined)?.instructions?.items,
     [],
   );
-  assert.ok(((instructionsOnlySuppressed.structuredContent as { skills?: { items?: unknown[] } } | undefined)?.skills?.items?.length ?? 0) > 0);
+  assert.equal(
+    (instructionsOnlySuppressed.structuredContent as {
+      skills?: { included?: unknown };
+    } | undefined)?.skills?.included,
+    true,
+  );
+  assert.deepEqual(
+    (instructionsOnlySuppressed.structuredContent as {
+      skills?: { items?: unknown[] };
+    } | undefined)?.skills?.items,
+    [],
+  );
   const skillsOnlySuppressed = await client.callTool({
     name: "get_workspace_context",
     arguments: {
@@ -658,14 +685,6 @@ try {
   assert.equal(advertisedSkill.trust, "repository_untrusted");
   assert.equal(advertisedSkill.explicitOnly, true);
   assert.doesNotMatch(JSON.stringify(advertisedSkill), new RegExp(root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-  const listedSkills = await client.callTool({
-    name: "list_skills",
-    arguments: { workspaceId, query: "context-budget", limit: 10 },
-  });
-  assert.equal(
-    (listedSkills.structuredContent as { total?: unknown } | undefined)?.total,
-    1,
-  );
   assert.equal(
     (listedSkills.structuredContent as { skills?: Array<{ skillId?: unknown }> } | undefined)
       ?.skills?.[0]?.skillId,
@@ -893,7 +912,7 @@ try {
   assert.deepEqual(
     initialActiveKeys,
     [
-      "commandExecuted", "context", "continuation", "effects", "ok", "operation",
+      "commandExecuted", "continuation", "effects", "ok", "operation",
       ...(
         typeof (activeCommand.structuredContent as { outputId?: unknown } | undefined)?.outputId === "string"
           ? ["outputId"]
@@ -926,7 +945,7 @@ try {
   );
   assert.deepEqual(
     Object.keys((activeProcessOutput.structuredContent ?? {}) as Record<string, unknown>).sort(),
-    ["context", "continuation", "nextOffset", "ok", "status", "workspace"],
+    ["continuation", "nextOffset", "ok", "status", "workspace"],
   );
   assert.match(toolText(activeProcessOutput), /active-status/s);
   assert.doesNotMatch(toolText(activeProcessOutput), /current end|poll offset|more: offset/i);
@@ -1581,7 +1600,6 @@ try {
     ok?: unknown;
     eof?: unknown;
     workspace?: Record<string, unknown>;
-    context?: Record<string, unknown>;
     continuation?: {
       receipt?: unknown;
       expiresAt?: unknown;
@@ -1603,15 +1621,6 @@ try {
     generation: (openWorkspace.structuredContent as {
       workspace?: { generation?: unknown };
     } | undefined)?.workspace?.generation,
-  });
-  assert.deepEqual(readOutputStructured.context, {
-    phase: "context_loaded",
-    instructionRevision: (openWorkspace.structuredContent as {
-      instructions?: { revision?: unknown };
-    } | undefined)?.instructions?.revision,
-    skillRevision: (openWorkspace.structuredContent as {
-      skills?: { revision?: unknown };
-    } | undefined)?.skills?.revision,
   });
   assert.equal(
     readOutputStructured.continuation?.receipt,
@@ -1645,14 +1654,12 @@ try {
     eof?: unknown;
     status?: unknown;
     workspace?: unknown;
-    context?: unknown;
     continuation?: { receipt?: unknown; expiresAt?: unknown };
   };
   assert.equal(unknownOutputStructured.ok, true);
   assert.equal(unknownOutputStructured.eof, true);
   assert.equal(unknownOutputStructured.status, "unknown");
   assert.deepEqual(unknownOutputStructured.workspace, readOutputStructured.workspace);
-  assert.deepEqual(unknownOutputStructured.context, readOutputStructured.context);
   assert.equal(
     unknownOutputStructured.continuation?.receipt,
     readOutputStructured.continuation?.receipt,

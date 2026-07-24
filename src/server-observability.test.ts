@@ -90,7 +90,11 @@ const catalogSkills: Skill[] = Array.from({ length: 80 }, (_, index) => ({
     baseDir: "/tmp/catalog",
   },
 }));
-const boundedCatalog = buildWorkspaceSkillCatalog(catalogSkills);
+const boundedCatalog = buildWorkspaceSkillCatalog(
+  catalogSkills,
+  MAX_SKILL_CATALOG_BYTES,
+  { includeExplicitOnly: true },
+);
 assert.ok(boundedCatalog.bytes <= MAX_SKILL_CATALOG_BYTES);
 assert.equal(Buffer.byteLength(JSON.stringify(boundedCatalog.skills), "utf8"), boundedCatalog.bytes);
 assert.equal(boundedCatalog.totalSkills, catalogSkills.length);
@@ -119,6 +123,7 @@ assert.doesNotMatch(
 const multibyteCatalog = buildWorkspaceSkillCatalog(
   catalogSkills.map((skill) => ({ ...skill, description: `中文😀${skill.description}` })),
   1_024,
+  { includeExplicitOnly: true },
 );
 assert.ok(multibyteCatalog.bytes <= 1_024);
 assert.equal(

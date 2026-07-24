@@ -362,6 +362,8 @@ DevSpace 也会告诉 ChatGPT 当前可用的本地 Skill；`list_skills` 支持
 仓库来源 Skill 始终标记为 `repository_untrusted` 并默认 `explicitOnly=true`；仓库自己的
 `agents/openai.yaml` 不能为自身开启隐式调用。`load_skill` 把正文放入结构化
 `skill.content`，固定文本只说明来源和信任边界，避免把服务端话术与不可信正文混在一起。
+explicit-only Skill 不进入自动 full-context 目录；用户明确提到 Skill 时，模型先用
+`list_skills(query=<精确名称>)` 取得清洗后的描述和 `skillId`，再调用 `load_skill`。
 如需本机显式信任某一个仓库 Skill，可把它的精确目录或 `SKILL.md` 路径加入
 `DEVSPACE_SKILL_PATHS`；该本机 allowlist 优先于自动仓库发现，同时不会重复加载同一清单。
 
@@ -407,7 +409,9 @@ relink/revoke、Owner 凭据或授权根等真实权限边界变更以及
 `mtimeNs`。`apply_patch` 默认要求每个 touched path 都有 `ifMatch`：已有文件使用最新读取
 版本，预期不存在的新路径显式传 `null`。缺少任一路径的前置条件时，补丁不会开始执行。
 
-所有 Workspace-scoped 工具都会返回统一的 `workspace`、`context` 和 `continuation`。
+所有 Workspace-scoped 工具都会返回统一的 `workspace` 和 `continuation`；只有
+`open_workspace`、`resume_workspace` 与 `get_workspace_context` 的上下文载荷保留独立
+`context.phase`，避免普通工具重复两份 revision。
 写入、命令、可写进程交互、显式推进的变更 checkpoint、关闭和撤销还会返回
 `operation` 和 `effects`。operation 明确给出 `not_started`、`committed` 或
 `outcome_unknown`，以及是否可安全重试和副作用是否已知。每项 effect 还标记证据可信度：

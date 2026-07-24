@@ -340,13 +340,13 @@ Copy or adapt them into one of the active profile directories before use.
 
 Legacy project paths such as `.pi/skills` can be added through `DEVSPACE_SKILL_PATHS` when needed.
 
-If a Skill appears in `open_workspace`, ChatGPT web should call `load_skill`
-with its `skillId` before reading other files inside the Skill directory.
-Duplicate names require the ID. Skills marked
-`explicitOnly=true` remain available only for explicit user
-requests. Check `DEVSPACE_DISABLED_SKILL_PATHS` when an expected Skill is
-missing; the catalog also reports entries omitted by its 8,000-byte UTF-8
-budget.
+If a Skill appears in full context, ChatGPT web should call `load_skill` with
+its `skillId` before reading other files inside the Skill directory. Skills
+marked `explicitOnly=true` are intentionally absent from automatic context;
+after an explicit user request, call `list_skills` with the exact name or query.
+Duplicate names require the returned ID. Check `DEVSPACE_DISABLED_SKILL_PATHS`
+when an explicitly queried Skill is still missing; the automatic catalog also
+reports eligible entries omitted by its 8,000-byte UTF-8 budget.
 
 ## Review Card Does Not Appear
 
