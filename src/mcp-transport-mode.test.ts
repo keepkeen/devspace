@@ -95,10 +95,25 @@ try {
     (opened.structuredContent as { instructions?: { revision?: unknown } } | undefined)?.instructions?.revision ?? "",
   );
   assert.ok(instructionRevision);
-  const compactReopen = await firstChatGpt.callTool({
+  const unverifiedRetainedOpen = await firstChatGpt.callTool({
     name: "open_workspace",
     arguments: {
       path: workspaceRoot,
+      contextMode: "retained",
+      knownInstructionRevision: instructionRevision,
+    },
+  });
+  assert.equal(unverifiedRetainedOpen.isError, true);
+  assert.equal(
+    (unverifiedRetainedOpen.structuredContent as {
+      error?: { code?: unknown };
+    } | undefined)?.error?.code,
+    "retained_context_unverified",
+  );
+  const compactReopen = await firstChatGpt.callTool({
+    name: "get_workspace_context",
+    arguments: {
+      receipt,
       contextMode: "retained",
       knownInstructionRevision: instructionRevision,
     },
@@ -330,6 +345,7 @@ function seedClient(accessToken: string, redirectUri: string, name: string): voi
       redirect_uris: [redirectUri],
       client_name: name,
     });
+    store.ensurePrincipalForClient(client.client_id);
     const resource = new URL("/mcp", publicBaseUrl).href;
     const expiresAt = Math.floor(Date.now() / 1_000) + 3_600;
     store.saveTokenPair({

@@ -31,7 +31,7 @@ const DEFAULT_ROWS = 24;
 export const MAX_PROCESS_INPUT_BYTES = 1024 * 1024;
 
 export interface StartCommandInput {
-  ownerClientId: string;
+  connectionPrincipalId: string;
   workspaceId: string;
   command: ProcessCommand;
   cwd: string;
@@ -59,7 +59,7 @@ export interface PreparedProcessInput {
 }
 
 export interface WriteStdinInput {
-  ownerClientId: string;
+  connectionPrincipalId: string;
   workspaceId: string;
   sessionId: number;
   chars?: string;
@@ -126,7 +126,7 @@ interface ManagedProcess {
 
 interface ProcessSession {
   id: number;
-  ownerClientId: string;
+  connectionPrincipalId: string;
   workspaceId: string;
   cwd: string;
   instructionScopePaths: string[];
@@ -171,7 +171,7 @@ export interface ProcessSessionManagerOptions {
   outputStore?: ProcessOutputStore;
   onOutputStorageError?: (
     error: unknown,
-    context: { ownerClientId: string; workspaceId: string; outputId?: string },
+    context: { connectionPrincipalId: string; workspaceId: string; outputId?: string },
   ) => void;
 }
 
@@ -179,7 +179,7 @@ export interface ProcessSessionUsageSnapshot {
   sessions: number;
   running: number;
   limit: number;
-  owner?: {
+  principal?: {
     sessions: number;
     running: number;
     limit: number;
@@ -208,8 +208,8 @@ function assertProcessInputSize(value: string | undefined): void {
   }
 }
 
-function workspaceKey(ownerClientId: string, workspaceId: string): string {
-  return `${ownerClientId}\u0000${workspaceId}`;
+function workspaceKey(connectionPrincipalId: string, workspaceId: string): string {
+  return `${connectionPrincipalId}\u0000${workspaceId}`;
 }
 
 export function isInteractiveShellCommand(command: string, depth = 0): boolean {
@@ -332,9 +332,35 @@ function processEnvironment(input?: {
   workspaceRoot?: string;
   overrides?: Record<string, string>;
 }): Record<string, string> {
+  const inheritedKeys = [
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PROGRAMDATA",
+    "SYSTEMROOT",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+  ] as const;
   const environment: Record<string, string> = {
     ...Object.fromEntries(
-      Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined),
+      inheritedKeys.flatMap((name) => {
+        const value = process.env[name];
+        return value === undefined ? [] : [[name, value] as const];
+      }),
     ),
     NO_COLOR: "1",
     TERM: "dumb",
@@ -514,20 +540,20 @@ export class ProcessSessionManager {
 
   async start(input: StartCommandInput): Promise<ProcessSnapshot> {
     if (this.shuttingDown) throw new Error("Process manager is shutting down.");
-    if (this.closingWorkspaces.has(workspaceKey(input.ownerClientId, input.workspaceId))) {
+    if (this.closingWorkspaces.has(workspaceKey(input.connectionPrincipalId, input.workspaceId))) {
       throw new Error("Workspace is closing and cannot start new processes.");
     }
     if (this.sessions.size >= this.maxSessions) {
       throw new Error(`Process session limit reached (${this.maxSessions}).`);
     }
     const clientSessions = Array.from(this.sessions.values()).filter(
-      (session) => session.ownerClientId === input.ownerClientId,
+      (session) => session.connectionPrincipalId === input.connectionPrincipalId,
     ).length;
     if (clientSessions >= this.maxSessionsPerClient) {
       throw new Error(`Process session limit reached for this OAuth client (${this.maxSessionsPerClient}).`);
     }
     const workspaceSessions = Array.from(this.sessions.values()).filter(
-      (session) => session.ownerClientId === input.ownerClientId && session.workspaceId === input.workspaceId,
+      (session) => session.connectionPrincipalId === input.connectionPrincipalId && session.workspaceId === input.workspaceId,
     ).length;
     if (workspaceSessions >= this.maxSessionsPerWorkspace) {
       throw new Error(`Process session limit reached for this workspace (${this.maxSessionsPerWorkspace}).`);
@@ -549,9 +575,24 @@ export class ProcessSessionManager {
       if (input.stdin) session.process?.write(input.stdin);
       if (closeStdin) this.closeProcessStdin(session);
     } catch (error) {
-      session.process?.kill("SIGTERM");
-      this.finalizeDurableOutput(session);
-      this.sessions.delete(session.id);
+      if (session.process) {
+        session.cancelRequested = true;
+        const terminationError = this.killSession(session, "SIGTERM");
+        if (terminationError) {
+          this.append(session, `\nFailed to terminate process after startup error: ${String(terminationError)}\n`);
+        }
+        session.escalationTimer = setTimeout(() => {
+          if (!session.running) return;
+          const escalationError = this.killSession(session, "SIGKILL");
+          if (escalationError) {
+            this.append(session, `\nFailed to force-kill process after startup error: ${String(escalationError)}\n`);
+          }
+        }, this.terminationGraceMs);
+        session.escalationTimer.unref();
+      } else {
+        this.finalizeDurableOutput(session);
+        this.sessions.delete(session.id);
+      }
       throw error;
     }
 
@@ -564,7 +605,7 @@ export class ProcessSessionManager {
   }
 
   async write(input: WriteStdinInput): Promise<ProcessSnapshot> {
-    const session = this.getOwnedSession(input.ownerClientId, input.workspaceId, input.sessionId);
+    const session = this.getOwnedSession(input.connectionPrincipalId, input.workspaceId, input.sessionId);
     if (
       input.preparedInput &&
       input.preparedInput.expectedRevision !== session.inputRevision
@@ -633,11 +674,11 @@ export class ProcessSessionManager {
   }
 
   instructionContext(
-    ownerClientId: string,
+    connectionPrincipalId: string,
     workspaceId: string,
     sessionId: number,
   ): ProcessInstructionContext {
-    const session = this.getOwnedSession(ownerClientId, workspaceId, sessionId);
+    const session = this.getOwnedSession(connectionPrincipalId, workspaceId, sessionId);
     return {
       cwd: session.cwd,
       scopePaths: [...session.instructionScopePaths],
@@ -648,15 +689,15 @@ export class ProcessSessionManager {
     };
   }
 
-  terminate(ownerClientId: string, workspaceId: string, sessionId: number): void {
-    const session = this.getOwnedSession(ownerClientId, workspaceId, sessionId);
+  terminate(connectionPrincipalId: string, workspaceId: string, sessionId: number): void {
+    const session = this.getOwnedSession(connectionPrincipalId, workspaceId, sessionId);
     if (session.running) session.process?.kill("SIGTERM");
   }
 
-  async terminateWorkspace(ownerClientId: string, workspaceId: string): Promise<number> {
-    this.closingWorkspaces.add(workspaceKey(ownerClientId, workspaceId));
+  async terminateWorkspace(connectionPrincipalId: string, workspaceId: string): Promise<number> {
+    this.closingWorkspaces.add(workspaceKey(connectionPrincipalId, workspaceId));
     const sessions = Array.from(this.sessions.values()).filter(
-      (session) => session.running && session.ownerClientId === ownerClientId && session.workspaceId === workspaceId,
+      (session) => session.running && session.connectionPrincipalId === connectionPrincipalId && session.workspaceId === workspaceId,
     );
     const errors: unknown[] = [];
     for (const session of sessions) {
@@ -676,34 +717,34 @@ export class ProcessSessionManager {
       if (!session.running) this.removeSession(session.id);
     }
     if (survivors.length > 0) {
-      this.reopenWorkspace(ownerClientId, workspaceId);
+      this.reopenWorkspace(connectionPrincipalId, workspaceId);
       errors.push(new Error(`Failed to terminate ${survivors.length} process session(s).`));
       throw new AggregateError(errors, "Workspace processes could not be terminated");
     }
     return sessions.length;
   }
 
-  blockWorkspace(ownerClientId: string, workspaceId: string): void {
-    this.closingWorkspaces.add(workspaceKey(ownerClientId, workspaceId));
+  blockWorkspace(connectionPrincipalId: string, workspaceId: string): void {
+    this.closingWorkspaces.add(workspaceKey(connectionPrincipalId, workspaceId));
   }
 
-  hasActive(ownerClientId: string, workspaceId: string): boolean {
+  hasActive(connectionPrincipalId: string, workspaceId: string): boolean {
     return Array.from(this.sessions.values()).some(
-      (session) => session.running && session.ownerClientId === ownerClientId && session.workspaceId === workspaceId,
+      (session) => session.running && session.connectionPrincipalId === connectionPrincipalId && session.workspaceId === workspaceId,
     );
   }
 
-  usageSnapshot(ownerClientId?: string): ProcessSessionUsageSnapshot {
+  usageSnapshot(connectionPrincipalId?: string): ProcessSessionUsageSnapshot {
     const sessions = Array.from(this.sessions.values());
     return {
       sessions: sessions.length,
       running: sessions.filter((session) => session.running).length,
       limit: this.maxSessions,
-      ...(ownerClientId === undefined ? {} : {
-        owner: {
-          sessions: sessions.filter((session) => session.ownerClientId === ownerClientId).length,
+      ...(connectionPrincipalId === undefined ? {} : {
+        principal: {
+          sessions: sessions.filter((session) => session.connectionPrincipalId === connectionPrincipalId).length,
           running: sessions.filter(
-            (session) => session.ownerClientId === ownerClientId && session.running,
+            (session) => session.connectionPrincipalId === connectionPrincipalId && session.running,
           ).length,
           limit: this.maxSessionsPerClient,
         },
@@ -711,18 +752,18 @@ export class ProcessSessionManager {
     };
   }
 
-  flushOutput(ownerClientId: string, workspaceId: string, outputId: string): void {
+  flushOutput(connectionPrincipalId: string, workspaceId: string, outputId: string): void {
     const session = Array.from(this.sessions.values()).find(
       (candidate) =>
         candidate.outputId === outputId &&
-        candidate.ownerClientId === ownerClientId &&
+        candidate.connectionPrincipalId === connectionPrincipalId &&
         candidate.workspaceId === workspaceId,
     );
     if (session) this.flushDurableOutput(session);
   }
 
-  reopenWorkspace(ownerClientId: string, workspaceId: string): void {
-    this.closingWorkspaces.delete(workspaceKey(ownerClientId, workspaceId));
+  reopenWorkspace(connectionPrincipalId: string, workspaceId: string): void {
+    this.closingWorkspaces.delete(workspaceKey(connectionPrincipalId, workspaceId));
   }
 
   shutdown(): Promise<void> {
@@ -752,7 +793,7 @@ export class ProcessSessionManager {
 
     return {
       id: this.nextSessionId++,
-      ownerClientId: input.ownerClientId,
+      connectionPrincipalId: input.connectionPrincipalId,
       workspaceId: input.workspaceId,
       cwd: input.cwd,
       instructionScopePaths: [...new Set(
@@ -926,7 +967,7 @@ export class ProcessSessionManager {
     }
     try {
       session.outputId ??= this.outputStore.create({
-        ownerClientId: session.ownerClientId,
+        connectionPrincipalId: session.connectionPrincipalId,
         workspaceId: session.workspaceId,
       });
       this.outputStore.append(session.outputId, output);
@@ -937,7 +978,7 @@ export class ProcessSessionManager {
       } else {
         session.outputStorageError = "unavailable";
         this.onOutputStorageError?.(error, {
-          ownerClientId: session.ownerClientId,
+          connectionPrincipalId: session.connectionPrincipalId,
           workspaceId: session.workspaceId,
           outputId: session.outputId,
         });
@@ -1006,7 +1047,7 @@ export class ProcessSessionManager {
     }
     try {
       const metadata = this.outputStore.metadata(
-        session.ownerClientId,
+        session.connectionPrincipalId,
         session.workspaceId,
         session.outputId,
       );
@@ -1025,10 +1066,10 @@ export class ProcessSessionManager {
     }
   }
 
-  private getOwnedSession(ownerClientId: string, workspaceId: string, sessionId: number): ProcessSession {
+  private getOwnedSession(connectionPrincipalId: string, workspaceId: string, sessionId: number): ProcessSession {
     const session = this.sessions.get(sessionId);
     if (!session) throw unknownProcessSessionError(sessionId);
-    if (session.ownerClientId !== ownerClientId || session.workspaceId !== workspaceId) {
+    if (session.connectionPrincipalId !== connectionPrincipalId || session.workspaceId !== workspaceId) {
       throw unknownProcessSessionError(sessionId);
     }
     return session;

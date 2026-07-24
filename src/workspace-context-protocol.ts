@@ -20,7 +20,7 @@ const DEFAULT_RECEIPT_TTL_MS = 6 * 60 * 60 * 1_000;
 const MAX_RECEIPT_TTL_MS = 24 * 60 * 60 * 1_000;
 
 export interface WorkspaceContextReceiptBinding {
-  ownerClientId: string;
+  connectionPrincipalId: string;
   workspaceId: string;
   contextSessionId: string;
   generation: number;
@@ -68,7 +68,7 @@ export interface WorkspaceContextSkillItem {
 }
 
 export interface WorkspaceContextProtocolInput {
-  ownerClientId: string;
+  connectionPrincipalId: string;
   workspaceId: string;
   contextSessionId: string;
   phase: WorkspaceContextPhase;
@@ -142,7 +142,7 @@ export function createWorkspaceContextReceiptManager(options: {
     const hmac = createHmac("sha256", key);
     hmac.update(RECEIPT_DOMAIN, "utf8");
     updateFramed(hmac, processGeneration);
-    updateFramed(hmac, binding.ownerClientId);
+    updateFramed(hmac, binding.connectionPrincipalId);
     updateFramed(hmac, binding.workspaceId);
     updateFramed(hmac, binding.contextSessionId);
     updateFramed(hmac, String(binding.generation));
@@ -247,7 +247,7 @@ export function serializeWorkspaceContext(
       : {}),
   };
   const receipt = receipts.issue({
-    ownerClientId: input.ownerClientId,
+    connectionPrincipalId: input.connectionPrincipalId,
     workspaceId: input.workspaceId,
     contextSessionId: input.contextSessionId,
     generation: input.workspace.generation,
@@ -295,7 +295,7 @@ function validateKey(key: Uint8Array): Buffer {
 }
 
 function assertReceiptBinding(binding: WorkspaceContextReceiptBinding): void {
-  assertBoundedString("ownerClientId", binding.ownerClientId);
+  assertBoundedString("connectionPrincipalId", binding.connectionPrincipalId);
   assertBoundedString("workspaceId", binding.workspaceId);
   assertBoundedString("contextSessionId", binding.contextSessionId);
   assertPositiveSafeInteger("generation", binding.generation);

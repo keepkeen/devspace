@@ -17,6 +17,7 @@ import {
   removeManagedWorktree,
   removeManagedWorktreeSync,
   resolveManagedWorktreeBase,
+  restoreManagedWorktree,
 } from "./git-worktrees.js";
 
 export { WorkspaceQuotaError } from "./workspace-store.js";
@@ -45,6 +46,10 @@ import {
   loadLocalAgentProfiles,
   type LocalAgentProfile,
 } from "./local-agent-profiles.js";
+import {
+  WorkspaceRootLockManager,
+  type WorkspaceRootLockMode,
+} from "./workspace-root-locks.js";
 
 export interface LoadedAgentsFile {
   path: string;
@@ -70,7 +75,7 @@ export interface WorkspaceWorktree {
 
 export interface Workspace {
   id: string;
-  ownerClientId: string;
+  connectionPrincipalId: string;
   alias: string;
   root: string;
   mode: WorkspaceMode;
@@ -88,7 +93,7 @@ export interface Workspace {
 
 export interface WorkspaceInstructionContext {
   id: string;
-  ownerClientId: string;
+  connectionPrincipalId: string;
   workspaceId: string;
   workspaceGeneration: number;
   deliveredInstructionVersions: Map<string, string>;
@@ -123,6 +128,10 @@ export interface WorkspaceContext {
   availableAgentsFiles: AvailableAgentsFile[];
   instructionScan: InstructionScanResult;
   reused: boolean;
+  recovery?: {
+    kind: "managed_worktree_recreated";
+    dataLossPossible: true;
+  };
 }
 
 export interface WorkspaceReadPath {
@@ -153,7 +162,7 @@ export interface WorkspaceSummary {
   dirtySource?: boolean;
   writeAccess: WorkspaceWriteAccess;
   workspaceGeneration: number;
-  hydrationStatus: "ready" | "requires_resume";
+  hydrationStatus: "ready" | "requires_resume" | "recovery_required";
   createdAt: string;
   lastUsedAt: string;
 }
@@ -191,6 +200,24 @@ export class WorkspaceAliasConflictError extends Error {
   }
 }
 
+export class WorkspaceSelectionRequiredError extends Error {
+  readonly code = "workspace_selection_required";
+
+  constructor(readonly aliases: string[]) {
+    super("Multiple active managed workspaces match this project.");
+    this.name = "WorkspaceSelectionRequiredError";
+  }
+}
+
+export class WorkspaceRecoveryRequiredError extends Error {
+  readonly code = "workspace_recovery_required";
+
+  constructor(readonly alias: string, readonly reason: string) {
+    super(`Workspace ${alias} could not be recovered: ${reason}`);
+    this.name = "WorkspaceRecoveryRequiredError";
+  }
+}
+
 class ExistingManagedWorkspaceError extends Error {
   constructor(readonly session: WorkspaceSession) {
     super("An equivalent managed workspace is already active.");
@@ -203,7 +230,7 @@ export interface AllowedRootsUpdateResult {
   added: number;
   removed: number;
   persistenceFailures: number;
-  invalidated: Array<{ workspaceId: string; ownerClientId: string }>;
+  invalidated: Array<{ workspaceId: string; connectionPrincipalId: string }>;
 }
 
 export class UnknownWorkspaceError extends Error {
@@ -296,7 +323,7 @@ export class WorkspaceContextSessionError extends Error {
 }
 
 interface WorkspaceLifecycleState {
-  ownerClientId: string;
+  connectionPrincipalId: string;
   phase: "open" | "closing";
   activeOperations: number;
   drained?: Promise<void>;
@@ -325,6 +352,7 @@ export class WorkspaceRegistry {
   private readonly pendingManagedWorkspaces = new Map<string, Promise<WorkspaceContext>>();
   private readonly pendingHydrations = new Map<string, Promise<WorkspaceContext>>();
   private readonly lifecycleStates = new Map<string, WorkspaceLifecycleState>();
+  private readonly rootLocks = new WorkspaceRootLockManager();
   private readonly instructionDirectoryCache = new Map<string, {
     fingerprint: string;
     files: string[];
@@ -342,7 +370,10 @@ export class WorkspaceRegistry {
     private readonly store?: WorkspaceStore,
   ) {}
 
-  async openWorkspace(ownerClientId: string, input: string | OpenWorkspaceInput): Promise<WorkspaceContext> {
+  async openWorkspace(
+    connectionPrincipalId: string,
+    input: string | OpenWorkspaceInput,
+  ): Promise<WorkspaceContext> {
     const options = typeof input === "string" ? { path: input } : input;
     const mode = options.mode ?? "checkout";
     const alias = options.alias === undefined ? undefined : validateWorkspaceAlias(options.alias);
@@ -354,7 +385,7 @@ export class WorkspaceRegistry {
           throw new Error("Managed worktree workspaces must use writeAccess=read_write.");
         }
         return await this.openWorktreeWorkspace(
-          ownerClientId,
+          connectionPrincipalId,
           options.path,
           options.baseRef,
           alias,
@@ -363,7 +394,7 @@ export class WorkspaceRegistry {
       }
 
       return await this.openCheckoutWorkspace(
-        ownerClientId,
+        connectionPrincipalId,
         options.path,
         alias,
         writeAccess,
@@ -377,33 +408,45 @@ export class WorkspaceRegistry {
     }
   }
 
-  getWorkspace(ownerClientId: string, workspaceId: string, expectedGeneration?: number): Workspace {
+  getWorkspace(
+    connectionPrincipalId: string,
+    workspaceId: string,
+    expectedGeneration?: number,
+  ): Workspace {
     const workspace = this.workspaces.get(workspaceId);
-    if (workspace?.ownerClientId === ownerClientId) {
+    if (workspace?.connectionPrincipalId === connectionPrincipalId) {
       if (!this.workspaceRootAllowed(workspace.root, workspace.mode, workspace.sourceRoot)) {
-        this.invalidateWorkspace(workspaceId, ownerClientId, workspace.root);
+        if (workspace.mode === "worktree" && workspace.worktree?.managed) {
+          const lifecycle = this.lifecycleStates.get(workspaceId);
+          if (lifecycle && (lifecycle.phase === "closing" || lifecycle.activeOperations > 0)) {
+            throw new WorkspaceResumeRequiredError();
+          }
+          this.evictWorkspace(workspaceId, workspace.root);
+          throw new WorkspaceResumeRequiredError();
+        }
+        this.invalidateWorkspace(workspaceId, connectionPrincipalId, workspace.root);
         throw new UnknownWorkspaceError(workspaceId);
       }
       workspace.lastUsedAt = Date.now();
       if (expectedGeneration !== undefined && workspace.stateGeneration !== expectedGeneration) {
         throw new StaleWorkspaceGenerationError();
       }
-      this.store?.touchSession(workspaceId, ownerClientId);
+      this.store?.touchSession(workspaceId, connectionPrincipalId);
       return workspace;
     }
 
-    const session = this.store?.getSession(workspaceId, ownerClientId);
+    const session = this.store?.getSession(workspaceId, connectionPrincipalId);
     if (!session) {
       throw new UnknownWorkspaceError(workspaceId);
     }
     throw new WorkspaceResumeRequiredError();
   }
 
-  listWorkspaces(ownerClientId: string): WorkspaceSummary[] {
+  listWorkspaces(connectionPrincipalId: string): WorkspaceSummary[] {
     this.reconcileMissingManagedSessions();
-    const summaries = this.store?.listActiveSessionSummaries?.(ownerClientId)
+    const summaries = this.store?.listActiveSessionSummaries?.(connectionPrincipalId)
       ?? Array.from(this.workspaces.values())
-        .filter((workspace) => workspace.ownerClientId === ownerClientId)
+        .filter((workspace) => workspace.connectionPrincipalId === connectionPrincipalId)
         .map((workspace): ActiveWorkspaceSummary => ({
           alias: workspace.alias,
           mode: workspace.mode,
@@ -418,10 +461,17 @@ export class WorkspaceRegistry {
         }));
 
     return summaries.map((summary) => {
-      const session = this.store?.getActiveSessionByAlias?.(ownerClientId, summary.alias);
+      const session = this.store?.getActiveSessionByAlias?.(connectionPrincipalId, summary.alias);
       const resident = Array.from(this.workspaces.values()).find(
-        (workspace) => workspace.ownerClientId === ownerClientId && workspace.alias === summary.alias,
+        (workspace) =>
+          workspace.connectionPrincipalId === connectionPrincipalId &&
+          workspace.alias === summary.alias,
       );
+      const available = resident
+        ? this.workspaceRootAllowed(resident.root, resident.mode, resident.sourceRoot)
+        : session
+          ? this.workspaceRootAllowed(session.root, session.mode, session.sourceRoot)
+          : true;
       return {
         alias: summary.alias,
         displayPath: formatWorkspaceDisplayPath(
@@ -434,16 +484,21 @@ export class WorkspaceRegistry {
           : {}),
         writeAccess: summary.writeAccess,
         workspaceGeneration: summary.stateGeneration,
-        hydrationStatus: resident ? "ready" : "requires_resume",
+        hydrationStatus: summary.managed && !available
+          ? "recovery_required"
+          : resident
+            ? "ready"
+            : "requires_resume",
         createdAt: summary.createdAt,
         lastUsedAt: summary.lastUsedAt,
       };
     });
   }
 
-  workspaceSummary(ownerClientId: string, alias: string): WorkspaceSummary {
+  workspaceSummary(connectionPrincipalId: string, alias: string): WorkspaceSummary {
     const normalizedAlias = validateWorkspaceAlias(alias);
-    const summary = this.listWorkspaces(ownerClientId).find((candidate) => candidate.alias === normalizedAlias);
+    const summary = this.listWorkspaces(connectionPrincipalId)
+      .find((candidate) => candidate.alias === normalizedAlias);
     if (!summary) throw new UnknownWorkspaceAliasError();
     return summary;
   }
@@ -454,12 +509,12 @@ export class WorkspaceRegistry {
     return sessions.map((session) => ({ ...session }));
   }
 
-  bumpAuthorityGenerations(ownerClientId?: string): number {
-    const updates = this.store?.bumpActiveStateGenerations?.(ownerClientId);
+  bumpAuthorityGenerations(connectionPrincipalId?: string): number {
+    const updates = this.store?.bumpActiveStateGenerations?.(connectionPrincipalId);
     if (updates) {
       for (const update of updates) {
         const resident = this.workspaces.get(update.id);
-        if (resident?.ownerClientId === update.ownerClientId) {
+        if (resident?.connectionPrincipalId === update.connectionPrincipalId) {
           resident.stateGeneration = update.stateGeneration;
         }
       }
@@ -468,23 +523,40 @@ export class WorkspaceRegistry {
 
     let bumped = 0;
     for (const workspace of this.workspaces.values()) {
-      if (ownerClientId !== undefined && workspace.ownerClientId !== ownerClientId) continue;
+      if (
+        connectionPrincipalId !== undefined &&
+        workspace.connectionPrincipalId !== connectionPrincipalId
+      ) continue;
       workspace.stateGeneration += 1;
       bumped += 1;
     }
     return bumped;
   }
 
-  async resumeWorkspace(ownerClientId: string, alias: string): Promise<WorkspaceContext> {
+  async resumeWorkspace(connectionPrincipalId: string, alias: string): Promise<WorkspaceContext> {
     const normalizedAlias = validateWorkspaceAlias(alias);
     const resident = Array.from(this.workspaces.values()).find(
-      (workspace) => workspace.ownerClientId === ownerClientId && workspace.alias === normalizedAlias,
+      (workspace) =>
+        workspace.connectionPrincipalId === connectionPrincipalId &&
+        workspace.alias === normalizedAlias,
     );
-    if (resident) return this.contextForWorkspace(resident, true);
+    if (resident) {
+      if (this.workspaceRootAllowed(resident.root, resident.mode, resident.sourceRoot)) {
+        return this.contextForWorkspace(resident, true);
+      }
+      const lifecycle = this.lifecycleStates.get(resident.id);
+      if (lifecycle && (lifecycle.phase === "closing" || lifecycle.activeOperations > 0)) {
+        throw new WorkspaceRecoveryRequiredError(
+          normalizedAlias,
+          "an active process or operation must finish before the missing worktree can be recreated",
+        );
+      }
+      this.evictWorkspace(resident.id, resident.root);
+    }
 
-    const session = this.store?.getActiveSessionByAlias?.(ownerClientId, normalizedAlias);
+    const session = this.store?.getActiveSessionByAlias?.(connectionPrincipalId, normalizedAlias);
     if (!session) throw new UnknownWorkspaceAliasError();
-    const identity = workspaceIdentity(session.id, ownerClientId);
+    const identity = workspaceIdentity(session.id, connectionPrincipalId);
     const pending = this.pendingHydrations.get(identity);
     if (pending) return pending;
 
@@ -498,11 +570,11 @@ export class WorkspaceRegistry {
   }
 
   async getWorkspaceContext(
-    ownerClientId: string,
+    connectionPrincipalId: string,
     workspaceId: string,
     workspaceGeneration?: number,
   ): Promise<WorkspaceContext> {
-    const workspace = this.getWorkspace(ownerClientId, workspaceId, workspaceGeneration);
+    const workspace = this.getWorkspace(connectionPrincipalId, workspaceId, workspaceGeneration);
     return this.contextForWorkspace(workspace, true);
   }
 
@@ -526,7 +598,7 @@ export class WorkspaceRegistry {
     const sessions = this.store?.listActiveSessions?.() ?? Array.from(this.workspaces.values()).map(
       (workspace): WorkspaceSession => ({
         id: workspace.id,
-        ownerClientId: workspace.ownerClientId,
+        connectionPrincipalId: workspace.connectionPrincipalId,
         root: workspace.root,
         status: "active",
         mode: workspace.mode,
@@ -543,16 +615,16 @@ export class WorkspaceRegistry {
       (session) => !this.workspaceRootAllowed(session.root, session.mode, session.sourceRoot),
     );
     for (const session of revoked) {
-      this.pendingSessionClosures.set(workspaceIdentity(session.id, session.ownerClientId), session);
+      this.pendingSessionClosures.set(workspaceIdentity(session.id, session.connectionPrincipalId), session);
     }
     const pendingClosures = Array.from(this.pendingSessionClosures.values());
-    const identities = pendingClosures.map(({ id, ownerClientId }) => ({ id, ownerClientId }));
+    const identities = pendingClosures.map(({ id, connectionPrincipalId }) => ({ id, connectionPrincipalId }));
     let persistenceFailures = 0;
     try {
       if (this.store?.closeSessions) {
         this.store.closeSessions(identities);
       } else {
-        for (const session of pendingClosures) this.store?.closeSession(session.id, session.ownerClientId);
+        for (const session of pendingClosures) this.store?.closeSession(session.id, session.connectionPrincipalId);
       }
       this.pendingSessionClosures.clear();
     } catch {
@@ -569,7 +641,7 @@ export class WorkspaceRegistry {
       for (const update of this.store?.bumpActiveStateGenerations?.() ?? []) {
         if (invalidatedIds.has(update.id)) continue;
         const resident = this.workspaces.get(update.id);
-        if (resident?.ownerClientId === update.ownerClientId) {
+        if (resident?.connectionPrincipalId === update.connectionPrincipalId) {
           resident.stateGeneration = update.stateGeneration;
         }
       }
@@ -585,7 +657,10 @@ export class WorkspaceRegistry {
       added: normalized.filter((root) => !previousSet.has(root)).length,
       removed: previous.filter((root) => !nextSet.has(root)).length,
       persistenceFailures,
-      invalidated: pendingClosures.map(({ id, ownerClientId }) => ({ workspaceId: id, ownerClientId })),
+      invalidated: pendingClosures.map(({ id, connectionPrincipalId }) => ({
+        workspaceId: id,
+        connectionPrincipalId: connectionPrincipalId,
+      })),
     };
   }
 
@@ -674,11 +749,11 @@ export class WorkspaceRegistry {
   }
 
   async loadSkill(
-    ownerClientId: string,
+    connectionPrincipalId: string,
     workspaceId: string,
     skillId: string,
   ): Promise<LoadedWorkspaceSkill> {
-    const workspace = this.getWorkspace(ownerClientId, workspaceId);
+    const workspace = this.getWorkspace(connectionPrincipalId, workspaceId);
     const skill = workspace.skills.find((candidate) => candidate.skillId === skillId);
     if (!skill) {
       throw new SkillLoadError("skill_not_found", "The requested Skill is not available in this workspace.");
@@ -789,7 +864,7 @@ export class WorkspaceRegistry {
     const existing = workspace.instructionContexts.get(id);
     if (existing) {
       if (
-        existing.ownerClientId !== workspace.ownerClientId ||
+        existing.connectionPrincipalId !== workspace.connectionPrincipalId ||
         existing.workspaceId !== workspace.id ||
         existing.workspaceGeneration !== workspace.stateGeneration
       ) {
@@ -804,7 +879,7 @@ export class WorkspaceRegistry {
     const now = Date.now();
     workspace.instructionContexts.set(id, {
       id,
-      ownerClientId: workspace.ownerClientId,
+      connectionPrincipalId: workspace.connectionPrincipalId,
       workspaceId: workspace.id,
       workspaceGeneration: workspace.stateGeneration,
       deliveredInstructionVersions: new Map(),
@@ -988,7 +1063,7 @@ export class WorkspaceRegistry {
     const instructionContext = workspace.instructionContexts.get(id);
     if (
       !instructionContext ||
-      instructionContext.ownerClientId !== workspace.ownerClientId ||
+      instructionContext.connectionPrincipalId !== workspace.connectionPrincipalId ||
       instructionContext.workspaceId !== workspace.id ||
       instructionContext.workspaceGeneration !== workspace.stateGeneration
     ) {
@@ -1018,47 +1093,95 @@ export class WorkspaceRegistry {
   }
 
   async withWorkspaceOperation<T>(
-    ownerClientId: string,
+    connectionPrincipalId: string,
+    workspaceId: string,
+    workspaceGeneration: number,
+    callback: (workspace: Workspace) => T | Promise<T>,
+    lockMode: WorkspaceRootLockMode = "read",
+  ): Promise<T> {
+    const initialWorkspace = this.getWorkspace(
+      connectionPrincipalId,
+      workspaceId,
+      workspaceGeneration,
+    );
+    const lockKey = this.workspaceRootLockKey(initialWorkspace);
+    return this.rootLocks.withLock(lockKey, lockMode, async () => {
+      const existingLifecycle = this.lifecycleStates.get(workspaceId);
+      if (
+        existingLifecycle?.connectionPrincipalId === connectionPrincipalId &&
+        existingLifecycle.phase === "closing"
+      ) {
+        throw new Error(`Workspace ${workspaceId} is closing and cannot accept new operations.`);
+      }
+      // Revalidate after waiting for the root lock. A close, revoke, allowed-root
+      // edit, or generation bump may have invalidated the original handle.
+      const workspace = this.getWorkspace(connectionPrincipalId, workspaceId, workspaceGeneration);
+      const lifecycle = this.ensureLifecycleState(workspace);
+      if (lifecycle.phase === "closing") {
+        throw new Error(`Workspace ${workspaceId} is closing and cannot accept new operations.`);
+      }
+      lifecycle.activeOperations += 1;
+      try {
+        return await callback(workspace);
+      } finally {
+        lifecycle.activeOperations -= 1;
+        if (lifecycle.activeOperations < 0) {
+          throw new Error(`Workspace ${workspaceId} operation count underflow.`);
+        }
+        if (lifecycle.activeOperations === 0) lifecycle.resolveDrained?.();
+        this.evictResidentWorkspaces();
+      }
+    });
+  }
+
+  async withExclusiveWorkspaceRoot<T>(
+    connectionPrincipalId: string,
     workspaceId: string,
     workspaceGeneration: number,
     callback: (workspace: Workspace) => T | Promise<T>,
   ): Promise<T> {
-    const existingLifecycle = this.lifecycleStates.get(workspaceId);
-    if (existingLifecycle?.ownerClientId === ownerClientId && existingLifecycle.phase === "closing") {
-      throw new Error(`Workspace ${workspaceId} is closing and cannot accept new operations.`);
-    }
-    const workspace = this.getWorkspace(ownerClientId, workspaceId, workspaceGeneration);
-    const lifecycle = this.ensureLifecycleState(workspace);
-    if (lifecycle.phase === "closing") {
-      throw new Error(`Workspace ${workspaceId} is closing and cannot accept new operations.`);
-    }
-    lifecycle.activeOperations += 1;
-    try {
-      return await callback(workspace);
-    } finally {
-      lifecycle.activeOperations -= 1;
-      if (lifecycle.activeOperations === 0) lifecycle.resolveDrained?.();
-      this.evictResidentWorkspaces();
-    }
+    const initialWorkspace = this.getWorkspace(
+      connectionPrincipalId,
+      workspaceId,
+      workspaceGeneration,
+    );
+    const lockKey = this.workspaceRootLockKey(initialWorkspace);
+    return this.rootLocks.withLock(lockKey, "write", async () => {
+      const workspace = this.getWorkspace(connectionPrincipalId, workspaceId, workspaceGeneration);
+      return callback(workspace);
+    });
   }
 
   async acquireExclusiveClose(
-    ownerClientId: string,
+    connectionPrincipalId: string,
     workspaceId: string,
     workspaceGeneration?: number,
+    options: { beforeDrain?: () => unknown | Promise<unknown> } = {},
   ): Promise<WorkspaceCloseLease> {
     const existingLifecycle = this.lifecycleStates.get(workspaceId);
-    if (existingLifecycle?.ownerClientId === ownerClientId && existingLifecycle.phase === "closing") {
+    if (
+      existingLifecycle?.connectionPrincipalId === connectionPrincipalId &&
+      existingLifecycle.phase === "closing"
+    ) {
       throw new Error(`Workspace ${workspaceId} is already closing.`);
     }
-    const workspace = this.getWorkspace(ownerClientId, workspaceId, workspaceGeneration);
+    const workspace = this.getWorkspace(connectionPrincipalId, workspaceId, workspaceGeneration);
     const lifecycle = this.ensureLifecycleState(workspace);
     lifecycle.phase = "closing";
-    if (lifecycle.activeOperations > 0) {
-      lifecycle.drained = new Promise<void>((resolve) => {
-        lifecycle.resolveDrained = resolve;
-      });
-      await lifecycle.drained;
+    try {
+      await options.beforeDrain?.();
+      if (lifecycle.activeOperations > 0) {
+        lifecycle.drained = new Promise<void>((resolve) => {
+          lifecycle.resolveDrained = resolve;
+        });
+        await lifecycle.drained;
+      }
+    } catch (error) {
+      lifecycle.phase = "open";
+      lifecycle.drained = undefined;
+      lifecycle.resolveDrained = undefined;
+      this.evictResidentWorkspaces();
+      throw error;
     }
 
     let finished = false;
@@ -1076,10 +1199,10 @@ export class WorkspaceRegistry {
         if (finished) return false;
         const closed = this.store
           ? options.revoke
-            ? this.store.revokeSession?.(workspaceId, ownerClientId) !== undefined
+            ? this.store.revokeSession?.(workspaceId, connectionPrincipalId) !== undefined
             : options.delete
-            ? this.store.deleteSession(workspaceId, ownerClientId)
-            : this.store.closeSession(workspaceId, ownerClientId)
+            ? this.store.deleteSession(workspaceId, connectionPrincipalId)
+            : this.store.closeSession(workspaceId, connectionPrincipalId)
           : this.workspaces.has(workspaceId);
         if (!closed) {
           abort();
@@ -1096,14 +1219,24 @@ export class WorkspaceRegistry {
     };
   }
 
-  usageSnapshot(ownerClientId?: string): WorkspaceUsageSnapshot {
+  private workspaceRootLockKey(workspace: Workspace): string {
+    try {
+      return realpathSync(workspace.root);
+    } catch {
+      return resolve(workspace.root);
+    }
+  }
+
+  usageSnapshot(connectionPrincipalId?: string): WorkspaceUsageSnapshot {
     const resident = Array.from(this.workspaces.values())
-      .filter((workspace) => !ownerClientId || workspace.ownerClientId === ownerClientId)
+      .filter((workspace) =>
+        !connectionPrincipalId || workspace.connectionPrincipalId === connectionPrincipalId)
       .length;
     const lifecycle = Array.from(this.lifecycleStates.values())
-      .filter((state) => !ownerClientId || state.ownerClientId === ownerClientId);
+      .filter((state) =>
+        !connectionPrincipalId || state.connectionPrincipalId === connectionPrincipalId);
     return {
-      activePersisted: this.store?.countActiveSessions?.(ownerClientId) ?? resident,
+      activePersisted: this.store?.countActiveSessions?.(connectionPrincipalId) ?? resident,
       resident,
       closing: lifecycle.filter((state) => state.phase === "closing").length,
       leased: lifecycle.reduce((count, state) => count + state.activeOperations, 0),
@@ -1148,12 +1281,12 @@ export class WorkspaceRegistry {
     return { expiredInstructionTokens, deletedClosedWorkspaceSessions };
   }
 
-  closeWorkspace(ownerClientId: string, workspaceId: string): boolean {
+  closeWorkspace(connectionPrincipalId: string, workspaceId: string): boolean {
     const workspace = this.workspaces.get(workspaceId);
-    if (workspace && workspace.ownerClientId !== ownerClientId) return false;
+    if (workspace && workspace.connectionPrincipalId !== connectionPrincipalId) return false;
     const lifecycle = this.lifecycleStates.get(workspaceId);
     if (lifecycle && (lifecycle.phase === "closing" || lifecycle.activeOperations > 0)) return false;
-    const closed = this.store?.closeSession(workspaceId, ownerClientId) ?? Boolean(workspace);
+    const closed = this.store?.closeSession(workspaceId, connectionPrincipalId) ?? Boolean(workspace);
     if (closed) {
       this.workspaces.delete(workspaceId);
       this.lifecycleStates.delete(workspaceId);
@@ -1163,12 +1296,12 @@ export class WorkspaceRegistry {
     return closed;
   }
 
-  deleteWorkspace(ownerClientId: string, workspaceId: string): boolean {
+  deleteWorkspace(connectionPrincipalId: string, workspaceId: string): boolean {
     const workspace = this.workspaces.get(workspaceId);
-    if (workspace && workspace.ownerClientId !== ownerClientId) return false;
+    if (workspace && workspace.connectionPrincipalId !== connectionPrincipalId) return false;
     const lifecycle = this.lifecycleStates.get(workspaceId);
     if (lifecycle && (lifecycle.phase === "closing" || lifecycle.activeOperations > 0)) return false;
-    const deleted = this.store?.deleteSession(workspaceId, ownerClientId) ?? Boolean(workspace);
+    const deleted = this.store?.deleteSession(workspaceId, connectionPrincipalId) ?? Boolean(workspace);
     if (deleted) {
       this.workspaces.delete(workspaceId);
       this.lifecycleStates.delete(workspaceId);
@@ -1178,9 +1311,13 @@ export class WorkspaceRegistry {
     return deleted;
   }
 
-  evictRevokedWorkspace(ownerClientId: string, workspaceId: string, root: string): void {
+  evictRevokedWorkspace(
+    connectionPrincipalId: string,
+    workspaceId: string,
+    root: string,
+  ): void {
     const workspace = this.workspaces.get(workspaceId);
-    if (workspace && workspace.ownerClientId !== ownerClientId) return;
+    if (workspace && workspace.connectionPrincipalId !== connectionPrincipalId) return;
     this.workspaces.delete(workspaceId);
     this.lifecycleStates.delete(workspaceId);
     this.removeCheckoutWorkspaceId(workspaceId);
@@ -1189,7 +1326,7 @@ export class WorkspaceRegistry {
 
   closeExpiredSessions(
     idleTtlMs: number,
-    hasActiveProcess: (ownerClientId: string, workspaceId: string) => boolean,
+    hasActiveProcess: (connectionPrincipalId: string, workspaceId: string) => boolean,
   ): string[] {
     if (!this.store) return [];
     const before = new Date(Date.now() - idleTtlMs).toISOString();
@@ -1212,12 +1349,12 @@ export class WorkspaceRegistry {
       cursor = { lastUsedAt: lastCandidate.lastUsedAt, id: lastCandidate.id };
 
       for (const session of candidates) {
-        if (hasActiveProcess(session.ownerClientId, session.id)) continue;
+        if (hasActiveProcess(session.connectionPrincipalId, session.id)) continue;
         const lifecycle = this.lifecycleStates.get(session.id);
         if (lifecycle && (lifecycle.phase === "closing" || lifecycle.activeOperations > 0)) continue;
         if (session.managed) {
           if (!session.sourceRoot) {
-            this.invalidateWorkspace(session.id, session.ownerClientId, session.root);
+            this.invalidateWorkspace(session.id, session.connectionPrincipalId, session.root);
             closed.push(session.id);
             continue;
           }
@@ -1235,7 +1372,7 @@ export class WorkspaceRegistry {
             continue;
           }
         }
-        if (!this.store.closeSession(session.id, session.ownerClientId)) continue;
+        if (!this.store.closeSession(session.id, session.connectionPrincipalId)) continue;
         this.workspaces.delete(session.id);
         this.lifecycleStates.delete(session.id);
         this.removeCheckoutWorkspaceId(session.id);
@@ -1256,7 +1393,7 @@ export class WorkspaceRegistry {
   }
 
   private async openCheckoutWorkspace(
-    ownerClientId: string,
+    connectionPrincipalId: string,
     path: string,
     alias: string | undefined,
     writeAccess: WorkspaceWriteAccess,
@@ -1275,12 +1412,12 @@ export class WorkspaceRegistry {
         .map((allowedRoot) => realpath(allowedRoot)),
     );
     const validatedRoot = assertAllowedPath(canonicalRoot, canonicalAllowedRoots);
-    const checkoutKey = checkoutWorkspaceKey(ownerClientId, canonicalRoot);
+    const checkoutKey = checkoutWorkspaceKey(connectionPrincipalId, canonicalRoot);
     const previous = this.pendingCheckoutWorkspaces.get(checkoutKey);
     const opening = (async () => {
       if (previous) await previous.catch(() => undefined);
       return this.createWorkspaceContext({
-        ownerClientId,
+        connectionPrincipalId,
         alias,
         root: validatedRoot,
         canonicalRoot,
@@ -1300,7 +1437,7 @@ export class WorkspaceRegistry {
   }
 
   private async openWorktreeWorkspace(
-    ownerClientId: string,
+    connectionPrincipalId: string,
     path: string,
     baseRef: string | undefined,
     alias: string | undefined,
@@ -1314,8 +1451,39 @@ export class WorkspaceRegistry {
     this.reconcileMissingManagedSessions();
 
     if (!forceNew) {
+      if (alias) {
+        const residentByAlias = Array.from(this.workspaces.values()).find(
+          (workspace) =>
+            workspace.connectionPrincipalId === connectionPrincipalId &&
+            workspace.alias === alias,
+        );
+        if (residentByAlias) {
+          if (
+            residentByAlias.worktree?.managed &&
+            residentByAlias.sourceRoot === resolvedBase.sourceRoot
+          ) {
+            return this.contextForWorkspace(residentByAlias, true);
+          }
+          throw new WorkspaceAliasConflictError(alias);
+        }
+        const persistedByAlias = this.store?.getActiveSessionByAlias?.(
+          connectionPrincipalId,
+          alias,
+        );
+        if (persistedByAlias) {
+          if (
+            persistedByAlias.managed &&
+            persistedByAlias.mode === "worktree" &&
+            persistedByAlias.sourceRoot === resolvedBase.sourceRoot
+          ) {
+            return this.reuseManagedSession(persistedByAlias, alias);
+          }
+          throw new WorkspaceAliasConflictError(alias);
+        }
+      }
+
       const resident = Array.from(this.workspaces.values()).find(
-        (workspace) => workspace.ownerClientId === ownerClientId &&
+        (workspace) => workspace.connectionPrincipalId === connectionPrincipalId &&
           workspace.worktree?.managed &&
           workspace.sourceRoot === resolvedBase.sourceRoot &&
           workspace.worktree.baseSha === resolvedBase.baseSha,
@@ -1328,14 +1496,33 @@ export class WorkspaceRegistry {
       }
 
       const persisted = this.store?.findActiveManagedSession?.(
-        ownerClientId,
+        connectionPrincipalId,
         resolvedBase.sourceRoot,
         resolvedBase.baseSha,
       );
       if (persisted) return this.reuseManagedSession(persisted, alias);
+
+      if (baseRef === undefined) {
+        const candidates = this.activeManagedSessionsForSource(
+          connectionPrincipalId,
+          resolvedBase.sourceRoot,
+        );
+        if (candidates.length === 1) {
+          return this.reuseManagedSession(candidates[0]!, alias);
+        }
+        if (candidates.length > 1) {
+          throw new WorkspaceSelectionRequiredError(
+            candidates.flatMap((session) => session.alias ? [session.alias] : []),
+          );
+        }
+      }
     }
 
-    const managedKey = managedWorkspaceKey(ownerClientId, resolvedBase.sourceRoot, resolvedBase.baseSha);
+    const managedKey = managedWorkspaceKey(
+      connectionPrincipalId,
+      resolvedBase.sourceRoot,
+      resolvedBase.baseSha,
+    );
     if (!forceNew) {
       const pending = this.pendingManagedWorkspaces.get(managedKey);
       if (pending) {
@@ -1349,7 +1536,7 @@ export class WorkspaceRegistry {
     }
 
     const opening = this.createManagedWorkspaceContext(
-      ownerClientId,
+      connectionPrincipalId,
       path,
       alias,
       forceNew,
@@ -1364,7 +1551,7 @@ export class WorkspaceRegistry {
   }
 
   private async createManagedWorkspaceContext(
-    ownerClientId: string,
+    connectionPrincipalId: string,
     path: string,
     alias: string | undefined,
     forceNew: boolean,
@@ -1387,7 +1574,7 @@ export class WorkspaceRegistry {
       });
       try {
         return await this.createWorkspaceContext({
-          ownerClientId,
+          connectionPrincipalId,
           alias,
           root: worktree.path,
           mode: "worktree",
@@ -1423,7 +1610,7 @@ export class WorkspaceRegistry {
   }
 
   private async createWorkspaceContext(input: {
-    ownerClientId: string;
+    connectionPrincipalId: string;
     alias?: string;
     root: string;
     canonicalRoot?: string;
@@ -1435,7 +1622,7 @@ export class WorkspaceRegistry {
     forceNew?: boolean;
   }): Promise<WorkspaceContext> {
     const checkoutKey = input.canonicalRoot
-      ? checkoutWorkspaceKey(input.ownerClientId, input.canonicalRoot)
+      ? checkoutWorkspaceKey(input.connectionPrincipalId, input.canonicalRoot)
       : undefined;
     const indexedCheckoutId = checkoutKey
       ? this.checkoutWorkspaceIds.get(checkoutKey)
@@ -1448,8 +1635,11 @@ export class WorkspaceRegistry {
     }
     const workspace: Workspace = {
       id: residentCheckoutId ?? `ws_${randomUUID()}`,
-      ownerClientId: input.ownerClientId,
-      alias: input.alias ?? `ws-${randomUUID()}`,
+      connectionPrincipalId: input.connectionPrincipalId,
+      alias: input.alias ?? this.defaultWorkspaceAlias(
+        input.connectionPrincipalId,
+        input.sourceRoot ?? input.canonicalRoot ?? input.root,
+      ),
       root: input.root,
       mode: input.mode,
       writeAccess: input.writeAccess,
@@ -1475,7 +1665,7 @@ export class WorkspaceRegistry {
     if (input.mode === "checkout" && input.canonicalRoot && this.store?.createOrReuseCheckoutSession) {
       const session = this.store.createOrReuseCheckoutSession({
         id: workspace.id,
-        ownerClientId: workspace.ownerClientId,
+        connectionPrincipalId: workspace.connectionPrincipalId,
         alias: workspace.alias,
         root: workspace.root,
         canonicalRoot: input.canonicalRoot,
@@ -1493,7 +1683,7 @@ export class WorkspaceRegistry {
         throw new WorkspaceAliasConflictError(session.alias ?? "the existing alias");
       }
       const resident = this.workspaces.get(session.id);
-      if (resident?.ownerClientId === session.ownerClientId) {
+      if (resident?.connectionPrincipalId === session.connectionPrincipalId) {
         resident.root = session.root;
         resident.writeAccess = session.writeAccess ?? resident.writeAccess;
         resident.stateGeneration = session.stateGeneration ?? resident.stateGeneration;
@@ -1502,7 +1692,7 @@ export class WorkspaceRegistry {
       workspace.id = session.id;
       workspace.alias = session.alias ?? this.store.allocateSessionAlias?.(
         session.id,
-        session.ownerClientId,
+        session.connectionPrincipalId,
         workspace.alias,
       ) ?? workspace.alias;
       workspace.root = session.root;
@@ -1511,7 +1701,7 @@ export class WorkspaceRegistry {
       if (reused && !this.workspaces.has(session.id)) {
         workspace.stateGeneration = this.store.bumpStateGeneration?.(
           session.id,
-          session.ownerClientId,
+          session.connectionPrincipalId,
         ) ?? workspace.stateGeneration + 1;
       }
     } else if (residentCheckoutId) {
@@ -1527,7 +1717,7 @@ export class WorkspaceRegistry {
     } else if (workspace.mode === "worktree" && workspace.worktree && this.store?.createOrReuseManagedSession) {
       const session = this.store.createOrReuseManagedSession({
         id: workspace.id,
-        ownerClientId: workspace.ownerClientId,
+        connectionPrincipalId: workspace.connectionPrincipalId,
         alias: workspace.alias,
         root: workspace.root,
         sourceRoot: workspace.sourceRoot!,
@@ -1543,7 +1733,7 @@ export class WorkspaceRegistry {
     } else {
       this.store?.createSession({
         id: workspace.id,
-        ownerClientId: workspace.ownerClientId,
+        connectionPrincipalId: workspace.connectionPrincipalId,
         alias: workspace.alias,
         root: workspace.root,
         mode: workspace.mode,
@@ -1574,35 +1764,93 @@ export class WorkspaceRegistry {
   }
 
   private async hydrateWorkspaceSession(session: WorkspaceSession): Promise<WorkspaceContext> {
-    this.store?.touchSession(session.id, session.ownerClientId);
-    const storedSession = this.store?.getSession(session.id, session.ownerClientId);
+    this.store?.touchSession(session.id, session.connectionPrincipalId);
+    const storedSession = this.store?.getSession(session.id, session.connectionPrincipalId);
     if (this.store && !storedSession) throw new UnknownWorkspaceAliasError();
     session = storedSession ?? session;
     const lifecycle = this.lifecycleStates.get(session.id) ?? {
-      ownerClientId: session.ownerClientId,
+      connectionPrincipalId: session.connectionPrincipalId,
       phase: "open" as const,
       activeOperations: 0,
     };
-    if (lifecycle.ownerClientId !== session.ownerClientId || lifecycle.phase === "closing") {
+    if (
+      lifecycle.connectionPrincipalId !== session.connectionPrincipalId ||
+      lifecycle.phase === "closing"
+    ) {
       throw new UnknownWorkspaceAliasError();
     }
     this.lifecycleStates.set(session.id, lifecycle);
     lifecycle.activeOperations += 1;
     let published = false;
     try {
+      const alias = session.alias
+        ?? this.store?.allocateSessionAlias?.(
+          session.id,
+          session.connectionPrincipalId,
+          this.defaultWorkspaceAlias(
+            session.connectionPrincipalId,
+            session.sourceRoot ?? session.root,
+          ),
+        )
+        ?? `ws-${randomUUID()}`;
+      let recovery: WorkspaceContext["recovery"];
+      let recoveredWorktree: WorkspaceWorktree | undefined;
+      if (session.mode === "worktree" && session.managed) {
+        try {
+          const metadata = await stat(session.root);
+          if (!metadata.isDirectory()) {
+            throw new WorkspaceRecoveryRequiredError(alias, "the saved worktree path is not a directory");
+          }
+        } catch (error) {
+          if (error instanceof WorkspaceRecoveryRequiredError) throw error;
+          if (!isMissingPathError(error)) {
+            throw new WorkspaceRecoveryRequiredError(alias, "the saved worktree path is not accessible");
+          }
+          if (!session.sourceRoot || !session.baseSha) {
+            throw new WorkspaceRecoveryRequiredError(alias, "the saved source repository metadata is incomplete");
+          }
+          try {
+            recoveredWorktree = await restoreManagedWorktree({
+              sourceRoot: session.sourceRoot,
+              worktreePath: session.root,
+              baseRef: session.baseRef ?? "HEAD",
+              baseSha: session.baseSha,
+              dirtySource: session.dirtySource,
+              config: this.config,
+            });
+            this.store?.updateManagedSessionBaseSha?.(
+              session.id,
+              session.connectionPrincipalId,
+              recoveredWorktree.baseSha,
+            );
+            recovery = {
+              kind: "managed_worktree_recreated",
+              dataLossPossible: true,
+            };
+          } catch {
+            throw new WorkspaceRecoveryRequiredError(
+              alias,
+              "the source repository or saved base commit is unavailable",
+            );
+          }
+        }
+      }
       let root: string;
       try {
         root = this.assertWorkspaceRootAllowed(session.root, session.mode, session.sourceRoot);
       } catch {
-        this.invalidateWorkspace(session.id, session.ownerClientId, session.root);
+        if (session.mode === "worktree" && session.managed) {
+          throw new WorkspaceRecoveryRequiredError(
+            alias,
+            "the source repository is no longer approved or accessible",
+          );
+        }
+        this.invalidateWorkspace(session.id, session.connectionPrincipalId, session.root);
         throw new UnknownWorkspaceAliasError();
       }
-      const alias = session.alias
-        ?? this.store?.allocateSessionAlias?.(session.id, session.ownerClientId)
-        ?? `ws-${randomUUID()}`;
       const bumpedGeneration = this.store?.bumpStateGeneration?.(
         session.id,
-        session.ownerClientId,
+        session.connectionPrincipalId,
       );
       if (this.store?.bumpStateGeneration && bumpedGeneration === undefined) {
         throw new UnknownWorkspaceAliasError();
@@ -1610,7 +1858,7 @@ export class WorkspaceRegistry {
       const stateGeneration = bumpedGeneration ?? (session.stateGeneration ?? 1) + 1;
       const workspace: Workspace = {
         id: session.id,
-        ownerClientId: session.ownerClientId,
+        connectionPrincipalId: session.connectionPrincipalId,
         alias,
         root,
         mode: session.mode,
@@ -1618,7 +1866,7 @@ export class WorkspaceRegistry {
         stateGeneration,
         sourceRoot: session.sourceRoot,
         worktree: session.mode === "worktree"
-          ? {
+          ? recoveredWorktree ?? {
               path: root,
               baseRef: session.baseRef ?? "HEAD",
               baseSha: session.baseSha ?? "",
@@ -1634,7 +1882,10 @@ export class WorkspaceRegistry {
         lastUsedAt: Date.now(),
       };
       const context = await this.contextForWorkspace(workspace, true);
-      const activeSession = this.store?.getSession(workspace.id, workspace.ownerClientId);
+      const activeSession = this.store?.getSession(
+        workspace.id,
+        workspace.connectionPrincipalId,
+      );
       if (this.store && !activeSession) throw new UnknownWorkspaceAliasError();
       if (activeSession) {
         workspace.writeAccess = activeSession.writeAccess ?? workspace.writeAccess;
@@ -1643,14 +1894,17 @@ export class WorkspaceRegistry {
       this.workspaces.set(workspace.id, workspace);
       if (workspace.mode === "checkout") {
         this.checkoutWorkspaceIds.set(
-          checkoutWorkspaceKey(workspace.ownerClientId, realpathSync(workspace.root)),
+          checkoutWorkspaceKey(
+            workspace.connectionPrincipalId,
+            realpathSync(workspace.root),
+          ),
           workspace.id,
         );
       }
       this.ensureLifecycleState(workspace);
       published = true;
       this.evictResidentWorkspaces();
-      return context;
+      return recovery ? { ...context, recovery } : context;
     } finally {
       lifecycle.activeOperations -= 1;
       if (lifecycle.activeOperations === 0) lifecycle.resolveDrained?.();
@@ -1662,17 +1916,86 @@ export class WorkspaceRegistry {
   }
 
   private async reuseManagedSession(
-    session: WorkspaceSession,
+    originalSession: WorkspaceSession,
     alias: string | undefined,
   ): Promise<WorkspaceContext> {
+    const session = originalSession.alias
+      ? originalSession
+      : {
+          ...originalSession,
+          alias: this.store?.allocateSessionAlias?.(
+            originalSession.id,
+            originalSession.connectionPrincipalId,
+            this.defaultWorkspaceAlias(
+              originalSession.connectionPrincipalId,
+              originalSession.sourceRoot ?? originalSession.root,
+            ),
+          ),
+        };
     if (alias && session.alias !== alias) {
       throw new WorkspaceAliasConflictError(session.alias ?? "the existing alias");
     }
     const resident = this.workspaces.get(session.id);
-    if (resident?.ownerClientId === session.ownerClientId) {
+    if (resident?.connectionPrincipalId === session.connectionPrincipalId) {
       return this.contextForWorkspace(resident, true);
     }
     return this.hydrateWorkspaceSession(session);
+  }
+
+  private activeManagedSessionsForSource(
+    connectionPrincipalId: string,
+    sourceRoot: string,
+  ): WorkspaceSession[] {
+    const sessions = (this.store?.findActiveManagedSessionsBySource?.(
+      connectionPrincipalId,
+      sourceRoot,
+    ) ?? []).map((session) => session.alias ? session : {
+      ...session,
+      alias: this.store?.allocateSessionAlias?.(
+        session.id,
+        connectionPrincipalId,
+        this.defaultWorkspaceAlias(connectionPrincipalId, sourceRoot),
+      ),
+    });
+    const byId = new Map(sessions.map((session) => [session.id, session]));
+    for (const workspace of this.workspaces.values()) {
+      if (
+        workspace.connectionPrincipalId !== connectionPrincipalId ||
+        workspace.sourceRoot !== sourceRoot ||
+        !workspace.worktree?.managed
+      ) continue;
+      byId.set(workspace.id, workspaceToSessionSnapshot(workspace));
+    }
+    return [...byId.values()].sort(
+      (left, right) => right.lastUsedAt.localeCompare(left.lastUsedAt),
+    );
+  }
+
+  private defaultWorkspaceAlias(
+    connectionPrincipalId: string,
+    path: string,
+  ): string {
+    const normalized = basename(resolve(path))
+      .replace(/[^A-Za-z0-9._-]+/gu, "-")
+      .replace(/^-+|-+$/gu, "")
+      .slice(0, 48) || "project";
+    const occupied = new Set<string>();
+    for (const session of this.store?.listActiveSessions?.() ?? []) {
+      if (session.connectionPrincipalId === connectionPrincipalId && session.alias) {
+        occupied.add(session.alias);
+      }
+    }
+    for (const workspace of this.workspaces.values()) {
+      if (workspace.connectionPrincipalId === connectionPrincipalId) {
+        occupied.add(workspace.alias);
+      }
+    }
+    if (!occupied.has(normalized)) return normalized;
+    for (let suffix = 2; suffix <= 999; suffix += 1) {
+      const candidate = `${normalized.slice(0, 59 - String(suffix).length)}-${suffix}`;
+      if (!occupied.has(candidate)) return candidate;
+    }
+    return `project-${randomUUID().slice(0, 8)}`;
   }
 
   private async contextForWorkspace(workspace: Workspace, reused: boolean): Promise<WorkspaceContext> {
@@ -1683,7 +2006,7 @@ export class WorkspaceRegistry {
       workspace.activatedSkillDirs,
     );
     workspace.lastUsedAt = Date.now();
-    this.store?.touchSession(workspace.id, workspace.ownerClientId);
+    this.store?.touchSession(workspace.id, workspace.connectionPrincipalId);
     const refreshedAgentProfiles = await loadLocalAgentProfiles(this.config, workspace.root);
     workspace.skills = refreshedSkills.skills;
     workspace.skillDiagnostics = refreshedSkills.skillDiagnostics;
@@ -1738,7 +2061,7 @@ export class WorkspaceRegistry {
     const sessions = this.store?.listActiveSessions?.()
       ?? Array.from(this.workspaces.values()).map((workspace): WorkspaceSession => ({
         id: workspace.id,
-        ownerClientId: workspace.ownerClientId,
+        connectionPrincipalId: workspace.connectionPrincipalId,
         alias: workspace.alias,
         root: workspace.root,
         status: "active",
@@ -1755,12 +2078,20 @@ export class WorkspaceRegistry {
       }));
     for (const session of sessions) {
       if (!session.managed || this.workspaceRootAllowed(session.root, session.mode, session.sourceRoot)) continue;
-      this.invalidateWorkspace(session.id, session.ownerClientId, session.root);
+      const lifecycle = this.lifecycleStates.get(session.id);
+      if (lifecycle && (lifecycle.phase === "closing" || lifecycle.activeOperations > 0)) continue;
+      // Keep managed sessions discoverable by alias. A missing path can often
+      // be recreated from the persisted source root and base SHA during resume.
+      this.evictWorkspace(session.id, session.root);
     }
   }
 
-  private invalidateWorkspace(workspaceId: string, ownerClientId: string, root: string): void {
-    this.store?.closeSession(workspaceId, ownerClientId);
+  private invalidateWorkspace(
+    workspaceId: string,
+    connectionPrincipalId: string,
+    root: string,
+  ): void {
+    this.store?.closeSession(workspaceId, connectionPrincipalId);
     this.evictWorkspace(workspaceId, root);
   }
 
@@ -1914,7 +2245,7 @@ export class WorkspaceRegistry {
     const existing = this.lifecycleStates.get(workspace.id);
     if (existing) return existing;
     const state: WorkspaceLifecycleState = {
-      ownerClientId: workspace.ownerClientId,
+      connectionPrincipalId: workspace.connectionPrincipalId,
       phase: "open",
       activeOperations: 0,
     };
@@ -1939,8 +2270,11 @@ export class WorkspaceRegistry {
   }
 }
 
-function checkoutWorkspaceKey(ownerClientId: string, canonicalRoot: string): string {
-  return JSON.stringify([ownerClientId, canonicalRoot]);
+function checkoutWorkspaceKey(
+  connectionPrincipalId: string,
+  canonicalRoot: string,
+): string {
+  return JSON.stringify([connectionPrincipalId, canonicalRoot]);
 }
 
 export async function ensureCheckoutWorkspaceRoot(
@@ -2043,12 +2377,16 @@ function formatWorkspaceDisplayPath(path: string | undefined): string {
   return `…/${basename(resolvedPath)}`;
 }
 
-function workspaceIdentity(workspaceId: string, ownerClientId: string): string {
-  return `${ownerClientId}\0${workspaceId}`;
+function workspaceIdentity(workspaceId: string, connectionPrincipalId: string): string {
+  return `${connectionPrincipalId}\0${workspaceId}`;
 }
 
-function managedWorkspaceKey(ownerClientId: string, sourceRoot: string, baseSha: string): string {
-  return `${ownerClientId}\0${sourceRoot}\0${baseSha}`;
+function managedWorkspaceKey(
+  connectionPrincipalId: string,
+  sourceRoot: string,
+  baseSha: string,
+): string {
+  return `${connectionPrincipalId}\0${sourceRoot}\0${baseSha}`;
 }
 
 function lazyInstructionScan(): InstructionScanResult {
@@ -2134,7 +2472,7 @@ function workspaceToSessionSnapshot(workspace: Workspace): WorkspaceSession {
   const lastUsedAt = new Date(workspace.lastUsedAt).toISOString();
   return {
     id: workspace.id,
-    ownerClientId: workspace.ownerClientId,
+    connectionPrincipalId: workspace.connectionPrincipalId,
     alias: workspace.alias,
     root: workspace.root,
     status: "active",

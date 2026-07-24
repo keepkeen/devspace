@@ -14,7 +14,7 @@ export const workspaceSessions = sqliteTable(
   "workspace_sessions",
   {
     id: text("id").primaryKey(),
-    ownerClientId: text("owner_client_id").notNull().default("__legacy_unowned__"),
+    connectionPrincipalId: text("owner_client_id").notNull().default("__legacy_unowned__"),
     alias: text("alias"),
     root: text("root").notNull(),
     canonicalRoot: text("canonical_root"),
@@ -37,13 +37,13 @@ export const workspaceSessions = sqliteTable(
   (table) => [
     index("workspace_sessions_root_idx").on(table.root, table.lastUsedAt),
     index("workspace_sessions_status_idx").on(table.status, table.lastUsedAt),
-    index("workspace_sessions_owner_status_idx").on(table.ownerClientId, table.status, table.lastUsedAt),
-    uniqueIndex("workspace_sessions_id_owner_uq").on(table.id, table.ownerClientId),
+    index("workspace_sessions_owner_status_idx").on(table.connectionPrincipalId, table.status, table.lastUsedAt),
+    uniqueIndex("workspace_sessions_id_owner_uq").on(table.id, table.connectionPrincipalId),
     uniqueIndex("workspace_sessions_owner_alias_uq")
-      .on(table.ownerClientId, table.alias)
+      .on(table.connectionPrincipalId, table.alias)
       .where(sql`${table.alias} is not null`),
     uniqueIndex("workspace_sessions_active_checkout_owner_canonical_root_uq")
-      .on(table.ownerClientId, table.canonicalRoot)
+      .on(table.connectionPrincipalId, table.canonicalRoot)
       .where(sql`${table.canonicalRoot} is not null and ${table.mode} = 'checkout' and ${table.status} = 'active'`),
     check(
       "workspace_sessions_write_access_check",
@@ -60,7 +60,7 @@ export const workspaceSessions = sqliteTable(
 export const mutationOperations = sqliteTable(
   "mutation_operations",
   {
-    ownerClientId: text("owner_client_id").notNull(),
+    connectionPrincipalId: text("owner_client_id").notNull(),
     workspaceId: text("workspace_id").notNull(),
     tool: text("tool").notNull(),
     operationId: text("operation_id").notNull(),
@@ -74,11 +74,11 @@ export const mutationOperations = sqliteTable(
   },
   (table) => [
     primaryKey({
-      columns: [table.ownerClientId, table.operationId],
+      columns: [table.connectionPrincipalId, table.operationId],
     }),
     foreignKey({
-      columns: [table.workspaceId, table.ownerClientId],
-      foreignColumns: [workspaceSessions.id, workspaceSessions.ownerClientId],
+      columns: [table.workspaceId, table.connectionPrincipalId],
+      foreignColumns: [workspaceSessions.id, workspaceSessions.connectionPrincipalId],
     }).onDelete("cascade"),
     index("mutation_operations_expires_at_idx").on(table.expiresAt),
     check(
@@ -114,9 +114,52 @@ export const oauthClients = sqliteTable(
   "oauth_clients",
   {
     clientId: text("client_id").primaryKey(),
+    principalId: text("principal_id"),
     clientJson: text("client_json").notNull(),
     issuedAt: integer("issued_at").notNull(),
   },
+  (table) => [index("oauth_clients_principal_id_idx").on(table.principalId)],
+);
+
+export const connectionPrincipals = sqliteTable(
+  "connection_principals",
+  {
+    principalId: text("principal_id").primaryKey(),
+    createdAt: text("created_at").notNull(),
+    lastUsedAt: text("last_used_at").notNull(),
+    revokedAt: text("revoked_at"),
+  },
+  (table) => [index("connection_principals_last_used_idx").on(table.lastUsedAt)],
+);
+
+export const oauthPrincipalReconnectCodes = sqliteTable(
+  "oauth_principal_reconnect_codes",
+  {
+    codeHash: text("code_hash").primaryKey(),
+    principalId: text("principal_id")
+      .notNull()
+      .references(() => connectionPrincipals.principalId, { onDelete: "cascade" }),
+    createdAt: integer("created_at").notNull(),
+    expiresAt: integer("expires_at").notNull(),
+  },
+  (table) => [
+    index("oauth_principal_reconnect_codes_principal_idx").on(table.principalId),
+    index("oauth_principal_reconnect_codes_expires_idx").on(table.expiresAt),
+  ],
+);
+
+export const oauthAuthorizationLimits = sqliteTable(
+  "oauth_authorization_limits",
+  {
+    keyHash: text("key_hash").primaryKey(),
+    scope: text("scope", { enum: ["session", "client", "ip", "global"] }).notNull(),
+    tokens: integer("tokens").notNull(),
+    updatedAt: integer("updated_at").notNull(),
+    failureStreak: integer("failure_streak").notNull(),
+    blockedUntil: integer("blocked_until").notNull(),
+    expiresAt: integer("expires_at").notNull(),
+  },
+  (table) => [index("oauth_authorization_limits_expires_idx").on(table.expiresAt)],
 );
 
 export const oauthAccessTokens = sqliteTable(
@@ -159,7 +202,7 @@ export const oauthRevocationCleanupJobs = sqliteTable(
   "oauth_revocation_cleanup_jobs",
   {
     id: integer("id").primaryKey({ autoIncrement: true }),
-    ownerClientId: text("owner_client_id").notNull(),
+    connectionPrincipalId: text("owner_client_id").notNull(),
     workspaceId: text("workspace_id").notNull(),
     workspaceRoot: text("workspace_root").notNull(),
     workspaceMode: text("workspace_mode", { enum: ["checkout", "worktree"] }).notNull(),
@@ -179,7 +222,7 @@ export const oauthRevocationCleanupJobs = sqliteTable(
   },
   (table) => [
     uniqueIndex("oauth_revocation_cleanup_jobs_owner_workspace_uq")
-      .on(table.ownerClientId, table.workspaceId),
+      .on(table.connectionPrincipalId, table.workspaceId),
     index("oauth_revocation_cleanup_jobs_status_idx")
       .on(table.status, table.leaseExpiresAt, table.createdAt, table.id),
     index("oauth_revocation_cleanup_jobs_completed_idx")
@@ -192,7 +235,7 @@ export const oauthRevocationDirtyWorktreeArtifacts = sqliteTable(
   "oauth_revocation_dirty_worktree_artifacts",
   {
     jobId: integer("job_id").primaryKey(),
-    ownerClientId: text("owner_client_id").notNull(),
+    connectionPrincipalId: text("owner_client_id").notNull(),
     workspaceId: text("workspace_id").notNull(),
     workspaceRoot: text("workspace_root").notNull(),
     sourceRoot: text("source_root"),

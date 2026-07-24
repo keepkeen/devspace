@@ -31,7 +31,7 @@ pass it to `get_workspace_context`:
 
 The result contains structured instruction and Skill sections plus a refreshed
 receipt. Pass the current receipt to later Workspace-scoped tools. It binds the
-OAuth connection, Workspace identity and generation, a private context session,
+local connection principal, Workspace identity and generation, a private context session,
 instruction revision, Skill revision, context phase, and current server process;
 callers do not repeat host paths or internal IDs.
 
@@ -45,14 +45,43 @@ In a new conversation, do not resend or guess the host path. Call
 }
 ```
 
-through `resume_workspace`. Aliases and Workspace identities are scoped to the OAuth
-connection, so a second ChatGPT account or a newly registered connector cannot
-use them. Resume returns a fresh receipt.
+through `resume_workspace`. Aliases and Workspace identities are scoped to a
+local connection principal. A newly registered connector remains unassigned
+until its first successful Owner approval, which creates a separate principal
+by default and cannot use earlier aliases. DevSpace does not receive a verified
+ChatGPT account subject, so this is connection-level isolation rather than an
+account identity claim. Resume returns a fresh receipt.
+
+To deliberately recover aliases after deleting and re-adding a connector, run
+these commands locally:
+
+```bash
+devspace auth principals
+devspace auth reconnect-code <principal-id>
+```
+
+Enter the one-time short-lived code on the new OAuth approval page. The code
+links only a fresh registration that does not already own retained Workspace
+state, revokes any tokens issued before relinking, and is consumed once. Never
+paste it into a chat or repository file.
 
 ChatGPT OAuth clients use stateless MCP HTTP requests: each tool call may arrive
 on a fresh transport, and a stale `mcp-session-id` header is ignored. The
 persisted Workspace record is the durable continuity state, not the transport
 session or receipt. Other MCP hosts retain stateful Streamable HTTP behavior.
+
+ChatGPT does not provide a trusted conversation ID. When several conversations
+share one connection principal, each conversation must keep its own selected
+alias as the project continuity key. After a platform disconnect, a later-day
+turn, or a new browser transport, call `list_workspaces` and resume that alias;
+do not infer that a missing receipt means a new worktree is needed.
+
+If a managed worktree path is missing, its alias stays listed with
+`hydrationStatus="recovery_required"`. Resume attempts to reconstruct the same
+Workspace ID and path, preferring Git's retained worktree HEAD and otherwise
+falling back to the saved base commit. The structured response reports
+`recovery.kind="managed_worktree_recreated"` and `dataLossPossible=true` because
+physically lost, uncommitted files cannot be guaranteed.
 
 Do not reopen the same folder by path unless:
 
@@ -60,17 +89,25 @@ Do not reopen the same folder by path unless:
 - the user switches to another folder
 - the user switches between checkout and worktree mode
 
+When one source repository has exactly one active managed Workspace,
+`open_workspace(mode="worktree")` reuses it even if the source branch HEAD has
+advanced. When several candidates exist, DevSpace returns
+`workspace_selection_required` with aliases instead of silently creating a new
+branch. Use `forceNew=true` only for an explicitly separate task.
+
 Do not call `close_workspace` as a normal end-of-turn or end-of-conversation
 step. Call it only after the user explicitly asks to close or release the
 workspace.
 
 `contextMode: "full"` is the safe default for resume/context calls and ignores
-revision hints. Only when the exact returned context is still retained may a
-caller select `contextMode: "retained"` and pass
+revision hints. `retained` is accepted only by `get_workspace_context` while
+refreshing the exact current context-loaded receipt. The caller may then pass
 `instructionRevision` as `knownInstructionRevision` and `skillRevision` as
 `knownSkillRevision`. DevSpace omits only the corresponding unchanged
-instruction or Skill context. `contextMode: "metadata"` still returns a receipt,
-but no instruction or Skill bodies.
+instruction or Skill context. `open_workspace`, `resume_workspace`, metadata
+receipts, new conversations, and context-compacted callers must use `full`.
+`contextMode: "metadata"` still returns a receipt, but no instruction or Skill
+bodies.
 
 After a backend restart, an old receipt fails with
 `workspace_context_required`. Resume by alias with full context. Cold hydration
@@ -380,8 +417,9 @@ mutation adds one durable operation envelope:
 ```
 
 All Workspace-scoped tools require a current `receipt`. A single registration
-wrapper resolves it and checks ownership, generation, context phase, and the
-private context-session binding before the handler starts. Metadata receipts
+wrapper resolves it and checks the connection principal, OAuth capability,
+generation, context phase, and the private context-session binding before the
+handler starts. Metadata receipts
 are limited to context promotion and lifecycle operations. Full/retained
 receipts carry the context revisions of the delivered snapshot and their own
 instruction acknowledgement state; instruction gates, Skill reload checks, and
@@ -389,6 +427,15 @@ file versions handle later project changes without forcing a new receipt after
 every edit. Cold hydration, allowed-root changes,
 credential-epoch changes, close/reopen transitions, and server restart make an
 old receipt unusable.
+
+OAuth authorization can be restricted to `workspace:read`, `workspace:write`,
+`process:execute`, `network:access`, `worktree:create`, and
+`workspace:revoke`. The legacy `devspace` scope grants all six for compatibility.
+`open_workspace` adds conditional checks: a writable checkout needs
+`workspace:write`, while worktree mode also needs `worktree:create`.
+`exec_command` requires write, process, and network capability. Mutating
+`write_stdin` additionally requires workspace write authority; polling requires
+only process authority.
 
 `apply_patch`, `exec_command`, `close_workspace`, `revoke_workspace`, and
 `show_changes` require an `operationId`. Mutating `write_stdin` requires one;
@@ -405,6 +452,16 @@ The replay body may expire, but its lightweight identity tombstone remains
 until the Workspace record is deleted. An old ID therefore never becomes a new
 mutation merely because 24 hours elapsed.
 
+Within one DevSpace instance, all Workspace-scoped calls are coordinated by a
+fair read/write lock keyed by the canonical physical root. Inspection calls may
+share the read lock. Patches, commands, mutating process input, review
+checkpoint updates, close, and revoke use the write side. The key is the root,
+not the Workspace ID, so two principals opening the same checkout cannot submit
+those MCP calls concurrently. The lease ends when the tool call returns, so a
+long-running dev server does not block later reads or edits. A returned process
+may still produce effects outside DevSpace's observations; strict file
+preconditions and separate worktrees remain necessary.
+
 A command that ran and exited nonzero is not a tool transport failure. Its
 structured result says `ok=false`, `status="exited"`,
 `commandExecuted=true`, and includes `exitCode`. A rejected command has an
@@ -418,8 +475,8 @@ file contents, Skill manifests, or process output between MCP `content` and
   reads add `contentHash` and exact decimal-string `mtimeNs` as structured
   metadata. `apply_patch` requires an `ifMatch` entry for every touched path by
   default: use the latest version for an existing path and `null` for a path
-  expected not to exist. `preconditionMode="blind"` requires an explicit
-  `blindWriteReason` and should only follow direct user authorization.
+  expected not to exist. Missing preconditions are rejected before execution;
+  no blind-write bypass is exposed.
 - `batch_read` and `batch_inspect` return a short text completion summary and
   keep ordered results in `structuredContent.items[]` as optional `ref`, `ok`,
   `result`, and exceptional `truncated=true`. Top-level `status`, `succeeded`,
@@ -472,10 +529,12 @@ structured `stdin` field instead of nesting shell quotes. Pipe stdin closes by
 default after the initial payload; set `closeStdin: false` only when later
 `write_stdin` calls must add data. PTY sessions cannot use automatic EOF.
 A bounded command policy follows common static nesting and blocks executable
-`sudo`, forced or recursive `rm`, and pipe-to-executing-shell. Parse-only shell
-checks remain available. Normal workspace shell writes are allowed; explicit
-literal targets for common mutations and redirections are rejected if they
-leave the workspace. This is an accident guardrail, not an OS sandbox.
+`sudo` and pipe-to-executing-shell. Parse-only shell checks remain available.
+Normal build, test, Git, package-manager, workspace writes, and project-relative
+cleanup commands are allowed, including recursive removal of `dist`,
+`node_modules`, and similar generated paths. Removal of the Workspace root,
+outside paths, and unresolved dynamic targets remains blocked. This is an
+accident guardrail, not an OS sandbox.
 
 `maxOutputTokens` limits only the current inline process response and defaults
 to 10,000 tokens. Short output is returned in full; long output keeps a
@@ -485,7 +544,7 @@ opaque `outputId` whose retained UTF-8 bytes can be replayed with
 `read_process_output(receipt, outputId, offset, limit)`.
 The page body is in text `content`; structured paging metadata deliberately
 does not repeat it. Use the returned `nextOffset` for the next page. Output
-ownership is checked against both the OAuth client and workspace; no local log
+ownership is checked against both the connection principal and workspace; no local log
 path is exposed.
 An exceptional text warning reports bytes that exceeded the final durable disk
 quota and cannot be recovered. Completed output uses its
@@ -527,9 +586,14 @@ Behavior is aligned with Codex's unified exec surface:
 - working directory does **not** persist; pass `workingDirectory` when needed and do not rely on `cd`
 - shell env vars / aliases do **not** persist
 - long-running processes return a `sessionId`; poll with `write_stdin`
+
+The server-level automated tests exercise this protocol, but they do not prove
+that a particular ChatGPT host build retains every receipt or operation field.
+Run the [real-host acceptance matrix](./chatgpt-host-acceptance.md) after tool or
+OAuth contract changes.
 - truncated output reports omitted bytes and, when durable storage is available,
   an `outputId` recovery command
-- bounded static checks block forced/recursive `rm`, executable `sudo`, and pipe-to-executing-shell
+- bounded static checks block executable `sudo`, pipe-to-executing-shell, outside writes, and unsafe recursive-removal targets
 - independent commands should be issued as parallel tool calls; dependent ones use `&&`
 - HEREDOC and normal workspace shell writes are allowed
 - do not sleep-poll; use session + `write_stdin` instead

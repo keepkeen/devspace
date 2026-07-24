@@ -35,7 +35,7 @@ writeDevspaceConfig({
 const staleStore = new SqliteWorkspaceStore(stateDir);
 staleStore.createSession({
   id: "ws_stale_startup_root",
-  ownerClientId: "startup-client",
+  connectionPrincipalId: "startup-client",
   root: rootB,
 });
 staleStore.close();

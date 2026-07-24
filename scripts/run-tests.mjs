@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
-import { resolve } from "node:path";
+import { createRequire } from "node:module";
+import { dirname, resolve } from "node:path";
 
 const tests = [
   "src/version.test.ts",
@@ -20,6 +21,7 @@ const tests = [
   "src/apply-patch.test.ts",
   "src/tool-effects.test.ts",
   "src/workspace-context-protocol.test.ts",
+  "src/workspace-root-locks.test.ts",
   "src/pi-tools.test.ts",
   "src/bash-prompt.test.ts",
   "src/batch-tools.test.ts",
@@ -50,10 +52,12 @@ const tests = [
   "src/review-checkpoints.test.ts",
   "src/oauth-store.test.ts",
   "src/oauth-http.test.ts",
+  "src/oauth-scope-e2e.test.ts",
   "src/cli.test.ts",
 ];
 
-const tsxCli = resolve("node_modules/tsx/dist/cli.mjs");
+const require = createRequire(import.meta.url);
+const tsxCli = resolve(dirname(require.resolve("tsx/package.json")), "dist/cli.mjs");
 for (const test of tests) {
   const result = spawnSync(process.execPath, [tsxCli, test], {
     stdio: "inherit",

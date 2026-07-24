@@ -31,6 +31,9 @@ try {
   const allowed = [
     "touch file.txt",
     "mkdir -p build/generated",
+    "rm -rf build/generated",
+    "rm -f *.tmp",
+    "rm --recursive src/generated",
     "cp source.txt build/copy.txt",
     "mv source.txt build/moved.txt",
     "printf 'hello' > build/output.txt",
@@ -116,6 +119,23 @@ try {
     assert(violation, `${command} should be rejected`);
     assert.match(violation.reason, /outside the workspace/);
   }
+
+  assert.match(
+    validateShellWriteTargets(`rm -rf ${join(outside, "cache")}`, root, root)?.reason ?? "",
+    /outside the workspace/,
+  );
+  assert.match(
+    validateShellWriteTargets("rm -rf .", root, root)?.reason ?? "",
+    /workspace root itself/,
+  );
+  assert.match(
+    validateShellWriteTargets('rm -rf "$HOME/cache"', root, root)?.reason ?? "",
+    /not safely workspace-relative/,
+  );
+  assert.match(
+    validateShellWriteTargets("rm --recursive", root, root)?.reason ?? "",
+    /explicit workspace target/,
+  );
 
   const payloadOverflow = `echo ${Array.from({ length: 128 }, () => "$(printf safe)").join(" ")} $(touch ${join(outside, "overflow.txt")})`;
   const overflowViolation = validateShellWriteTargets(payloadOverflow, root, root);

@@ -38,6 +38,7 @@ interface WorkspaceUsage {
 
 interface OAuthUsage {
   clients: number;
+  principals: number;
   accessTokens: number;
   refreshTokens: number;
   workspaceCleanupJobs: number;
@@ -153,6 +154,7 @@ export function createRuntimeControlPlane(options: RuntimeControlPlaneOptions): 
         },
         oauth: {
           clients: oauthUsage.clients,
+          principals: oauthUsage.principals,
           accessTokens: oauthUsage.accessTokens,
           refreshTokens: oauthUsage.refreshTokens,
           workspaceCleanupJobs: oauthUsage.workspaceCleanupJobs,

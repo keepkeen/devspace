@@ -99,7 +99,7 @@ const manager = new ProcessSessionManager({
   maxBufferCharacters: 1_024,
   completedSessionTtlMs: 1_000,
 });
-const ownerClientId = "client-a";
+const connectionPrincipalId = "client-a";
 
 const node = process.platform === "win32"
   ? `"${process.execPath}"`
@@ -121,6 +121,18 @@ async function waitForFile(path: string, timeoutMs = 2_000): Promise<string> {
     }
   }
   throw new Error(`Timed out waiting for ${path}`);
+}
+
+async function waitForCondition(
+  predicate: () => boolean,
+  timeoutMs = 2_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+  }
+  assert.fail("Timed out waiting for process state");
 }
 
 function processExists(pid: number): boolean {
@@ -172,7 +184,7 @@ async function startStubbornPtyTree(
     "setInterval(() => {}, 1000);",
   ].join("\n");
   const started = await treeManager.start({
-    ownerClientId,
+    connectionPrincipalId,
     workspaceId,
     cwd: process.cwd(),
     command: { program: process.execPath, args: ["-e", rootScript, markerPath, readyPath] },
@@ -198,7 +210,7 @@ function forceKillLeftovers(pids: ProcessTreePids | undefined): void {
 }
 
 const foreground = await manager.start({
-  ownerClientId,
+  connectionPrincipalId,
   workspaceId: "workspace-a",
   cwd: process.cwd(),
   command: `${node} -e "console.log('foreground')"`,
@@ -212,7 +224,7 @@ assert.equal(foreground.stdinClosed, true);
 
 const literalArgs = ["two words", "$(echo not-executed)", "semi;colon", "*.ts", "'quoted'", ""];
 const directForeground = await manager.start({
-  ownerClientId,
+  connectionPrincipalId,
   workspaceId: "workspace-a",
   cwd: process.cwd(),
   command: {
@@ -226,7 +238,7 @@ assert.equal(directForeground.exitCode, 0);
 assert.deepEqual(JSON.parse(directForeground.output), literalArgs);
 
 const initialStdin = await manager.start({
-  ownerClientId,
+  connectionPrincipalId,
   workspaceId: "workspace-a",
   cwd: process.cwd(),
   command: `${node} -e "let data=''; process.stdin.on('data', chunk => data += chunk); process.stdin.on('end', () => console.log(JSON.stringify(data)))"`,
@@ -239,7 +251,7 @@ assert.equal(initialStdin.stdinClosed, true);
 assert.match(initialStdin.output, /first line\\n第二行\\n/);
 
 const earlyExitWithStdin = await manager.start({
-  ownerClientId,
+  connectionPrincipalId,
   workspaceId: "workspace-a",
   cwd: process.cwd(),
   command: "true",
@@ -250,7 +262,7 @@ assert.equal(earlyExitWithStdin.running, false);
 assert.equal(earlyExitWithStdin.exitCode, 0);
 
 const emptyInitialStdin = await manager.start({
-  ownerClientId,
+  connectionPrincipalId,
   workspaceId: "workspace-a",
   cwd: process.cwd(),
   command: `${node} -e "process.stdin.on('end', () => console.log('empty-eof')); process.stdin.resume()"`,
@@ -261,7 +273,7 @@ assert.equal(emptyInitialStdin.running, false);
 assert.match(emptyInitialStdin.output, /empty-eof/);
 
 const streamedStdin = await manager.start({
-  ownerClientId,
+  connectionPrincipalId,
   workspaceId: "workspace-a",
   cwd: process.cwd(),
   command: `${node} -e "let data=''; process.stdin.on('data', chunk => data += chunk); process.stdin.on('end', () => console.log(data))"`,
@@ -272,7 +284,7 @@ const streamedStdin = await manager.start({
 assert.equal(streamedStdin.running, true);
 assert.equal(streamedStdin.stdinClosed, false);
 const streamedResult = await manager.write({
-  ownerClientId,
+  connectionPrincipalId,
   workspaceId: "workspace-a",
   sessionId: streamedStdin.sessionId!,
   chars: "second",
@@ -284,7 +296,7 @@ assert.equal(streamedResult.stdinClosed, true);
 assert.match(streamedResult.output, /first-second/);
 
 const closedButRunning = await manager.start({
-  ownerClientId,
+  connectionPrincipalId,
   workspaceId: "workspace-a",
   cwd: process.cwd(),
   command: `${node} -e "process.stdin.on('end', () => setTimeout(() => process.exit(0), 500)); process.stdin.resume()"`,
@@ -295,7 +307,7 @@ assert.equal(closedButRunning.running, true);
 assert.equal(closedButRunning.stdinClosed, true);
 await assert.rejects(
   manager.write({
-    ownerClientId,
+    connectionPrincipalId,
     workspaceId: "workspace-a",
     sessionId: closedButRunning.sessionId!,
     chars: "too-late",
@@ -303,7 +315,7 @@ await assert.rejects(
   /stdin is already closed/,
 );
 const repeatedClose = await manager.write({
-  ownerClientId,
+  connectionPrincipalId,
   workspaceId: "workspace-a",
   sessionId: closedButRunning.sessionId!,
   closeStdin: true,
@@ -313,7 +325,7 @@ assert.equal(repeatedClose.stdinClosed, true);
 
 await assert.rejects(
   manager.start({
-    ownerClientId,
+    connectionPrincipalId,
     workspaceId: "workspace-a",
     cwd: process.cwd(),
     command: "sh",
@@ -324,7 +336,7 @@ await assert.rejects(
 );
 await assert.rejects(
   manager.start({
-    ownerClientId,
+    connectionPrincipalId,
     workspaceId: "workspace-a",
     cwd: process.cwd(),
     command: "printf unreachable",
@@ -334,22 +346,30 @@ await assert.rejects(
 );
 
 const previousCdPath = process.env.CDPATH;
+const previousSecret = process.env.DEVSPACE_TEST_SECRET;
 process.env.CDPATH = "/tmp/should-not-leak";
+process.env.DEVSPACE_TEST_SECRET = "must-not-leak";
 const environment = await manager.start({
-  ownerClientId,
+  connectionPrincipalId,
   workspaceId: "workspace-a",
   workspaceRoot: "/tmp/devspace-workspace-a",
   cwd: process.cwd(),
-  command: `${node} -e "console.log([process.env.NO_COLOR, process.env.TERM, process.env.PAGER, process.env.GIT_PAGER, process.env.GH_PAGER, process.env.CODEX_CI, process.env.DEVSPACE_WORKSPACE_ID, process.env.DEVSPACE_WORKSPACE_ROOT, process.env.CDPATH ?? 'unset'].join(','))"`,
+  command: `${node} -e "console.log([process.env.NO_COLOR, process.env.TERM, process.env.PAGER, process.env.GIT_PAGER, process.env.GH_PAGER, process.env.CODEX_CI, process.env.DEVSPACE_WORKSPACE_ID, process.env.DEVSPACE_WORKSPACE_ROOT, process.env.CDPATH ?? 'unset', process.env.DEVSPACE_TEST_SECRET ?? 'unset', process.env.DEVSPACE_EXPLICIT_ENV, process.env.PATH ? 'path' : 'no-path'].join(','))"`,
+  environment: { DEVSPACE_EXPLICIT_ENV: "explicit" },
   yieldTimeMs: 2_000,
 });
 if (previousCdPath === undefined) delete process.env.CDPATH;
 else process.env.CDPATH = previousCdPath;
+if (previousSecret === undefined) delete process.env.DEVSPACE_TEST_SECRET;
+else process.env.DEVSPACE_TEST_SECRET = previousSecret;
 assert.equal(environment.running, false);
-assert.match(environment.output, /1,dumb,cat,cat,cat,1,workspace-a,\/tmp\/devspace-workspace-a,unset/);
+assert.match(
+  environment.output,
+  /1,dumb,cat,cat,cat,1,workspace-a,\/tmp\/devspace-workspace-a,unset,unset,explicit,path/,
+);
 
 const background = await manager.start({
-  ownerClientId,
+  connectionPrincipalId,
   workspaceId: "workspace-a",
   cwd: process.cwd(),
   command: `${node} -e "setTimeout(() => console.log('finished'), 100)"`,
@@ -362,7 +382,7 @@ assert.equal(typeof background.sessionId, "number");
 const backgroundSessionId = background.sessionId;
 assert.ok(backgroundSessionId);
 assert.deepEqual(
-  manager.instructionContext(ownerClientId, "workspace-a", backgroundSessionId),
+  manager.instructionContext(connectionPrincipalId, "workspace-a", backgroundSessionId),
   {
     cwd: process.cwd(),
     scopePaths: [process.cwd(), `${process.cwd()}/nested`],
@@ -382,7 +402,7 @@ await assert.rejects(
 
 await assert.rejects(
   manager.write({
-    ownerClientId,
+    connectionPrincipalId,
     workspaceId: "workspace-b",
     sessionId: background.sessionId,
     yieldTimeMs: 1,
@@ -391,7 +411,7 @@ await assert.rejects(
 );
 
 await manager.write({
-  ownerClientId,
+  connectionPrincipalId,
   workspaceId: "workspace-a",
   sessionId: backgroundSessionId,
   chars: "x",
@@ -399,12 +419,12 @@ await manager.write({
   yieldTimeMs: 1,
 });
 assert.deepEqual(
-  manager.instructionContext(ownerClientId, "workspace-a", backgroundSessionId).scopePaths,
+  manager.instructionContext(connectionPrincipalId, "workspace-a", backgroundSessionId).scopePaths,
   [process.cwd(), `${process.cwd()}/nested`, `${process.cwd()}/deeper`],
 );
 
 const completed = await manager.write({
-  ownerClientId,
+  connectionPrincipalId,
   workspaceId: "workspace-a",
   sessionId: background.sessionId,
   yieldTimeMs: 2_000,
@@ -414,7 +434,7 @@ assert.equal(completed.exitCode, 0);
 assert.match(completed.output, /finished/);
 
 const interactive = await manager.start({
-  ownerClientId,
+  connectionPrincipalId,
   workspaceId: "workspace-a",
   cwd: process.cwd(),
   command: `${node} -e "process.stdin.once('data', data => { console.log('input:' + data.toString().trim()); process.exit(0); })"`,
@@ -425,7 +445,7 @@ assert.ok(interactive.sessionId);
 assert.equal(typeof interactive.sessionId, "number");
 
 const inputResult = await manager.write({
-  ownerClientId,
+  connectionPrincipalId,
   workspaceId: "workspace-a",
   sessionId: interactive.sessionId,
   chars: "hello\n",
@@ -435,7 +455,7 @@ assert.equal(inputResult.running, false);
 assert.match(inputResult.output, /input:hello/);
 
 const fragmentedShellInput = await manager.start({
-  ownerClientId,
+  connectionPrincipalId,
   workspaceId: "workspace-a",
   cwd: process.cwd(),
   command: `${node} -e "process.stdin.once('data', data => { console.log('fragment:' + JSON.stringify(data.toString())); process.exit(0); })"`,
@@ -444,7 +464,7 @@ const fragmentedShellInput = await manager.start({
 });
 assert.ok(fragmentedShellInput.sessionId);
 const bufferedFragment = await manager.write({
-  ownerClientId,
+  connectionPrincipalId,
   workspaceId: "workspace-a",
   sessionId: fragmentedShellInput.sessionId,
   chars: "c",
@@ -460,11 +480,11 @@ const bufferedFragment = await manager.write({
 assert.equal(bufferedFragment.running, true);
 assert.doesNotMatch(bufferedFragment.output, /fragment:/);
 assert.equal(
-  manager.instructionContext(ownerClientId, "workspace-a", fragmentedShellInput.sessionId).pendingInput,
+  manager.instructionContext(connectionPrincipalId, "workspace-a", fragmentedShellInput.sessionId).pendingInput,
   "c",
 );
 const completedFragment = await manager.write({
-  ownerClientId,
+  connectionPrincipalId,
   workspaceId: "workspace-a",
   sessionId: fragmentedShellInput.sessionId,
   chars: "d nested\n",
@@ -481,7 +501,7 @@ assert.equal(completedFragment.running, false);
 assert.match(completedFragment.output, /fragment:"cd nested\\n"/);
 
 const defaultInteractive = await manager.start({
-  ownerClientId,
+  connectionPrincipalId,
   workspaceId: "workspace-a",
   cwd: process.cwd(),
   command: `${node} -e "process.stdin.once('data', data => setTimeout(() => { console.log('default-input:' + data.toString().trim()); process.exit(0); }, 100))"`,
@@ -491,16 +511,17 @@ assert.equal(defaultInteractive.running, true);
 assert.ok(defaultInteractive.sessionId);
 
 const defaultInputResult = await manager.write({
-  ownerClientId,
+  connectionPrincipalId,
   workspaceId: "workspace-a",
   sessionId: defaultInteractive.sessionId,
   chars: "hello\n",
+  yieldTimeMs: 2_000,
 });
 assert.equal(defaultInputResult.running, false);
 assert.match(defaultInputResult.output, /default-input:hello/);
 
 const noisyInteractive = await manager.start({
-  ownerClientId,
+  connectionPrincipalId,
   workspaceId: "workspace-a",
   cwd: process.cwd(),
   command: `${node} -e "setInterval(() => console.log('tick'), 10); process.stdin.once('data', data => { console.log('input:' + data.toString().trim()); process.exit(0); })"`,
@@ -511,7 +532,7 @@ assert.ok(noisyInteractive.sessionId);
 
 await new Promise((resolve) => setTimeout(resolve, 50));
 const noisyInputResult = await manager.write({
-  ownerClientId,
+  connectionPrincipalId,
   workspaceId: "workspace-a",
   sessionId: noisyInteractive.sessionId,
   chars: "hello\n",
@@ -521,7 +542,7 @@ assert.equal(noisyInputResult.running, false);
 assert.match(noisyInputResult.output, /input:hello/);
 
 const interruptible = await manager.start({
-  ownerClientId,
+  connectionPrincipalId,
   workspaceId: "workspace-a",
   cwd: process.cwd(),
   command: `${node} -e "setInterval(() => console.log('tick'), 10)"`,
@@ -532,7 +553,7 @@ assert.ok(interruptible.sessionId);
 
 await new Promise((resolve) => setTimeout(resolve, 50));
 const interrupted = await manager.write({
-  ownerClientId,
+  connectionPrincipalId,
   workspaceId: "workspace-a",
   sessionId: interruptible.sessionId,
   chars: "\u0003",
@@ -542,7 +563,7 @@ assert.equal(interrupted.running, false);
 if (process.platform !== "win32") assert.equal(interrupted.signal, "SIGINT");
 
 let buffered = await manager.start({
-  ownerClientId,
+  connectionPrincipalId,
   workspaceId: "workspace-a",
   cwd: process.cwd(),
   command: `${node} -e "console.log('x'.repeat(5000)); setTimeout(() => {}, 100)"`,
@@ -551,7 +572,7 @@ let buffered = await manager.start({
 });
 if (!buffered.outputTruncated && buffered.sessionId) {
   buffered = await manager.write({
-    ownerClientId,
+    connectionPrincipalId,
     workspaceId: "workspace-a",
     sessionId: buffered.sessionId,
     yieldTimeMs: 2_000,
@@ -561,11 +582,11 @@ if (!buffered.outputTruncated && buffered.sessionId) {
 assert.equal(buffered.outputTruncated, true);
 assert.ok(buffered.originalTokenCount >= 1);
 assert.ok(buffered.outputOmittedBytes >= 1);
-if (buffered.sessionId) manager.terminate(ownerClientId, "workspace-a", buffered.sessionId);
+if (buffered.sessionId) manager.terminate(connectionPrincipalId, "workspace-a", buffered.sessionId);
 
 for (const expression of ["'🙂'.repeat(200)", "'中文'.repeat(200)"]) {
   const multibyteLimited = await manager.start({
-    ownerClientId,
+    connectionPrincipalId,
     workspaceId: "workspace-a",
     cwd: process.cwd(),
     command: `${node} -e "process.stdout.write(${expression})"`,
@@ -580,7 +601,7 @@ for (const expression of ["'🙂'.repeat(200)", "'中文'.repeat(200)"]) {
 try {
   if (process.platform === "win32") {
     const pty = await manager.start({
-      ownerClientId,
+      connectionPrincipalId,
       workspaceId: "workspace-a",
       cwd: process.cwd(),
       command: "echo pty-ok",
@@ -591,7 +612,7 @@ try {
     assert.match(pty.output, /pty-ok/);
   } else {
     const directPty = await manager.start({
-      ownerClientId,
+      connectionPrincipalId,
       workspaceId: "workspace-a",
       cwd: process.cwd(),
       command: {
@@ -606,7 +627,7 @@ try {
     assert.deepEqual(JSON.parse(directPty.output), literalArgs);
 
     const pty = await manager.start({
-      ownerClientId,
+      connectionPrincipalId,
       workspaceId: "workspace-a",
       cwd: process.cwd(),
       command: `${node} -e "setTimeout(() => console.log('columns:' + process.stdout.columns), 250)"`,
@@ -619,7 +640,7 @@ try {
     assert.ok(pty.sessionId);
 
     const resizedPty = await manager.write({
-      ownerClientId,
+      connectionPrincipalId,
       workspaceId: "workspace-a",
       sessionId: pty.sessionId,
       columns: 120,
@@ -630,7 +651,7 @@ try {
     assert.match(resizedPty.output, /columns:120/);
 
     const interruptiblePty = await manager.start({
-      ownerClientId,
+      connectionPrincipalId,
       workspaceId: "workspace-a",
       cwd: process.cwd(),
       command: { program: process.execPath, args: ["-e", "setInterval(() => {}, 1000)"] },
@@ -639,7 +660,7 @@ try {
     });
     assert.ok(interruptiblePty.sessionId);
     const interruptedPty = await manager.write({
-      ownerClientId,
+      connectionPrincipalId,
       workspaceId: "workspace-a",
       sessionId: interruptiblePty.sessionId,
       chars: "\u0003",
@@ -658,7 +679,7 @@ const quotaManager = new ProcessSessionManager({
 });
 try {
   const firstQuotaSession = await quotaManager.start({
-    ownerClientId,
+    connectionPrincipalId,
     workspaceId: "quota-a",
     cwd: process.cwd(),
     command: `${node} -e "setInterval(() => {}, 1000)"`,
@@ -667,7 +688,7 @@ try {
   assert.ok(firstQuotaSession.sessionId);
   await assert.rejects(
     quotaManager.start({
-      ownerClientId,
+      connectionPrincipalId,
       workspaceId: "quota-a",
       cwd: process.cwd(),
       command: `${node} -e "setInterval(() => {}, 1000)"`,
@@ -677,7 +698,7 @@ try {
   );
   await assert.rejects(
     quotaManager.write({
-      ownerClientId: "client-b",
+      connectionPrincipalId: "client-b",
       workspaceId: "quota-a",
       sessionId: firstQuotaSession.sessionId,
       yieldTimeMs: 1,
@@ -686,7 +707,7 @@ try {
   );
 
   const secondQuotaSession = await quotaManager.start({
-    ownerClientId,
+    connectionPrincipalId,
     workspaceId: "quota-b",
     cwd: process.cwd(),
     command: `${node} -e "setInterval(() => {}, 1000)"`,
@@ -695,7 +716,7 @@ try {
   assert.ok(secondQuotaSession.sessionId);
   await assert.rejects(
     quotaManager.start({
-      ownerClientId,
+      connectionPrincipalId,
       workspaceId: "quota-c",
       cwd: process.cwd(),
       command: `${node} -e "setInterval(() => {}, 1000)"`,
@@ -715,7 +736,7 @@ const clientQuotaManager = new ProcessSessionManager({
 });
 try {
   const clientASession = await clientQuotaManager.start({
-    ownerClientId: "client-a",
+    connectionPrincipalId: "client-a",
     workspaceId: "client-quota-a",
     cwd: process.cwd(),
     command: `${node} -e "setInterval(() => {}, 1000)"`,
@@ -724,7 +745,7 @@ try {
   assert.ok(clientASession.sessionId);
   await assert.rejects(
     clientQuotaManager.start({
-      ownerClientId: "client-a",
+      connectionPrincipalId: "client-a",
       workspaceId: "client-quota-b",
       cwd: process.cwd(),
       command: `${node} -e "setInterval(() => {}, 1000)"`,
@@ -733,7 +754,7 @@ try {
     /limit reached for this OAuth client/,
   );
   const clientBSession = await clientQuotaManager.start({
-    ownerClientId: "client-b",
+    connectionPrincipalId: "client-b",
     workspaceId: "client-quota-a",
     cwd: process.cwd(),
     command: `${node} -e "setInterval(() => {}, 1000)"`,
@@ -744,7 +765,7 @@ try {
     sessions: 2,
     running: 2,
     limit: 3,
-    owner: { sessions: 1, running: 1, limit: 1 },
+    principal: { sessions: 1, running: 1, limit: 1 },
   });
 } finally {
   await clientQuotaManager.shutdown();
@@ -756,17 +777,19 @@ const completedQuotaManager = new ProcessSessionManager({
 });
 try {
   const awaitingPoll = await completedQuotaManager.start({
-    ownerClientId,
+    connectionPrincipalId,
     workspaceId: "completed-quota",
     cwd: process.cwd(),
     command: `${node} -e "setTimeout(() => console.log('retained-result'), 50)"`,
     yieldTimeMs: 1,
   });
   assert.ok(awaitingPoll.sessionId);
-  await new Promise((resolveWait) => setTimeout(resolveWait, 150));
+  await waitForCondition(
+    () => completedQuotaManager.usageSnapshot(connectionPrincipalId).running === 0,
+  );
   await assert.rejects(
     completedQuotaManager.start({
-      ownerClientId,
+      connectionPrincipalId,
       workspaceId: "completed-quota",
       cwd: process.cwd(),
       command: `${node} -e "console.log('must-not-start')"`,
@@ -775,7 +798,7 @@ try {
     /Process session limit reached/,
   );
   const retainedResult = await completedQuotaManager.write({
-    ownerClientId,
+    connectionPrincipalId,
     workspaceId: "completed-quota",
     sessionId: awaitingPoll.sessionId,
     yieldTimeMs: 1,
@@ -783,7 +806,7 @@ try {
   assert.equal(retainedResult.running, false);
   assert.match(retainedResult.output, /retained-result/);
   const afterConsumption = await completedQuotaManager.start({
-    ownerClientId,
+    connectionPrincipalId,
     workspaceId: "completed-quota",
     cwd: process.cwd(),
     command: `${node} -e "console.log('after-consumption')"`,
@@ -801,7 +824,7 @@ const timeoutManager = new ProcessSessionManager({
 try {
   await assert.rejects(
     timeoutManager.start({
-      ownerClientId,
+      connectionPrincipalId,
       workspaceId: "timeout-over-global-limit",
       cwd: process.cwd(),
       command: "echo should-not-run",
@@ -810,7 +833,7 @@ try {
     /timeoutMs 1001 exceeds the global maximum 1000ms/,
   );
   const timedOut = await timeoutManager.start({
-    ownerClientId,
+    connectionPrincipalId,
     workspaceId: "timeout",
     cwd: process.cwd(),
     command: `${node} -e "setInterval(() => {}, 1000)"`,
@@ -830,27 +853,27 @@ const closeManager = new ProcessSessionManager({
 });
 try {
   const stubborn = await closeManager.start({
-    ownerClientId,
+    connectionPrincipalId,
     workspaceId: "closing",
     cwd: process.cwd(),
     command: `${node} -e "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"`,
     yieldTimeMs: 20,
   });
   assert.ok(stubborn.sessionId);
-  assert.equal(await closeManager.terminateWorkspace(ownerClientId, "closing"), 1);
-  assert.equal(closeManager.hasActive(ownerClientId, "closing"), false);
+  assert.equal(await closeManager.terminateWorkspace(connectionPrincipalId, "closing"), 1);
+  assert.equal(closeManager.hasActive(connectionPrincipalId, "closing"), false);
   await assert.rejects(
     closeManager.start({
-      ownerClientId,
+      connectionPrincipalId,
       workspaceId: "closing",
       cwd: process.cwd(),
       command: "echo should-not-run",
     }),
     /Workspace is closing/,
   );
-  closeManager.reopenWorkspace(ownerClientId, "closing");
+  closeManager.reopenWorkspace(connectionPrincipalId, "closing");
   const reopened = await closeManager.start({
-    ownerClientId,
+    connectionPrincipalId,
     workspaceId: "closing",
     cwd: process.cwd(),
     command: "echo reopened",
@@ -858,10 +881,10 @@ try {
   });
   assert.equal(reopened.exitCode, 0);
   assert.match(reopened.output, /reopened/);
-  closeManager.blockWorkspace(ownerClientId, "revoked-root");
+  closeManager.blockWorkspace(connectionPrincipalId, "revoked-root");
   await assert.rejects(
     closeManager.start({
-      ownerClientId,
+      connectionPrincipalId,
       workspaceId: "revoked-root",
       cwd: process.cwd(),
       command: "echo should-not-run",
@@ -892,7 +915,7 @@ if (process.platform !== "win32") {
       );
       timeoutPids = started.pids;
       const timedOutTree = await ptyTimeoutManager.write({
-        ownerClientId,
+        connectionPrincipalId,
         workspaceId: "pty-timeout",
         sessionId: started.sessionId,
         yieldTimeMs: 2_000,
@@ -918,7 +941,7 @@ if (process.platform !== "win32") {
         join(ptyTreeRoot, "workspace-ready"),
       );
       workspacePids = started.pids;
-      assert.equal(await ptyWorkspaceManager.terminateWorkspace(ownerClientId, "pty-workspace"), 1);
+      assert.equal(await ptyWorkspaceManager.terminateWorkspace(connectionPrincipalId, "pty-workspace"), 1);
       await assertProcessTreeExited(started.pids);
       workspacePids = undefined;
     } finally {
@@ -962,7 +985,7 @@ const durableManager = new ProcessSessionManager({
 let durableOutputId = "";
 try {
   const empty = await durableManager.start({
-    ownerClientId,
+    connectionPrincipalId,
     workspaceId: "durable",
     cwd: process.cwd(),
     command: `${node} -e "process.exit(0)"`,
@@ -971,31 +994,40 @@ try {
   assert.equal(empty.outputId, undefined);
   assert.equal(durableStore.usageSnapshot().outputs, 0);
 
-  const active = await durableManager.start({
-    ownerClientId,
+  let active = await durableManager.start({
+    connectionPrincipalId,
     workspaceId: "durable",
     cwd: process.cwd(),
     command: `${node} -e "process.stdout.write('seed'); setTimeout(() => process.stdout.write('late'), 250); setTimeout(() => process.exit(0), 1000)"`,
     yieldTimeMs: 100,
   });
+  const outputIdDeadline = Date.now() + 2_000;
+  while (active.running && !active.outputId && Date.now() < outputIdDeadline) {
+    active = await durableManager.write({
+      connectionPrincipalId,
+      workspaceId: "durable",
+      sessionId: active.sessionId!,
+      yieldTimeMs: 50,
+    });
+  }
   assert.equal(active.running, true);
   assert.ok(active.outputId);
   await new Promise((resolveWait) => setTimeout(resolveWait, 350));
-  durableManager.flushOutput(ownerClientId, "durable", active.outputId);
+  durableManager.flushOutput(connectionPrincipalId, "durable", active.outputId);
   assert.equal(
-    durableStore.read(ownerClientId, "durable", active.outputId, { offset: 0, limit: 100 }).content,
+    durableStore.read(connectionPrincipalId, "durable", active.outputId, { offset: 0, limit: 100 }).content,
     "seedlate",
   );
-  durableManager.terminate(ownerClientId, "durable", active.sessionId!);
+  durableManager.terminate(connectionPrincipalId, "durable", active.sessionId!);
   await durableManager.write({
-    ownerClientId,
+    connectionPrincipalId,
     workspaceId: "durable",
     sessionId: active.sessionId!,
     yieldTimeMs: 2_000,
   });
 
   const durable = await durableManager.start({
-    ownerClientId,
+    connectionPrincipalId,
     workspaceId: "durable",
     cwd: process.cwd(),
     command: `${node} -e "process.stdout.write('x'.repeat(100000))"`,
@@ -1012,7 +1044,7 @@ try {
   let offset = 0;
   let recovered = "";
   while (offset < durable.storedOutputBytes) {
-    const page = durableStore.read(ownerClientId, "durable", durable.outputId, {
+    const page = durableStore.read(connectionPrincipalId, "durable", durable.outputId, {
       offset,
       limit: 7_777,
     });
@@ -1020,10 +1052,10 @@ try {
     offset = page.nextOffset;
   }
   assert.equal(recovered, "x".repeat(100_000));
-  assert.equal(durableStore.metadata(ownerClientId, "durable", durable.outputId).status, "completed");
+  assert.equal(durableStore.metadata(connectionPrincipalId, "durable", durable.outputId).status, "completed");
 
   const quotaLimited = await durableManager.start({
-    ownerClientId,
+    connectionPrincipalId,
     workspaceId: "durable",
     cwd: process.cwd(),
     command: `${node} -e "process.stdout.write('y'.repeat(150000))"`,
@@ -1046,7 +1078,7 @@ const reopenedDurableStore = new ProcessOutputStore({
 });
 try {
   assert.equal(
-    reopenedDurableStore.read(ownerClientId, "durable", durableOutputId, { offset: 0, limit: 10 }).content,
+    reopenedDurableStore.read(connectionPrincipalId, "durable", durableOutputId, { offset: 0, limit: 10 }).content,
     "xxxxxxxxxx",
   );
 } finally {
@@ -1074,7 +1106,7 @@ const storageFailureManager = new ProcessSessionManager({
 });
 try {
   const snapshot = await storageFailureManager.start({
-    ownerClientId,
+    connectionPrincipalId,
     workspaceId: "storage-failure",
     cwd: process.cwd(),
     command: `${node} -e "process.stdout.write('model-visible-stdout')"`,

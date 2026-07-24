@@ -25,6 +25,11 @@ try {
       (4, 'workspace-oauth-ownership', '2026-01-01T00:00:00.000Z'),
       (5, 'workspace-checkout-reuse', '2026-01-01T00:00:00.000Z'),
       (6, 'oauth-owner-credential', '2026-01-01T00:00:00.000Z');
+    create table oauth_clients (
+      client_id text primary key,
+      client_json text not null,
+      issued_at integer not null
+    );
     create table workspace_sessions (
       id text primary key,
       owner_client_id text not null default '__legacy_unowned__',
@@ -135,7 +140,7 @@ try {
   try {
     const original = first.createOrReuseCheckoutSession({
       id: "ws-a",
-      ownerClientId: "client-a",
+      connectionPrincipalId: "client-a",
       root: "/workspace/a",
       canonicalRoot: "/workspace/a",
       maxActiveSessionsPerClient: 1,
@@ -149,7 +154,7 @@ try {
 
     const reused = second.createOrReuseCheckoutSession({
       id: "ws-a-duplicate",
-      ownerClientId: "client-a",
+      connectionPrincipalId: "client-a",
       root: "/workspace/a-alias",
       canonicalRoot: "/workspace/a",
       maxActiveSessionsPerClient: 1,
@@ -160,7 +165,7 @@ try {
 
     const downgraded = second.createOrReuseCheckoutSession({
       id: "ws-a-downgrade",
-      ownerClientId: "client-a",
+      connectionPrincipalId: "client-a",
       root: "/workspace/a",
       canonicalRoot: "/workspace/a",
       writeAccess: "read_only",
@@ -173,7 +178,7 @@ try {
 
     const preservedDowngrade = first.createOrReuseCheckoutSession({
       id: "ws-a-preserved",
-      ownerClientId: "client-a",
+      connectionPrincipalId: "client-a",
       root: "/workspace/a",
       canonicalRoot: "/workspace/a",
       writeAccess: "read_write",
@@ -184,7 +189,7 @@ try {
 
     const upgraded = first.createOrReuseCheckoutSession({
       id: "ws-a-upgrade",
-      ownerClientId: "client-a",
+      connectionPrincipalId: "client-a",
       root: "/workspace/a",
       canonicalRoot: "/workspace/a",
       writeAccess: "read_write",
@@ -196,16 +201,16 @@ try {
 
     const aliasGuarded = first.createOrReuseCheckoutSession({
       id: "ws-alias-guarded",
-      ownerClientId: "client-alias-guarded",
+      connectionPrincipalId: "client-alias-guarded",
       alias: "stable-alias",
       root: "/workspace/alias-guarded",
       canonicalRoot: "/workspace/alias-guarded",
       writeAccess: "read_only",
     });
-    assert.equal(first.closeSession(aliasGuarded.id, aliasGuarded.ownerClientId), true);
+    assert.equal(first.closeSession(aliasGuarded.id, aliasGuarded.connectionPrincipalId), true);
     const rejectedAliasReuse = second.createOrReuseCheckoutSession({
       id: "ws-alias-guarded-reuse",
-      ownerClientId: aliasGuarded.ownerClientId,
+      connectionPrincipalId: aliasGuarded.connectionPrincipalId,
       alias: "conflicting-alias",
       root: aliasGuarded.root,
       canonicalRoot: aliasGuarded.root,
@@ -216,18 +221,18 @@ try {
     assert.equal(rejectedAliasReuse.alias, "stable-alias");
     assert.equal(rejectedAliasReuse.writeAccess, "read_only");
     assert.equal(rejectedAliasReuse.stateGeneration, 2);
-    assert.equal(first.countActiveSessions(aliasGuarded.ownerClientId), 0);
+    assert.equal(first.countActiveSessions(aliasGuarded.connectionPrincipalId), 0);
 
     first.createSession({
       id: "ws-quota-active",
-      ownerClientId: aliasGuarded.ownerClientId,
+      connectionPrincipalId: aliasGuarded.connectionPrincipalId,
       alias: "quota-active",
       root: "/workspace/quota-active",
     });
     assert.throws(
       () => second.createOrReuseCheckoutSession({
         id: "ws-alias-guarded-reactivate",
-        ownerClientId: aliasGuarded.ownerClientId,
+        connectionPrincipalId: aliasGuarded.connectionPrincipalId,
         alias: "stable-alias",
         root: aliasGuarded.root,
         canonicalRoot: aliasGuarded.root,
@@ -235,18 +240,18 @@ try {
       }),
       /limit reached for this OAuth client/,
     );
-    assert.equal(first.countActiveSessions(aliasGuarded.ownerClientId), 1);
+    assert.equal(first.countActiveSessions(aliasGuarded.connectionPrincipalId), 1);
     assert.throws(
-      () => first.reactivateClosedSession(aliasGuarded.id, aliasGuarded.ownerClientId, 1),
+      () => first.reactivateClosedSession(aliasGuarded.id, aliasGuarded.connectionPrincipalId, 1),
       /limit reached for this OAuth client/,
     );
-    assert.equal(first.deleteSession("ws-quota-active", aliasGuarded.ownerClientId), true);
-    assert.equal(first.deleteSession(aliasGuarded.id, aliasGuarded.ownerClientId), true);
+    assert.equal(first.deleteSession("ws-quota-active", aliasGuarded.connectionPrincipalId), true);
+    assert.equal(first.deleteSession(aliasGuarded.id, aliasGuarded.connectionPrincipalId), true);
 
     assert.throws(
       () => second.createSession({
         id: "ws-a-over-limit",
-        ownerClientId: "client-a",
+        connectionPrincipalId: "client-a",
         root: "/workspace/other",
         maxActiveSessionsPerClient: 1,
       }),
@@ -255,7 +260,7 @@ try {
 
     second.createSession({
       id: "ws-b",
-      ownerClientId: "client-b",
+      connectionPrincipalId: "client-b",
       root: "/workspace/b",
       maxActiveSessionsPerClient: 1,
     });
@@ -263,16 +268,16 @@ try {
     assert.equal(second.countActiveSessions("client-b"), 1);
     assert.deepEqual(
       second.listActiveSessions()
-        .map(({ id, ownerClientId }) => ({ id, ownerClientId }))
+        .map(({ id, connectionPrincipalId }) => ({ id, connectionPrincipalId }))
         .sort((left, right) => left.id.localeCompare(right.id)),
       [
-        { id: "ws-a", ownerClientId: "client-a" },
-        { id: "ws-b", ownerClientId: "client-b" },
+        { id: "ws-a", connectionPrincipalId: "client-a" },
+        { id: "ws-b", connectionPrincipalId: "client-b" },
       ],
     );
     assert.equal(second.closeSessions([
-      { id: "ws-a", ownerClientId: "wrong-client" },
-      { id: "ws-b", ownerClientId: "client-b" },
+      { id: "ws-a", connectionPrincipalId: "wrong-client" },
+      { id: "ws-b", connectionPrincipalId: "client-b" },
     ]), 1);
     assert.equal(second.getSession("ws-a", "client-a")?.status, "active");
     assert.equal(second.getSession("ws-b", "client-b"), undefined);
@@ -281,7 +286,7 @@ try {
     assert.equal(first.closeSession("ws-a", "client-a"), true);
     first.createSession({
       id: "ws-a-replacement",
-      ownerClientId: "client-a",
+      connectionPrincipalId: "client-a",
       root: "/workspace/replacement",
       maxActiveSessionsPerClient: 1,
     });
@@ -296,7 +301,7 @@ try {
 
     const aliased = first.createSession({
       id: "ws-fields",
-      ownerClientId: "client-fields",
+      connectionPrincipalId: "client-fields",
       alias: "devspace",
       root: "/workspace/fields",
       writeAccess: "read_only",
@@ -318,7 +323,7 @@ try {
     assert.throws(
       () => second.createSession({
         id: "ws-fields-duplicate",
-        ownerClientId: "client-fields",
+        connectionPrincipalId: "client-fields",
         alias: "devspace",
         root: "/workspace/fields-duplicate",
       }),
@@ -326,7 +331,7 @@ try {
     );
     const otherOwner = second.createSession({
       id: "ws-fields-other-owner",
-      ownerClientId: "client-fields-other",
+      connectionPrincipalId: "client-fields-other",
       alias: "devspace",
       root: "/workspace/fields-other-owner",
     });
@@ -334,7 +339,7 @@ try {
 
     const managed = first.createOrReuseManagedSession({
       id: "ws-managed",
-      ownerClientId: "client-managed",
+      connectionPrincipalId: "client-managed",
       root: "/managed/worktree-a",
       sourceRoot: "/workspace/source",
       baseRef: "HEAD",
@@ -348,7 +353,7 @@ try {
     );
     const reusedManaged = second.createOrReuseManagedSession({
       id: "ws-managed-duplicate",
-      ownerClientId: "client-managed",
+      connectionPrincipalId: "client-managed",
       root: "/managed/worktree-duplicate",
       sourceRoot: "/workspace/source",
       baseRef: "main",
@@ -359,7 +364,7 @@ try {
     assert.equal(reusedManaged.dirtySource, true);
     const isolatedManaged = second.createOrReuseManagedSession({
       id: "ws-managed-isolated",
-      ownerClientId: "client-managed",
+      connectionPrincipalId: "client-managed",
       root: "/managed/worktree-b",
       sourceRoot: "/workspace/source",
       baseRef: "HEAD",
@@ -392,19 +397,19 @@ try {
 
     const generationActive = first.createSession({
       id: "ws-generation-active",
-      ownerClientId: "client-generation",
+      connectionPrincipalId: "client-generation",
       root: "/workspace/generation-active",
       stateGeneration: 2,
     });
     first.createSession({
       id: "ws-generation-closed",
-      ownerClientId: "client-generation",
+      connectionPrincipalId: "client-generation",
       root: "/workspace/generation-closed",
       stateGeneration: 9,
     });
     first.createSession({
       id: "ws-generation-revoked",
-      ownerClientId: "client-generation",
+      connectionPrincipalId: "client-generation",
       root: "/workspace/generation-revoked",
       stateGeneration: 20,
     });
@@ -417,16 +422,16 @@ try {
     assert.equal(first.bumpStateGeneration(generationActive.id, "wrong-client"), undefined);
     assert.deepEqual(first.bumpActiveStateGenerations("client-generation"), [{
       id: generationActive.id,
-      ownerClientId: "client-generation",
+      connectionPrincipalId: "client-generation",
       stateGeneration: 4,
     }]);
 
     const allGenerationUpdates = first.bumpActiveStateGenerations();
     assert.deepEqual(
-      allGenerationUpdates.filter((entry) => entry.ownerClientId === "client-generation"),
+      allGenerationUpdates.filter((entry) => entry.connectionPrincipalId === "client-generation"),
       [{
         id: generationActive.id,
-        ownerClientId: "client-generation",
+        connectionPrincipalId: "client-generation",
         stateGeneration: 5,
       }],
     );

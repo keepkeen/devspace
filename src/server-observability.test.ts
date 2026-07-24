@@ -16,12 +16,15 @@ import {
   processCallSucceeded,
   processModelState,
   processResult,
+  requiredOAuthScopesForToolCall,
+  requiredOAuthScopesForTool,
   recoverableWorkspaceError,
   toolSurface,
   toolCallOperationId,
   toolCallWorkspaceId,
   readinessSnapshot,
   workspaceOperationId,
+  workspaceToolRootLockMode,
   toolCallWorkspaceReceipt,
   workspaceAppAssetPaths,
 } from "./server.js";
@@ -30,6 +33,7 @@ import { UnknownWorkspaceError } from "./workspaces.js";
 import {
   connectionRef,
   isLoopbackProxyPeer,
+  oauthClientRef,
   workspaceActivityRef,
 } from "./logger.js";
 
@@ -39,24 +43,27 @@ assert.equal(isLoopbackProxyPeer("::1"), true);
 assert.equal(isLoopbackProxyPeer("::ffff:127.0.0.1"), true);
 assert.equal(isLoopbackProxyPeer("10.0.0.1"), false);
 assert.equal(isLoopbackProxyPeer("::ffff:10.0.0.1"), false);
-assert.equal(connectionRef("oauth-client-a"), connectionRef("oauth-client-a"));
-assert.notEqual(connectionRef("oauth-client-a"), connectionRef("oauth-client-b"));
-assert.match(connectionRef("oauth-client-a") ?? "", /^conn_[a-f0-9]{12}$/u);
+assert.equal(connectionRef("principal-a"), connectionRef("principal-a"));
+assert.notEqual(connectionRef("principal-a"), connectionRef("principal-b"));
+assert.match(connectionRef("principal-a") ?? "", /^conn_[a-f0-9]{12}$/u);
+assert.equal(oauthClientRef("oauth-client-a"), oauthClientRef("oauth-client-a"));
+assert.notEqual(oauthClientRef("oauth-client-a"), oauthClientRef("oauth-client-b"));
+assert.match(oauthClientRef("oauth-client-a") ?? "", /^oauth_[a-f0-9]{12}$/u);
 assert.equal(
-  workspaceActivityRef("oauth-client-a", "ws_project_a"),
-  workspaceActivityRef("oauth-client-a", "ws_project_a"),
+  workspaceActivityRef("principal-a", "ws_project_a"),
+  workspaceActivityRef("principal-a", "ws_project_a"),
 );
 assert.notEqual(
-  workspaceActivityRef("oauth-client-a", "ws_project_a"),
-  workspaceActivityRef("oauth-client-a", "ws_project_b"),
+  workspaceActivityRef("principal-a", "ws_project_a"),
+  workspaceActivityRef("principal-a", "ws_project_b"),
 );
 assert.notEqual(
-  workspaceActivityRef("oauth-client-a", "ws_project_a"),
-  workspaceActivityRef("oauth-client-b", "ws_project_a"),
+  workspaceActivityRef("principal-a", "ws_project_a"),
+  workspaceActivityRef("principal-b", "ws_project_a"),
 );
-assert.match(workspaceActivityRef("oauth-client-a", "ws_project_a") ?? "", /^act_[a-f0-9]{12}$/u);
+assert.match(workspaceActivityRef("principal-a", "ws_project_a") ?? "", /^act_[a-f0-9]{12}$/u);
 assert.equal(workspaceActivityRef(undefined, "ws_project_a"), undefined);
-assert.equal(workspaceActivityRef("oauth-client-a", undefined), undefined);
+assert.equal(workspaceActivityRef("principal-a", undefined), undefined);
 assert.equal(isExpectedPiToolError(Object.assign(new Error("missing"), { code: "ENOENT" })), true);
 assert.equal(isExpectedPiToolError(Object.assign(new Error("not a directory"), { code: "ENOTDIR" })), true);
 assert.equal(isExpectedPiToolError(Object.assign(new Error("storage failure"), { code: "EIO" })), false);
@@ -372,10 +379,7 @@ const dangerousInputFragment = processInputInstructionScopePaths(
   },
 );
 assert.ok(dangerousInputFragment && "paths" in dangerousInputFragment);
-assert.match(
-  processInputPolicyViolation(dangerousInputFragment.preparedInput) ?? "",
-  /blocked by command policy/i,
-);
+assert.equal(processInputPolicyViolation(dangerousInputFragment.preparedInput), undefined);
 const multilineDangerousInput = processInputInstructionScopePaths(
   shellWorkspaceRoot,
   "echo ok\nrm -rf nested/file\n",
@@ -388,8 +392,21 @@ const multilineDangerousInput = processInputInstructionScopePaths(
   },
 );
 assert.ok(multilineDangerousInput && "paths" in multilineDangerousInput);
+assert.equal(processInputPolicyViolation(multilineDangerousInput.preparedInput), undefined);
+const privilegedInput = processInputInstructionScopePaths(
+  shellWorkspaceRoot,
+  "sudo id\n",
+  {
+    cwd: shellWorkspaceRoot,
+    scopePaths: [shellWorkspaceRoot],
+    inputMode: "shell",
+    pendingInput: "",
+    inputRevision: 0,
+  },
+);
+assert.ok(privilegedInput && "paths" in privilegedInput);
 assert.match(
-  processInputPolicyViolation(multilineDangerousInput.preparedInput) ?? "",
+  processInputPolicyViolation(privilegedInput.preparedInput) ?? "",
   /blocked by command policy/i,
 );
 const outsideWriteInput = processInputInstructionScopePaths(
@@ -531,6 +548,57 @@ assert.equal(toolCallOperationId({
   method: "tools/call",
   params: { name: "exec_command", arguments: { operationId: "x".repeat(129) } },
 }), undefined);
+assert.equal(workspaceToolRootLockMode({
+  method: "tools/call",
+  params: { name: "read", arguments: { receipt: `wctx3.${"A".repeat(43)}` } },
+}), "read");
+assert.equal(workspaceToolRootLockMode({
+  method: "tools/call",
+  params: { name: "apply_patch", arguments: { receipt: `wctx3.${"A".repeat(43)}` } },
+}), "write");
+assert.equal(workspaceToolRootLockMode({
+  method: "tools/call",
+  params: { name: "write_stdin", arguments: { receipt: `wctx3.${"A".repeat(43)}`, sessionId: 1 } },
+}), "read");
+assert.equal(workspaceToolRootLockMode({
+  method: "tools/call",
+  params: {
+    name: "write_stdin",
+    arguments: { receipt: `wctx3.${"A".repeat(43)}`, sessionId: 1, chars: "input" },
+  },
+}), "write");
+assert.deepEqual(requiredOAuthScopesForTool("read"), ["workspace:read"]);
+assert.deepEqual(requiredOAuthScopesForTool("get_operation_status"), ["workspace:read"]);
+assert.deepEqual(requiredOAuthScopesForTool("exec_command"), [
+  "workspace:read",
+  "workspace:write",
+  "process:execute",
+  "network:access",
+]);
+assert.deepEqual(requiredOAuthScopesForTool("read_process_output"), [
+  "workspace:read",
+  "process:execute",
+]);
+assert.deepEqual(requiredOAuthScopesForTool("show_changes"), [
+  "workspace:read",
+  "workspace:write",
+]);
+assert.deepEqual(requiredOAuthScopesForToolCall({
+  method: "tools/call",
+  params: { name: "write_stdin", arguments: { sessionId: 1 } },
+}), ["workspace:read", "process:execute"]);
+assert.deepEqual(requiredOAuthScopesForToolCall({
+  method: "tools/call",
+  params: { name: "write_stdin", arguments: { sessionId: 1, chars: "input" } },
+}), ["workspace:read", "process:execute", "workspace:write", "network:access"]);
+assert.deepEqual(requiredOAuthScopesForToolCall({
+  method: "tools/call",
+  params: {
+    name: "open_workspace",
+    arguments: { path: "/tmp/project", mode: "worktree" },
+  },
+}), ["workspace:read", "workspace:write", "worktree:create"]);
+assert.deepEqual(requiredOAuthScopesForTool("revoke_workspace"), ["workspace:revoke"]);
 assert.equal(workspaceOperationId({
   method: "tools/call",
   params: { name: "close_workspace", arguments: { workspaceId: "ws_test" } },
@@ -556,7 +624,7 @@ assert.equal(jsonRpcRequestId({ jsonrpc: "2.0", id: "call-1" }), "call-1");
 assert.equal(jsonRpcRequestId([{ jsonrpc: "2.0", id: 42 }]), null);
 assert.match(
   recoverableWorkspaceError(new UnknownWorkspaceError("ws_stale")) ?? "",
-  /^unknown_workspace: Call open_workspace/,
+  /^unknown_workspace: Call list_workspaces/,
 );
 assert.doesNotMatch(
   recoverableWorkspaceError(new UnknownWorkspaceError("ws_stale")) ?? "",

@@ -1,7 +1,7 @@
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
 
 export interface MutationOperationKey {
-  ownerClientId: string;
+  connectionPrincipalId: string;
   workspaceId: string;
   tool: string;
   operationId: string;
@@ -125,7 +125,7 @@ export class MutationOperationStore {
            where owner_client_id = ? and operation_id = ? and expires_at <= ?
              and result_json is not null`,
         )
-        .run(normalizedKey.ownerClientId, normalizedKey.operationId, nowTimestamp);
+        .run(normalizedKey.connectionPrincipalId, normalizedKey.operationId, nowTimestamp);
 
       const row = this.getRow(normalizedKey);
       if (row && !rowMatchesKey(row, normalizedKey)) return { status: "conflict" };
@@ -271,13 +271,13 @@ export class MutationOperationStore {
   }
 
   getOperationStatus(
-    ownerClientId: string,
+    connectionPrincipalId: string,
     operationId: string,
   ): MutationOperationStatus | undefined {
     this.assertOpen();
-    const normalizedOwnerClientId = boundedNonEmptyString(
-      ownerClientId,
-      "ownerClientId",
+    const normalizedConnectionPrincipalId = boundedNonEmptyString(
+      connectionPrincipalId,
+      "connectionPrincipalId",
       MAX_KEY_PART_LENGTH,
     );
     const normalizedOperationId = boundedNonEmptyString(
@@ -290,7 +290,7 @@ export class MutationOperationStore {
       set result_json = null
       where owner_client_id = ? and operation_id = ? and expires_at <= ?
         and result_json is not null
-    `).run(normalizedOwnerClientId, normalizedOperationId, timestampFromMs(this.currentTime()));
+    `).run(normalizedConnectionPrincipalId, normalizedOperationId, timestampFromMs(this.currentTime()));
     const row = this.database.sqlite.prepare(`
       select
         operation_id as operationId,
@@ -304,7 +304,7 @@ export class MutationOperationStore {
         case when state = 'settled' and result_json is not null then 1 else 0 end as resultAvailable
       from mutation_operations
       where owner_client_id = ? and operation_id = ?
-    `).get(normalizedOwnerClientId, normalizedOperationId) as
+    `).get(normalizedConnectionPrincipalId, normalizedOperationId) as
       | Omit<MutationOperationStatus, "resultAvailable"> & { resultAvailable: 0 | 1 }
       | undefined;
     return row ? { ...row, resultAvailable: row.resultAvailable === 1 } : undefined;
@@ -357,7 +357,7 @@ export class MutationOperationStore {
          from mutation_operations
          where owner_client_id = ? and operation_id = ?`,
       )
-      .get(key.ownerClientId, key.operationId) as MutationOperationRow | undefined;
+      .get(key.connectionPrincipalId, key.operationId) as MutationOperationRow | undefined;
   }
 
   private getWorkspaceGeneration(key: MutationOperationKey): number | undefined {
@@ -365,7 +365,7 @@ export class MutationOperationStore {
       select state_generation as stateGeneration
       from workspace_sessions
       where id = ? and owner_client_id = ?
-    `).get(key.workspaceId, key.ownerClientId) as { stateGeneration: number } | undefined;
+    `).get(key.workspaceId, key.connectionPrincipalId) as { stateGeneration: number } | undefined;
     return row?.stateGeneration;
   }
 
@@ -396,7 +396,11 @@ export class MutationOperationStore {
 function validateKey(key: MutationOperationKey): MutationOperationKey {
   if (!key || typeof key !== "object") throw new TypeError("key must be an object");
   return {
-    ownerClientId: boundedNonEmptyString(key.ownerClientId, "ownerClientId", MAX_KEY_PART_LENGTH),
+    connectionPrincipalId: boundedNonEmptyString(
+      key.connectionPrincipalId,
+      "connectionPrincipalId",
+      MAX_KEY_PART_LENGTH,
+    ),
     workspaceId: boundedNonEmptyString(key.workspaceId, "workspaceId", MAX_KEY_PART_LENGTH),
     tool: boundedNonEmptyString(key.tool, "tool", MAX_TOOL_LENGTH),
     operationId: boundedNonEmptyString(key.operationId, "operationId", MAX_KEY_PART_LENGTH),
@@ -404,7 +408,7 @@ function validateKey(key: MutationOperationKey): MutationOperationKey {
 }
 
 function keyValues(key: MutationOperationKey): [string, string, string, string] {
-  return [key.ownerClientId, key.workspaceId, key.tool, key.operationId];
+  return [key.connectionPrincipalId, key.workspaceId, key.tool, key.operationId];
 }
 
 function rowMatchesKey(row: MutationOperationRow, key: MutationOperationKey): boolean {

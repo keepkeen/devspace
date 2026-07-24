@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { platform, tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { promisify } from "node:util";
@@ -15,7 +15,9 @@ import {
   InstructionBudgetError,
   UnknownWorkspaceError,
   WorkspaceQuotaError,
+  WorkspaceRecoveryRequiredError,
   WorkspaceRegistry,
+  WorkspaceSelectionRequiredError,
 } from "./workspaces.js";
 import { formatPathForPrompt } from "./skills.js";
 
@@ -23,7 +25,7 @@ const execFileAsync = promisify(execFile);
 const root = await mkdtemp(join(tmpdir(), "devspace-workspace-test-"));
 const outsideRoot = await mkdtemp(join(tmpdir(), "devspace-workspace-outside-test-"));
 const canonicalRoot = await realpath(root);
-const ownerClientId = "client-a";
+const connectionPrincipalId = "client-a";
 
 assert.equal(
   new UnknownWorkspaceError("ws_old").message,
@@ -101,8 +103,8 @@ try {
   });
   const pendingRegistry = new WorkspaceRegistry(config);
   const [pendingCreator, pendingWaiter] = await Promise.all([
-    pendingRegistry.openWorkspace(ownerClientId, root),
-    pendingRegistry.openWorkspace(ownerClientId, root),
+    pendingRegistry.openWorkspace(connectionPrincipalId, root),
+    pendingRegistry.openWorkspace(connectionPrincipalId, root),
   ]);
   assert.equal(pendingCreator.workspace.id, pendingWaiter.workspace.id);
   assert.deepEqual(
@@ -113,12 +115,12 @@ try {
   const pendingAliasStore = new SqliteWorkspaceStore(join(root, ".pending-alias-state"));
   const pendingAliasRegistry = new WorkspaceRegistry(config, pendingAliasStore);
   const pendingAliasResults = await Promise.allSettled([
-    pendingAliasRegistry.openWorkspace(ownerClientId, {
+    pendingAliasRegistry.openWorkspace(connectionPrincipalId, {
       path: root,
       alias: "pending-alpha",
       writeAccess: "read_only",
     }),
-    pendingAliasRegistry.openWorkspace(ownerClientId, {
+    pendingAliasRegistry.openWorkspace(connectionPrincipalId, {
       path: root,
       alias: "pending-beta",
       writeAccess: "read_write",
@@ -141,12 +143,12 @@ try {
   const pendingAccessStore = new SqliteWorkspaceStore(join(root, ".pending-access-state"));
   const pendingAccessRegistry = new WorkspaceRegistry(config, pendingAccessStore);
   const [pendingReadOnly, pendingReadWrite] = await Promise.all([
-    pendingAccessRegistry.openWorkspace(ownerClientId, {
+    pendingAccessRegistry.openWorkspace(connectionPrincipalId, {
       path: root,
       alias: "pending-access",
       writeAccess: "read_only",
     }),
-    pendingAccessRegistry.openWorkspace(ownerClientId, {
+    pendingAccessRegistry.openWorkspace(connectionPrincipalId, {
       path: root,
       alias: "pending-access",
       writeAccess: "read_write",
@@ -166,20 +168,20 @@ try {
     availableAgentsFiles,
     instructionScan,
     reused,
-  } = await registry.openWorkspace(ownerClientId, root);
+  } = await registry.openWorkspace(connectionPrincipalId, root);
   assert.equal(reused, false);
   assert.match(instructionRevision, /^sha256-v1:[A-Za-z0-9_-]{43}$/);
   assert.match(skillRevision, /^sha256-v1:[A-Za-z0-9_-]{43}$/);
   const instructionContextId = registry.createInstructionContext(workspace);
   await registry.markAgentsFilesDelivered(workspace, instructionContextId, agentsFiles);
-  const sequentialCheckout = await registry.openWorkspace(ownerClientId, root);
+  const sequentialCheckout = await registry.openWorkspace(connectionPrincipalId, root);
   assert.equal(sequentialCheckout.reused, true);
   assert.equal(sequentialCheckout.instructionRevision, instructionRevision);
   assert.equal(sequentialCheckout.skillRevision, skillRevision);
   assert.equal(sequentialCheckout.workspace.id, workspace.id);
   const [concurrentCheckoutA, concurrentCheckoutB] = await Promise.all([
-    registry.openWorkspace(ownerClientId, root),
-    registry.openWorkspace(ownerClientId, root),
+    registry.openWorkspace(connectionPrincipalId, root),
+    registry.openWorkspace(connectionPrincipalId, root),
   ]);
   assert.equal(concurrentCheckoutA.workspace.id, workspace.id);
   assert.equal(concurrentCheckoutB.workspace.id, workspace.id);
@@ -190,20 +192,20 @@ try {
   assert.equal(otherOwnerCheckout.skillRevision, skillRevision);
 
   const generationRegistry = new WorkspaceRegistry({ ...config, allowedRoots: [root] });
-  const generationWorkspace = (await generationRegistry.openWorkspace(ownerClientId, root)).workspace;
+  const generationWorkspace = (await generationRegistry.openWorkspace(connectionPrincipalId, root)).workspace;
   const generationBeforeRootChange = generationWorkspace.stateGeneration;
   generationRegistry.applyAllowedRoots([root, outsideRoot]);
   assert.equal(generationWorkspace.stateGeneration, generationBeforeRootChange + 1);
   assert.throws(
     () => generationRegistry.getWorkspace(
-      ownerClientId,
+      connectionPrincipalId,
       generationWorkspace.id,
       generationBeforeRootChange,
     ),
     /generation is stale/,
   );
 
-  const rediscoveredSkills = await new WorkspaceRegistry(config).openWorkspace(ownerClientId, root);
+  const rediscoveredSkills = await new WorkspaceRegistry(config).openWorkspace(connectionPrincipalId, root);
   assert.equal(rediscoveredSkills.skillRevision, skillRevision);
 
   const emptySkillsProject = join(root, "empty-skills-project");
@@ -218,11 +220,11 @@ try {
     PORT: "1",
   });
   const emptySkillsOpen = await new WorkspaceRegistry(emptySkillsConfig)
-    .openWorkspace(ownerClientId, emptySkillsProject);
+    .openWorkspace(connectionPrincipalId, emptySkillsProject);
   const repeatedEmptySkillsOpen = await new WorkspaceRegistry(emptySkillsConfig)
-    .openWorkspace(ownerClientId, emptySkillsProject);
+    .openWorkspace(connectionPrincipalId, emptySkillsProject);
   const otherEmptySkillsOpen = await new WorkspaceRegistry(emptySkillsConfig)
-    .openWorkspace(ownerClientId, otherEmptySkillsProject);
+    .openWorkspace(connectionPrincipalId, otherEmptySkillsProject);
   assert.deepEqual(emptySkillsOpen.workspace.skills, []);
   assert.equal(repeatedEmptySkillsOpen.skillRevision, emptySkillsOpen.skillRevision);
   assert.notEqual(otherEmptySkillsOpen.skillRevision, emptySkillsOpen.skillRevision);
@@ -245,26 +247,26 @@ try {
     PORT: "1",
   });
   const initialSkillRevision = await new WorkspaceRegistry(skillRevisionConfig)
-    .openWorkspace(ownerClientId, emptySkillsProject);
+    .openWorkspace(connectionPrincipalId, emptySkillsProject);
   await writeFile(
     revisionSkillManifest,
     "---\nname: revision-skill\ndescription: Changed description.\n---\n",
   );
   const manifestChangedSkillRevision = await new WorkspaceRegistry(skillRevisionConfig)
-    .openWorkspace(ownerClientId, emptySkillsProject);
+    .openWorkspace(connectionPrincipalId, emptySkillsProject);
   assert.notEqual(manifestChangedSkillRevision.skillRevision, initialSkillRevision.skillRevision);
   await writeFile(revisionSkillMetadata, "policy:\n  allow_implicit_invocation: false\n");
   const policyChangedSkillRevision = await new WorkspaceRegistry(skillRevisionConfig)
-    .openWorkspace(ownerClientId, emptySkillsProject);
+    .openWorkspace(connectionPrincipalId, emptySkillsProject);
   assert.notEqual(policyChangedSkillRevision.skillRevision, manifestChangedSkillRevision.skillRevision);
 
   const residentSkillRegistry = new WorkspaceRegistry(skillRevisionConfig);
-  const residentSkillContext = await residentSkillRegistry.openWorkspace(ownerClientId, emptySkillsProject);
+  const residentSkillContext = await residentSkillRegistry.openWorkspace(connectionPrincipalId, emptySkillsProject);
   const residentRevisionSkill = residentSkillContext.workspace.skills.find(
     (skill) => skill.name === "revision-skill",
   )!;
   await residentSkillRegistry.loadSkill(
-    ownerClientId,
+    connectionPrincipalId,
     residentSkillContext.workspace.id,
     residentRevisionSkill.skillId,
   );
@@ -273,7 +275,7 @@ try {
     try {
       Date.now = () => 4_242_424_242;
       return await residentSkillRegistry.resumeWorkspace(
-        ownerClientId,
+        connectionPrincipalId,
         residentSkillContext.workspace.alias,
       );
     } finally {
@@ -290,7 +292,7 @@ try {
     "---\nname: revision-skill\ndescription: Resident refresh description.\n---\n",
   );
   const refreshedResidentContext = await residentSkillRegistry.resumeWorkspace(
-    ownerClientId,
+    connectionPrincipalId,
     residentSkillContext.workspace.alias,
   );
   assert.notEqual(refreshedResidentContext.skillRevision, residentSkillContext.skillRevision);
@@ -315,9 +317,9 @@ try {
     PORT: "1",
   });
   const revisionRegistry = new WorkspaceRegistry(revisionConfig);
-  const firstRevisionOpen = await revisionRegistry.openWorkspace(ownerClientId, revisionProject);
+  const firstRevisionOpen = await revisionRegistry.openWorkspace(connectionPrincipalId, revisionProject);
   await writeFile(revisionInstructionsPath, "revision two is different\n");
-  const secondRevisionOpen = await revisionRegistry.openWorkspace(ownerClientId, revisionProject);
+  const secondRevisionOpen = await revisionRegistry.openWorkspace(connectionPrincipalId, revisionProject);
   assert.notEqual(secondRevisionOpen.instructionRevision, firstRevisionOpen.instructionRevision);
   assert.deepEqual(secondRevisionOpen.agentsFiles.map((file) => file.content), ["revision two is different\n"]);
   const alternateRevisionInstructionsPath = join(root, "alternate-user-revision.md");
@@ -330,30 +332,30 @@ try {
     PORT: "1",
   });
   const alternateRevisionOpen = await new WorkspaceRegistry(alternateRevisionConfig)
-    .openWorkspace(ownerClientId, revisionProject);
+    .openWorkspace(connectionPrincipalId, revisionProject);
   assert.notEqual(alternateRevisionOpen.instructionRevision, secondRevisionOpen.instructionRevision);
 
   const hotReloadConfig = { ...config, allowedRoots: [root] };
   const hotReloadStore = new SqliteWorkspaceStore(join(root, ".hot-reload-state"));
   const hotReloadRegistry = new WorkspaceRegistry(hotReloadConfig, hotReloadStore);
-  const revokedWorkspace = (await hotReloadRegistry.openWorkspace(ownerClientId, root)).workspace;
+  const revokedWorkspace = (await hotReloadRegistry.openWorkspace(connectionPrincipalId, root)).workspace;
   assert.throws(() => hotReloadRegistry.applyAllowedRoots([]), /At least one allowed root/);
-  assert.equal(hotReloadRegistry.getWorkspace(ownerClientId, revokedWorkspace.id).id, revokedWorkspace.id);
+  assert.equal(hotReloadRegistry.getWorkspace(connectionPrincipalId, revokedWorkspace.id).id, revokedWorkspace.id);
   const hotReloadResult = hotReloadRegistry.applyAllowedRoots([outsideRoot]);
   assert.equal(hotReloadResult.changed, true);
   assert.equal(hotReloadResult.added, 1);
   assert.equal(hotReloadResult.removed, 1);
   assert.deepEqual(hotReloadResult.invalidated, [{
     workspaceId: revokedWorkspace.id,
-    ownerClientId,
+    connectionPrincipalId: connectionPrincipalId,
   }]);
-  assert.equal(hotReloadStore.getSession(revokedWorkspace.id, ownerClientId), undefined);
+  assert.equal(hotReloadStore.getSession(revokedWorkspace.id, connectionPrincipalId), undefined);
   assert.throws(
-    () => hotReloadRegistry.getWorkspace(ownerClientId, revokedWorkspace.id),
+    () => hotReloadRegistry.getWorkspace(connectionPrincipalId, revokedWorkspace.id),
     /workspace is no longer available/,
   );
   await assert.rejects(
-    hotReloadRegistry.openWorkspace(ownerClientId, root),
+    hotReloadRegistry.openWorkspace(connectionPrincipalId, root),
     (error: unknown) => {
       const message = error instanceof Error ? error.message : String(error);
       assert.match(message, /outside allowed roots/);
@@ -363,7 +365,7 @@ try {
       return true;
     },
   );
-  const addedWorkspace = await hotReloadRegistry.openWorkspace(ownerClientId, await realpath(outsideRoot));
+  const addedWorkspace = await hotReloadRegistry.openWorkspace(connectionPrincipalId, await realpath(outsideRoot));
   assert.equal(addedWorkspace.workspace.root, await realpath(outsideRoot));
   assert.equal(hotReloadRegistry.applyAllowedRoots([outsideRoot]).changed, false);
   hotReloadStore.close();
@@ -388,7 +390,7 @@ try {
 
   const retryStore = new SqliteWorkspaceStore(join(root, ".hot-reload-retry-state"));
   const retryRegistry = new WorkspaceRegistry({ ...config, allowedRoots: [root] }, retryStore);
-  const retryWorkspace = (await retryRegistry.openWorkspace(ownerClientId, root)).workspace;
+  const retryWorkspace = (await retryRegistry.openWorkspace(connectionPrincipalId, root)).workspace;
   const closeSessions = retryStore.closeSessions.bind(retryStore);
   let failCloseOnce = true;
   retryStore.closeSessions = (sessions) => {
@@ -402,7 +404,7 @@ try {
   assert.equal(failedRetry.persistenceFailures, 1);
   assert.deepEqual(failedRetry.invalidated, [{
     workspaceId: retryWorkspace.id,
-    ownerClientId,
+    connectionPrincipalId: connectionPrincipalId,
   }]);
   // Re-authorizing the root must not resurrect an ID whose revocation failed
   // to persist on the first attempt.
@@ -411,11 +413,11 @@ try {
   assert.equal(reconciledRetry.persistenceFailures, 0);
   assert.deepEqual(reconciledRetry.invalidated, [{
     workspaceId: retryWorkspace.id,
-    ownerClientId,
+    connectionPrincipalId: connectionPrincipalId,
   }]);
-  assert.equal(retryStore.getSession(retryWorkspace.id, ownerClientId), undefined);
+  assert.equal(retryStore.getSession(retryWorkspace.id, connectionPrincipalId), undefined);
   assert.throws(
-    () => retryRegistry.getWorkspace(ownerClientId, retryWorkspace.id),
+    () => retryRegistry.getWorkspace(connectionPrincipalId, retryWorkspace.id),
     /workspace is no longer available/,
   );
   retryStore.close();
@@ -423,7 +425,7 @@ try {
   const leasedHotReloadConfig = { ...config, allowedRoots: [root] };
   const leasedHotReloadRegistry = new WorkspaceRegistry(leasedHotReloadConfig);
   const leasedHotReloadWorkspace = (
-    await leasedHotReloadRegistry.openWorkspace(ownerClientId, root)
+    await leasedHotReloadRegistry.openWorkspace(connectionPrincipalId, root)
   ).workspace;
   let releaseHotReloadOperation!: () => void;
   let markHotReloadOperationStarted!: () => void;
@@ -434,7 +436,7 @@ try {
     releaseHotReloadOperation = resolveOperation;
   });
   const leasedHotReloadOperation = leasedHotReloadRegistry.withWorkspaceOperation(
-    ownerClientId,
+    connectionPrincipalId,
     leasedHotReloadWorkspace.id,
     leasedHotReloadWorkspace.stateGeneration,
     async () => {
@@ -446,14 +448,14 @@ try {
   await hotReloadOperationStarted;
   leasedHotReloadRegistry.applyAllowedRoots([outsideRoot]);
   assert.throws(
-    () => leasedHotReloadRegistry.getWorkspace(ownerClientId, leasedHotReloadWorkspace.id),
+    () => leasedHotReloadRegistry.getWorkspace(connectionPrincipalId, leasedHotReloadWorkspace.id),
     /workspace is no longer available/,
   );
   releaseHotReloadOperation();
   assert.equal(await leasedHotReloadOperation, "finished");
 
   const lifecycleRegistry = new WorkspaceRegistry(config);
-  const lifecycleWorkspace = (await lifecycleRegistry.openWorkspace(ownerClientId, root)).workspace;
+  const lifecycleWorkspace = (await lifecycleRegistry.openWorkspace(connectionPrincipalId, root)).workspace;
   let releaseOperation!: () => void;
   let operationStarted!: () => void;
   const operationStartedPromise = new Promise<void>((resolve) => {
@@ -463,7 +465,7 @@ try {
     releaseOperation = resolve;
   });
   const activeOperation = lifecycleRegistry.withWorkspaceOperation(
-    ownerClientId,
+    connectionPrincipalId,
     lifecycleWorkspace.id,
     lifecycleWorkspace.stateGeneration,
     async (leasedWorkspace) => {
@@ -473,10 +475,10 @@ try {
     },
   );
   await operationStartedPromise;
-  const exclusiveClosePromise = lifecycleRegistry.acquireExclusiveClose(ownerClientId, lifecycleWorkspace.id);
+  const exclusiveClosePromise = lifecycleRegistry.acquireExclusiveClose(connectionPrincipalId, lifecycleWorkspace.id);
   await assert.rejects(
     lifecycleRegistry.withWorkspaceOperation(
-      ownerClientId,
+      connectionPrincipalId,
       lifecycleWorkspace.id,
       lifecycleWorkspace.stateGeneration,
       () => undefined,
@@ -484,10 +486,10 @@ try {
     /is closing/,
   );
   await assert.rejects(
-    lifecycleRegistry.openWorkspace(ownerClientId, root),
+    lifecycleRegistry.openWorkspace(connectionPrincipalId, root),
     /is closing/,
   );
-  assert.deepEqual(lifecycleRegistry.usageSnapshot(ownerClientId), {
+  assert.deepEqual(lifecycleRegistry.usageSnapshot(connectionPrincipalId), {
     activePersisted: 1,
     resident: 1,
     closing: 1,
@@ -500,29 +502,29 @@ try {
   exclusiveClose.abort();
   assert.equal(
     await lifecycleRegistry.withWorkspaceOperation(
-      ownerClientId,
+      connectionPrincipalId,
       lifecycleWorkspace.id,
       lifecycleWorkspace.stateGeneration,
       (current) => current.id,
     ),
     lifecycleWorkspace.id,
   );
-  const committedClose = await lifecycleRegistry.acquireExclusiveClose(ownerClientId, lifecycleWorkspace.id);
+  const committedClose = await lifecycleRegistry.acquireExclusiveClose(connectionPrincipalId, lifecycleWorkspace.id);
   assert.equal(committedClose.commit(), true);
   assert.throws(
-    () => lifecycleRegistry.getWorkspace(ownerClientId, lifecycleWorkspace.id),
+    () => lifecycleRegistry.getWorkspace(connectionPrincipalId, lifecycleWorkspace.id),
     /workspace is no longer available/,
   );
   const leaseDeleteStore = new SqliteWorkspaceStore(join(root, ".lease-delete-state"));
   const leaseDeleteRegistry = new WorkspaceRegistry(config, leaseDeleteStore);
-  const leaseDeleteWorkspace = (await leaseDeleteRegistry.openWorkspace(ownerClientId, root)).workspace;
-  const deleteLease = await leaseDeleteRegistry.acquireExclusiveClose(ownerClientId, leaseDeleteWorkspace.id);
+  const leaseDeleteWorkspace = (await leaseDeleteRegistry.openWorkspace(connectionPrincipalId, root)).workspace;
+  const deleteLease = await leaseDeleteRegistry.acquireExclusiveClose(connectionPrincipalId, leaseDeleteWorkspace.id);
   await assert.rejects(
-    leaseDeleteRegistry.openWorkspace(ownerClientId, root),
+    leaseDeleteRegistry.openWorkspace(connectionPrincipalId, root),
     /is closing/,
   );
   assert.equal(deleteLease.commit({ delete: true }), true);
-  assert.equal(leaseDeleteStore.deleteSession(leaseDeleteWorkspace.id, ownerClientId), false);
+  assert.equal(leaseDeleteStore.deleteSession(leaseDeleteWorkspace.id, connectionPrincipalId), false);
   leaseDeleteStore.close();
 
   assert.equal(workspace.mode, "checkout");
@@ -556,13 +558,13 @@ try {
     /must be loaded before its files can be read/i,
   );
   const loadedWorkspaceSkill = await registry.loadSkill(
-    ownerClientId,
+    connectionPrincipalId,
     workspace.id,
     workspaceSkill.skillId,
   );
   assert.equal(loadedWorkspaceSkill.skill.skillId, workspaceSkill.skillId);
   assert.match(loadedWorkspaceSkill.content, /workspace-skill/);
-  const skillActivatedWorkspace = registry.getWorkspace(ownerClientId, workspace.id);
+  const skillActivatedWorkspace = registry.getWorkspace(connectionPrincipalId, workspace.id);
   const workspaceSkillRead = registry.resolveReadPath(skillActivatedWorkspace, promptedSkillPath);
   assert.equal(workspaceSkillRead.skillRead?.isSkillFile, true);
   assert.equal(workspaceSkillRead.absolutePath, workspaceSkill.filePath);
@@ -593,13 +595,13 @@ try {
     "---\nname: mutable-skill\ndescription: Changed after discovery.\n---\n",
   );
   await assert.rejects(
-    registry.loadSkill(ownerClientId, workspace.id, mutableSkill.skillId),
+    registry.loadSkill(connectionPrincipalId, workspace.id, mutableSkill.skillId),
     (error: unknown) =>
       error instanceof Error && "code" in error && error.code === "skill_manifest_changed",
   );
   await writeFile(mutableSkillManifest, "x".repeat(70_000));
   await assert.rejects(
-    registry.loadSkill(ownerClientId, workspace.id, mutableSkill.skillId),
+    registry.loadSkill(connectionPrincipalId, workspace.id, mutableSkill.skillId),
     (error: unknown) =>
       error instanceof Error && "code" in error && error.code === "skill_too_large",
   );
@@ -616,7 +618,7 @@ try {
     "interface:\n  display_name: After discovery\npolicy:\n  allow_implicit_invocation: true\n",
   );
   await assert.rejects(
-    registry.loadSkill(ownerClientId, workspace.id, mutableMetadataSkill.skillId),
+    registry.loadSkill(connectionPrincipalId, workspace.id, mutableMetadataSkill.skillId),
     (error: unknown) =>
       error instanceof Error && "code" in error && error.code === "skill_metadata_changed",
   );
@@ -672,7 +674,7 @@ try {
     PORT: "1",
   });
   const fallbackRegistry = new WorkspaceRegistry(fallbackConfig);
-  const fallbackOpen = await fallbackRegistry.openWorkspace(ownerClientId, fallbackProject);
+  const fallbackOpen = await fallbackRegistry.openWorkspace(connectionPrincipalId, fallbackProject);
   const fallbackInstructionContextId = fallbackRegistry.createInstructionContext(
     fallbackOpen.workspace,
   );
@@ -703,7 +705,7 @@ try {
     }],
   );
   await rm(join(fallbackProject, "AGENTS.override.md"));
-  const fallbackWithoutOverride = await fallbackRegistry.openWorkspace(ownerClientId, fallbackProject);
+  const fallbackWithoutOverride = await fallbackRegistry.openWorkspace(connectionPrincipalId, fallbackProject);
   assert.deepEqual(
     fallbackWithoutOverride.agentsFiles
       .filter((file) => file.path.startsWith(canonicalFallbackProject))
@@ -711,7 +713,7 @@ try {
     ["root ordinary instructions\n"],
   );
   await rm(join(fallbackProject, "AGENTS.md"));
-  const fallbackOnly = await fallbackRegistry.openWorkspace(ownerClientId, fallbackProject);
+  const fallbackOnly = await fallbackRegistry.openWorkspace(connectionPrincipalId, fallbackProject);
   assert.deepEqual(
     fallbackOnly.agentsFiles
       .filter((file) => file.path.startsWith(canonicalFallbackProject))
@@ -737,7 +739,7 @@ try {
     PORT: "1",
   });
   const emptyGlobalOpen = await new WorkspaceRegistry(emptyGlobalConfig).openWorkspace(
-    ownerClientId,
+    connectionPrincipalId,
     emptyGlobalProject,
   );
   const canonicalEmptyGlobalAgentDir = await realpath(emptyGlobalAgentDir);
@@ -776,7 +778,7 @@ try {
     PORT: "1",
   });
   const budgetRegistry = new WorkspaceRegistry(budgetConfig);
-  const exactBudgetOpen = await budgetRegistry.openWorkspace(ownerClientId, exactBudgetProject);
+  const exactBudgetOpen = await budgetRegistry.openWorkspace(connectionPrincipalId, exactBudgetProject);
   assert.equal(
     exactBudgetOpen.agentsFiles.reduce(
       (bytes, file) => bytes + Buffer.byteLength(file.content, "utf8"),
@@ -785,7 +787,7 @@ try {
     MAX_PROJECT_INSTRUCTION_BYTES,
   );
   await assert.rejects(
-    budgetRegistry.openWorkspace(ownerClientId, beyondBudgetProject),
+    budgetRegistry.openWorkspace(connectionPrincipalId, beyondBudgetProject),
     new RegExp(`instruction chain exceeds the ${MAX_PROJECT_INSTRUCTION_BYTES}-byte UTF-8 limit`),
   );
 
@@ -797,7 +799,7 @@ try {
   );
   await writeFile(join(nestedBudgetProject, "AGENTS.md"), nestedRootContent);
   await writeFile(join(nestedBudgetProject, "nested", "AGENTS.md"), nestedContent);
-  const nestedBudgetOpen = await budgetRegistry.openWorkspace(ownerClientId, nestedBudgetProject);
+  const nestedBudgetOpen = await budgetRegistry.openWorkspace(connectionPrincipalId, nestedBudgetProject);
   const nestedBudgetContextId = budgetRegistry.createInstructionContext(
     nestedBudgetOpen.workspace,
   );
@@ -915,7 +917,7 @@ try {
     registry.acknowledgeInstructions(workspace, instructionContextId, instructionToken),
     /instruction token is no longer valid/,
   );
-  const currentWorkspace = registry.getWorkspace(ownerClientId, workspace.id);
+  const currentWorkspace = registry.getWorkspace(connectionPrincipalId, workspace.id);
   const expiringToken = await registry.createInstructionAcknowledgement(
     currentWorkspace,
     instructionContextId,
@@ -1018,7 +1020,7 @@ try {
       DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
       PORT: "1",
     });
-    const unsafeWorkspace = await new WorkspaceRegistry(unsafeConfig).openWorkspace(ownerClientId, root);
+    const unsafeWorkspace = await new WorkspaceRegistry(unsafeConfig).openWorkspace(connectionPrincipalId, root);
     assert.deepEqual(
       unsafeWorkspace.agentsFiles.map((file) => file.content),
       ["root instructions\n"],
@@ -1034,7 +1036,7 @@ try {
       PORT: "1",
     });
     const skillOnlyAgentDirOpen = await new WorkspaceRegistry(skillOnlyAgentDirConfig)
-      .openWorkspace(ownerClientId, skillOnlyAgentDirProject);
+      .openWorkspace(connectionPrincipalId, skillOnlyAgentDirProject);
     assert.deepEqual(skillOnlyAgentDirOpen.agentsFiles, []);
 
     const missingInstructionsConfig = loadConfig({
@@ -1045,7 +1047,7 @@ try {
       PORT: "1",
     });
     await assert.rejects(
-      new WorkspaceRegistry(missingInstructionsConfig).openWorkspace(ownerClientId, root),
+      new WorkspaceRegistry(missingInstructionsConfig).openWorkspace(connectionPrincipalId, root),
       /ENOENT/,
     );
     const directoryInstructionsConfig = loadConfig({
@@ -1056,7 +1058,7 @@ try {
       PORT: "1",
     });
     await assert.rejects(
-      new WorkspaceRegistry(directoryInstructionsConfig).openWorkspace(ownerClientId, root),
+      new WorkspaceRegistry(directoryInstructionsConfig).openWorkspace(connectionPrincipalId, root),
       /must be a file/,
     );
 
@@ -1069,7 +1071,7 @@ try {
   }
 
   const missingWorkspaceRoot = join(root, "missing", "workspace");
-  const missingWorkspace = await registry.openWorkspace(ownerClientId, missingWorkspaceRoot);
+  const missingWorkspace = await registry.openWorkspace(connectionPrincipalId, missingWorkspaceRoot);
   assert.equal(missingWorkspace.workspace.root, await realpath(missingWorkspaceRoot));
   assert.equal(missingWorkspace.workspace.mode, "checkout");
   assert.equal((await stat(missingWorkspaceRoot)).isDirectory(), true);
@@ -1090,7 +1092,7 @@ try {
   }
 
   await assert.rejects(
-    () => registry.openWorkspace(ownerClientId, { path: root, mode: "worktree" }),
+    () => registry.openWorkspace(connectionPrincipalId, { path: root, mode: "worktree" }),
     (error: unknown) =>
       error instanceof GitWorktreeError && error.code === "GIT_REPOSITORY_NOT_FOUND",
   );
@@ -1106,7 +1108,7 @@ try {
   await git(gitRoot, ["commit", "-m", "Initial commit"]);
   await writeFile(join(gitRoot, "dirty.txt"), "not copied\n");
 
-  const worktreeWorkspace = await registry.openWorkspace(ownerClientId, {
+  const worktreeWorkspace = await registry.openWorkspace(connectionPrincipalId, {
     path: gitRoot,
     mode: "worktree",
   });
@@ -1117,9 +1119,38 @@ try {
   assert.equal(worktreeWorkspace.workspace.worktree?.baseRef, "HEAD");
   assert.equal(worktreeWorkspace.workspace.worktree?.dirtySource, true);
   assert.equal(worktreeWorkspace.workspace.worktree?.managed, true);
+  assert.equal(worktreeWorkspace.workspace.alias, "git-project");
   assert.equal((await stat(worktreeWorkspace.workspace.root)).isDirectory(), true);
   assert.match(worktreeWorkspace.agentsFiles.map((file) => file.content).join("\n"), /global override instructions/);
   assert.match(worktreeWorkspace.agentsFiles.map((file) => file.content).join("\n"), /git root instructions/);
+
+  await writeFile(join(gitRoot, "head-advanced.txt"), "new source commit\n");
+  await git(gitRoot, ["add", "head-advanced.txt"]);
+  await git(gitRoot, ["commit", "-m", "Advance source head"]);
+  const reopenedAfterHeadMove = await registry.openWorkspace(connectionPrincipalId, {
+    path: gitRoot,
+    mode: "worktree",
+  });
+  assert.equal(reopenedAfterHeadMove.workspace.id, worktreeWorkspace.workspace.id);
+  assert.equal(reopenedAfterHeadMove.workspace.alias, worktreeWorkspace.workspace.alias);
+
+  const secondConversationWorktree = await registry.openWorkspace(connectionPrincipalId, {
+    path: gitRoot,
+    mode: "worktree",
+    alias: "git-project-second",
+    forceNew: true,
+  });
+  assert.notEqual(secondConversationWorktree.workspace.id, worktreeWorkspace.workspace.id);
+  await writeFile(join(gitRoot, "head-advanced-again.txt"), "another source commit\n");
+  await git(gitRoot, ["add", "head-advanced-again.txt"]);
+  await git(gitRoot, ["commit", "-m", "Advance source head again"]);
+  await assert.rejects(
+    registry.openWorkspace(connectionPrincipalId, { path: gitRoot, mode: "worktree" }),
+    (error: unknown) =>
+      error instanceof WorkspaceSelectionRequiredError &&
+      error.aliases.includes("git-project") &&
+      error.aliases.includes("git-project-second"),
+  );
 
   const cappedConfig = loadConfig({
     DEVSPACE_CONFIG_DIR: join(root, ".devspace-capped-home"),
@@ -1133,8 +1164,8 @@ try {
   const cappedStore = new SqliteWorkspaceStore(join(root, ".capped-state"));
   const cappedRegistry = new WorkspaceRegistry(cappedConfig, cappedStore);
   const concurrentWorktrees = await Promise.allSettled([
-    cappedRegistry.openWorkspace(ownerClientId, { path: gitRoot, mode: "worktree" }),
-    cappedRegistry.openWorkspace(ownerClientId, { path: gitRoot, mode: "worktree" }),
+    cappedRegistry.openWorkspace(connectionPrincipalId, { path: gitRoot, mode: "worktree" }),
+    cappedRegistry.openWorkspace(connectionPrincipalId, { path: gitRoot, mode: "worktree" }),
   ]);
   assert.equal(concurrentWorktrees.filter((result) => result.status === "fulfilled").length, 2);
   const cappedContexts = concurrentWorktrees.map((result) => {
@@ -1143,22 +1174,75 @@ try {
   });
   assert.equal(cappedContexts[0]!.workspace.id, cappedContexts[1]!.workspace.id);
   const cappedWorkspace = cappedContexts[0]!.workspace;
+  await writeFile(join(cappedWorkspace.root, "recoverable-commit.txt"), "persisted commit\n");
+  await git(cappedWorkspace.root, ["add", "recoverable-commit.txt"]);
+  await git(cappedWorkspace.root, ["commit", "-m", "Persist worktree state"]);
+  const recoverableHead = (await execFileAsync(
+    "git",
+    ["rev-parse", "HEAD"],
+    { cwd: cappedWorkspace.root },
+  )).stdout.trim();
+  let releaseRecoveryOperation!: () => void;
+  let markRecoveryOperationStarted!: () => void;
+  const recoveryOperationBarrier = new Promise<void>((resolve) => {
+    releaseRecoveryOperation = resolve;
+  });
+  const recoveryOperationStarted = new Promise<void>((resolve) => {
+    markRecoveryOperationStarted = resolve;
+  });
+  const activeRecoveryOperation = cappedRegistry.withWorkspaceOperation(
+    connectionPrincipalId,
+    cappedWorkspace.id,
+    cappedWorkspace.stateGeneration,
+    async () => {
+      markRecoveryOperationStarted();
+      await recoveryOperationBarrier;
+    },
+    "write",
+  );
+  await recoveryOperationStarted;
   await assert.rejects(
-    cappedRegistry.openWorkspace(ownerClientId, { path: gitRoot, mode: "worktree", forceNew: true }),
+    cappedRegistry.openWorkspace(connectionPrincipalId, { path: gitRoot, mode: "worktree", forceNew: true }),
     /Managed worktree limit reached/,
   );
-  const cappedRemoval = await removeManagedWorktree({
-    sourceRoot: gitRoot,
-    worktreePath: cappedWorkspace.root,
-    config: cappedConfig,
-  });
-  assert.equal(cappedRemoval.removed, true);
-  assert.equal(
-    cappedRegistry.listWorkspaces(ownerClientId).some((summary) => summary.alias === cappedWorkspace.alias),
-    false,
+  await rm(cappedConfig.worktreeRoot, { recursive: true, force: true });
+  const recoverableSummary = cappedRegistry.listWorkspaces(connectionPrincipalId)
+    .find((summary) => summary.alias === cappedWorkspace.alias);
+  assert.equal(recoverableSummary?.hydrationStatus, "recovery_required");
+  await assert.rejects(
+    cappedRegistry.resumeWorkspace(connectionPrincipalId, cappedWorkspace.alias),
+    (error: unknown) => error instanceof WorkspaceRecoveryRequiredError,
   );
+  releaseRecoveryOperation();
+  await activeRecoveryOperation;
+  assert.equal(cappedStore.countManagedWorktrees(), 1);
+  const recoveredCapped = await cappedRegistry.resumeWorkspace(
+    connectionPrincipalId,
+    cappedWorkspace.alias,
+  );
+  assert.equal(recoveredCapped.workspace.id, cappedWorkspace.id);
+  assert.equal(recoveredCapped.workspace.alias, cappedWorkspace.alias);
+  assert.deepEqual(recoveredCapped.recovery, {
+    kind: "managed_worktree_recreated",
+    dataLossPossible: true,
+  });
+  assert.equal((await stat(recoveredCapped.workspace.root)).isDirectory(), true);
+  assert.equal(
+    await readFile(join(recoveredCapped.workspace.root, "recoverable-commit.txt"), "utf8"),
+    "persisted commit\n",
+  );
+  assert.equal(recoveredCapped.workspace.worktree?.baseSha, recoverableHead);
+  assert.equal(
+    cappedStore.getSession(cappedWorkspace.id, connectionPrincipalId)?.baseSha,
+    recoverableHead,
+  );
+  assert.equal((await removeManagedWorktree({
+    sourceRoot: gitRoot,
+    worktreePath: recoveredCapped.workspace.root,
+    config: cappedConfig,
+  })).removed, true);
+  assert.equal(cappedRegistry.deleteWorkspace(connectionPrincipalId, cappedWorkspace.id), true);
   assert.equal(cappedStore.countManagedWorktrees(), 0);
-  assert.equal(cappedRegistry.deleteWorkspace(ownerClientId, cappedWorkspace.id), true);
   cappedStore.close();
 
   const worktreesBeforeRollback = (await execFileAsync("git", ["worktree", "list", "--porcelain"], { cwd: gitRoot })).stdout;
@@ -1175,7 +1259,7 @@ try {
     isReady: () => true,
   };
   await assert.rejects(
-    new WorkspaceRegistry(config, failingStore).openWorkspace(ownerClientId, {
+    new WorkspaceRegistry(config, failingStore).openWorkspace(connectionPrincipalId, {
       path: gitRoot,
       mode: "worktree",
     }),
@@ -1186,7 +1270,7 @@ try {
 
   const hydrationSession = {
     id: "ws-hydration-race",
-    ownerClientId,
+    connectionPrincipalId,
     alias: "hydration-race",
     root: canonicalRoot,
     status: "active" as const,
@@ -1205,7 +1289,7 @@ try {
     getActiveSessionByAlias: (_owner, alias) => hydrationActive && alias === hydrationSession.alias
       ? { ...hydrationSession }
       : undefined,
-    getSession: (id, owner) => hydrationActive && id === hydrationSession.id && owner === ownerClientId
+    getSession: (id, owner) => hydrationActive && id === hydrationSession.id && owner === connectionPrincipalId
       ? { ...hydrationSession }
       : undefined,
     bumpStateGeneration: () => {
@@ -1225,8 +1309,8 @@ try {
     isReady: () => true,
   };
   const hydrationRegistry = new WorkspaceRegistry(config, hydrationStore);
-  const reservedHydration = hydrationRegistry.resumeWorkspace(ownerClientId, hydrationSession.alias);
-  assert.equal(hydrationRegistry.usageSnapshot(ownerClientId).leased, 1);
+  const reservedHydration = hydrationRegistry.resumeWorkspace(connectionPrincipalId, hydrationSession.alias);
+  assert.equal(hydrationRegistry.usageSnapshot(connectionPrincipalId).leased, 1);
   assert.deepEqual(hydrationRegistry.closeExpiredSessions(-1, () => false), []);
   const hydratedContext = await reservedHydration;
   assert.equal(hydratedContext.workspace.id, hydrationSession.id);
@@ -1244,7 +1328,7 @@ try {
     getActiveSessionByAlias: (_owner, alias) => disappearingActive && alias === disappearingSession.alias
       ? { ...disappearingSession }
       : undefined,
-    getSession: (id, owner) => disappearingActive && id === disappearingSession.id && owner === ownerClientId
+    getSession: (id, owner) => disappearingActive && id === disappearingSession.id && owner === connectionPrincipalId
       ? { ...disappearingSession }
       : undefined,
     bumpStateGeneration: () => {
@@ -1256,13 +1340,13 @@ try {
   };
   const disappearingRegistry = new WorkspaceRegistry(config, disappearingStore);
   const disappearingHydration = disappearingRegistry.resumeWorkspace(
-    ownerClientId,
+    connectionPrincipalId,
     disappearingSession.alias,
   );
   disappearingActive = false;
   await assert.rejects(disappearingHydration, /workspace alias is unavailable/);
-  assert.equal(disappearingRegistry.usageSnapshot(ownerClientId).resident, 0);
-  assert.equal(disappearingRegistry.usageSnapshot(ownerClientId).leased, 0);
+  assert.equal(disappearingRegistry.usageSnapshot(connectionPrincipalId).resident, 0);
+  assert.equal(disappearingRegistry.usageSnapshot(connectionPrincipalId).leased, 0);
 
   const worktreeReadmePath = registry.resolvePath(worktreeWorkspace.workspace, "README.md");
   assert.equal(worktreeReadmePath.startsWith(worktreeWorkspace.workspace.root), true);
@@ -1270,23 +1354,23 @@ try {
   const stateDir = join(root, ".state");
   const firstStore = new SqliteWorkspaceStore(stateDir);
   const persistentRegistry = new WorkspaceRegistry(config, firstStore);
-  const persistentWorkspace = await persistentRegistry.openWorkspace(ownerClientId, root);
-  const persistentWorktree = await persistentRegistry.openWorkspace(ownerClientId, {
+  const persistentWorkspace = await persistentRegistry.openWorkspace(connectionPrincipalId, root);
+  const persistentWorktree = await persistentRegistry.openWorkspace(connectionPrincipalId, {
     path: gitRoot,
     mode: "worktree",
   });
   assert.notEqual(persistentWorktree.workspace.id, worktreeWorkspace.workspace.id);
-  const reusedPersistentWorktree = await persistentRegistry.openWorkspace(ownerClientId, {
+  const reusedPersistentWorktree = await persistentRegistry.openWorkspace(connectionPrincipalId, {
     path: join(gitRoot, "."),
     mode: "worktree",
   });
   assert.equal(reusedPersistentWorktree.workspace.id, persistentWorktree.workspace.id);
   assert.equal(reusedPersistentWorktree.reused, true);
-  const repeatedPersistentWorkspace = await persistentRegistry.openWorkspace(ownerClientId, root);
+  const repeatedPersistentWorkspace = await persistentRegistry.openWorkspace(connectionPrincipalId, root);
   assert.equal(repeatedPersistentWorkspace.workspace.id, persistentWorkspace.workspace.id);
   assert.equal(persistentWorkspace.workspace.writeAccess, "read_only");
   const readOnlyGeneration = persistentWorkspace.workspace.stateGeneration;
-  const writablePersistentWorkspace = await persistentRegistry.openWorkspace(ownerClientId, {
+  const writablePersistentWorkspace = await persistentRegistry.openWorkspace(connectionPrincipalId, {
     path: root,
     writeAccess: "read_write",
   });
@@ -1294,13 +1378,13 @@ try {
   assert.equal(writablePersistentWorkspace.workspace.writeAccess, "read_write");
   assert.equal(writablePersistentWorkspace.workspace.stateGeneration, readOnlyGeneration + 1);
   assert.throws(
-    () => persistentRegistry.getWorkspace(ownerClientId, persistentWorkspace.workspace.id, readOnlyGeneration),
+    () => persistentRegistry.getWorkspace(connectionPrincipalId, persistentWorkspace.workspace.id, readOnlyGeneration),
     /generation is stale/,
   );
-  const preservedWritableWorkspace = await persistentRegistry.openWorkspace(ownerClientId, root);
+  const preservedWritableWorkspace = await persistentRegistry.openWorkspace(connectionPrincipalId, root);
   assert.equal(preservedWritableWorkspace.workspace.writeAccess, "read_write");
   assert.equal(preservedWritableWorkspace.workspace.stateGeneration, readOnlyGeneration + 1);
-  const downgradedPersistentWorkspace = await persistentRegistry.openWorkspace(ownerClientId, {
+  const downgradedPersistentWorkspace = await persistentRegistry.openWorkspace(connectionPrincipalId, {
     path: root,
     writeAccess: "read_only",
   });
@@ -1311,7 +1395,7 @@ try {
   activityDatabase.prepare("update workspace_sessions set last_used_at = ? where id = ?")
     .run("2026-01-01T00:00:00.000Z", persistentWorktree.workspace.id);
   persistentWorktree.workspace.lastUsedAt = 0;
-  const activeManagedReuse = await persistentRegistry.openWorkspace(ownerClientId, {
+  const activeManagedReuse = await persistentRegistry.openWorkspace(connectionPrincipalId, {
     path: gitRoot,
     mode: "worktree",
   });
@@ -1337,9 +1421,9 @@ try {
 
   const secondStore = new SqliteWorkspaceStore(stateDir);
   const restoredRegistry = new WorkspaceRegistry(config, secondStore);
-  const reopenedWorkspace = await restoredRegistry.openWorkspace(ownerClientId, root);
+  const reopenedWorkspace = await restoredRegistry.openWorkspace(connectionPrincipalId, root);
   assert.equal(reopenedWorkspace.workspace.id, persistentWorkspace.workspace.id);
-  const restoredWorkspace = restoredRegistry.getWorkspace(ownerClientId, persistentWorkspace.workspace.id);
+  const restoredWorkspace = restoredRegistry.getWorkspace(connectionPrincipalId, persistentWorkspace.workspace.id);
   assert.equal(restoredWorkspace.root, canonicalRoot);
   assert.equal(restoredWorkspace.mode, "checkout");
   assert.deepEqual(
@@ -1357,17 +1441,17 @@ try {
   assert.notEqual(persistedOtherOwner.workspace.id, persistentWorkspace.workspace.id);
   assert.equal(restoredRegistry.closeWorkspace("client-b", persistedOtherOwner.workspace.id), true);
   assert.throws(
-    () => restoredRegistry.getWorkspace(ownerClientId, persistentWorktree.workspace.id),
+    () => restoredRegistry.getWorkspace(connectionPrincipalId, persistentWorktree.workspace.id),
     /must be resumed before use/,
   );
   const worktreeAlias = persistentWorktree.workspace.alias;
-  const coldSummary = restoredRegistry.listWorkspaces(ownerClientId).find(
+  const coldSummary = restoredRegistry.listWorkspaces(connectionPrincipalId).find(
     (summary) => summary.alias === worktreeAlias,
   );
   assert.equal(coldSummary?.hydrationStatus, "requires_resume");
   assert.equal(coldSummary?.displayPath, `…/${basename(gitRoot)}`);
   assert.equal(coldSummary?.displayPath.includes("~"), false);
-  const resumedWorktree = await restoredRegistry.resumeWorkspace(ownerClientId, worktreeAlias);
+  const resumedWorktree = await restoredRegistry.resumeWorkspace(connectionPrincipalId, worktreeAlias);
   const restoredWorktree = resumedWorktree.workspace;
   assert.equal(restoredWorktree.mode, "worktree");
   assert.equal(restoredWorktree.sourceRoot, await realpath(gitRoot));
@@ -1380,13 +1464,13 @@ try {
     persistentWorktree.workspace.agentProfiles.map((profile) => profile.name),
   );
   assert.equal(restoredRegistry.closeWorkspace("client-b", persistentWorkspace.workspace.id), false);
-  assert.equal(restoredRegistry.closeWorkspace(ownerClientId, persistentWorkspace.workspace.id), true);
+  assert.equal(restoredRegistry.closeWorkspace(connectionPrincipalId, persistentWorkspace.workspace.id), true);
   assert.deepEqual(restoredRegistry.cleanupLifecycleState(Date.now() + 31 * 24 * 60 * 60_000), {
     expiredInstructionTokens: 0,
     deletedClosedWorkspaceSessions: 2,
   });
   assert.throws(
-    () => restoredRegistry.getWorkspace(ownerClientId, persistentWorkspace.workspace.id),
+    () => restoredRegistry.getWorkspace(connectionPrincipalId, persistentWorkspace.workspace.id),
     /workspace is no longer available/,
   );
   const removal = await removeManagedWorktree({
@@ -1395,7 +1479,7 @@ try {
     config,
   });
   assert.equal(removal.removed, true);
-  assert.equal(restoredRegistry.deleteWorkspace(ownerClientId, persistentWorktree.workspace.id), true);
+  assert.equal(restoredRegistry.deleteWorkspace(connectionPrincipalId, persistentWorktree.workspace.id), true);
   await assert.rejects(stat(restoredWorktree.root));
   const expired = restoredRegistry.closeExpiredSessions(-1, () => false);
   assert.deepEqual(expired, []);
@@ -1413,12 +1497,12 @@ try {
   });
   const expiryStore = new SqliteWorkspaceStore(expiryStateDir);
   const expiryRegistry = new WorkspaceRegistry(expiryConfig, expiryStore);
-  const dirtyExpiredWorktree = (await expiryRegistry.openWorkspace(ownerClientId, {
+  const dirtyExpiredWorktree = (await expiryRegistry.openWorkspace(connectionPrincipalId, {
     path: gitRoot,
     mode: "worktree",
   })).workspace;
   await writeFile(join(dirtyExpiredWorktree.root, "dirty-local.txt"), "preserve me\n");
-  const cleanExpiredWorktree = (await expiryRegistry.openWorkspace(ownerClientId, {
+  const cleanExpiredWorktree = (await expiryRegistry.openWorkspace(connectionPrincipalId, {
     path: gitRoot,
     mode: "worktree",
     forceNew: true,
@@ -1448,7 +1532,7 @@ try {
     worktreePath: dirtyExpiredWorktree.root,
     config: expiryConfig,
   })).removed, true);
-  assert.equal(expiryRegistry.deleteWorkspace(ownerClientId, dirtyExpiredWorktree.id), true);
+  assert.equal(expiryRegistry.deleteWorkspace(connectionPrincipalId, dirtyExpiredWorktree.id), true);
   expiryStore.close();
 
   const rotationStateDir = join(root, ".expiry-rotation-state");
@@ -1456,9 +1540,9 @@ try {
   const rotationRegistry = new WorkspaceRegistry(expiryConfig, rotationStore);
   for (let index = 0; index < 1_024; index += 1) {
     const id = `blocked-${String(index).padStart(4, "0")}`;
-    rotationStore.createSession({ id, ownerClientId, alias: id, root });
+    rotationStore.createSession({ id, connectionPrincipalId, alias: id, root });
   }
-  rotationStore.createSession({ id: "zz-clean", ownerClientId, alias: "zz-clean", root });
+  rotationStore.createSession({ id: "zz-clean", connectionPrincipalId, alias: "zz-clean", root });
   const rotationDatabase = new Database(databasePath(rotationStateDir));
   rotationDatabase.prepare("update workspace_sessions set last_used_at = ?")
     .run("2026-01-01T00:00:00.000Z");
@@ -1476,9 +1560,9 @@ try {
   const reopenStateDir = join(root, ".reopen-state");
   const reopenStore = new SqliteWorkspaceStore(reopenStateDir);
   const reopenRegistry = new WorkspaceRegistry(config, reopenStore);
-  const beforeClose = (await reopenRegistry.openWorkspace(ownerClientId, root)).workspace;
-  assert.equal(reopenRegistry.closeWorkspace(ownerClientId, beforeClose.id), true);
-  const afterReopen = (await reopenRegistry.openWorkspace(ownerClientId, root)).workspace;
+  const beforeClose = (await reopenRegistry.openWorkspace(connectionPrincipalId, root)).workspace;
+  assert.equal(reopenRegistry.closeWorkspace(connectionPrincipalId, beforeClose.id), true);
+  const afterReopen = (await reopenRegistry.openWorkspace(connectionPrincipalId, root)).workspace;
   assert.equal(afterReopen.id, beforeClose.id);
   assert.equal(afterReopen.stateGeneration, beforeClose.stateGeneration + 2);
   reopenStore.close();
@@ -1489,8 +1573,8 @@ try {
   const concurrentRegistryA = new WorkspaceRegistry(config, concurrentStoreA);
   const concurrentRegistryB = new WorkspaceRegistry(config, concurrentStoreB);
   const [storedConcurrentA, storedConcurrentB] = await Promise.all([
-    concurrentRegistryA.openWorkspace(ownerClientId, root),
-    concurrentRegistryB.openWorkspace(ownerClientId, root),
+    concurrentRegistryA.openWorkspace(connectionPrincipalId, root),
+    concurrentRegistryB.openWorkspace(connectionPrincipalId, root),
   ]);
   assert.equal(storedConcurrentA.workspace.id, storedConcurrentB.workspace.id);
   concurrentStoreA.close();
@@ -1510,6 +1594,11 @@ try {
       (2, 'oauth-state', '2026-01-01T00:00:00.000Z'),
       (3, 'local-agent-sessions', '2026-01-01T00:00:00.000Z'),
       (4, 'workspace-oauth-ownership', '2026-01-01T00:00:00.000Z');
+    create table oauth_clients (
+      client_id text primary key,
+      client_json text not null,
+      issued_at integer not null
+    );
     create table workspace_sessions (
       id text primary key,
       owner_client_id text not null default '__legacy_unowned__',
@@ -1550,7 +1639,7 @@ try {
   migratedLegacyDatabase.close();
   const migratedLegacyStore = new SqliteWorkspaceStore(legacyStateDir);
   const adoptedLegacy = await new WorkspaceRegistry(config, migratedLegacyStore).openWorkspace(
-    ownerClientId,
+    connectionPrincipalId,
     root,
   );
   assert.equal(adoptedLegacy.workspace.id, "ws_legacy");
@@ -1561,27 +1650,27 @@ try {
     const escapedCheckoutRoot = join(root, "escaped-checkout-root");
     await symlink(outsideRoot, escapedCheckoutRoot, "dir");
     await assert.rejects(
-      registry.openWorkspace(ownerClientId, escapedCheckoutRoot),
+      registry.openWorkspace(connectionPrincipalId, escapedCheckoutRoot),
       /Path is outside allowed roots/,
     );
     const escapedStateDir = join(root, ".escaped-checkout-state");
     const escapedStore = new SqliteWorkspaceStore(escapedStateDir);
     const escapedSession = escapedStore.createSession({
       id: "ws_escaped_checkout",
-      ownerClientId,
+      connectionPrincipalId,
       root: escapedCheckoutRoot,
       mode: "checkout",
     });
     assert.throws(
       () => new WorkspaceRegistry(config, escapedStore).getWorkspace(
-        ownerClientId,
+        connectionPrincipalId,
         "ws_escaped_checkout",
       ),
       /must be resumed before use/,
     );
     await assert.rejects(
       new WorkspaceRegistry(config, escapedStore).resumeWorkspace(
-        ownerClientId,
+        connectionPrincipalId,
         escapedSession.alias!,
       ),
       /workspace alias is unavailable/,
@@ -1598,13 +1687,13 @@ try {
       DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
       PORT: "1",
     });
-    const aliasWorkspace = await new WorkspaceRegistry(aliasConfig).openWorkspace(ownerClientId, {
+    const aliasWorkspace = await new WorkspaceRegistry(aliasConfig).openWorkspace(connectionPrincipalId, {
       path: join(aliasRoot, "git-project"),
       mode: "worktree",
     });
     assert.equal(aliasWorkspace.workspace.sourceRoot, await realpath(gitRoot));
 
-    const aliasCheckout = await new WorkspaceRegistry(aliasConfig).openWorkspace(ownerClientId, aliasRoot);
+    const aliasCheckout = await new WorkspaceRegistry(aliasConfig).openWorkspace(connectionPrincipalId, aliasRoot);
     assert.deepEqual(
       aliasCheckout.agentsFiles.map((file) => file.content),
       ["global override instructions\n", "root instructions\n"],
@@ -1612,19 +1701,19 @@ try {
 
     const aliasReuseStore = new SqliteWorkspaceStore(join(root, ".alias-reuse-state"));
     const aliasReuseRegistry = new WorkspaceRegistry(config, aliasReuseStore);
-    const realCheckout = await aliasReuseRegistry.openWorkspace(ownerClientId, root);
-    const aliasedCheckout = await aliasReuseRegistry.openWorkspace(ownerClientId, aliasRoot);
+    const realCheckout = await aliasReuseRegistry.openWorkspace(connectionPrincipalId, root);
+    const aliasedCheckout = await aliasReuseRegistry.openWorkspace(connectionPrincipalId, aliasRoot);
     assert.equal(aliasedCheckout.workspace.id, realCheckout.workspace.id);
     assert.equal(aliasedCheckout.skillRevision, realCheckout.skillRevision);
     aliasReuseStore.close();
     const restoredAliasStore = new SqliteWorkspaceStore(join(root, ".alias-reuse-state"));
     const restoredAliasRegistry = new WorkspaceRegistry(aliasConfig, restoredAliasStore);
     assert.throws(
-      () => restoredAliasRegistry.getWorkspace(ownerClientId, realCheckout.workspace.id),
+      () => restoredAliasRegistry.getWorkspace(connectionPrincipalId, realCheckout.workspace.id),
       /must be resumed before use/,
     );
     const restoredAlias = (
-      await restoredAliasRegistry.resumeWorkspace(ownerClientId, realCheckout.workspace.alias)
+      await restoredAliasRegistry.resumeWorkspace(connectionPrincipalId, realCheckout.workspace.alias)
     ).workspace;
     assert.equal(restoredAlias.root, canonicalRoot);
     restoredAliasStore.close();

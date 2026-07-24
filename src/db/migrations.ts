@@ -57,6 +57,21 @@ const migrations: Migration[] = [
     name: "oauth-revocation-cleanup",
     up: migrateOAuthRevocationCleanup,
   },
+  {
+    version: 11,
+    name: "connection-principals",
+    up: migrateConnectionPrincipals,
+  },
+  {
+    version: 12,
+    name: "oauth-authorization-limits",
+    up: migrateOAuthAuthorizationLimits,
+  },
+  {
+    version: 13,
+    name: "connection-principal-approval-lifecycle",
+    up: migrateConnectionPrincipalApprovalLifecycle,
+  },
 ];
 
 export function migrateDatabase(sqlite: Database.Database): void {
@@ -462,9 +477,152 @@ function migrateOAuthRevocationCleanup(sqlite: Database.Database): void {
   `);
 }
 
+function migrateConnectionPrincipals(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists connection_principals (
+      principal_id text primary key,
+      created_at text not null,
+      last_used_at text not null,
+      revoked_at text
+    );
+
+    create index if not exists connection_principals_last_used_idx
+      on connection_principals(last_used_at);
+
+    create table if not exists oauth_principal_reconnect_codes (
+      code_hash text primary key,
+      principal_id text not null,
+      created_at integer not null,
+      expires_at integer not null,
+      foreign key (principal_id)
+        references connection_principals(principal_id)
+        on delete cascade
+    );
+
+    create index if not exists oauth_principal_reconnect_codes_principal_idx
+      on oauth_principal_reconnect_codes(principal_id);
+
+    create index if not exists oauth_principal_reconnect_codes_expires_idx
+      on oauth_principal_reconnect_codes(expires_at);
+  `);
+
+  addColumnIfMissing(sqlite, "oauth_clients", "principal_id", "text");
+  const now = new Date().toISOString();
+  sqlite.prepare(`
+    insert into connection_principals (principal_id, created_at, last_used_at, revoked_at)
+    select client_id, @now, @now, null
+    from oauth_clients
+    where principal_id is null
+    on conflict(principal_id) do nothing
+  `).run({ now });
+  sqlite.prepare(`
+    update oauth_clients
+    set principal_id = client_id
+    where principal_id is null
+  `).run();
+
+  sqlite.exec(`
+    create index if not exists oauth_clients_principal_id_idx
+      on oauth_clients(principal_id);
+
+    create trigger if not exists oauth_clients_principal_insert_check
+      before insert on oauth_clients
+      when new.principal_id is not null
+        and not exists (
+          select 1 from connection_principals
+          where principal_id = new.principal_id and revoked_at is null
+        )
+      begin
+        select raise(abort, 'invalid connection principal');
+      end;
+
+    create trigger if not exists oauth_clients_principal_update_check
+      before update of principal_id on oauth_clients
+      when new.principal_id is not null
+        and not exists (
+          select 1 from connection_principals
+          where principal_id = new.principal_id and revoked_at is null
+        )
+      begin
+        select raise(abort, 'invalid connection principal');
+      end;
+
+    create trigger if not exists connection_principals_delete_check
+      before delete on connection_principals
+      when exists (
+        select 1 from oauth_clients where principal_id = old.principal_id
+      )
+      or exists (
+        select 1 from workspace_sessions where owner_client_id = old.principal_id
+      )
+      begin
+        select raise(abort, 'connection principal still has retained state');
+      end;
+  `);
+}
+
+function migrateOAuthAuthorizationLimits(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists oauth_authorization_limits (
+      key_hash text primary key,
+      scope text not null check (scope in ('session', 'client', 'ip', 'global')),
+      tokens integer not null check (tokens >= 0),
+      updated_at integer not null,
+      failure_streak integer not null check (failure_streak >= 0),
+      blocked_until integer not null,
+      expires_at integer not null
+    );
+
+    create index if not exists oauth_authorization_limits_expires_idx
+      on oauth_authorization_limits(expires_at);
+  `);
+}
+
+function migrateConnectionPrincipalApprovalLifecycle(sqlite: Database.Database): void {
+  sqlite.exec(`
+    drop trigger if exists oauth_clients_principal_insert_check;
+    drop trigger if exists oauth_clients_principal_update_check;
+    drop trigger if exists connection_principals_delete_check;
+
+    create trigger oauth_clients_principal_insert_check
+      before insert on oauth_clients
+      when new.principal_id is not null
+        and not exists (
+          select 1 from connection_principals
+          where principal_id = new.principal_id and revoked_at is null
+        )
+      begin
+        select raise(abort, 'invalid connection principal');
+      end;
+
+    create trigger oauth_clients_principal_update_check
+      before update of principal_id on oauth_clients
+      when new.principal_id is not null
+        and not exists (
+          select 1 from connection_principals
+          where principal_id = new.principal_id and revoked_at is null
+        )
+      begin
+        select raise(abort, 'invalid connection principal');
+      end;
+
+    create trigger connection_principals_delete_check
+      before delete on connection_principals
+      when exists (
+        select 1 from oauth_clients where principal_id = old.principal_id
+      )
+      or exists (
+        select 1 from workspace_sessions where owner_client_id = old.principal_id
+      )
+      begin
+        select raise(abort, 'connection principal still has retained state');
+      end;
+  `);
+}
+
 function addColumnIfMissing(
   sqlite: Database.Database,
-  table: "workspace_sessions" | "local_agent_sessions",
+  table: "workspace_sessions" | "local_agent_sessions" | "oauth_clients",
   column: string,
   definition: string,
 ): void {

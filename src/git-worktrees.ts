@@ -3,7 +3,7 @@ import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import { realpathSync, statSync } from "node:fs";
 import { mkdir, realpath, rm, stat } from "node:fs/promises";
-import { basename, join, relative, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import type { ServerConfig } from "./config.js";
 import { assertAllowedPath, isPathInsideRoot } from "./roots.js";
 
@@ -159,6 +159,77 @@ export async function createManagedWorktree(input: {
     detached: true,
     managed: true,
   };
+}
+
+export async function restoreManagedWorktree(input: {
+  sourceRoot: string;
+  worktreePath: string;
+  baseRef: string;
+  baseSha: string;
+  dirtySource: boolean;
+  config: ServerConfig;
+}): Promise<ManagedWorktree> {
+  const sourceRoot = await assertGitRootAllowed(input.sourceRoot, input.config.allowedRoots);
+  const worktreePath = assertAllowedPath(input.worktreePath, [input.config.worktreeRoot]);
+  const registeredHead = await registeredWorktreeHead(sourceRoot, worktreePath).catch(() => undefined);
+  const recoverySha = registeredHead ?? input.baseSha;
+  await mkdir(dirname(worktreePath), { recursive: true });
+  await git(["worktree", "prune"], sourceRoot).catch(() => undefined);
+  try {
+    await git(["worktree", "add", "--detach", worktreePath, recoverySha], sourceRoot);
+  } catch (error) {
+    await rm(worktreePath, { recursive: true, force: true });
+    const message = error instanceof Error ? error.message : String(error);
+    throw new GitWorktreeError(
+      "GIT_WORKTREE_CREATE_FAILED",
+      `Git failed to restore the managed worktree. ${message}`,
+    );
+  }
+  return {
+    sourceRoot,
+    path: worktreePath,
+    baseRef: input.baseRef,
+    baseSha: recoverySha,
+    dirtySource: input.dirtySource,
+    detached: true,
+    managed: true,
+  };
+}
+
+async function registeredWorktreeHead(
+  sourceRoot: string,
+  worktreePath: string,
+): Promise<string | undefined> {
+  const output = await git(["worktree", "list", "--porcelain"], sourceRoot);
+  const expected = await canonicalMissingPath(worktreePath);
+  for (const block of output.split(/\n\s*\n/gu)) {
+    let listedPath: string | undefined;
+    let head: string | undefined;
+    for (const line of block.split("\n")) {
+      if (line.startsWith("worktree ")) {
+        listedPath = await canonicalMissingPath(line.slice("worktree ".length));
+      }
+      else if (line.startsWith("HEAD ")) head = line.slice("HEAD ".length).trim();
+    }
+    if (listedPath === expected && /^[0-9a-f]{40,64}$/u.test(head ?? "")) return head;
+  }
+  return undefined;
+}
+
+async function canonicalMissingPath(path: string): Promise<string> {
+  const absolute = resolve(path);
+  const suffix: string[] = [basename(absolute)];
+  let ancestor = dirname(absolute);
+  for (;;) {
+    try {
+      return join(await realpath(ancestor), ...suffix);
+    } catch {
+      const parent = dirname(ancestor);
+      if (parent === ancestor) return absolute;
+      suffix.unshift(basename(ancestor));
+      ancestor = parent;
+    }
+  }
 }
 
 async function resolveGitRoot(path: string, allowedRoots: string[]): Promise<string> {

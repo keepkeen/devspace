@@ -1,20 +1,28 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { loadConfig } from "./config.js";
-import { connectionRef, workspaceActivityRef } from "./logger.js";
+import { connectionRef, oauthClientRef, workspaceActivityRef } from "./logger.js";
+import { SqliteOAuthStore } from "./oauth-store.js";
 import { createServer } from "./server.js";
+import { SqliteWorkspaceStore } from "./workspace-store.js";
+
+const execFileAsync = promisify(execFile);
 
 // This is a server-side simulation of ChatGPT's OAuth/MCP protocol behavior.
 // Whether the web model retains workspaceId in its conversation context still
 // requires a real ChatGPT acceptance test.
 const root = await mkdtemp(join(tmpdir(), "devspace-chatgpt-flow-e2e-"));
 const workspaceRoot = join(root, "workspace");
+const projectOneRoot = join(workspaceRoot, "project-one");
+const projectTwoRoot = join(workspaceRoot, "project-two");
 const publicBaseUrl = "https://devspace.chatgpt-flow.test";
 const resource = `${publicBaseUrl}/mcp`;
 const ownerPassword = "chatgpt-flow-e2e-owner-password-long-enough";
@@ -39,11 +47,14 @@ console.error = captureLog;
 try {
   await mkdir(workspaceRoot, { recursive: true });
   await writeFile(join(workspaceRoot, "payload.txt"), "chatgpt-flow-ready\n");
+  await initializeGitProject(projectOneRoot, "project-one");
+  await initializeGitProject(projectTwoRoot, "project-two");
 
   const mainConfig = loadConfig({
     DEVSPACE_CONFIG_DIR: join(root, "config"),
     DEVSPACE_STATE_DIR: join(root, "state"),
     DEVSPACE_ALLOWED_ROOTS: workspaceRoot,
+    DEVSPACE_WORKTREE_ROOT: join(root, "managed-worktrees"),
     DEVSPACE_ALLOWED_HOSTS: "*",
     DEVSPACE_PUBLIC_BASE_URL: publicBaseUrl,
     DEVSPACE_OAUTH_OWNER_TOKEN: ownerPassword,
@@ -332,6 +343,124 @@ try {
   assertToolSucceeded(newSessionExec);
   await closeClient(newSession);
 
+  const projectConversationOne = await connectClient(
+    "same-principal-project-one",
+    oauthA.accessToken,
+    active.origin,
+  );
+  const projectOneOpen = await projectConversationOne.callTool({
+    name: "open_workspace",
+    arguments: {
+      path: projectOneRoot,
+      mode: "worktree",
+      alias: "project-one-task",
+      contextMode: "full",
+    },
+  });
+  assertToolSucceeded(projectOneOpen);
+  const projectOneWorkspaceId = workspaceId(projectOneOpen);
+  assertToolSucceeded(await projectConversationOne.callTool({
+    name: "apply_patch",
+    arguments: {
+      workspaceId: projectOneWorkspaceId,
+      ifMatch: { "conversation-state.txt": null },
+      patch: "*** Begin Patch\n*** Add File: conversation-state.txt\n+project one persisted\n*** End Patch",
+    },
+  }));
+  assertToolSucceeded(await projectConversationOne.callTool({
+    name: "exec_command",
+    arguments: {
+      workspaceId: projectOneWorkspaceId,
+      cmd: "git add conversation-state.txt && git commit -m 'Persist conversation state'",
+    },
+  }));
+  await closeClient(projectConversationOne);
+
+  const projectConversationTwo = await connectClient(
+    "same-principal-project-two",
+    oauthA.accessToken,
+    active.origin,
+  );
+  const projectTwoOpen = await projectConversationTwo.callTool({
+    name: "open_workspace",
+    arguments: {
+      path: projectTwoRoot,
+      mode: "worktree",
+      alias: "project-two-task",
+      contextMode: "full",
+    },
+  });
+  assertToolSucceeded(projectTwoOpen);
+  const projectTwoWorkspaceId = workspaceId(projectTwoOpen);
+  assertToolSucceeded(await projectConversationTwo.callTool({
+    name: "apply_patch",
+    arguments: {
+      workspaceId: projectTwoWorkspaceId,
+      ifMatch: { "conversation-state.txt": null },
+      patch: "*** Begin Patch\n*** Add File: conversation-state.txt\n+project two persisted\n*** End Patch",
+    },
+  }));
+  await closeClient(projectConversationTwo);
+
+  const continuitySession = await connectClient(
+    "same-principal-later-day",
+    oauthA.accessToken,
+    active.origin,
+    "expired-platform-session",
+  );
+  const projectList = await continuitySession.callTool({ name: "list_workspaces", arguments: {} });
+  assertToolSucceeded(projectList);
+  assert.match(JSON.stringify(projectList.structuredContent), /project-one-task/);
+  assert.match(JSON.stringify(projectList.structuredContent), /project-two-task/);
+
+  const continuityPrincipalStore = new SqliteOAuthStore(mainConfig.stateDir);
+  const connectionPrincipalId = continuityPrincipalStore.principalForClient(oauthA.clientId);
+  continuityPrincipalStore.close();
+  assert.equal(typeof connectionPrincipalId, "string");
+  const workspaceStore = new SqliteWorkspaceStore(mainConfig.stateDir);
+  const projectOneSession = workspaceStore.getActiveSessionByAlias(
+    connectionPrincipalId!,
+    "project-one-task",
+  );
+  workspaceStore.close();
+  assert.ok(projectOneSession);
+  await rm(projectOneSession.root, { recursive: true, force: true });
+
+  const recoveryList = await continuitySession.callTool({ name: "list_workspaces", arguments: {} });
+  assertToolSucceeded(recoveryList);
+  assert.match(JSON.stringify(recoveryList.structuredContent), /project-one-task/);
+  assert.match(JSON.stringify(recoveryList.structuredContent), /recovery_required/);
+  const recoveredProjectOne = await continuitySession.callTool({
+    name: "resume_workspace",
+    arguments: { alias: "project-one-task", contextMode: "full" },
+  });
+  assertToolSucceeded(recoveredProjectOne);
+  assert.equal(workspaceId(recoveredProjectOne), projectOneWorkspaceId);
+  assert.deepEqual(
+    (recoveredProjectOne.structuredContent as { recovery?: unknown } | undefined)?.recovery,
+    { kind: "managed_worktree_recreated", dataLossPossible: true },
+  );
+  const recoveredProjectOneRead = await continuitySession.callTool({
+    name: "read",
+    arguments: { workspaceId: projectOneWorkspaceId, path: "conversation-state.txt" },
+  });
+  assertToolSucceeded(recoveredProjectOneRead);
+  assert.match(JSON.stringify(recoveredProjectOneRead.content), /project one persisted/);
+
+  const resumedProjectTwo = await continuitySession.callTool({
+    name: "resume_workspace",
+    arguments: { alias: "project-two-task", contextMode: "full" },
+  });
+  assertToolSucceeded(resumedProjectTwo);
+  assert.equal(workspaceId(resumedProjectTwo), projectTwoWorkspaceId);
+  const resumedProjectTwoRead = await continuitySession.callTool({
+    name: "read",
+    arguments: { workspaceId: projectTwoWorkspaceId, path: "conversation-state.txt" },
+  });
+  assertToolSucceeded(resumedProjectTwoRead);
+  assert.match(JSON.stringify(resumedProjectTwoRead.content), /project two persisted/);
+  await closeClient(continuitySession);
+
   const [concurrentA, concurrentB] = await Promise.all([
     connectClient("concurrent-client-a", oauthA.accessToken, active.origin),
     connectClient("concurrent-client-b", oauthB.accessToken, active.origin),
@@ -515,6 +644,7 @@ try {
   }));
   let quietCredentials: OAuthCredentials | undefined;
   let quietWorkspaceId: string | undefined;
+  let quietPrincipalId: string | undefined;
   try {
     const quietMetadata = await discoverOAuth(quietServer.origin);
     quietCredentials = await registerAndAuthorize(quietServer.origin, quietMetadata, "quiet-client");
@@ -530,24 +660,44 @@ try {
     await quietServer.close();
   }
 
+  const principalStore = new SqliteOAuthStore(join(root, "state"));
+  const quietPrincipalStore = new SqliteOAuthStore(join(root, "quiet-state"));
+  const principalA = principalStore.principalForClient(oauthA.clientId);
+  const principalB = principalStore.principalForClient(oauthB.clientId);
+  quietPrincipalId = quietCredentials
+    ? quietPrincipalStore.principalForClient(quietCredentials.clientId)
+    : undefined;
+  principalStore.close();
+  quietPrincipalStore.close();
+
   const logText = capturedLogs.join("\n");
-  const connectionA = connectionRef(oauthA.clientId);
-  const connectionB = connectionRef(oauthB.clientId);
-  const activityA = workspaceActivityRef(oauthA.clientId, workspaceA);
-  const activityB = workspaceActivityRef(oauthB.clientId, workspaceB);
-  const quietConnection = connectionRef(quietCredentials?.clientId);
-  const quietActivity = workspaceActivityRef(quietCredentials?.clientId, quietWorkspaceId);
-  assert.ok(connectionA && connectionB && activityA && activityB && quietCredentials && quietConnection && quietActivity);
+  const oauthRefA = oauthClientRef(oauthA.clientId);
+  const oauthRefB = oauthClientRef(oauthB.clientId);
+  const connectionA = connectionRef(principalA);
+  const connectionB = connectionRef(principalB);
+  const activityA = workspaceActivityRef(principalA, workspaceA);
+  const activityB = workspaceActivityRef(principalB, workspaceB);
+  const quietOauthRef = oauthClientRef(quietCredentials?.clientId);
+  const quietConnection = connectionRef(quietPrincipalId);
+  const quietActivity = workspaceActivityRef(quietPrincipalId, quietWorkspaceId);
+  assert.ok(
+    oauthRefA && oauthRefB && connectionA && connectionB && activityA && activityB &&
+    quietCredentials && quietOauthRef && quietConnection && quietActivity,
+  );
+  assert.notEqual(oauthRefA, oauthRefB);
   assert.notEqual(connectionA, connectionB);
   assert.notEqual(activityA, activityB);
+  assert.match(logText, new RegExp(`"oauthClientRef":"${oauthRefA}"`));
+  assert.match(logText, new RegExp(`"oauthClientRef":"${oauthRefB}"`));
   assert.match(logText, new RegExp(`"connectionRef":"${connectionA}"`));
   assert.match(logText, new RegExp(`"connectionRef":"${connectionB}"`));
   assert.match(logText, new RegExp(`"workspaceActivityRef":"${activityA}"`));
   assert.match(logText, new RegExp(`"workspaceActivityRef":"${activityB}"`));
-  assert.match(logText, new RegExp(`"event":"oauth_client_registered"[^\n]*"connectionRef":"${connectionA}"`));
-  assert.match(logText, new RegExp(`"event":"oauth_authorization_succeeded"[^\n]*"connectionRef":"${connectionA}"`));
-  assert.match(logText, new RegExp(`"event":"oauth_token_issued"[^\n]*"connectionRef":"${connectionA}"`));
-  assert.match(logText, new RegExp(`"event":"oauth_token_refreshed"[^\n]*"connectionRef":"${connectionA}"`));
+  assert.match(logText, new RegExp(`"event":"oauth_client_registered"[^\n]*"oauthClientRef":"${oauthRefA}"`));
+  assert.match(logText, new RegExp(`"event":"oauth_authorization_succeeded"[^\n]*"oauthClientRef":"${oauthRefA}"`));
+  assert.match(logText, new RegExp(`"event":"oauth_token_issued"[^\n]*"oauthClientRef":"${oauthRefA}"`));
+  assert.match(logText, new RegExp(`"event":"oauth_token_refreshed"[^\n]*"oauthClientRef":"${oauthRefA}"`));
+  assert.match(logText, new RegExp(`"event":"oauth_authorization_epoch_changed"[^\n]*"connectionRef":"${connectionA}"`));
   const parsedLogs = capturedLogs.flatMap((line): Array<Record<string, unknown>> => {
     try {
       const value = JSON.parse(line) as unknown;
@@ -560,21 +710,26 @@ try {
   });
   assert.ok(parsedLogs.some((entry) =>
     entry.event === "tool_call" &&
+    entry.oauthClientRef === oauthRefA &&
     entry.connectionRef === connectionA &&
     entry.workspaceActivityRef === activityA &&
     entry.workspaceId === workspaceA
   ));
   assert.ok(parsedLogs.some((entry) =>
     entry.event === "http_request" &&
+    entry.oauthClientRef === oauthRefA &&
     entry.connectionRef === connectionA &&
     entry.workspaceActivityRef === activityA &&
     entry.path === "/mcp"
   ));
   assert.equal(parsedLogs.some((entry) =>
-    entry.event === "tool_call" && entry.connectionRef === quietConnection
+    entry.event === "tool_call" &&
+    entry.oauthClientRef === quietOauthRef &&
+    entry.connectionRef === quietConnection
   ), false);
   assert.ok(parsedLogs.some((entry) =>
     entry.event === "http_request" &&
+    entry.oauthClientRef === quietOauthRef &&
     entry.connectionRef === quietConnection &&
     entry.workspaceActivityRef === quietActivity &&
     entry.path === "/mcp"
@@ -601,6 +756,20 @@ try {
   console.error = originalConsole.error;
   const failedCleanup = cleanup.find((result) => result.status === "rejected");
   if (failedCleanup?.status === "rejected") throw failedCleanup.reason;
+}
+
+async function initializeGitProject(path: string, label: string): Promise<void> {
+  await mkdir(path, { recursive: true });
+  await writeFile(join(path, "README.md"), `${label}\n`);
+  for (const args of [
+    ["init"],
+    ["config", "user.email", "devspace@example.com"],
+    ["config", "user.name", "DevSpace Test"],
+    ["add", "."],
+    ["commit", "-m", "Initial commit"],
+  ]) {
+    await execFileAsync("git", args, { cwd: path });
+  }
 }
 
 interface OAuthMetadata {

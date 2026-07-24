@@ -17,16 +17,16 @@ function createTransport(closeError?: Error): FakeTransport {
 }
 
 let now = 0;
-const ownerClientId = "client-a";
+const connectionPrincipalId = "client-a";
 const registry = new McpSessionRegistry<FakeTransport>({ now: () => now });
 const staleTransport = createTransport();
 const activeTransport = createTransport();
 
-registry.register("stale", ownerClientId, staleTransport);
+registry.register("stale", connectionPrincipalId, staleTransport);
 now = 1_000;
-registry.register("active", ownerClientId, activeTransport);
+registry.register("active", connectionPrincipalId, activeTransport);
 now = 1_500;
-assert.equal(registry.get("active", ownerClientId), activeTransport);
+assert.equal(registry.get("active", connectionPrincipalId), activeTransport);
 assert.equal(registry.get("active", "client-b"), undefined);
 now = 2_000;
 
@@ -35,8 +35,8 @@ assert.deepEqual(idleResults, [{ sessionId: "stale" }]);
 assert.equal(staleTransport.closeCalls, 1);
 assert.equal(activeTransport.closeCalls, 0);
 assert.equal(registry.size, 1);
-assert.equal(registry.get("stale", ownerClientId), undefined);
-assert.equal(registry.get("active", ownerClientId), activeTransport);
+assert.equal(registry.get("stale", connectionPrincipalId), undefined);
+assert.equal(registry.get("active", connectionPrincipalId), activeTransport);
 
 const closeError = new Error("close failed");
 const failingTransport: FakeTransport = {
@@ -46,7 +46,7 @@ const failingTransport: FakeTransport = {
     if (this.closeCalls === 1) throw closeError;
   },
 };
-registry.register("failing", ownerClientId, failingTransport);
+registry.register("failing", connectionPrincipalId, failingTransport);
 now = 10_000;
 
 const failingResults = await registry.closeIdle(1);
@@ -55,15 +55,15 @@ assert.deepEqual(failingResults.map((result) => result.sessionId).sort(), ["acti
 assert.equal(failingResults.find((result) => result.sessionId === "failing")?.error, closeError);
 assert.equal(failingTransport.closeCalls, 1);
 assert.equal(registry.size, 1);
-assert.equal(registry.get("failing", ownerClientId), undefined);
+assert.equal(registry.get("failing", connectionPrincipalId), undefined);
 assert.deepEqual(await registry.closeIdle(1), [{ sessionId: "failing" }]);
 assert.equal(failingTransport.closeCalls, 2);
 assert.equal(registry.size, 0);
 
 const first = createTransport();
 const second = createTransport();
-registry.register("first", ownerClientId, first);
-registry.register("second", ownerClientId, second);
+registry.register("first", connectionPrincipalId, first);
+registry.register("second", connectionPrincipalId, second);
 registry.remove("first");
 
 const shutdownResults = await registry.closeAll();
@@ -84,7 +84,7 @@ const delayedTransport: FakeTransport = {
   },
 };
 const delayedRegistry = new McpSessionRegistry<FakeTransport>();
-delayedRegistry.register("delayed", ownerClientId, delayedTransport);
+delayedRegistry.register("delayed", connectionPrincipalId, delayedTransport);
 const delayedClose = delayedRegistry.closeAll();
 void delayedClose.then(() => {
   delayedCloseResolved = true;
@@ -100,33 +100,33 @@ assert.equal(delayedRegistry.size, 0);
 
 const activeCloseRegistry = new McpSessionRegistry<FakeTransport>({ maxSessions: 2 });
 const activeCloseTransport = createTransport();
-activeCloseRegistry.register("active-close", ownerClientId, activeCloseTransport);
-const preActiveCloseReservation = activeCloseRegistry.tryReserve(ownerClientId);
+activeCloseRegistry.register("active-close", connectionPrincipalId, activeCloseTransport);
+const preActiveCloseReservation = activeCloseRegistry.tryReserve(connectionPrincipalId);
 assert(preActiveCloseReservation);
 assert.deepEqual(await activeCloseRegistry.closeActive(), [{ sessionId: "active-close" }]);
 assert.equal(activeCloseTransport.closeCalls, 1);
 assert.throws(
   () => activeCloseRegistry.register(
     "reserved-before-active-close",
-    ownerClientId,
+    connectionPrincipalId,
     createTransport(),
     preActiveCloseReservation,
   ),
   /reservation is no longer valid/,
 );
-const postActiveCloseReservation = activeCloseRegistry.tryReserve(ownerClientId);
+const postActiveCloseReservation = activeCloseRegistry.tryReserve(connectionPrincipalId);
 assert(postActiveCloseReservation);
 activeCloseRegistry.register(
   "after-active-close",
-  ownerClientId,
+  connectionPrincipalId,
   createTransport(),
   postActiveCloseReservation,
 );
-assert.equal(activeCloseRegistry.get("after-active-close", ownerClientId) !== undefined, true);
+assert.equal(activeCloseRegistry.get("after-active-close", connectionPrincipalId) !== undefined, true);
 await activeCloseRegistry.closeAll();
 
 const transportCloseRegistry = new McpSessionRegistry<FakeTransport>();
-transportCloseRegistry.register("unexpected-close", ownerClientId, createTransport());
+transportCloseRegistry.register("unexpected-close", connectionPrincipalId, createTransport());
 assert.equal(
   transportCloseRegistry.removeOnTransportClose("unexpected-close"),
   "unexpected",
@@ -143,7 +143,7 @@ const intentionalCloseTransport: FakeTransport = {
     });
   },
 };
-transportCloseRegistry.register("intentional-close", ownerClientId, intentionalCloseTransport);
+transportCloseRegistry.register("intentional-close", connectionPrincipalId, intentionalCloseTransport);
 const intentionalClose = transportCloseRegistry.closeIdle(0);
 await Promise.resolve();
 assert.equal(
@@ -159,8 +159,8 @@ const limitedReservation = limited.tryReserve();
 assert(limitedReservation);
 assert.equal(limited.tryReserve(), undefined);
 const limitedTransport = createTransport();
-limited.register("limited", ownerClientId, limitedTransport, limitedReservation);
-assert.equal(limited.get("limited", ownerClientId), limitedTransport);
+limited.register("limited", connectionPrincipalId, limitedTransport, limitedReservation);
+assert.equal(limited.get("limited", connectionPrincipalId), limitedTransport);
 assert.equal(limited.get("limited", "client-b"), undefined);
 assert.equal(limited.tryReserve(), undefined);
 assert.equal(limited.remove("limited"), true);
@@ -178,10 +178,10 @@ const ownerOlder = createTransport();
 const ownerNewest = createTransport();
 reclaiming.register("other-oldest", "client-b", otherOldest);
 reclaimNow = 10;
-reclaiming.register("owner-older", ownerClientId, ownerOlder);
+reclaiming.register("owner-older", connectionPrincipalId, ownerOlder);
 reclaimNow = 20;
-reclaiming.register("owner-newest", ownerClientId, ownerNewest);
-const reclaimedReservation = await reclaiming.reserveWithIdleReclaim(ownerClientId);
+reclaiming.register("owner-newest", connectionPrincipalId, ownerNewest);
+const reclaimedReservation = await reclaiming.reserveWithIdleReclaim(connectionPrincipalId);
 assert.deepEqual(reclaimedReservation, {
   reservation: reclaimedReservation.reservation,
   reclaimed: { sessionId: "owner-older" },
@@ -195,9 +195,9 @@ reclaiming.releaseReservation(reclaimedReservation.reservation);
 
 const allActive = new McpSessionRegistry<FakeTransport>({ maxSessions: 1 });
 const allActiveTransport = createTransport();
-allActive.register("active-at-capacity", ownerClientId, allActiveTransport);
-assert.equal(allActive.acquire("active-at-capacity", ownerClientId), allActiveTransport);
-assert.deepEqual(await allActive.reserveWithIdleReclaim(ownerClientId), {});
+allActive.register("active-at-capacity", connectionPrincipalId, allActiveTransport);
+assert.equal(allActive.acquire("active-at-capacity", connectionPrincipalId), allActiveTransport);
+assert.deepEqual(await allActive.reserveWithIdleReclaim(connectionPrincipalId), {});
 assert.equal(allActiveTransport.closeCalls, 0);
 
 const failedReclaim = new McpSessionRegistry<FakeTransport>({ maxSessions: 1 });
@@ -209,15 +209,15 @@ const failedReclaimTransport: FakeTransport = {
     if (this.closeCalls === 1) throw failedReclaimError;
   },
 };
-failedReclaim.register("failed-reclaim", ownerClientId, failedReclaimTransport);
-const failedReservation = await failedReclaim.reserveWithIdleReclaim(ownerClientId);
+failedReclaim.register("failed-reclaim", connectionPrincipalId, failedReclaimTransport);
+const failedReservation = await failedReclaim.reserveWithIdleReclaim(connectionPrincipalId);
 assert.equal(failedReservation.reservation, undefined);
 assert.equal(failedReservation.reclaimed?.sessionId, "failed-reclaim");
 assert.equal(failedReservation.reclaimed?.error, failedReclaimError);
 assert.equal(failedReclaim.size, 1);
-assert.equal(failedReclaim.get("failed-reclaim", ownerClientId), undefined);
+assert.equal(failedReclaim.get("failed-reclaim", connectionPrincipalId), undefined);
 assert.equal(failedReclaim.tryReserve(), undefined);
-const retriedReclaim = await failedReclaim.reserveWithIdleReclaim(ownerClientId);
+const retriedReclaim = await failedReclaim.reserveWithIdleReclaim(connectionPrincipalId);
 assert(retriedReclaim.reservation);
 assert.equal(retriedReclaim.reclaimed?.error, undefined);
 assert.equal(failedReclaimTransport.closeCalls, 2);
@@ -226,7 +226,7 @@ failedReclaim.releaseReservation(retriedReclaim.reservation);
 let finishFirstReclaim: (() => void) | undefined;
 let finishSecondReclaim: (() => void) | undefined;
 const concurrentReclaim = new McpSessionRegistry<FakeTransport>({ maxSessions: 2 });
-concurrentReclaim.register("concurrent-first", ownerClientId, {
+concurrentReclaim.register("concurrent-first", connectionPrincipalId, {
   closeCalls: 0,
   close() {
     this.closeCalls += 1;
@@ -235,7 +235,7 @@ concurrentReclaim.register("concurrent-first", ownerClientId, {
     });
   },
 });
-concurrentReclaim.register("concurrent-second", ownerClientId, {
+concurrentReclaim.register("concurrent-second", connectionPrincipalId, {
   closeCalls: 0,
   close() {
     this.closeCalls += 1;
@@ -244,15 +244,15 @@ concurrentReclaim.register("concurrent-second", ownerClientId, {
     });
   },
 });
-const firstReclaimPromise = concurrentReclaim.reserveWithIdleReclaim(ownerClientId);
-const secondReclaimPromise = concurrentReclaim.reserveWithIdleReclaim(ownerClientId);
+const firstReclaimPromise = concurrentReclaim.reserveWithIdleReclaim(connectionPrincipalId);
+const secondReclaimPromise = concurrentReclaim.reserveWithIdleReclaim(connectionPrincipalId);
 await Promise.resolve();
 finishFirstReclaim?.();
 const firstConcurrentReservation = await firstReclaimPromise;
 assert(firstConcurrentReservation.reservation);
 concurrentReclaim.register(
   "replacement-first",
-  ownerClientId,
+  connectionPrincipalId,
   createTransport(),
   firstConcurrentReservation.reservation,
 );
@@ -262,7 +262,7 @@ const secondConcurrentReservation = await secondReclaimPromise;
 assert(secondConcurrentReservation.reservation);
 concurrentReclaim.register(
   "replacement-second",
-  ownerClientId,
+  connectionPrincipalId,
   createTransport(),
   secondConcurrentReservation.reservation,
 );
@@ -271,12 +271,12 @@ assert.equal(concurrentReclaim.size, 2);
 let activeNow = 100;
 const activeRegistry = new McpSessionRegistry<FakeTransport>({ now: () => activeNow });
 const inFlightTransport = createTransport();
-activeRegistry.register("in-flight", ownerClientId, inFlightTransport);
-assert.equal(activeRegistry.acquire("in-flight", ownerClientId), inFlightTransport);
+activeRegistry.register("in-flight", connectionPrincipalId, inFlightTransport);
+assert.equal(activeRegistry.acquire("in-flight", connectionPrincipalId), inFlightTransport);
 activeNow = 1_000;
 assert.deepEqual(await activeRegistry.closeIdle(1), []);
 assert.equal(inFlightTransport.closeCalls, 0);
-activeRegistry.release("in-flight", ownerClientId);
+activeRegistry.release("in-flight", connectionPrincipalId);
 activeNow = 2_000;
 assert.deepEqual(await activeRegistry.closeIdle(1), [{ sessionId: "in-flight" }]);
 
@@ -293,7 +293,7 @@ const closeRaceTransport: FakeTransport = {
     });
   },
 };
-closeRaceRegistry.register("close-race", ownerClientId, closeRaceTransport);
+closeRaceRegistry.register("close-race", connectionPrincipalId, closeRaceTransport);
 const idleClose = closeRaceRegistry.closeIdle(0);
 await Promise.resolve();
 assert.equal(closeRaceDisposition, "intentional");
@@ -311,7 +311,7 @@ assert.deepEqual(await shutdownClose, []);
 assert.equal(closeRaceRegistry.size, 0);
 
 const hungRegistry = new McpSessionRegistry<FakeTransport>({ closeTimeoutMs: 10 });
-hungRegistry.register("hung", ownerClientId, {
+hungRegistry.register("hung", connectionPrincipalId, {
   closeCalls: 0,
   async close() {
     this.closeCalls += 1;
@@ -322,14 +322,14 @@ const hungResults = await hungRegistry.closeAll();
 assert.equal(hungResults.length, 1);
 assert.match(String(hungResults[0]?.error), /Timed out closing MCP session/);
 assert.equal(hungRegistry.size, 1);
-assert.equal(hungRegistry.get("hung", ownerClientId), undefined);
+assert.equal(hungRegistry.get("hung", connectionPrincipalId), undefined);
 
 let finishHungIdle: (() => void) | undefined;
 const hungIdleRegistry = new McpSessionRegistry<FakeTransport>({
   closeTimeoutMs: 10,
   maxSessions: 1,
 });
-hungIdleRegistry.register("hung-idle", ownerClientId, {
+hungIdleRegistry.register("hung-idle", connectionPrincipalId, {
   closeCalls: 0,
   close() {
     this.closeCalls += 1;
@@ -355,7 +355,7 @@ const detachedHungRegistry = new McpSessionRegistry<FakeTransport>({
   maxSessions: 1,
 });
 let detachedHungDisposition: "intentional" | "unexpected" | undefined;
-detachedHungRegistry.register("detached-hung", ownerClientId, {
+detachedHungRegistry.register("detached-hung", connectionPrincipalId, {
   closeCalls: 0,
   close() {
     this.closeCalls += 1;

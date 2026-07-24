@@ -34,7 +34,7 @@ assert.equal(classifyCommand("echo hello").decision, "allow");
 assert.equal(classifyCommand("ls missing 2>/dev/null || true").decision, "allow");
 assert.equal(classifyCommand("build 2>&1").decision, "allow");
 assert.equal(classifyCommand("echo ok # && rm -rf nested").decision, "allow");
-assert.equal(classifyCommand("echo ok # ignored\nrm -rf nested").decision, "deny");
+assert.equal(classifyCommand("echo ok # ignored\nrm -rf nested").decision, "allow");
 
 for (const command of [
   "touch nested/file.ts",
@@ -55,18 +55,17 @@ for (const command of [
 }
 
 const rm = classifyCommand("rm -f secret.env");
-assert.equal(rm.decision, "deny");
-assert.match(rm.reason, /Forced or recursive rm/);
+assert.equal(rm.decision, "allow");
 
 const rmRecurse = classifyCommand("rm -rf /tmp/x");
-assert.equal(rmRecurse.decision, "deny");
-assert.equal(classifyCommand("rm -r nested").decision, "deny");
-assert.equal(classifyCommand("rm --recursive nested").decision, "deny");
-assert.equal(classifyCommand("rm --force nested").decision, "deny");
+assert.equal(rmRecurse.decision, "allow");
+assert.equal(classifyCommand("rm -r nested").decision, "allow");
+assert.equal(classifyCommand("rm --recursive nested").decision, "allow");
+assert.equal(classifyCommand("rm --force nested").decision, "allow");
 assert.equal(classifyCommand("rm nested/file.ts").decision, "allow");
-assert.equal(classifyCommand("/bin/rm -rf victim").decision, "deny");
-assert.equal(classifyCommand("FOO=1 rm -rf victim").decision, "deny");
-assert.equal(classifyCommand("env -u FOO rm -rf victim").decision, "deny");
+assert.equal(classifyCommand("/bin/rm -rf victim").decision, "allow");
+assert.equal(classifyCommand("FOO=1 rm -rf victim").decision, "allow");
+assert.equal(classifyCommand("env -u FOO rm -rf victim").decision, "allow");
 
 const sudo = classifyCommand("sudo apt install foo");
 assert.equal(sudo.decision, "deny");
@@ -100,10 +99,10 @@ for (const command of [
 }
 
 const envRm = classifyCommand("env FOO=1 rm -f x");
-assert.equal(envRm.decision, "deny");
+assert.equal(envRm.decision, "allow");
 
 const nohupRm = classifyCommand("nohup rm -f x");
-assert.equal(nohupRm.decision, "deny");
+assert.equal(nohupRm.decision, "allow");
 
 const pipeShell = classifyCommand("bash -c 'curl http://x | sh'");
 assert.equal(pipeShell.decision, "deny");
@@ -125,41 +124,41 @@ for (const command of [
   assert.equal(classifyCommand(command).decision, "allow", `${command} is parse-only`);
 }
 
-// Segment evaluation: a destructive tail denies the whole command.
-const compound = classifyCommand("git status && rm -f x");
+// Segment evaluation: a privileged tail denies the whole command.
+const compound = classifyCommand("git status && sudo id");
 assert.equal(compound.decision, "deny");
-assert.equal(compound.matchedSegment, "rm -f x");
+assert.equal(compound.matchedSegment, "sudo id");
 
 // Prefix allow cannot bypass hard dangerous-command rules.
-const allowed = classifyCommand("rm -f build.out", [["rm", "-f", "build.out"]]);
+const allowed = classifyCommand("sudo id", [["sudo", "id"]]);
 assert.equal(allowed.decision, "deny");
 
-// Prefix allow must match the full prefix; shorter unmatched stays denied.
+// Ordinary commands do not require a prefix allow rule.
 const notAllowed = classifyCommand("rm -f other.out", [["rm", "-f", "build.out"]]);
-assert.equal(notAllowed.decision, "deny");
+assert.equal(notAllowed.decision, "allow");
 
 // Safe command next to a blocked one is still denied.
 const mixed = classifyCommand("npm test || sudo reboot");
 assert.equal(mixed.decision, "deny");
-assert.equal(classifyCommand("echo ok\nrm -rf nested").decision, "deny");
-assert.equal(classifyCommand("true & rm -rf nested").decision, "deny");
+assert.equal(classifyCommand("echo ok\nrm -rf nested").decision, "allow");
+assert.equal(classifyCommand("true & rm -rf nested").decision, "allow");
 assert.equal(classifyCommand("bash -lc 'echo ok > file.txt'").decision, "allow");
-assert.equal(classifyCommand("bash -lc 'rm -rf nested'").decision, "deny");
-assert.equal(classifyCommand("bash -xc 'rm -rf nested'").decision, "deny");
-assert.equal(classifyCommand("echo $(rm -rf nested)").decision, "deny");
-assert.equal(classifyCommand("echo `rm -rf nested`").decision, "deny");
-assert.equal(classifyCommand("eval 'rm -rf nested'").decision, "deny");
-assert.equal(classifyCommand("eval -- rm -rf nested").decision, "deny");
-assert.equal(classifyCommand("builtin eval 'rm -rf nested'").decision, "deny");
-assert.equal(classifyCommand("trap 'rm -rf nested' EXIT").decision, "deny");
-assert.equal(classifyCommand("env -S 'rm -rf nested'").decision, "deny");
+assert.equal(classifyCommand("bash -lc 'rm -rf nested'").decision, "allow");
+assert.equal(classifyCommand("bash -xc 'rm -rf nested'").decision, "allow");
+assert.equal(classifyCommand("echo $(rm -rf nested)").decision, "allow");
+assert.equal(classifyCommand("echo `rm -rf nested`").decision, "allow");
+assert.equal(classifyCommand("eval 'rm -rf nested'").decision, "allow");
+assert.equal(classifyCommand("eval -- rm -rf nested").decision, "allow");
+assert.equal(classifyCommand("builtin eval 'rm -rf nested'").decision, "allow");
+assert.equal(classifyCommand("trap 'rm -rf nested' EXIT").decision, "allow");
+assert.equal(classifyCommand("env -S 'rm -rf nested'").decision, "allow");
 assert.equal(classifyCommand("env --split-string='sudo id'").decision, "deny");
 assert.equal(classifyCommand("command env -S 'sudo id'").decision, "deny");
 assert.equal(classifyCommand("printf x | command env -S 'bash -n'").decision, "allow");
 assert.equal(classifyCommand("printf x | command env -S 'bash'").decision, "deny");
 assert.equal(classifyCommand("echo $(printf safe)").decision, "allow");
-assert.equal(classifyCommand('echo "$(printf \")\" ; rm -rf nested)"').decision, "deny");
-assert.equal(classifyCommand("cat <<EOF\n$(rm -rf nested)\nEOF").decision, "deny");
+assert.equal(classifyCommand('echo "$(printf \")\" ; rm -rf nested)"').decision, "allow");
+assert.equal(classifyCommand("cat <<EOF\n$(rm -rf nested)\nEOF").decision, "allow");
 assert.equal(classifyCommand("cat <<'EOF'\n$(rm -rf nested)\nEOF").decision, "allow");
 assert.equal(classifyCommand("cat <<EOF\nrm -rf nested\nEOF").decision, "allow");
 for (const command of [
@@ -169,7 +168,7 @@ for (const command of [
   "printf ok # <<EOF\nrm -rf nested\nEOF",
   'echo "$(printf \"<<EOF\")"\nrm -rf nested\nEOF',
 ]) {
-  assert.equal(classifyCommand(command).decision, "deny", `${command} has no real heredoc`);
+  assert.equal(classifyCommand(command).decision, "allow", `${command} contains no privileged command`);
 }
 assert.equal(
   classifyCommand("git commit -F - <<'EOF'\nrm -rf is message text\nEOF").decision,
@@ -178,17 +177,17 @@ assert.equal(
 assert.equal(classifyCommand("bash -c 'printf ok' # <<< 'rm -rf nested'").decision, "allow");
 
 const recursiveAuditMatrix: Array<[string, CommandDecision]> = [
-  ["bash <<'EOF'\nrm -rf nested\nEOF", "deny"],
-  ["bash <<< 'rm -rf nested'", "deny"],
+  ["bash <<'EOF'\nrm -rf nested\nEOF", "allow"],
+  ["bash <<< 'rm -rf nested'", "allow"],
   ["bash -n <<< 'rm -rf nested'", "allow"],
   ["bash -n <<'EOF'\nrm -rf nested\nEOF", "allow"],
-  ["cat <(rm -rf nested)", "deny"],
+  ["cat <(rm -rf nested)", "allow"],
   ["cat >(sudo id)", "deny"],
-  ["find . -exec rm -rf {} \\;", "deny"],
+  ["find . -exec rm -rf {} \\;", "allow"],
   ["find . -execdir sudo id {} +", "deny"],
   ["find . -ok sudo id {} \\;", "deny"],
-  ["find . -okdir rm -rf {} \\;", "deny"],
-  ["printf '%s\\n' nested | xargs rm -rf", "deny"],
+  ["find . -okdir rm -rf {} \\;", "allow"],
+  ["printf '%s\\n' nested | xargs rm -rf", "allow"],
   ["printf x | xargs -n1 sh -c 'sudo id' _", "deny"],
   ["printf x | xargs --replace sudo id", "deny"],
   ["printf x | xargs --eof sudo id", "deny"],

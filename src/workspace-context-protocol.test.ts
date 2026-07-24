@@ -13,7 +13,7 @@ const key = Buffer.alloc(32, 0x5a);
 const processGeneration = "process-generation-a";
 const receipts = createWorkspaceContextReceiptManager({ key, processGeneration });
 const binding: WorkspaceContextReceiptBinding = {
-  ownerClientId: "owner-secret-17",
+  connectionPrincipalId: "principal-secret-17",
   workspaceId: "workspace-opaque-ref",
   contextSessionId: "wctxs_context-session-a",
   generation: 7,
@@ -38,7 +38,7 @@ assert.equal(
 );
 assert.equal(equivalentManager.resolve(receipt), undefined, "only locally issued receipts can be resolved");
 for (const changed of [
-  { ...binding, ownerClientId: "different-owner" },
+  { ...binding, connectionPrincipalId: "different-principal" },
   { ...binding, workspaceId: "different-workspace" },
   { ...binding, contextSessionId: "wctxs_context-session-b" },
   { ...binding, generation: binding.generation + 1 },
@@ -64,7 +64,7 @@ const alteredReceipt = `${receipt.slice(0, -1)}${receipt.endsWith("A") ? "B" : "
 assert.equal(receipts.verify(alteredReceipt, binding), false);
 assert.equal(receipts.verify("wctx3.not-a-receipt", binding), false);
 assert.equal(receipts.verify("x".repeat(10_000), binding), false);
-assert.equal(receipts.verify(receipt, { ...binding, ownerClientId: "x".repeat(1_025) }), false);
+assert.equal(receipts.verify(receipt, { ...binding, connectionPrincipalId: "x".repeat(1_025) }), false);
 assert.doesNotMatch(receipt, /owner|workspace|instruction|skill|secret/);
 assert.throws(
   () => receipts.issue({ ...binding, workspaceId: "x".repeat(1_025) }),
@@ -105,7 +105,7 @@ clock = 1_050;
 assert.equal(expiringReceipts.resolve(expiringReceipt), undefined, "receipt expires at its fixed deadline");
 
 const input: WorkspaceContextProtocolInput = {
-  ownerClientId: binding.ownerClientId,
+  connectionPrincipalId: binding.connectionPrincipalId,
   workspaceId: binding.workspaceId,
   contextSessionId: binding.contextSessionId,
   phase: "context_loaded",

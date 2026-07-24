@@ -33,7 +33,7 @@ export interface ProcessOutputStoreOptions {
 }
 
 export interface CreateProcessOutputInput {
-  ownerClientId: string;
+  connectionPrincipalId: string;
   workspaceId: string;
 }
 
@@ -198,7 +198,7 @@ export class ProcessOutputStore {
 
   create(input: CreateProcessOutputInput): string {
     this.assertOpenAndStorageDirectory();
-    const ownerClientId = boundedNonEmptyString(input.ownerClientId, "ownerClientId");
+    const connectionPrincipalId = boundedNonEmptyString(input.connectionPrincipalId, "connectionPrincipalId");
     const workspaceId = boundedNonEmptyString(input.workspaceId, "workspaceId");
     let usage = this.getUsageRow();
     while (usage.outputs >= this.maxOutputs || usage.stored_bytes >= this.maxStorageBytes) {
@@ -248,7 +248,7 @@ export class ProcessOutputStore {
               completed_at, total_bytes, stored_bytes, dropped_bytes, file_dev, file_ino
             ) values (?, ?, ?, 'active', ?, ?, null, 0, 0, 0, ?, ?)`,
           )
-          .run(outputId, ownerClientId, workspaceId, now, now, fileStats.dev.toString(), fileStats.ino.toString());
+          .run(outputId, connectionPrincipalId, workspaceId, now, now, fileStats.dev.toString(), fileStats.ino.toString());
         this.database
           .prepare(
             `update process_output_usage
@@ -376,18 +376,18 @@ export class ProcessOutputStore {
   }
 
   read(
-    ownerClientId: string,
+    connectionPrincipalId: string,
     workspaceId: string,
     outputId: string,
     options: ProcessOutputReadOptions,
   ): ProcessOutputReadResult {
     this.assertOpenAndStorageDirectory();
     validateOutputId(outputId);
-    boundedNonEmptyString(ownerClientId, "ownerClientId");
+    boundedNonEmptyString(connectionPrincipalId, "connectionPrincipalId");
     boundedNonEmptyString(workspaceId, "workspaceId");
     const offset = nonNegativeSafeInteger(options.offset, "offset");
     const limit = positiveBoundedInteger(options.limit, "limit", MAX_READ_BYTES);
-    const row = this.getOwnedReadableRow(ownerClientId, workspaceId, outputId);
+    const row = this.getOwnedReadableRow(connectionPrincipalId, workspaceId, outputId);
     if (offset > row.stored_bytes) throw new RangeError("offset exceeds stored process output bytes");
     if (offset > 0 && offset < row.stored_bytes) {
       const descriptor = this.openVerifiedFile(row, constants.O_RDONLY | NO_FOLLOW);
@@ -435,12 +435,12 @@ export class ProcessOutputStore {
     };
   }
 
-  metadata(ownerClientId: string, workspaceId: string, outputId: string): ProcessOutputMetadata {
+  metadata(connectionPrincipalId: string, workspaceId: string, outputId: string): ProcessOutputMetadata {
     this.assertOpenAndStorageDirectory();
     validateOutputId(outputId);
-    boundedNonEmptyString(ownerClientId, "ownerClientId");
+    boundedNonEmptyString(connectionPrincipalId, "connectionPrincipalId");
     boundedNonEmptyString(workspaceId, "workspaceId");
-    const row = this.getOwnedReadableRow(ownerClientId, workspaceId, outputId);
+    const row = this.getOwnedReadableRow(connectionPrincipalId, workspaceId, outputId);
     this.assertFile(row);
     return rowToMetadata(row);
   }
@@ -474,9 +474,9 @@ export class ProcessOutputStore {
     return { deleted, bytesReclaimed };
   }
 
-  retireWorkspace(ownerClientId: string, workspaceId: string): ProcessOutputCleanupResult {
+  retireWorkspace(connectionPrincipalId: string, workspaceId: string): ProcessOutputCleanupResult {
     this.assertOpenAndStorageDirectory();
-    const owner = boundedNonEmptyString(ownerClientId, "ownerClientId");
+    const owner = boundedNonEmptyString(connectionPrincipalId, "connectionPrincipalId");
     const workspace = boundedNonEmptyString(workspaceId, "workspaceId");
     this.recoverPendingDeletions();
     const now = this.currentTime();
@@ -884,13 +884,13 @@ export class ProcessOutputStore {
     }
   }
 
-  private getOwnedReadableRow(ownerClientId: string, workspaceId: string, outputId: string): ProcessOutputRow {
+  private getOwnedReadableRow(connectionPrincipalId: string, workspaceId: string, outputId: string): ProcessOutputRow {
     const row = this.database
       .prepare(
         `select * from process_outputs
          where output_id = ? and owner_client_id = ? and workspace_id = ?`,
       )
-      .get(outputId, ownerClientId, workspaceId) as ProcessOutputRow | undefined;
+      .get(outputId, connectionPrincipalId, workspaceId) as ProcessOutputRow | undefined;
     if (!row || this.isExpired(row)) throw new ProcessOutputNotFoundError();
     return row;
   }

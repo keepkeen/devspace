@@ -150,7 +150,13 @@ export interface AdminDiagnostics {
     processSessions?: AdminUsageMetric;
     processOutput?: AdminUsageMetric & { outputs?: number | null; activeOutputs?: number | null; droppedBytes?: number | null };
     workspaces?: AdminUsageMetric & { resident?: number | null; closing?: number | null };
-    oauth?: { clients?: number | null; accessTokens?: number | null; refreshTokens?: number | null; expiredRecords?: number | null };
+    oauth?: {
+      clients?: number | null;
+      principals?: number | null;
+      accessTokens?: number | null;
+      refreshTokens?: number | null;
+      expiredRecords?: number | null;
+    };
   };
   recentFailures?: AdminRecentFailure[];
   [key: string]: unknown;

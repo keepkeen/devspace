@@ -15,17 +15,17 @@ export interface McpSessionReservationResult {
 export interface McpSessionReservation {
   readonly id: symbol;
   readonly reclaimsSessionId?: string;
-  readonly ownerClientId?: string;
+  readonly connectionPrincipalId?: string;
 }
 
 export interface StatelessMcpRequestLease {
   readonly id: symbol;
-  readonly ownerClientId: string;
+  readonly connectionPrincipalId: string;
 }
 
 interface McpSessionEntry<TTransport> {
   transport: TTransport;
-  ownerClientId: string;
+  connectionPrincipalId: string;
   lastActivityAt: number;
   activeRequests: number;
   closing: boolean;
@@ -34,7 +34,7 @@ interface McpSessionEntry<TTransport> {
 
 interface McpSessionCloseAttempt {
   underlying: Promise<void>;
-  ownerClientId: string;
+  connectionPrincipalId: string;
 }
 
 export interface McpSessionRegistryOptions {
@@ -83,29 +83,29 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
     return size;
   }
 
-  tryReserve(ownerClientId?: string): McpSessionReservation | undefined {
+  tryReserve(connectionPrincipalId?: string): McpSessionReservation | undefined {
     if (
       this.sealed ||
       this.occupiedSlots() >= this.maxSessions ||
-      (ownerClientId !== undefined &&
-        this.occupiedClientSlots(ownerClientId) >= this.maxSessionsPerClient)
+      (connectionPrincipalId !== undefined &&
+        this.occupiedClientSlots(connectionPrincipalId) >= this.maxSessionsPerClient)
     ) {
       return undefined;
     }
-    const reservation = { id: Symbol("mcp-session-reservation"), ownerClientId };
+    const reservation = { id: Symbol("mcp-session-reservation"), connectionPrincipalId };
     this.reservations.add(reservation);
     return reservation;
   }
 
-  tryAcquireStatelessRequest(ownerClientId: string): StatelessMcpRequestLease | undefined {
+  tryAcquireStatelessRequest(connectionPrincipalId: string): StatelessMcpRequestLease | undefined {
     if (
       this.sealed ||
       this.occupiedSlots() >= this.maxSessions ||
-      this.occupiedClientSlots(ownerClientId) >= this.maxSessionsPerClient
+      this.occupiedClientSlots(connectionPrincipalId) >= this.maxSessionsPerClient
     ) {
       return undefined;
     }
-    const lease = { id: Symbol("stateless-mcp-request"), ownerClientId };
+    const lease = { id: Symbol("stateless-mcp-request"), connectionPrincipalId };
     this.statelessRequests.add(lease);
     return lease;
   }
@@ -114,19 +114,19 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
     this.statelessRequests.delete(lease);
   }
 
-  async reserveWithIdleReclaim(ownerClientId: string): Promise<McpSessionReservationResult> {
-    const available = this.tryReserve(ownerClientId);
+  async reserveWithIdleReclaim(connectionPrincipalId: string): Promise<McpSessionReservationResult> {
+    const available = this.tryReserve(connectionPrincipalId);
     if (available) return { reservation: available };
     if (this.sealed) return {};
 
-    const clientAtCapacity = this.occupiedClientSlots(ownerClientId) >= this.maxSessionsPerClient;
-    const candidate = this.oldestInactiveSession(ownerClientId, clientAtCapacity);
+    const clientAtCapacity = this.occupiedClientSlots(connectionPrincipalId) >= this.maxSessionsPerClient;
+    const candidate = this.oldestInactiveSession(connectionPrincipalId, clientAtCapacity);
     if (!candidate) return {};
 
     const reservation = {
       id: Symbol("mcp-session-reclaim-reservation"),
       reclaimsSessionId: candidate.sessionId,
-      ownerClientId,
+      connectionPrincipalId,
     };
     this.reservations.add(reservation);
     const reclaimed = await this.beginClosing(candidate.sessionId, candidate.entry).promise;
@@ -149,7 +149,7 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
 
   register(
     sessionId: string,
-    ownerClientId: string,
+    connectionPrincipalId: string,
     transport: TTransport,
     reservation?: McpSessionReservation,
     activeRequests = 0,
@@ -161,44 +161,44 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
     if (this.sessions.has(sessionId)) {
       throw new Error(`Duplicate MCP session: ${sessionId}`);
     }
-    if (reservation?.ownerClientId && reservation.ownerClientId !== ownerClientId) {
+    if (reservation?.connectionPrincipalId && reservation.connectionPrincipalId !== connectionPrincipalId) {
       throw new Error("The MCP session reservation belongs to a different OAuth client.");
     }
     if (this.occupiedSlots(reservation) >= this.maxSessions) {
       throw new Error(`MCP session limit reached (${this.maxSessions}).`);
     }
-    if (this.occupiedClientSlots(ownerClientId, reservation) >= this.maxSessionsPerClient) {
+    if (this.occupiedClientSlots(connectionPrincipalId, reservation) >= this.maxSessionsPerClient) {
       throw new Error(`MCP session limit reached for this OAuth client (${this.maxSessionsPerClient}).`);
     }
     if (reservation) this.reservations.delete(reservation);
     this.sessions.set(sessionId, {
       transport,
-      ownerClientId,
+      connectionPrincipalId,
       lastActivityAt: this.now(),
       activeRequests,
       closing: false,
     });
   }
 
-  get(sessionId: string, ownerClientId: string): TTransport | undefined {
+  get(sessionId: string, connectionPrincipalId: string): TTransport | undefined {
     const entry = this.sessions.get(sessionId);
-    if (!entry || entry.closing || entry.ownerClientId !== ownerClientId) return undefined;
+    if (!entry || entry.closing || entry.connectionPrincipalId !== connectionPrincipalId) return undefined;
 
     entry.lastActivityAt = this.now();
     return entry.transport;
   }
 
-  acquire(sessionId: string, ownerClientId: string): TTransport | undefined {
+  acquire(sessionId: string, connectionPrincipalId: string): TTransport | undefined {
     const entry = this.sessions.get(sessionId);
-    if (!entry || entry.closing || entry.ownerClientId !== ownerClientId) return undefined;
+    if (!entry || entry.closing || entry.connectionPrincipalId !== connectionPrincipalId) return undefined;
     entry.lastActivityAt = this.now();
     entry.activeRequests += 1;
     return entry.transport;
   }
 
-  release(sessionId: string, ownerClientId: string): void {
+  release(sessionId: string, connectionPrincipalId: string): void {
     const entry = this.sessions.get(sessionId);
-    if (!entry || entry.ownerClientId !== ownerClientId) return;
+    if (!entry || entry.connectionPrincipalId !== connectionPrincipalId) return;
     entry.activeRequests = Math.max(0, entry.activeRequests - 1);
     entry.lastActivityAt = this.now();
   }
@@ -212,7 +212,7 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
     if (!entry) return undefined;
     this.sessions.delete(sessionId);
     const inFlightClosing = this.inFlightClosings.get(sessionId);
-    if (entry.closing && inFlightClosing?.ownerClientId === entry.ownerClientId) {
+    if (entry.closing && inFlightClosing?.connectionPrincipalId === entry.connectionPrincipalId) {
       this.inFlightClosings.delete(sessionId);
     }
     return entry.closing ? "intentional" : "unexpected";
@@ -260,17 +260,17 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
     return Promise.all(initiatedClosings);
   }
 
-  usageSnapshot(ownerClientId?: string): McpSessionUsageSnapshot {
+  usageSnapshot(connectionPrincipalId?: string): McpSessionUsageSnapshot {
     return {
       sessions: this.size,
       reservations: this.reservations.size,
       statelessRequests: this.statelessRequests.size,
       limit: this.maxSessions,
-      ...(ownerClientId === undefined ? {} : {
+      ...(connectionPrincipalId === undefined ? {} : {
         owner: {
-          sessions: this.clientSessionCount(ownerClientId),
-          reservations: this.clientReservationCount(ownerClientId),
-          statelessRequests: this.clientStatelessRequestCount(ownerClientId),
+          sessions: this.clientSessionCount(connectionPrincipalId),
+          reservations: this.clientReservationCount(connectionPrincipalId),
+          statelessRequests: this.clientStatelessRequestCount(connectionPrincipalId),
           limit: this.maxSessionsPerClient,
         },
       }),
@@ -295,7 +295,7 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
     const underlyingClose = Promise.resolve().then(() => entry.transport.close());
     const promise = closeSession(sessionId, underlyingClose, this.closeTimeoutMs);
     entry.closePromise = promise;
-    const attempt = { underlying: underlyingClose, ownerClientId: entry.ownerClientId };
+    const attempt = { underlying: underlyingClose, connectionPrincipalId: entry.connectionPrincipalId };
     this.inFlightClosings.set(sessionId, attempt);
 
     void underlyingClose.then(
@@ -320,7 +320,7 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
     return { promise, initiated: true };
   }
 
-  private oldestInactiveSession(ownerClientId: string, ownerOnly = false): {
+  private oldestInactiveSession(connectionPrincipalId: string, ownerOnly = false): {
     sessionId: string;
     entry: McpSessionEntry<TTransport>;
   } | undefined {
@@ -333,7 +333,7 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
         oldestGlobal = { sessionId, entry };
       }
       if (
-        entry.ownerClientId === ownerClientId &&
+        entry.connectionPrincipalId === connectionPrincipalId &&
         (!oldestForOwner || entry.lastActivityAt < oldestForOwner.entry.lastActivityAt)
       ) {
         oldestForOwner = { sessionId, entry };
@@ -360,16 +360,16 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
   }
 
   private occupiedClientSlots(
-    ownerClientId: string,
+    connectionPrincipalId: string,
     excludedReservation?: McpSessionReservation,
   ): number {
     let occupied =
-      this.clientSessionCount(ownerClientId) + this.clientStatelessRequestCount(ownerClientId);
+      this.clientSessionCount(connectionPrincipalId) + this.clientStatelessRequestCount(connectionPrincipalId);
     for (const reservation of this.reservations) {
-      if (reservation === excludedReservation || reservation.ownerClientId !== ownerClientId) continue;
+      if (reservation === excludedReservation || reservation.connectionPrincipalId !== connectionPrincipalId) continue;
       if (
         reservation.reclaimsSessionId &&
-        this.occupiedSessionOwner(reservation.reclaimsSessionId) === ownerClientId
+        this.occupiedSessionOwner(reservation.reclaimsSessionId) === connectionPrincipalId
       ) {
         continue;
       }
@@ -378,36 +378,36 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
     return occupied;
   }
 
-  private clientSessionCount(ownerClientId: string): number {
+  private clientSessionCount(connectionPrincipalId: string): number {
     let count = 0;
     for (const entry of this.sessions.values()) {
-      if (entry.ownerClientId === ownerClientId) count += 1;
+      if (entry.connectionPrincipalId === connectionPrincipalId) count += 1;
     }
     for (const [sessionId, attempt] of this.inFlightClosings) {
-      if (!this.sessions.has(sessionId) && attempt.ownerClientId === ownerClientId) count += 1;
+      if (!this.sessions.has(sessionId) && attempt.connectionPrincipalId === connectionPrincipalId) count += 1;
     }
     return count;
   }
 
-  private clientReservationCount(ownerClientId: string): number {
+  private clientReservationCount(connectionPrincipalId: string): number {
     let count = 0;
     for (const reservation of this.reservations) {
-      if (reservation.ownerClientId === ownerClientId) count += 1;
+      if (reservation.connectionPrincipalId === connectionPrincipalId) count += 1;
     }
     return count;
   }
 
-  private clientStatelessRequestCount(ownerClientId: string): number {
+  private clientStatelessRequestCount(connectionPrincipalId: string): number {
     let count = 0;
     for (const request of this.statelessRequests) {
-      if (request.ownerClientId === ownerClientId) count += 1;
+      if (request.connectionPrincipalId === connectionPrincipalId) count += 1;
     }
     return count;
   }
 
   private occupiedSessionOwner(sessionId: string): string | undefined {
-    return this.sessions.get(sessionId)?.ownerClientId
-      ?? this.inFlightClosings.get(sessionId)?.ownerClientId;
+    return this.sessions.get(sessionId)?.connectionPrincipalId
+      ?? this.inFlightClosings.get(sessionId)?.connectionPrincipalId;
   }
 }
 

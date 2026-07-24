@@ -33,7 +33,7 @@ function testPendingCancellation(stateDir: string): void {
     assert.deepEqual(store.reserve(key, "hash-a"), { status: "new" });
     assert.equal(store.cancelPending(key, "wrong-hash"), false);
     assert.equal(store.cancelPending(key, "hash-a"), true);
-    assert.equal(store.getOperationStatus(key.ownerClientId, key.operationId), undefined);
+    assert.equal(store.getOperationStatus(key.connectionPrincipalId, key.operationId), undefined);
     assert.deepEqual(store.reserve(key, "hash-b"), { status: "new" });
     assert.deepEqual(store.settle(key, "hash-b", { ok: true }), { status: "settled" });
     assert.equal(store.cancelPending(key, "hash-b"), false);
@@ -123,7 +123,7 @@ function testKeyIsolation(stateDir: string): void {
   const store = new MutationOperationStore(stateDir);
   const keys = [
     operationKey(),
-    operationKey({ ownerClientId: "owner-b", workspaceId: "workspace-owner-b" }),
+    operationKey({ connectionPrincipalId: "owner-b", workspaceId: "workspace-owner-b" }),
     operationKey({ workspaceId: "workspace-b", operationId: "operation-b" }),
     operationKey({ tool: "delete_file", operationId: "operation-c" }),
   ];
@@ -244,7 +244,7 @@ function testOversizedResultTombstone(stateDir: string): void {
     });
     assert.deepEqual(store.reserve(key, "hash"), { status: "result_unavailable" });
     assert.deepEqual(store.reserve(key, "different-hash"), { status: "conflict" });
-    assert.equal(store.getOperationStatus(key.ownerClientId, key.operationId)?.resultAvailable, false);
+    assert.equal(store.getOperationStatus(key.connectionPrincipalId, key.operationId)?.resultAvailable, false);
 
     const database = openDatabase(stateDir);
     try {
@@ -253,7 +253,7 @@ function testOversizedResultTombstone(stateDir: string): void {
           `select request_hash, state, result_json from mutation_operations
            where owner_client_id = ? and workspace_id = ? and tool = ? and operation_id = ?`,
         )
-        .get(key.ownerClientId, key.workspaceId, key.tool, key.operationId);
+        .get(key.connectionPrincipalId, key.workspaceId, key.tool, key.operationId);
       assert.deepEqual(row, { request_hash: "hash", state: "settled", result_json: null });
     } finally {
       database.close();
@@ -266,7 +266,7 @@ function testOversizedResultTombstone(stateDir: string): void {
 function testOwnerMatchedWorkspaceForeignKey(stateDir: string): void {
   prepareStateDir(stateDir);
   const store = new MutationOperationStore(stateDir);
-  const mismatched = operationKey({ ownerClientId: "owner-b", workspaceId: "workspace-a" });
+  const mismatched = operationKey({ connectionPrincipalId: "owner-b", workspaceId: "workspace-a" });
   try {
     assert.throws(
       () => store.reserve(mismatched, "hash"),
@@ -295,6 +295,12 @@ function testDuplicateMigration(stateDir: string): void {
       (5, 'workspace-checkout-reuse', '2026-01-01T00:00:00.000Z'),
       (6, 'oauth-owner-credential', '2026-01-01T00:00:00.000Z'),
       (7, 'workspace-resume-idempotency', '2026-01-01T00:00:00.000Z');
+
+    create table oauth_clients (
+      client_id text primary key,
+      client_json text not null,
+      issued_at integer not null
+    );
 
     create table workspace_sessions (
       id text primary key,
@@ -359,7 +365,7 @@ function testDuplicateMigration(stateDir: string): void {
     });
     assert.deepEqual(
       store.reserve({
-        ownerClientId: "owner-a",
+        connectionPrincipalId: "owner-a",
         workspaceId: "workspace-old",
         tool: "write_file",
         operationId: "shared",
@@ -401,7 +407,7 @@ function testDuplicateMigration(stateDir: string): void {
 
 function operationKey(overrides: Partial<MutationOperationKey> = {}): MutationOperationKey {
   return {
-    ownerClientId: "owner-a",
+    connectionPrincipalId: "owner-a",
     workspaceId: "workspace-a",
     tool: "write_file",
     operationId: "operation-a",

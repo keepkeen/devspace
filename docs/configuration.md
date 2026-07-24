@@ -96,7 +96,7 @@ DevSpace uses a single-user OAuth approval flow.
 | --- | --- |
 | `DEVSPACE_OAUTH_ACCESS_TOKEN_TTL_SECONDS` | `3600` |
 | `DEVSPACE_OAUTH_REFRESH_TOKEN_TTL_SECONDS` | `2592000` |
-| `DEVSPACE_OAUTH_SCOPES` | `devspace` |
+| `DEVSPACE_OAUTH_SCOPES` | `devspace,workspace:read,workspace:write,process:execute,network:access,worktree:create,workspace:revoke` |
 | `DEVSPACE_OAUTH_ALLOWED_REDIRECT_HOSTS` | `chatgpt.com,localhost,127.0.0.1` |
 
 MCP clients discover metadata from:
@@ -106,10 +106,58 @@ MCP clients discover metadata from:
 /.well-known/oauth-authorization-server
 ```
 
-Workspace and MCP resources are owned by the OAuth `clientId`. Reauthorizing the
-same registered client preserves access but advances its active Workspace
-generations, so conversations must resume them; a separately registered client cannot
-reuse another client's MCP session, workspace, or process identifiers.
+Workspace, process, operation, and MCP quota state is owned by a local
+connection principal, not directly by the dynamic OAuth `client_id`. A public
+dynamic registration is unassigned until its first successful Owner approval,
+which creates a new principal by default. DevSpace does not receive a
+verified ChatGPT account subject, so this is connection-level isolation rather
+than account-level identity.
+
+Use `devspace auth principals` to list local principals. To intentionally bind a
+fresh connector registration to an earlier principal, generate
+`devspace auth reconnect-code <principal-id>` and enter the one-time short-lived
+code on the OAuth approval page. Relinking is rejected after the fresh source
+principal has retained Workspace state, and any tokens issued before the
+relink are revoked. Reauthorizing the same registered client preserves its
+principal but advances active Workspace generations, so conversations must
+resume them.
+
+ChatGPT does not provide a trusted conversation identifier. A Workspace alias
+is therefore the durable conversation-to-project key. Multiple conversations
+under one principal may retain different aliases; after a disconnect, later-day
+turn, or new transport, each conversation should list and resume its own alias.
+Do not create a replacement managed worktree merely because an old receipt or
+MCP session disappeared.
+
+Managed Workspace records remain active when their worktree directory is
+missing. `list_workspaces` reports `recovery_required`, and
+`resume_workspace(alias, contextMode="full")` attempts to recreate the original
+path under the same Workspace ID. DevSpace prefers the latest commit retained
+in Git's worktree metadata, falling back to the saved base commit. If the
+physical directory and its uncommitted files were lost, recovery reports
+`dataLossPossible=true` rather than pretending those files were restored.
+
+The granular scopes mean:
+
+| Scope | Authority |
+| --- | --- |
+| `workspace:read` | Open/read approved workspaces, context, instructions, Skills, and metadata. |
+| `workspace:write` | Modify files and review checkpoints; request writable checkout access. |
+| `process:execute` | Start, poll, and interact with local processes. |
+| `network:access` | Permit executed processes to inherit host network access. |
+| `worktree:create` | Create managed Git worktrees. |
+| `workspace:revoke` | Close or revoke Workspace authority. |
+| `devspace` | Legacy compatibility alias for all capabilities above. |
+
+The OAuth approval page displays the requested capabilities, and every tool
+checks its required combination immediately before execution.
+
+Failed Owner-password attempts are limited by persistent SQLite token buckets
+for the exact authorization session, dynamic client registration, source IP,
+and a global fallback. Backoff grows after repeated exhaustion. A successful
+authorization clears only its exact session key. When `DEVSPACE_TRUST_PROXY=1`,
+forwarded client IPs are used only when the direct peer is loopback; otherwise
+forwarding headers are ignored.
 Changing the Owner password and restarting DevSpace revokes all access and refresh
 tokens, but preserves public OAuth client registrations so ChatGPT and other MCP
 clients can reauthorize without recreating their connector. The local Admin panel's
@@ -129,9 +177,9 @@ orphan Workspace authority.
 | `DEVSPACE_MCP_SESSION_CLOSE_TIMEOUT_SECONDS` | `5` | Maximum wait for one transport to close. |
 | `DEVSPACE_RESOURCE_CLEANUP_INTERVAL_SECONDS` | `300` | Sweep interval for idle resources. |
 | `DEVSPACE_MAX_MCP_SESSIONS` | `64` | Combined cap for live stateful transports and concurrent stateless ChatGPT requests. |
-| `DEVSPACE_MAX_MCP_SESSIONS_PER_CLIENT` | `8` | Per-client cap for that same combined MCP concurrency. |
+| `DEVSPACE_MAX_MCP_SESSIONS_PER_CLIENT` | `8` | Per-connection-principal cap for that same combined MCP concurrency. |
 | `DEVSPACE_MAX_PROCESS_SESSIONS` | `32` | Maximum retained process sessions. |
-| `DEVSPACE_MAX_PROCESS_SESSIONS_PER_CLIENT` | `16` | Maximum retained process sessions owned by one OAuth client. |
+| `DEVSPACE_MAX_PROCESS_SESSIONS_PER_CLIENT` | `16` | Maximum retained process sessions owned by one connection principal. |
 | `DEVSPACE_MAX_PROCESS_SESSIONS_PER_WORKSPACE` | `8` | Per-workspace process limit. |
 | `DEVSPACE_MAX_PROCESS_OUTPUT_FILE_BYTES` | `67108864` | Maximum durable output for one process (64 MiB; capped at 1 GiB). |
 | `DEVSPACE_MAX_PROCESS_OUTPUT_STORAGE_BYTES` | `1073741824` | Total durable process-output storage (1 GiB; capped at 10 GiB). |
@@ -141,7 +189,7 @@ orphan Workspace authority.
 | `DEVSPACE_HTTP_DRAIN_TIMEOUT_SECONDS` | `30` | Drain deadline before remaining HTTP sockets are closed. |
 | `DEVSPACE_WORKSPACE_IDLE_TTL_SECONDS` | `604800` | Close inactive checkout sessions and clean managed worktrees. Dirty managed worktrees are retained. |
 | `DEVSPACE_MAX_RESIDENT_WORKSPACES` | `256` | Maximum workspaces retained in memory. |
-| `DEVSPACE_MAX_ACTIVE_WORKSPACES_PER_CLIENT` | `32` | Maximum active persisted workspaces owned by one OAuth client. |
+| `DEVSPACE_MAX_ACTIVE_WORKSPACES_PER_CLIENT` | `32` | Maximum active persisted workspaces owned by one connection principal. |
 | `DEVSPACE_MAX_MANAGED_WORKTREES` | `64` | Maximum managed worktrees retained on disk. |
 
 Clients must not call `close_workspace` as routine turn or conversation cleanup.
@@ -150,8 +198,8 @@ It terminates running processes and closes the logical session. A clean managed
 worktree is removed; a dirty managed worktree is retained and the workspace
 stays open so its changes remain manageable.
 
-Equivalent managed worktree opens are reused by default for the same OAuth
-client, source repository, and base commit. `forceNew: true` explicitly creates
+Equivalent managed worktree opens are reused by default for the same connection
+principal, source repository, and base commit. `forceNew: true` explicitly creates
 a separate worktree and remains subject to the configured quotas. Missing
 managed directories are reconciled out of active session listings and quota
 counts.
@@ -274,11 +322,14 @@ network isolation without an operating-system sandbox.
 Shell commands are split at control operators (`&&`, `||`, `|`, `;`,
 subshells) and inspected through bounded static nesting, including shell
 payloads, heredocs, substitutions, `find -exec`, and `xargs`. Executable
-`sudo`, forced or recursive `rm`, and piping content into an executing shell
-are blocked; parse-only shell checks such as `bash -n` remain available. Normal
-shell writes, redirection, and commands such as `mkdir`, `touch`, `cp`, and
-`mv` are allowed. Literal targets for common direct writes are canonicalized
-and rejected when they leave the workspace, including through a symlink.
+`sudo` and piping content into an executing shell are blocked; parse-only shell
+checks such as `bash -n` remain available. Normal shell writes, redirection,
+build/test/package commands, and project-relative cleanup such as
+`rm -rf dist` or `rm -rf node_modules` are allowed. Forced or recursive removal
+is rejected when its target is outside the Workspace, is the Workspace root,
+or cannot be resolved as a safe project-relative path. Literal targets for
+common direct writes are canonicalized and rejected when they leave the
+workspace, including through a symlink.
 
 This is an accident-prevention guardrail, not an operating-system sandbox.
 Dynamic targets and opaque scripts run with the DevSpace OS user's permissions
@@ -312,9 +363,19 @@ tombstones remain until Workspace deletion, so an old ID cannot execute again.
 Reads expose `contentHash` and decimal-string `mtimeNs`;
 `apply_patch` defaults to strict preconditions and requires an `ifMatch` entry
 for every touched path before its first write. Use the latest read version for
-an existing path and explicit `null` for a path expected not to exist. Blind
-patching requires `preconditionMode: "blind"` plus `blindWriteReason`, and
-should only be used after explicit user authorization.
+an existing path and explicit `null` for a path expected not to exist. Missing
+preconditions are rejected before the patch starts; there is no blind-write
+bypass.
+
+Workspace operations also use a fair process-local read/write lock keyed by the
+canonical physical root. Reads and inspections may share the read side.
+`apply_patch`, `exec_command`, mutating `write_stdin`, `show_changes`, close,
+and revoke use the write side, including when different principals opened the
+same checkout. The DevSpace process-output writer lease permits only one server
+process for a state directory, so this lock is global within the supported
+single-server deployment. Separate DevSpace instances using different state
+directories are not coordinated; use distinct worktrees or OS-level isolation
+in that topology.
 
 ## Widgets
 
@@ -408,27 +469,37 @@ Boolean environment variables accept `1,true,yes,on` and
 `0,false,no,off` (case-insensitive). Other values fail startup instead of
 silently disabling a feature.
 
+`exec_command` uses a minimal inherited child-process environment rather than
+copying the DevSpace server's complete environment. Basic path, home/user,
+temporary-directory, locale, and operating-system variables are retained.
+Additional command-specific values must be supplied explicitly through the
+tool's `environment` input; server OAuth credentials, CI tokens, proxy secrets,
+SSH-agent sockets, and `NODE_OPTIONS` are not inherited automatically.
+
 Set `DEVSPACE_LOG_SHELL_COMMANDS=1` only when you intentionally want command
 previews in logs.
 
 `GET /healthz` is a liveness check. `GET /readyz` returns `503` while shutting
 down or when either SQLite store cannot answer a readiness probe.
 
-Structured request and tool logs use three correlation levels:
+Structured request and tool logs use four correlation levels:
 
 - `requestId` identifies one HTTP/MCP request.
-- `connectionRef` (`conn_…`) identifies one OAuth client registration across
-  access-token refreshes and server restarts.
-- `workspaceActivityRef` (`act_…`) identifies one connection + `workspaceId`
+- `oauthClientRef` (`oauth_…`) identifies one dynamic OAuth client registration.
+- `connectionRef` (`conn_…`) identifies the local connection principal across
+  token refreshes and any explicitly approved connector relink.
+- `workspaceActivityRef` (`act_…`) identifies one principal + `workspaceId`
   activity, so conversations working on different projects can be separated.
 
-`clientIdHash` remains as a compatibility alias for existing log consumers.
-Neither reference is a verified ChatGPT account or conversation ID: ChatGPT's
+`clientIdHash` remains as a compatibility alias for existing log consumers and
+hashes the dynamic OAuth registration. None of these references is a verified
+ChatGPT account or conversation ID: ChatGPT's
 remote MCP contract does not provide those claims to DevSpace. A removed and
-re-added connection receives a new `connectionRef`; two conversations using the
-same registration and same reused workspace remain intentionally
-indistinguishable. Logs never contain access tokens, Authorization headers, or
-full OAuth client identifiers.
+re-added connector receives a new `oauthClientRef`; it also receives a new
+`connectionRef` unless the owner explicitly uses a reconnect code. Two
+conversations using the same principal and same reused workspace remain
+intentionally indistinguishable. Logs never contain reconnect codes, access
+tokens, Authorization headers, or full OAuth client identifiers.
 
 ## Env-Only Example
 

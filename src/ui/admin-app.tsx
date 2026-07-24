@@ -76,16 +76,16 @@ const resourceFields: Array<{
   unit?: string;
 }> = [
   { key: "maxMcpSessions", label: "MCP 会话上限", description: "同时保持的 MCP 客户端连接数。" },
-  { key: "maxMcpSessionsPerClient", label: "单客户端 MCP 上限", description: "单个 OAuth 客户端可占用的 MCP 会话数。" },
+  { key: "maxMcpSessionsPerClient", label: "单连接主体 MCP 上限", description: "单个本机连接主体可占用的 MCP 会话数。" },
   { key: "maxProcessSessions", label: "进程会话总上限", description: "所有 workspace 合计可运行的终端进程数。" },
-  { key: "maxProcessSessionsPerClient", label: "单客户端进程上限", description: "单个 OAuth 客户端跨 workspace 可占用的进程会话数。" },
+  { key: "maxProcessSessionsPerClient", label: "单连接主体进程上限", description: "单个本机连接主体跨 workspace 可占用的进程会话数。" },
   { key: "maxProcessSessionsPerWorkspace", label: "单 workspace 进程上限", description: "单个 workspace 可同时占用的终端进程数。" },
   { key: "maxProcessOutputFileBytes", label: "单份进程输出上限", description: "单个进程可持久化的完整输出字节数。", unit: "字节" },
   { key: "maxProcessOutputStorageBytes", label: "进程输出存储总上限", description: "所有持久化进程输出合计可占用的字节数。", unit: "字节" },
   { key: "completedProcessOutputTtlMs", label: "已完成输出保留时间", description: "进程结束后完整输出继续保留的时间。", displaySeconds: true, unit: "秒" },
   { key: "maxCommandRuntimeMs", label: "命令最长运行时间", description: "命令达到此时间后会被终止。", displaySeconds: true, unit: "秒" },
   { key: "maxResidentWorkspaces", label: "驻留 workspace 上限", description: "内存中保留的 workspace 会话数量。" },
-  { key: "maxActiveWorkspacesPerClient", label: "单客户端 workspace 上限", description: "单个 OAuth 客户端可保持的活跃 workspace 数。" },
+  { key: "maxActiveWorkspacesPerClient", label: "单连接主体 workspace 上限", description: "单个本机连接主体可保持的活跃 workspace 数。" },
   { key: "maxManagedWorktrees", label: "托管 worktree 上限", description: "DevSpace 同时维护的 Git worktree 数量。" },
 ];
 
@@ -552,7 +552,8 @@ function AdminForm({
               <UsageCard label="进程会话" metric={diagnostics.diagnostics.usage?.processSessions} />
               <UsageCard label="进程输出字节" metric={diagnostics.diagnostics.usage?.processOutput} />
               <UsageCard label="驻留 workspace" metric={diagnostics.diagnostics.usage?.workspaces} activeKey="resident" />
-              <UsageCard label="OAuth 客户端" metric={{ active: diagnostics.diagnostics.usage?.oauth?.clients ?? undefined }} />
+              <UsageCard label="连接主体" metric={{ active: diagnostics.diagnostics.usage?.oauth?.principals ?? undefined }} />
+              <UsageCard label="OAuth 注册" metric={{ active: diagnostics.diagnostics.usage?.oauth?.clients ?? undefined }} />
             </div>
             <div className="runtime-columns">
               <div className="subsection">

@@ -35,6 +35,7 @@ import {
   connectionRef,
   errorFields,
   identifierHash,
+  oauthClientRef,
   sessionIdPrefix,
   workspaceActivityRef,
 } from "./logger.js";
@@ -100,6 +101,8 @@ import {
   UnknownWorkspaceAliasError,
   WorkspaceReadOnlyError,
   WorkspaceAliasConflictError,
+  WorkspaceRecoveryRequiredError,
+  WorkspaceSelectionRequiredError,
   WorkspaceQuotaError,
   WorkspaceRegistry,
   WorkspaceResumeRequiredError,
@@ -141,6 +144,10 @@ import {
   createWorkspaceRevokeEffects,
   type ToolEffects,
 } from "./tool-effects.js";
+import {
+  missingOAuthScopes,
+  type DevSpaceCapabilityScope,
+} from "./oauth-scopes.js";
 
 const SHELL_COMMAND_MAX_CHARACTERS = 100_000;
 
@@ -152,7 +159,9 @@ interface RequestCorrelationState {
 }
 
 const requestContext = new AsyncLocalStorage<{
-  clientId: string;
+  connectionPrincipalId: string;
+  oauthClientId: string;
+  scopes: string[];
   requestId?: string;
   correlation: RequestCorrelationState;
   workspaceBinding?: WorkspaceContextReceiptBinding;
@@ -220,8 +229,8 @@ function publicToolError(error: unknown, toolName: string): PublicToolError | un
   if (error instanceof UnknownWorkspaceError) {
     return {
       code: error.code,
-      text: "unknown_workspace: Call open_workspace for the project, replace workspaceId, and retry once.",
-      recovery: "open_workspace",
+      text: "unknown_workspace: Call list_workspaces and resume the matching alias before opening any new workspace.",
+      recovery: "list_workspaces",
     };
   }
   if (error instanceof UnknownProcessSessionError) {
@@ -346,6 +355,26 @@ function publicToolError(error: unknown, toolName: string): PublicToolError | un
     return {
       code: error.code,
       text: `${error.code}: Resume the existing workspace with alias ${JSON.stringify(error.currentAlias)}.`,
+      retryable: true,
+      safeToRetry: true,
+      recovery: "resume_workspace",
+      phase: "not_started",
+    };
+  }
+  if (error instanceof WorkspaceSelectionRequiredError) {
+    return {
+      code: error.code,
+      text: `${error.code}: Multiple workspaces match this project; resume one of these aliases: ${error.aliases.map((alias) => JSON.stringify(alias)).join(", ")}.`,
+      retryable: true,
+      safeToRetry: true,
+      recovery: "resume_workspace",
+      phase: "not_started",
+    };
+  }
+  if (error instanceof WorkspaceRecoveryRequiredError) {
+    return {
+      code: error.code,
+      text: `${error.code}: Alias ${JSON.stringify(error.alias)} is retained, but ${error.reason}. Resolve that condition, then retry resume_workspace; do not create a replacement worktree.`,
       retryable: true,
       safeToRetry: true,
       recovery: "resume_workspace",
@@ -564,7 +593,6 @@ const RELEASABLE_MUTATION_PREFLIGHT_CODES = new Set([
   "instruction_token_invalid",
   "if_match_required",
   "if_match_ambiguous",
-  "blind_write_reason_required",
 ]);
 
 function releasableMutationPreflightCode(value: unknown): string | undefined {
@@ -594,7 +622,7 @@ async function runMutationOperation<T>(options: {
     request: options.request,
   });
   const identity = [
-    options.key.ownerClientId,
+    options.key.connectionPrincipalId,
     options.key.operationId,
   ].join("\0");
   const inFlight = options.pending.get(identity);
@@ -777,6 +805,7 @@ const registerAppTool: typeof registerSdkAppTool = ((...args: unknown[]) => {
   if (typeof handler === "function") {
     const invoke = async (handlerArgs: unknown[]) => {
       try {
+        assertToolOAuthScopes(toolName);
         const result: unknown = await handler(...handlerArgs);
         if (!result || typeof result !== "object" || Array.isArray(result)) return result;
         const record = result as Record<string, unknown>;
@@ -1057,6 +1086,87 @@ const toolNames = {
   execCommand: "exec_command",
 } as const;
 
+const WORKSPACE_SCOPED_TOOL_NAMES = new Set<string>([
+  toolNames.getWorkspaceContext,
+  toolNames.loadWorkspaceInstructions,
+  toolNames.listSkills,
+  toolNames.loadSkill,
+  toolNames.closeWorkspace,
+  toolNames.revokeWorkspace,
+  toolNames.read,
+  toolNames.batchRead,
+  toolNames.batchInspect,
+  toolNames.writeStdin,
+  toolNames.applyPatch,
+  toolNames.execCommand,
+  toolNames.readProcessOutput,
+  "show_changes",
+]);
+
+const WORKSPACE_WRITE_TOOL_NAMES = new Set<string>([
+  toolNames.applyPatch,
+  toolNames.execCommand,
+  toolNames.closeWorkspace,
+  toolNames.revokeWorkspace,
+  "show_changes",
+]);
+
+export function requiredOAuthScopesForTool(
+  toolName: string,
+): readonly DevSpaceCapabilityScope[] {
+  switch (toolName) {
+    case toolNames.openWorkspace:
+    case toolNames.listWorkspaces:
+    case toolNames.resumeWorkspace:
+    case toolNames.getWorkspaceContext:
+    case toolNames.loadWorkspaceInstructions:
+    case toolNames.listSkills:
+    case toolNames.loadSkill:
+    case toolNames.read:
+    case toolNames.batchRead:
+    case toolNames.batchInspect:
+      return ["workspace:read"];
+    case toolNames.applyPatch:
+      return ["workspace:write"];
+    case "show_changes":
+      return ["workspace:read", "workspace:write"];
+    case toolNames.getOperationStatus:
+      return ["workspace:read"];
+    case toolNames.execCommand:
+      return ["workspace:read", "workspace:write", "process:execute", "network:access"];
+    case toolNames.writeStdin:
+    case toolNames.readProcessOutput:
+      return ["workspace:read", "process:execute"];
+    case toolNames.closeWorkspace:
+    case toolNames.revokeWorkspace:
+      return ["workspace:revoke"];
+    default:
+      return [];
+  }
+}
+
+function assertToolOAuthScopes(toolName: string): void {
+  assertOAuthScopes(requiredOAuthScopesForTool(toolName));
+}
+
+function assertOAuthScopes(requiredScopes: readonly DevSpaceCapabilityScope[]): void {
+  if (requiredScopes.length === 0) return;
+  const grantedScopes = requestContext.getStore()?.scopes ?? [];
+  const missing = missingOAuthScopes(grantedScopes, requiredScopes);
+  if (missing.length === 0) return;
+  throw new PublicActionError(
+    "insufficient_scope",
+    `Reauthorize DevSpace with the required OAuth scope(s): ${missing.join(", ")}.`,
+    {
+      retryable: false,
+      safeToRetry: false,
+      recovery: "reauthorize_oauth",
+      phase: "not_started",
+      effectsKnown: true,
+    },
+  );
+}
+
 function toolDescription(parts: {
   use: string;
   avoid: string;
@@ -1102,24 +1212,8 @@ interface ToolLogFields {
   error?: string;
 }
 
-function serverInstructions(config: ServerConfig): string {
-  const lifecycleInstruction = buildWorkspaceLifecycleInstruction({
-    openWorkspace: toolNames.openWorkspace,
-    getWorkspaceContext: toolNames.getWorkspaceContext,
-    listWorkspaces: toolNames.listWorkspaces,
-    resumeWorkspace: toolNames.resumeWorkspace,
-    closeWorkspace: toolNames.closeWorkspace,
-  });
-  return (
-    lifecycleInstruction + " " + buildCodexServerInstructions({
-      read: toolNames.read,
-      batchRead: toolNames.batchRead,
-      batchInspect: toolNames.batchInspect,
-      loadSkill: config.skillsEnabled ? toolNames.loadSkill : undefined,
-      readProcessOutput: toolNames.readProcessOutput,
-      writeStdin: toolNames.writeStdin,
-    })
-  );
+function serverInstructions(): string {
+  return `${buildWorkspaceLifecycleInstruction()} ${buildCodexServerInstructions()}`;
 }
 
 const workspaceSkillOutputSchema = z.object({
@@ -1298,7 +1392,7 @@ function renderWorkspaceContext(
   const returnedInstructions = instructionsIncluded ? loadedInstructions : [];
   const visibleSkills = skillsIncluded ? skillCatalog.skills : [];
   const serialized = serializeWorkspaceContext({
-    ownerClientId: workspace.ownerClientId,
+    connectionPrincipalId: workspace.connectionPrincipalId,
     workspaceId: workspace.id,
     contextSessionId,
     phase: contextMode === "metadata" ? "metadata" : "context_loaded",
@@ -1472,88 +1566,119 @@ export function workspaceOperationId(body: unknown): string | undefined {
   return workspaceToolLease(body) === "shared" ? toolCallWorkspaceId(body) : undefined;
 }
 
-export function workspaceToolLease(body: unknown): WorkspaceToolLease | undefined {
+interface ToolCallRequest {
+  name: string;
+  arguments: Record<string, unknown>;
+}
+
+function toolCallRequest(body: unknown): ToolCallRequest | undefined {
   if (!body || typeof body !== "object" || Array.isArray(body)) return undefined;
   const request = body as { method?: unknown; params?: unknown };
   if (request.method !== "tools/call" || !request.params || typeof request.params !== "object") {
     return undefined;
   }
-  const name = (request.params as { name?: unknown }).name;
-  return typeof name === "string" ? workspaceToolLeases.get(name) : undefined;
+  const params = request.params as { name?: unknown; arguments?: unknown };
+  if (typeof params.name !== "string") return undefined;
+  const args = params.arguments;
+  return {
+    name: params.name,
+    arguments: args && typeof args === "object" && !Array.isArray(args)
+      ? args as Record<string, unknown>
+      : {},
+  };
+}
+
+export function toolCallName(body: unknown): string | undefined {
+  return toolCallRequest(body)?.name;
+}
+
+export function requiredOAuthScopesForToolCall(
+  body: unknown,
+): readonly DevSpaceCapabilityScope[] {
+  const request = toolCallRequest(body);
+  if (!request) return [];
+  const required = [...requiredOAuthScopesForTool(request.name)];
+  if (request.name === toolNames.writeStdin) {
+    const input = request.arguments;
+    const mutates = input.chars !== undefined ||
+      input.closeStdin === true ||
+      input.columns !== undefined ||
+      input.rows !== undefined;
+    if (mutates) required.push("workspace:write", "network:access");
+  } else if (request.name === toolNames.openWorkspace) {
+    if (request.arguments.mode === "worktree") {
+      required.push("workspace:write", "worktree:create");
+    } else if (request.arguments.writeAccess === "read_write") {
+      required.push("workspace:write");
+    }
+  }
+  return [...new Set(required)];
+}
+
+export function workspaceToolLease(body: unknown): WorkspaceToolLease | undefined {
+  const name = toolCallName(body);
+  return name ? workspaceToolLeases.get(name) : undefined;
+}
+
+export function workspaceToolRootLockMode(
+  body: unknown,
+): "read" | "write" | undefined {
+  const request = toolCallRequest(body);
+  if (!request || !WORKSPACE_SCOPED_TOOL_NAMES.has(request.name)) return undefined;
+  if (request.name === toolNames.writeStdin) {
+    const input = request.arguments;
+    const mutates = input.chars !== undefined ||
+      input.closeStdin === true ||
+      input.columns !== undefined ||
+      input.rows !== undefined;
+    return mutates ? "write" : "read";
+  }
+  return WORKSPACE_WRITE_TOOL_NAMES.has(request.name) ? "write" : "read";
 }
 
 export function workspaceToolContextRequirement(
   body: unknown,
 ): WorkspaceContextRequirement | undefined {
-  if (!body || typeof body !== "object" || Array.isArray(body)) return undefined;
-  const request = body as { method?: unknown; params?: unknown };
-  if (request.method !== "tools/call" || !request.params || typeof request.params !== "object") {
-    return undefined;
-  }
-  const name = (request.params as { name?: unknown }).name;
-  return typeof name === "string" ? workspaceToolContextRequirements.get(name) : undefined;
+  const name = toolCallName(body);
+  return name ? workspaceToolContextRequirements.get(name) : undefined;
 }
 
 export function toolCallWorkspaceReceipt(body: unknown): string | undefined {
-  if (!body || typeof body !== "object" || Array.isArray(body)) return undefined;
-  const request = body as { method?: unknown; params?: unknown };
-  if (request.method !== "tools/call" || !request.params || typeof request.params !== "object") {
-    return undefined;
-  }
-  const args = (request.params as { arguments?: unknown }).arguments;
-  if (!args || typeof args !== "object" || Array.isArray(args)) return undefined;
-  const receipt = (args as { receipt?: unknown }).receipt;
+  const receipt = toolCallRequest(body)?.arguments.receipt;
   return typeof receipt === "string" && receipt.length > 0 ? receipt : undefined;
 }
 
 export function toolCallOperationId(body: unknown): string | undefined {
-  if (!body || typeof body !== "object" || Array.isArray(body)) return undefined;
-  const request = body as { method?: unknown; params?: unknown };
-  if (request.method !== "tools/call" || !request.params || typeof request.params !== "object") {
-    return undefined;
-  }
-  const args = (request.params as { arguments?: unknown }).arguments;
-  if (!args || typeof args !== "object" || Array.isArray(args)) return undefined;
-  const operationId = (args as { operationId?: unknown }).operationId;
+  const operationId = toolCallRequest(body)?.arguments.operationId;
   return typeof operationId === "string" && operationId.length > 0 && operationId.length <= 128
     ? operationId
     : undefined;
 }
 
 export function workspaceOperationGeneration(body: unknown): number | undefined {
-  if (!body || typeof body !== "object" || Array.isArray(body)) return undefined;
-  const params = "params" in body && body.params && typeof body.params === "object"
-    ? body.params as Record<string, unknown>
-    : undefined;
-  const args = params?.arguments;
-  if (!args || typeof args !== "object" || Array.isArray(args)) return undefined;
-  const generation = (args as Record<string, unknown>).workspaceGeneration;
+  const generation = toolCallRequest(body)?.arguments.workspaceGeneration;
   return typeof generation === "number" && Number.isSafeInteger(generation) && generation > 0
     ? generation
     : undefined;
 }
 
 export function toolCallWorkspaceId(body: unknown): string | undefined {
-  if (!body || typeof body !== "object" || Array.isArray(body)) return undefined;
-  const request = body as { method?: unknown; params?: unknown };
-  if (request.method !== "tools/call" || !request.params || typeof request.params !== "object") {
-    return undefined;
-  }
-  const params = request.params as { arguments?: unknown };
-  if (!params.arguments || typeof params.arguments !== "object") return undefined;
-  const workspaceId = (params.arguments as { workspaceId?: unknown }).workspaceId;
+  const workspaceId = toolCallRequest(body)?.arguments.workspaceId;
   return typeof workspaceId === "string" && workspaceId.length > 0 ? workspaceId : undefined;
 }
 
 function correlationLogFields(
-  clientId: string | undefined,
+  connectionPrincipalId: string | undefined,
   workspaceId?: string,
+  oauthClientId?: string,
 ): Record<string, string | undefined> {
   return {
-    // Retained for existing log consumers. `connectionRef` is the clearer name.
-    clientIdHash: identifierHash(clientId),
-    connectionRef: connectionRef(clientId),
-    workspaceActivityRef: workspaceActivityRef(clientId, workspaceId),
+    // Retained for existing log consumers; it hashes the OAuth registration
+    // when available, while connectionRef identifies the local principal.
+    clientIdHash: identifierHash(oauthClientId ?? connectionPrincipalId),
+    oauthClientRef: oauthClientRef(oauthClientId),
+    connectionRef: connectionRef(connectionPrincipalId),
+    workspaceActivityRef: workspaceActivityRef(connectionPrincipalId, workspaceId),
   };
 }
 
@@ -1581,13 +1706,20 @@ function logToolCall(config: ServerConfig, fields: ToolLogFields): void {
   const workspaceId = fields.workspaceId ?? context?.correlation.workspaceId;
   if (context && workspaceId) {
     context.correlation.workspaceId = workspaceId;
-    context.correlation.workspaceActivityRef = workspaceActivityRef(context.clientId, workspaceId);
+    context.correlation.workspaceActivityRef = workspaceActivityRef(
+      context.connectionPrincipalId,
+      workspaceId,
+    );
   }
   if (!config.logging.toolCalls) return;
 
   logEvent(config.logging, fields.success ? "info" : "warn", "tool_call", {
     requestId: context?.requestId,
-    ...correlationLogFields(context?.clientId, workspaceId),
+    ...correlationLogFields(
+      context?.connectionPrincipalId,
+      workspaceId,
+      context?.oauthClientId,
+    ),
     ...safeFields,
     commandPreview: config.logging.shellCommands && command ? commandPreview(command) : undefined,
   });
@@ -2306,7 +2438,7 @@ function registerWriteStdinTool(
   processSessions: ProcessSessionManager,
   mutationOperations: MutationOperationStore,
   pendingMutationOperations: Map<string, PendingMutationOperation>,
-  ownerClientId: string,
+  connectionPrincipalId: string,
 ): void {
   registerWorkspaceTool(
     server,
@@ -2354,8 +2486,11 @@ function registerWriteStdinTool(
     },
     async ({ workspaceId, workspaceGeneration, operationId, instructionToken, sessionId, chars, closeStdin, columns, rows, yieldTimeMs, maxOutputTokens }) => {
       const startedAt = performance.now();
-      const workspace = workspaces.getWorkspace(ownerClientId, workspaceId);
+      const workspace = workspaces.getWorkspace(connectionPrincipalId, workspaceId);
       const mutatesProcess = chars !== undefined || closeStdin === true || columns !== undefined || rows !== undefined;
+      if (mutatesProcess) {
+        assertOAuthScopes(["workspace:write", "network:access"]);
+      }
       if (mutatesProcess && !operationId) {
         throw new PublicActionError(
           "operation_id_required",
@@ -2371,7 +2506,7 @@ function registerWriteStdinTool(
       if (mutatesProcess) workspaces.assertWorkspaceWritable(workspace);
       const execute = async () => {
         const processContext = processSessions.instructionContext(
-          ownerClientId,
+          connectionPrincipalId,
           workspaceId,
           sessionId,
         );
@@ -2408,7 +2543,7 @@ function registerWriteStdinTool(
           if (instructionGate) return instructionGate;
         }
         const snapshot = await processSessions.write({
-          ownerClientId,
+          connectionPrincipalId: connectionPrincipalId,
           workspaceId,
           sessionId,
           chars,
@@ -2453,7 +2588,12 @@ function registerWriteStdinTool(
       return runMutationOperation({
         store: mutationOperations,
         pending: pendingMutationOperations,
-        key: { ownerClientId, workspaceId, tool: toolNames.writeStdin, operationId: operationId! },
+        key: {
+          connectionPrincipalId,
+          workspaceId,
+          tool: toolNames.writeStdin,
+          operationId: operationId!,
+        },
         workspaceGeneration,
         request: { sessionId, chars, closeStdin, columns, rows, yieldTimeMs, maxOutputTokens },
         execute,
@@ -2468,7 +2608,7 @@ function registerReadProcessOutputTool(
   workspaces: WorkspaceRegistry,
   processSessions: ProcessSessionManager,
   processOutputStore: ProcessOutputStore,
-  ownerClientId: string,
+  connectionPrincipalId: string,
 ): void {
   registerWorkspaceTool(
     server,
@@ -2508,9 +2648,9 @@ function registerReadProcessOutputTool(
     },
     async ({ workspaceId, outputId, offset, limit }) => {
       const startedAt = performance.now();
-      workspaces.getWorkspace(ownerClientId, workspaceId);
-      processSessions.flushOutput(ownerClientId, workspaceId, outputId);
-      const page = processOutputStore.read(ownerClientId, workspaceId, outputId, {
+      workspaces.getWorkspace(connectionPrincipalId, workspaceId);
+      processSessions.flushOutput(connectionPrincipalId, workspaceId, outputId);
+      const page = processOutputStore.read(connectionPrincipalId, workspaceId, outputId, {
         offset: offset ?? 0,
         limit: limit ?? DEFAULT_PROCESS_OUTPUT_READ_BYTES,
       });
@@ -2566,7 +2706,7 @@ function registerProcessTools(
   processSessions: ProcessSessionManager,
   mutationOperations: MutationOperationStore,
   pendingMutationOperations: Map<string, PendingMutationOperation>,
-  ownerClientId: string,
+  connectionPrincipalId: string,
 ): void {
   registerWorkspaceTool(
     server,
@@ -2630,8 +2770,12 @@ function registerProcessTools(
     },
     async ({ workspaceId, workspaceGeneration, operationId, instructionToken, program, args, shell, command, cmd: legacyCmd, stdin, closeStdin, tty, columns, rows, workingDirectory, cwd: requestedCwd, environment, network, yieldTimeMs, timeoutMs, maxOutputTokens }) => {
       const startedAt = performance.now();
-      const workspace = workspaces.getWorkspace(ownerClientId, workspaceId);
       const execute = async () => {
+      const workspace = workspaces.getWorkspace(
+        connectionPrincipalId,
+        workspaceId,
+        workspaceGeneration,
+      );
       workspaces.assertWorkspaceWritable(workspace);
       if (network === "deny") {
         throw new PublicActionError(
@@ -2807,7 +2951,7 @@ function registerProcessTools(
         );
         if (instructionGate) return instructionGate;
         const snapshot = await processSessions.start({
-          ownerClientId,
+          connectionPrincipalId: connectionPrincipalId,
           workspaceId,
           command: direct ? { program: program!, args: directArgs } : shellCommand!,
           cwd,
@@ -2857,7 +3001,7 @@ function registerProcessTools(
       return runMutationOperation({
         store: mutationOperations,
         pending: pendingMutationOperations,
-        key: { ownerClientId, workspaceId, tool: toolNames.execCommand, operationId },
+        key: { connectionPrincipalId, workspaceId, tool: toolNames.execCommand, operationId },
         workspaceGeneration,
         request: { program, args, shell, command, legacyCmd, stdin, closeStdin, tty, columns, rows, workingDirectory, requestedCwd, environment, network, yieldTimeMs, timeoutMs, maxOutputTokens },
         execute,
@@ -2872,13 +3016,13 @@ function registerProcessTools(
     processSessions,
     mutationOperations,
     pendingMutationOperations,
-    ownerClientId,
+    connectionPrincipalId,
   );
 }
 
 function createMcpServer(
   config: ServerConfig,
-  ownerClientId: string,
+  connectionPrincipalId: string,
   workspaces: WorkspaceRegistry,
   reviewCheckpoints: ReturnType<typeof createReviewCheckpointManager>,
   processSessions: ProcessSessionManager,
@@ -2893,7 +3037,7 @@ function createMcpServer(
   const server = new McpServer(
     DEVSPACE_SERVER_INFO,
     {
-      instructions: serverInstructions(config),
+      instructions: serverInstructions(),
     },
   );
   const enabledTools = new Set(toolSurface(config));
@@ -2902,7 +3046,10 @@ function createMcpServer(
     runtimeDiagnostics.recordFailure("mcp_tool_error", error);
     logEvent(config.logging, "error", "mcp_tool_error", {
       requestId: requestContext.getStore()?.requestId,
-      ...correlationLogFields(ownerClientId, requestContext.getStore()?.correlation.workspaceId),
+      ...correlationLogFields(
+        connectionPrincipalId,
+        requestContext.getStore()?.correlation.workspaceId,
+      ),
       tool,
       ...errorFields(error),
     });
@@ -2912,7 +3059,10 @@ function createMcpServer(
     if (!expected) runtimeDiagnostics.recordFailure("pi_tool_error", error);
     logEvent(config.logging, expected ? "info" : "error", expected ? "pi_tool_expected_error" : "pi_tool_error", {
       requestId: requestContext.getStore()?.requestId,
-      ...correlationLogFields(ownerClientId, requestContext.getStore()?.correlation.workspaceId),
+      ...correlationLogFields(
+        connectionPrincipalId,
+        requestContext.getStore()?.correlation.workspaceId,
+      ),
       ...errorFields(error),
     });
   };
@@ -2922,7 +3072,7 @@ function createMcpServer(
     workspaces,
     processSessions,
     processOutputStore,
-    ownerClientId,
+    connectionPrincipalId,
   );
 
   if (config.widgets !== "off") {
@@ -2972,7 +3122,7 @@ function createMcpServer(
     if (enabledTools.has("show_changes") && workspace.writeAccess === "read_write") {
       await reviewCheckpoints.initializeWorkspace({ workspaceId: workspace.id, root: workspace.root });
     }
-    const summary = workspaces.workspaceSummary(ownerClientId, workspace.alias);
+    const summary = workspaces.workspaceSummary(connectionPrincipalId, workspace.alias);
     const currentBinding = requestContext.getStore()?.workspaceBinding;
     const contextSessionId = workspaces.createInstructionContext(
       workspace,
@@ -3016,7 +3166,7 @@ function createMcpServer(
     });
     if (!instructionScan.complete) {
       logEvent(config.logging, "warn", "workspace_instruction_scan_incomplete", {
-        ...correlationLogFields(ownerClientId, workspace.id),
+        ...correlationLogFields(connectionPrincipalId, workspace.id),
         reason: instructionScan.reason,
         durationMs: instructionScan.durationMs,
       });
@@ -3034,6 +3184,7 @@ function createMcpServer(
       },
       structuredContent: {
         ...rendered.structuredContent,
+        ...(context.recovery ? { recovery: context.recovery } : {}),
         ...(tool === toolNames.openWorkspace
           ? {
               effects: createWorkspaceOpenEffects({
@@ -3059,7 +3210,7 @@ function createMcpServer(
     ...toolWidgetDescriptorMeta(config, "workspace"),
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async () => {
-    const summaries = workspaces.listWorkspaces(ownerClientId);
+    const summaries = workspaces.listWorkspaces(connectionPrincipalId);
     return {
       content: [textBlock(`Found ${summaries.length} resumable workspace(s).`)],
       structuredContent: {
@@ -3083,7 +3234,7 @@ function createMcpServer(
     ...toolWidgetDescriptorMeta(config, "workspace"),
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async ({ operationId }) => {
-    const status = mutationOperations.getOperationStatus(ownerClientId, operationId);
+    const status = mutationOperations.getOperationStatus(connectionPrincipalId, operationId);
     if (!status) {
       throw new PublicActionError(
         "unknown_operation",
@@ -3119,6 +3270,39 @@ function createMcpServer(
     knownInstructionRevision: z.string().max(128).optional(),
     knownSkillRevision: z.string().max(128).optional(),
   };
+  const retainedContextError = () => new PublicActionError(
+    "retained_context_unverified",
+    "Use contextMode=\"full\" unless refreshing the exact context-loaded receipt that supplied the retained revisions.",
+    {
+      retryable: true,
+      safeToRetry: true,
+      recovery: "get_workspace_context_full",
+      phase: "not_started",
+      effectsKnown: true,
+    },
+  );
+  const assertRetainedContextRefresh = (
+    workspaceId: string,
+    workspaceGeneration: number,
+    contextMode: WorkspaceContextMode | undefined,
+    knownInstructionRevision: string | undefined,
+    knownSkillRevision: string | undefined,
+  ): void => {
+    if (contextMode !== "retained") return;
+    const binding = requestContext.getStore()?.workspaceBinding;
+    if (
+      !binding ||
+      binding.phase !== "context_loaded" ||
+      binding.workspaceId !== workspaceId ||
+      binding.generation !== workspaceGeneration ||
+      (knownInstructionRevision === undefined && knownSkillRevision === undefined) ||
+      (knownInstructionRevision !== undefined &&
+        knownInstructionRevision !== binding.instructionRevision) ||
+      (knownSkillRevision !== undefined && knownSkillRevision !== binding.skillRevision)
+    ) {
+      throw retainedContextError();
+    }
+  };
   const resumeInputSchema = {
     alias: z.string().min(1).max(64),
     ...contextOptionsInputSchema,
@@ -3136,8 +3320,9 @@ function createMcpServer(
     ...toolWidgetDescriptorMeta(config, "workspace"),
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async ({ alias, contextMode, knownInstructionRevision, knownSkillRevision }) => {
+    if (contextMode === "retained") throw retainedContextError();
     const startedAt = performance.now();
-    const context = await workspaces.resumeWorkspace(ownerClientId, alias);
+    const context = await workspaces.resumeWorkspace(connectionPrincipalId, alias);
     return returnWorkspaceContext(
       toolNames.resumeWorkspace,
       context,
@@ -3160,9 +3345,16 @@ function createMcpServer(
     ...toolWidgetDescriptorMeta(config, "workspace"),
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async ({ workspaceId, workspaceGeneration, contextMode, knownInstructionRevision, knownSkillRevision }) => {
+    assertRetainedContextRefresh(
+      workspaceId,
+      workspaceGeneration,
+      contextMode,
+      knownInstructionRevision,
+      knownSkillRevision,
+    );
     const startedAt = performance.now();
     const context = await workspaces.getWorkspaceContext(
-      ownerClientId,
+      connectionPrincipalId,
       workspaceId,
       workspaceGeneration,
     );
@@ -3211,9 +3403,15 @@ function createMcpServer(
     knownInstructionRevision,
     knownSkillRevision,
   }) => {
+    if (contextMode === "retained") throw retainedContextError();
     const startedAt = performance.now();
     const effectiveMode = mode ?? "checkout";
-    const context = await workspaces.openWorkspace(ownerClientId, {
+    if (effectiveMode === "worktree") {
+      assertOAuthScopes(["workspace:write", "worktree:create"]);
+    } else if (writeAccess === "read_write") {
+      assertOAuthScopes(["workspace:write"]);
+    }
+    const context = await workspaces.openWorkspace(connectionPrincipalId, {
       path,
       alias,
       mode: effectiveMode,
@@ -3246,7 +3444,7 @@ function createMcpServer(
     ...toolWidgetDescriptorMeta(config, "read"),
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async ({ workspaceId, paths }) => {
-    const workspace = workspaces.getWorkspace(ownerClientId, workspaceId);
+    const workspace = workspaces.getWorkspace(connectionPrincipalId, workspaceId);
     const contextSessionId = currentWorkspaceContextSessionId();
     const files = await workspaces.loadApplicableAgentsFiles(
       workspace,
@@ -3290,7 +3488,7 @@ function createMcpServer(
       ...toolWidgetDescriptorMeta(config, "read"),
       annotations: { readOnlyHint: true, openWorldHint: false },
     }, async ({ workspaceId, query, cursor, limit }) => {
-      const workspace = workspaces.getWorkspace(ownerClientId, workspaceId);
+      const workspace = workspaces.getWorkspace(connectionPrincipalId, workspaceId);
       const revision = workspaces.skillRevision(workspace);
       const normalizedQuery = (query ?? "").trim().toLocaleLowerCase("en-US");
       const decoded = cursor ? decodeSkillCursor(cursor) : undefined;
@@ -3356,7 +3554,7 @@ function createMcpServer(
     },
     async ({ workspaceId, skillId, name }) => {
       const startedAt = performance.now();
-      const workspace = workspaces.getWorkspace(ownerClientId, workspaceId);
+      const workspace = workspaces.getWorkspace(connectionPrincipalId, workspaceId);
       let resolvedSkillId = skillId;
       if (!resolvedSkillId) {
         if (!name) {
@@ -3381,7 +3579,11 @@ function createMcpServer(
         resolvedSkillId = matches[0]!.skillId;
       }
 
-      const loaded = await workspaces.loadSkill(ownerClientId, workspaceId, resolvedSkillId);
+      const loaded = await workspaces.loadSkill(
+        connectionPrincipalId,
+        workspaceId,
+        resolvedSkillId,
+      );
       logToolCall(config, {
         tool: toolNames.loadSkill,
         workspaceId,
@@ -3425,26 +3627,51 @@ function createMcpServer(
     async ({ workspaceId, workspaceGeneration, operationId }) => {
       const startedAt = performance.now();
       const execute = async () => {
+        let processesTerminated = 0;
         const closeLease = await workspaces.acquireExclusiveClose(
-          ownerClientId,
+          connectionPrincipalId,
           workspaceId,
           workspaceGeneration,
+          {
+            beforeDrain: async () => {
+              processesTerminated = await processSessions.terminateWorkspace(
+                connectionPrincipalId,
+                workspaceId,
+              );
+            },
+          },
         );
         const workspace = closeLease.workspace;
-        let processesTerminated = 0;
-        let worktreeRemoved = false;
-        let worktreeRetainedReason: "dirty" | undefined;
-        let closed = false;
         try {
-          processesTerminated = await processSessions.terminateWorkspace(ownerClientId, workspaceId);
-          if (workspace.mode === "worktree" && workspace.sourceRoot && workspace.worktree?.managed) {
-            const removal = await removeManagedWorktree({
-              sourceRoot: workspace.sourceRoot,
-              worktreePath: workspace.root,
-              config,
-            });
-            worktreeRemoved = removal.removed;
-            if (removal.removed || removal.reason === "missing") {
+          return await workspaces.withExclusiveWorkspaceRoot(
+            connectionPrincipalId,
+            workspaceId,
+            workspaceGeneration,
+            async () => {
+          let worktreeRemoved = false;
+          let worktreeRetainedReason: "dirty" | undefined;
+          let closed = false;
+          try {
+            if (workspace.mode === "worktree" && workspace.sourceRoot && workspace.worktree?.managed) {
+              const removal = await removeManagedWorktree({
+                sourceRoot: workspace.sourceRoot,
+                worktreePath: workspace.root,
+                config,
+              });
+              worktreeRemoved = removal.removed;
+              if (removal.removed || removal.reason === "missing") {
+                try {
+                  await reviewCheckpoints.cleanupWorkspace({ workspaceId });
+                } catch (error) {
+                  runtimeDiagnostics.recordFailure("review_cleanup_failed", error);
+                  logEvent(config.logging, "warn", "review_cleanup_failed", { workspaceId, ...errorFields(error) });
+                }
+                closed = closeLease.commit();
+              } else {
+                worktreeRetainedReason = "dirty";
+                closeLease.abort();
+              }
+            } else {
               try {
                 await reviewCheckpoints.cleanupWorkspace({ workspaceId });
               } catch (error) {
@@ -3452,77 +3679,71 @@ function createMcpServer(
                 logEvent(config.logging, "warn", "review_cleanup_failed", { workspaceId, ...errorFields(error) });
               }
               closed = closeLease.commit();
-            } else {
-              worktreeRetainedReason = "dirty";
-              closeLease.abort();
             }
-          } else {
-            try {
-              await reviewCheckpoints.cleanupWorkspace({ workspaceId });
-            } catch (error) {
-              runtimeDiagnostics.recordFailure("review_cleanup_failed", error);
-              logEvent(config.logging, "warn", "review_cleanup_failed", { workspaceId, ...errorFields(error) });
-            }
-            closed = closeLease.commit();
+          } catch (error) {
+            closeLease.abort();
+            throw error;
           }
+          logToolCall(config, {
+            tool: "close_workspace",
+            workspaceId,
+            success: closed,
+            durationMs: Math.round(performance.now() - startedAt),
+          });
+          return {
+            content: [textBlock(
+              worktreeRetainedReason
+                ? `Workspace remains open: dirty worktree retained; ${processesTerminated} process(es) terminated.`
+                : `Workspace closed; ${processesTerminated} process(es) terminated.` +
+                  (worktreeRemoved ? " Clean managed worktree removed." : ""),
+            )],
+            structuredContent: {
+              ok: !worktreeRetainedReason,
+              effects: createWorkspaceCloseEffects({
+                observedAt: new Date().toISOString(),
+                closed,
+                managedWorktree: workspace.worktree?.managed === true,
+                worktreeRemoved,
+                processesTerminated,
+              }),
+            },
+            _meta: {
+              tool: "close_workspace",
+              ...(worktreeRetainedReason ? {
+                error: {
+                  code: "workspace_dirty",
+                  retryable: false,
+                  safeToRetry: false,
+                  recovery: "show_changes",
+                  phase: "committed",
+                  effectsKnown: true,
+                },
+              } : {}),
+              card: {
+                workspaceId,
+                summary: {
+                  closed,
+                  processesTerminated,
+                  worktreeRemoved,
+                  ...(worktreeRetainedReason ? { reason: worktreeRetainedReason } : {}),
+                },
+              },
+            },
+            ...(worktreeRetainedReason ? { isError: true as const } : {}),
+          };
+            },
+          );
         } catch (error) {
           closeLease.abort();
           throw error;
         } finally {
-          processSessions.reopenWorkspace(ownerClientId, workspaceId);
+          processSessions.reopenWorkspace(connectionPrincipalId, workspaceId);
         }
-        logToolCall(config, {
-          tool: "close_workspace",
-          workspaceId,
-          success: closed,
-          durationMs: Math.round(performance.now() - startedAt),
-        });
-        return {
-          content: [textBlock(
-            worktreeRetainedReason
-              ? `Workspace remains open: dirty worktree retained; ${processesTerminated} process(es) terminated.`
-              : `Workspace closed; ${processesTerminated} process(es) terminated.` +
-                (worktreeRemoved ? " Clean managed worktree removed." : ""),
-          )],
-          structuredContent: {
-            ok: !worktreeRetainedReason,
-            effects: createWorkspaceCloseEffects({
-              observedAt: new Date().toISOString(),
-              closed,
-              managedWorktree: workspace.worktree?.managed === true,
-              worktreeRemoved,
-              processesTerminated,
-            }),
-          },
-          _meta: {
-            tool: "close_workspace",
-            ...(worktreeRetainedReason ? {
-              error: {
-                code: "workspace_dirty",
-                retryable: false,
-                safeToRetry: false,
-                recovery: "show_changes",
-                phase: "committed",
-                effectsKnown: true,
-              },
-            } : {}),
-            card: {
-              workspaceId,
-              summary: {
-                closed,
-                processesTerminated,
-                worktreeRemoved,
-                ...(worktreeRetainedReason ? { reason: worktreeRetainedReason } : {}),
-              },
-            },
-          },
-          ...(worktreeRetainedReason ? { isError: true as const } : {}),
-        };
       };
       return runMutationOperation({
         store: mutationOperations,
         pending: pendingMutationOperations,
-        key: { ownerClientId, workspaceId, tool: toolNames.closeWorkspace, operationId },
+        key: { connectionPrincipalId, workspaceId, tool: toolNames.closeWorkspace, operationId },
         workspaceGeneration,
         request: {},
         execute,
@@ -3546,90 +3767,105 @@ function createMcpServer(
     annotations: { destructiveHint: true, idempotentHint: true, openWorldHint: false },
   }, async ({ workspaceId, workspaceGeneration, operationId }) => {
     const execute = async () => {
+      let processesTerminated = 0;
       const closeLease = await workspaces.acquireExclusiveClose(
-        ownerClientId,
+        connectionPrincipalId,
         workspaceId,
         workspaceGeneration,
+        {
+          beforeDrain: async () => {
+            processesTerminated = await processSessions.terminateWorkspace(
+              connectionPrincipalId,
+              workspaceId,
+            );
+          },
+        },
       );
+      const workspace = closeLease.workspace;
       try {
-        const processesTerminated = await processSessions.terminateWorkspace(ownerClientId, workspaceId);
-        const workspace = closeLease.workspace;
-        let worktreeRemoved = false;
-        if (workspace.worktree?.managed) {
-          const removal = await removeManagedWorktree({
-            sourceRoot: workspace.sourceRoot!,
-            worktreePath: workspace.root,
-            config,
-          });
-          if (removal.reason === "dirty") {
-            closeLease.abort();
+        return await workspaces.withExclusiveWorkspaceRoot(
+          connectionPrincipalId,
+          workspaceId,
+          workspaceGeneration,
+          async () => {
+            let worktreeRemoved = false;
+            if (workspace.worktree?.managed) {
+              const removal = await removeManagedWorktree({
+                sourceRoot: workspace.sourceRoot!,
+                worktreePath: workspace.root,
+                config,
+              });
+              if (removal.reason === "dirty") {
+                closeLease.abort();
+                return {
+                  content: [textBlock(
+                    `Workspace was not revoked because its managed worktree has uncommitted changes; ${processesTerminated} process(es) were terminated. Review or clean the worktree, then retry.`,
+                  )],
+                  isError: true as const,
+                  structuredContent: {
+                    ok: false,
+                    processesTerminated,
+                    worktreeRetained: true,
+                    effects: createWorkspaceRevokeEffects({
+                      observedAt: new Date().toISOString(),
+                      revoked: false,
+                      managedWorktree: true,
+                      worktreeRemoved: false,
+                      processesTerminated,
+                    }),
+                  },
+                  _meta: {
+                    error: {
+                      code: "workspace_dirty",
+                      retryable: false,
+                      safeToRetry: false,
+                      recovery: "show_changes",
+                      phase: processesTerminated > 0 ? "committed" : "not_started",
+                      effectsKnown: true,
+                    },
+                  },
+                };
+              }
+              worktreeRemoved = removal.removed || removal.reason === "missing";
+            }
+            await reviewCheckpoints.cleanupWorkspace({ workspaceId }).catch((error) => {
+              runtimeDiagnostics.recordFailure("review_cleanup_failed", error);
+            });
+            if (!closeLease.commit({ revoke: true })) {
+              throw new UnknownWorkspaceError(workspaceId);
+            }
             return {
               content: [textBlock(
-                `Workspace was not revoked because its managed worktree has uncommitted changes; ${processesTerminated} process(es) were terminated. Review or clean the worktree, then retry.`,
+                worktreeRemoved
+                  ? "Workspace access revoked and its clean managed worktree removed."
+                  : "Workspace access revoked for this connection.",
               )],
-              isError: true as const,
               structuredContent: {
-                ok: false,
+                ok: true,
                 processesTerminated,
-                worktreeRetained: true,
+                worktreeRemoved,
                 effects: createWorkspaceRevokeEffects({
                   observedAt: new Date().toISOString(),
-                  revoked: false,
-                  managedWorktree: true,
-                  worktreeRemoved: false,
+                  revoked: true,
+                  managedWorktree: workspace.worktree?.managed === true,
+                  worktreeRemoved,
                   processesTerminated,
                 }),
               },
-              _meta: {
-                error: {
-                  code: "workspace_dirty",
-                  retryable: false,
-                  safeToRetry: false,
-                  recovery: "show_changes",
-                  phase: processesTerminated > 0 ? "committed" : "not_started",
-                  effectsKnown: true,
-                },
-              },
             };
-          }
-          worktreeRemoved = removal.removed || removal.reason === "missing";
-        }
-        await reviewCheckpoints.cleanupWorkspace({ workspaceId }).catch((error) => {
-          runtimeDiagnostics.recordFailure("review_cleanup_failed", error);
-        });
-        if (!closeLease.commit({ revoke: true })) {
-          throw new UnknownWorkspaceError(workspaceId);
-        }
-        return {
-          content: [textBlock(
-            worktreeRemoved
-              ? "Workspace access revoked and its clean managed worktree removed."
-              : "Workspace access revoked for this connection.",
-          )],
-          structuredContent: {
-            ok: true,
-            processesTerminated,
-            worktreeRemoved,
-            effects: createWorkspaceRevokeEffects({
-              observedAt: new Date().toISOString(),
-              revoked: true,
-              managedWorktree: workspace.worktree?.managed === true,
-              worktreeRemoved,
-              processesTerminated,
-            }),
           },
-        };
+        );
       } catch (error) {
         closeLease.abort();
         throw error;
       } finally {
-        processSessions.reopenWorkspace(ownerClientId, workspaceId);
+        processSessions.reopenWorkspace(connectionPrincipalId, workspaceId);
       }
     };
     return runMutationOperation({
       store: mutationOperations,
       pending: pendingMutationOperations,
-      key: { ownerClientId, workspaceId, tool: toolNames.revokeWorkspace, operationId },
+      key: { connectionPrincipalId, workspaceId, tool: toolNames.revokeWorkspace, operationId },
       workspaceGeneration,
       request: {},
       execute,
@@ -3673,7 +3909,7 @@ function createMcpServer(
     },
     async ({ workspaceId, ...input }) => {
       const startedAt = performance.now();
-      const workspace = workspaces.getWorkspace(ownerClientId, workspaceId);
+      const workspace = workspaces.getWorkspace(connectionPrincipalId, workspaceId);
       let readPath = workspaces.resolveReadPath(workspace, input.path);
       const newlyLoadedAgentsFiles = readPath.skillRead
         ? []
@@ -3795,7 +4031,7 @@ function createMcpServer(
     },
     async ({ workspaceId, files }) => {
       const startedAt = performance.now();
-      const workspace = workspaces.getWorkspace(ownerClientId, workspaceId);
+      const workspace = workspaces.getWorkspace(connectionPrincipalId, workspaceId);
       const newlyLoadedAgentsFiles = await workspaces.loadApplicableAgentsFiles(
         workspace,
         files.map((file) => file.path),
@@ -3913,7 +4149,7 @@ function createMcpServer(
     },
     async ({ workspaceId, operations }) => {
       const startedAt = performance.now();
-      const workspace = workspaces.getWorkspace(ownerClientId, workspaceId);
+      const workspace = workspaces.getWorkspace(connectionPrincipalId, workspaceId);
       const normalized = operations.map((operation) => ({
         ...operation,
         path: operation.path ?? ".",
@@ -3996,8 +4232,6 @@ function createMcpServer(
           ...workspaceHandleInputSchema,
           operationId: z.string().min(1).max(128),
           instructionToken: z.string().optional(),
-          preconditionMode: z.enum(["strict", "blind"]).optional(),
-          blindWriteReason: z.string().min(1).max(500).optional(),
           ifMatch: z.union([
             z.string().regex(/^sha256:[a-f0-9]{64}$/u),
             z.record(
@@ -4023,31 +4257,16 @@ function createMcpServer(
         workspaceGeneration,
         operationId,
         instructionToken,
-        preconditionMode,
-        blindWriteReason,
         ifMatch,
         patch,
       }) => {
         const startedAt = performance.now();
-        const workspace = workspaces.getWorkspace(ownerClientId, workspaceId);
+        const workspace = workspaces.getWorkspace(connectionPrincipalId, workspaceId);
         const execute = async () => {
         workspaces.assertWorkspaceWritable(workspace);
         const preparedPatch = preparePatch(patch);
         const patchPaths = [...preparedPatch.paths];
         const uniquePatchPaths = [...new Set(patchPaths)];
-        const effectivePreconditionMode = preconditionMode ?? "strict";
-        if (effectivePreconditionMode === "blind" && !blindWriteReason) {
-          throw new PublicActionError(
-            "blind_write_reason_required",
-            "Blind patching requires a concise reason tied to explicit user authorization.",
-            {
-              retryable: true,
-              safeToRetry: true,
-              recovery: "provide_blind_write_reason",
-              phase: "not_started",
-            },
-          );
-        }
         const normalizedIfMatch = typeof ifMatch === "string"
           ? uniquePatchPaths.length === 1
             ? { [uniquePatchPaths[0]!]: ifMatch }
@@ -4065,24 +4284,22 @@ function createMcpServer(
                   : version,
               ])) as Record<string, string | FileVersion | null>
             : undefined;
-          if (effectivePreconditionMode === "strict") {
-            const missingPreconditions = uniquePatchPaths.filter(
-              (path) => !normalizedIfMatch || !Object.hasOwn(normalizedIfMatch, path),
+          const missingPreconditions = uniquePatchPaths.filter(
+            (path) => !normalizedIfMatch || !Object.hasOwn(normalizedIfMatch, path),
+          );
+          if (missingPreconditions.length > 0) {
+            throw new PublicActionError(
+              "if_match_required",
+              "Patching requires an ifMatch entry for every touched path. " +
+                "Use the latest read version for existing files and null for paths expected not to exist. " +
+                `Missing: ${missingPreconditions.join(", ")}`,
+              {
+                retryable: true,
+                safeToRetry: true,
+                recovery: "read_files_and_add_if_match",
+                phase: "not_started",
+              },
             );
-            if (missingPreconditions.length > 0) {
-              throw new PublicActionError(
-                "if_match_required",
-                "Strict patching requires an ifMatch entry for every touched path. " +
-                  "Use the latest read version for existing files and null for paths expected not to exist. " +
-                  `Missing: ${missingPreconditions.join(", ")}`,
-                {
-                  retryable: true,
-                  safeToRetry: true,
-                  recovery: "read_files_and_add_if_match",
-                  phase: "not_started",
-                },
-              );
-            }
           }
           const instructionGate = await applicableMutationGate(workspaces, workspace, patchPaths, instructionToken);
           if (instructionGate) return instructionGate;
@@ -4104,11 +4321,7 @@ function createMcpServer(
               ok: true,
               effects: createApplyPatchEffects(new Date().toISOString(), applied.files),
               preconditions: {
-                mode: effectivePreconditionMode,
-                complete: uniquePatchPaths.every(
-                  (path) => Boolean(normalizedIfMatch && Object.hasOwn(normalizedIfMatch, path)),
-                ),
-                ...(effectivePreconditionMode === "blind" ? { blindWriteReason } : {}),
+                complete: true,
               },
             },
             _meta: {
@@ -4130,9 +4343,9 @@ function createMcpServer(
         return runMutationOperation({
           store: mutationOperations,
           pending: pendingMutationOperations,
-          key: { ownerClientId, workspaceId, tool: toolNames.applyPatch, operationId },
+          key: { connectionPrincipalId, workspaceId, tool: toolNames.applyPatch, operationId },
           workspaceGeneration,
-          request: { patch, ifMatch, preconditionMode, blindWriteReason },
+          request: { patch, ifMatch },
           execute,
         });
       },
@@ -4163,7 +4376,7 @@ function createMcpServer(
       },
       async ({ workspaceId, workspaceGeneration, operationId }) => {
         const startedAt = performance.now();
-        const workspace = workspaces.getWorkspace(ownerClientId, workspaceId);
+        const workspace = workspaces.getWorkspace(connectionPrincipalId, workspaceId);
         const execute = async () => {
           workspaces.assertWorkspaceWritable(workspace);
           const review = await reviewCheckpoints.reviewChanges({
@@ -4207,7 +4420,7 @@ function createMcpServer(
         return runMutationOperation({
           store: mutationOperations,
           pending: pendingMutationOperations,
-          key: { ownerClientId, workspaceId, tool: "show_changes", operationId },
+          key: { connectionPrincipalId, workspaceId, tool: "show_changes", operationId },
           workspaceGeneration,
           request: { since: "last_shown", markReviewed: true },
           execute,
@@ -4224,7 +4437,7 @@ function createMcpServer(
       processSessions,
       mutationOperations,
       pendingMutationOperations,
-      ownerClientId,
+      connectionPrincipalId,
     );
   }
 
@@ -4273,13 +4486,13 @@ export function createServer(configInput?: ServerConfig): RunningServer {
     config.stateDir,
     ({ event, clientId }) => {
       logEvent(config.logging, event === "oauth_authorization_failed" || event === "oauth_authorization_rate_limited" ? "warn" : "info", event, {
-        ...correlationLogFields(clientId),
+        ...correlationLogFields(undefined, undefined, clientId),
       });
     },
-    (clientId) => {
-      const bumpedWorkspaces = workspaces.bumpAuthorityGenerations(clientId);
+    (connectionPrincipalId) => {
+      const bumpedWorkspaces = workspaces.bumpAuthorityGenerations(connectionPrincipalId);
       logEvent(config.logging, "info", "oauth_authorization_epoch_changed", {
-        ...correlationLogFields(clientId),
+        ...correlationLogFields(connectionPrincipalId),
         bumpedWorkspaces,
       });
     },
@@ -4293,7 +4506,10 @@ export function createServer(configInput?: ServerConfig): RunningServer {
   }
   const bearerAuth = requireBearerAuth({
     verifier: oauthProvider,
-    requiredScopes: [config.oauth.scopes[0] ?? "devspace"],
+    // Authentication is required here; per-tool capability checks run inside
+    // the MCP handler because granular scopes are an any-of/combination model,
+    // not one universal scope shared by every tool.
+    requiredScopes: [],
     resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(resourceServerUrl),
   });
   const pendingMutationOperations = new Map<string, PendingMutationOperation>();
@@ -4311,7 +4527,7 @@ export function createServer(configInput?: ServerConfig): RunningServer {
     onOutputStorageError: (error, context) => {
       runtimeDiagnostics.recordFailure("process_output_storage_failed", error);
       logEvent(config.logging, "error", "process_output_storage_failed", {
-        ...correlationLogFields(context.ownerClientId, context.workspaceId),
+        ...correlationLogFields(context.connectionPrincipalId, context.workspaceId),
         workspaceId: context.workspaceId,
         outputId: context.outputId,
         ...errorFields(error),
@@ -4322,7 +4538,10 @@ export function createServer(configInput?: ServerConfig): RunningServer {
   const localAgentProviders = config.subagents
     ? getLocalAgentProviderAvailabilitySnapshot()
     : [];
-  const pendingRootsCleanup = new Map<string, { workspaceId: string; ownerClientId: string }>();
+  const pendingRootsCleanup = new Map<
+    string,
+    { workspaceId: string; connectionPrincipalId: string }
+  >();
   let rootsReloadTail: Promise<void> = Promise.resolve();
   const reloadAllowedRoots = (): Promise<{
     changed: boolean;
@@ -4339,7 +4558,7 @@ export function createServer(configInput?: ServerConfig): RunningServer {
       const persistencePending = update.persistenceFailures > 0;
       for (const invalidated of update.invalidated) {
         pendingRootsCleanup.set(
-          `${invalidated.ownerClientId}\0${invalidated.workspaceId}`,
+          `${invalidated.connectionPrincipalId}\0${invalidated.workspaceId}`,
           invalidated,
         );
       }
@@ -4349,11 +4568,14 @@ export function createServer(configInput?: ServerConfig): RunningServer {
           let failed = false;
           try {
             terminatedProcesses = await processSessions.terminateWorkspace(
-              invalidated.ownerClientId,
+              invalidated.connectionPrincipalId,
               invalidated.workspaceId,
             );
           } catch (error) {
-            processSessions.blockWorkspace(invalidated.ownerClientId, invalidated.workspaceId);
+            processSessions.blockWorkspace(
+              invalidated.connectionPrincipalId,
+              invalidated.workspaceId,
+            );
             failed = true;
             runtimeDiagnostics.recordFailure("allowed_roots_process_cleanup_failed", error);
           }
@@ -4471,11 +4693,11 @@ export function createServer(configInput?: ServerConfig): RunningServer {
       for (const pending of listJobs(100)) {
         const job = claimJob(pending.id);
         if (!job?.claimToken) continue;
-        processSessions.blockWorkspace(job.ownerClientId, job.workspaceId);
-        workspaces.evictRevokedWorkspace(job.ownerClientId, job.workspaceId, job.workspaceRoot);
+        processSessions.blockWorkspace(job.connectionPrincipalId, job.workspaceId);
+        workspaces.evictRevokedWorkspace(job.connectionPrincipalId, job.workspaceId, job.workspaceRoot);
         try {
-          await processSessions.terminateWorkspace(job.ownerClientId, job.workspaceId);
-          processOutputStore.retireWorkspace(job.ownerClientId, job.workspaceId);
+          await processSessions.terminateWorkspace(job.connectionPrincipalId, job.workspaceId);
+          processOutputStore.retireWorkspace(job.connectionPrincipalId, job.workspaceId);
           await reviewCheckpoints.cleanupWorkspace({
             workspaceId: job.workspaceId,
             root: job.workspaceRoot,
@@ -4497,7 +4719,7 @@ export function createServer(configInput?: ServerConfig): RunningServer {
           })) {
             throw new Error("Revocation cleanup claim changed before completion.");
           }
-          processSessions.reopenWorkspace(job.ownerClientId, job.workspaceId);
+          processSessions.reopenWorkspace(job.connectionPrincipalId, job.workspaceId);
         } catch (error) {
           failJob({
             id: job.id,
@@ -4507,7 +4729,7 @@ export function createServer(configInput?: ServerConfig): RunningServer {
           runtimeDiagnostics.recordFailure("oauth_revocation_cleanup_failed", error);
           logEvent(config.logging, "error", "oauth_revocation_cleanup_failed", {
             workspaceId: job.workspaceId,
-            ...correlationLogFields(job.ownerClientId, job.workspaceId),
+            ...correlationLogFields(job.connectionPrincipalId, job.workspaceId),
             ...errorFields(error),
           });
         }
@@ -4530,7 +4752,7 @@ export function createServer(configInput?: ServerConfig): RunningServer {
       logSessionCloseResults("idle_timeout", results);
       const closedWorkspaceIds = workspaces.closeExpiredSessions(
         config.resources.workspaceIdleTtlMs,
-        (ownerClientId, workspaceId) => processSessions.hasActive(ownerClientId, workspaceId),
+        (connectionPrincipalId, workspaceId) => processSessions.hasActive(connectionPrincipalId, workspaceId),
       );
       const reviewCleanupResults = await Promise.allSettled(
         closedWorkspaceIds.map((workspaceId) => reviewCheckpoints.cleanupWorkspace({ workspaceId })),
@@ -4584,6 +4806,7 @@ export function createServer(configInput?: ServerConfig): RunningServer {
         status: res.statusCode,
         durationMs: Math.round(performance.now() - startedAt),
         clientIdHash: res.locals.clientIdHash as string | undefined,
+        oauthClientRef: res.locals.oauthClientRef as string | undefined,
         connectionRef: res.locals.connectionRef as string | undefined,
         workspaceActivityRef: (res.locals.correlation as RequestCorrelationState | undefined)?.workspaceActivityRef,
         ...requestLogFields(req, config),
@@ -4611,7 +4834,7 @@ export function createServer(configInput?: ServerConfig): RunningServer {
       }
       logEvent(config.logging, "warn", "oauth_stale_client", {
         requestId: res.locals.requestId as string | undefined,
-        ...correlationLogFields(clientId),
+        ...correlationLogFields(undefined, undefined, clientId),
         ...requestLogFields(req, config),
       });
       const uiLocales = typeof req.query.ui_locales === "string" ? req.query.ui_locales : undefined;
@@ -4714,18 +4937,37 @@ export function createServer(configInput?: ServerConfig): RunningServer {
     });
     if (res.headersSent) return;
 
-    const ownerClientId = req.auth?.clientId;
-    if (ownerClientId) {
-      res.locals.clientIdHash = identifierHash(ownerClientId);
-      res.locals.connectionRef = connectionRef(ownerClientId);
+    const oauthClientId = req.auth?.clientId;
+    const connectionPrincipalId = oauthClientId
+      ? oauthProvider.principalForClient(oauthClientId)
+      : undefined;
+    if (oauthClientId) {
+      res.locals.clientIdHash = identifierHash(oauthClientId);
+      res.locals.oauthClientRef = oauthClientRef(oauthClientId);
     }
-    if (!ownerClientId || !req.auth?.resource || !checkResourceAllowed({ requestedResource: req.auth.resource, configuredResource: resourceServerUrl })) {
+    if (connectionPrincipalId) {
+      res.locals.connectionRef = connectionRef(connectionPrincipalId);
+    }
+    if (
+      !oauthClientId ||
+      !connectionPrincipalId ||
+      !req.auth?.resource ||
+      !checkResourceAllowed({ requestedResource: req.auth.resource, configuredResource: resourceServerUrl })
+    ) {
       logEvent(config.logging, "warn", "auth_denied", {
         requestId,
         method: req.method,
         path: requestPath(req),
-        reason: ownerClientId ? "invalid_oauth_resource" : "missing_oauth_client",
-        ...correlationLogFields(ownerClientId, toolCallWorkspaceId(req.body)),
+        reason: !oauthClientId
+          ? "missing_oauth_client"
+          : !connectionPrincipalId
+            ? "missing_connection_principal"
+            : "invalid_oauth_resource",
+        ...correlationLogFields(
+          connectionPrincipalId,
+          toolCallWorkspaceId(req.body),
+          oauthClientId,
+        ),
         ...requestLogFields(req, config),
       });
       sendJsonRpcError(res, 401, -32001, "Unauthorized");
@@ -4735,20 +4977,24 @@ export function createServer(configInput?: ServerConfig): RunningServer {
     const requestWorkspaceId = toolCallWorkspaceId(req.body);
     const correlation: RequestCorrelationState = {
       workspaceId: requestWorkspaceId,
-      workspaceActivityRef: workspaceActivityRef(ownerClientId, requestWorkspaceId),
+      workspaceActivityRef: workspaceActivityRef(connectionPrincipalId, requestWorkspaceId),
     };
     res.locals.correlation = correlation;
 
     let transportMode: McpTransportMode = "stateful";
     try {
       const oauthClient = oauthProvider.clientsStore.getClient
-        ? await oauthProvider.clientsStore.getClient(ownerClientId)
+        ? await oauthProvider.clientsStore.getClient(oauthClientId)
         : undefined;
       if (isChatGptOAuthClient(oauthClient)) transportMode = "stateless";
     } catch (error) {
       logEvent(config.logging, "warn", "mcp_transport_classification_failed", {
         requestId,
-        ...correlationLogFields(ownerClientId, toolCallWorkspaceId(req.body)),
+        ...correlationLogFields(
+          connectionPrincipalId,
+          toolCallWorkspaceId(req.body),
+          oauthClientId,
+        ),
         ...errorFields(error),
       });
     }
@@ -4760,7 +5006,11 @@ export function createServer(configInput?: ServerConfig): RunningServer {
       sessionIdPrefix: sessionIdPrefix(sessionId),
       isInitialize: initializeRequest,
       transportMode,
-      ...correlationLogFields(ownerClientId, toolCallWorkspaceId(req.body)),
+      ...correlationLogFields(
+        connectionPrincipalId,
+        toolCallWorkspaceId(req.body),
+        oauthClientId,
+      ),
     });
 
     if (containsBatchedToolCall(req.body)) {
@@ -4787,11 +5037,15 @@ export function createServer(configInput?: ServerConfig): RunningServer {
           sendJsonRpcError(res, 405, -32000, "Method not allowed; stateless MCP accepts POST only.");
           return;
         }
-        statelessRequestLease = transports.tryAcquireStatelessRequest(ownerClientId);
+        statelessRequestLease = transports.tryAcquireStatelessRequest(connectionPrincipalId);
         if (!statelessRequestLease) {
           logEvent(config.logging, "warn", "mcp_session_rejected", {
             reason: "stateless_request_capacity",
-            ...correlationLogFields(ownerClientId, toolCallWorkspaceId(req.body)),
+            ...correlationLogFields(
+              connectionPrincipalId,
+              toolCallWorkspaceId(req.body),
+              oauthClientId,
+            ),
             maxSessions: config.resources.maxMcpSessions,
             maxSessionsPerClient: config.resources.maxMcpSessionsPerClient,
           });
@@ -4803,7 +5057,7 @@ export function createServer(configInput?: ServerConfig): RunningServer {
         });
         statelessServer = createMcpServer(
           config,
-          ownerClientId,
+          connectionPrincipalId,
           workspaces,
           reviewCheckpoints,
           processSessions,
@@ -4817,13 +5071,17 @@ export function createServer(configInput?: ServerConfig): RunningServer {
         );
         await statelessServer.connect(transport);
       } else if (sessionId) {
-        transport = transports.acquire(sessionId, ownerClientId);
+        transport = transports.acquire(sessionId, connectionPrincipalId);
         if (!transport) {
           logEvent(config.logging, "warn", "unknown_mcp_session", {
             requestId,
             method: req.method,
             sessionIdPrefix: sessionIdPrefix(sessionId),
-            ...correlationLogFields(ownerClientId, toolCallWorkspaceId(req.body)),
+            ...correlationLogFields(
+              connectionPrincipalId,
+              toolCallWorkspaceId(req.body),
+              oauthClientId,
+            ),
             reason: "not_found_or_not_owned",
           });
           sendJsonRpcError(
@@ -4836,14 +5094,18 @@ export function createServer(configInput?: ServerConfig): RunningServer {
         }
         acquiredSessionId = sessionId;
       } else if (initializeRequest) {
-        const reservationResult = await transports.reserveWithIdleReclaim(ownerClientId);
+        const reservationResult = await transports.reserveWithIdleReclaim(connectionPrincipalId);
         if (reservationResult.reclaimed) {
           logSessionCloseResults("capacity_reclaim", [reservationResult.reclaimed]);
         }
         if (!reservationResult.reservation) {
           logEvent(config.logging, "warn", "mcp_session_rejected", {
             reason: "capacity",
-            ...correlationLogFields(ownerClientId, toolCallWorkspaceId(req.body)),
+            ...correlationLogFields(
+              connectionPrincipalId,
+              toolCallWorkspaceId(req.body),
+              oauthClientId,
+            ),
             maxSessions: config.resources.maxMcpSessions,
           });
           sendJsonRpcError(res, 503, -32000, "MCP session capacity reached");
@@ -4860,14 +5122,18 @@ export function createServer(configInput?: ServerConfig): RunningServer {
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (newSessionId) => {
             if (transport && reservation) {
-              transports.register(newSessionId, ownerClientId, transport, reservation, 1);
+              transports.register(newSessionId, connectionPrincipalId, transport, reservation, 1);
               reservation = undefined;
               acquiredSessionId = newSessionId;
             }
             logEvent(config.logging, "info", "mcp_session_created", {
               requestId,
               sessionIdPrefix: sessionIdPrefix(newSessionId),
-              ...correlationLogFields(ownerClientId, toolCallWorkspaceId(req.body)),
+              ...correlationLogFields(
+                connectionPrincipalId,
+                toolCallWorkspaceId(req.body),
+                oauthClientId,
+              ),
               ...requestLogFields(req, config),
             });
           },
@@ -4883,14 +5149,18 @@ export function createServer(configInput?: ServerConfig): RunningServer {
             logEvent(config.logging, "info", "mcp_session_closed", {
               reason: "transport_close",
               sessionIdPrefix: sessionIdPrefix(closedSessionId),
-              ...correlationLogFields(ownerClientId, toolCallWorkspaceId(req.body)),
+              ...correlationLogFields(
+                connectionPrincipalId,
+                toolCallWorkspaceId(req.body),
+                oauthClientId,
+              ),
             });
           }
         };
 
         const server = createMcpServer(
           config,
-          ownerClientId,
+          connectionPrincipalId,
           workspaces,
           reviewCheckpoints,
           processSessions,
@@ -4914,10 +5184,20 @@ export function createServer(configInput?: ServerConfig): RunningServer {
       }
 
       const lease = workspaceToolLease(req.body);
+      const rootLockMode = workspaceToolRootLockMode(req.body);
       const contextRequirement = workspaceToolContextRequirement(req.body);
+      const requiredCallScopes = requiredOAuthScopesForToolCall(req.body);
+      const lacksRequiredOAuthScope = requiredCallScopes.length > 0 &&
+        missingOAuthScopes(
+          req.auth?.scopes ?? [],
+          requiredCallScopes,
+        ).length > 0;
       const receipt = lease ? toolCallWorkspaceReceipt(req.body) : undefined;
       const workspaceBinding = receipt ? contextReceipts.resolve(receipt) : undefined;
-      if (lease && (!workspaceBinding || workspaceBinding.ownerClientId !== ownerClientId)) {
+      if (
+        lease &&
+        (!workspaceBinding || workspaceBinding.connectionPrincipalId !== connectionPrincipalId)
+      ) {
         sendCallToolErrorResult(
           res,
           "workspace_context_required: Call list_workspaces, then resume_workspace with contextMode=\"full\" to obtain a fresh receipt.",
@@ -4946,20 +5226,28 @@ export function createServer(configInput?: ServerConfig): RunningServer {
       if (workspaceBinding) {
         correlation.workspaceId = workspaceBinding.workspaceId;
         correlation.workspaceActivityRef = workspaceActivityRef(
-          ownerClientId,
+          connectionPrincipalId,
           workspaceBinding.workspaceId,
         );
       }
       const handleRequest = () => requestContext.run(
-        { clientId: ownerClientId, requestId, correlation, workspaceBinding },
+        {
+          connectionPrincipalId,
+          oauthClientId,
+          scopes: [...(req.auth?.scopes ?? [])],
+          requestId,
+          correlation,
+          workspaceBinding,
+        },
         () => transport.handleRequest(req, res, req.body),
       );
-      if (lease === "shared" && workspaceBinding) {
+      if (lease === "shared" && workspaceBinding && !lacksRequiredOAuthScope) {
         await workspaces.withWorkspaceOperation(
-          ownerClientId,
+          connectionPrincipalId,
           workspaceBinding.workspaceId,
           workspaceBinding.generation,
           handleRequest,
+          rootLockMode ?? "read",
         );
       } else {
         await handleRequest();
@@ -4969,7 +5257,11 @@ export function createServer(configInput?: ServerConfig): RunningServer {
       if (workspaceError && !res.headersSent) {
         logEvent(config.logging, "warn", "workspace_reopen_required", {
           requestId,
-          ...correlationLogFields(ownerClientId, toolCallWorkspaceId(req.body)),
+          ...correlationLogFields(
+            connectionPrincipalId,
+            toolCallWorkspaceId(req.body),
+            oauthClientId,
+          ),
           workspaceId: workspaceOperationId(req.body),
         });
         sendCallToolErrorResult(
@@ -4988,7 +5280,11 @@ export function createServer(configInput?: ServerConfig): RunningServer {
       runtimeDiagnostics.recordFailure("mcp_request_error", error);
       logEvent(config.logging, "error", "mcp_request_error", {
         requestId,
-        ...correlationLogFields(ownerClientId, toolCallWorkspaceId(req.body)),
+        ...correlationLogFields(
+          connectionPrincipalId,
+          toolCallWorkspaceId(req.body),
+          oauthClientId,
+        ),
         ...errorFields(error),
       });
       if (!res.headersSent) {
@@ -5006,7 +5302,7 @@ export function createServer(configInput?: ServerConfig): RunningServer {
           }
         }
       }
-      if (acquiredSessionId) transports.release(acquiredSessionId, ownerClientId);
+      if (acquiredSessionId) transports.release(acquiredSessionId, connectionPrincipalId);
       if (statelessRequestLease) {
         transports.releaseStatelessRequest(statelessRequestLease);
         statelessRequestLease = undefined;
@@ -5018,7 +5314,11 @@ export function createServer(configInput?: ServerConfig): RunningServer {
           runtimeDiagnostics.recordFailure("stateless_mcp_cleanup_failed", error);
           logEvent(config.logging, "warn", "stateless_mcp_cleanup_failed", {
             requestId,
-            ...correlationLogFields(ownerClientId, toolCallWorkspaceId(req.body)),
+            ...correlationLogFields(
+              connectionPrincipalId,
+              toolCallWorkspaceId(req.body),
+              oauthClientId,
+            ),
             ...errorFields(error),
           });
         }

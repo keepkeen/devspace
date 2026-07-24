@@ -54,7 +54,8 @@ export function logEvent(
 }
 
 export function requestIp(req: Request, trustProxy: boolean): string | undefined {
-  if (trustProxy && isLoopbackProxyPeer(req.socket.remoteAddress)) {
+  const remoteAddress = req.socket?.remoteAddress;
+  if (trustProxy && isLoopbackProxyPeer(remoteAddress)) {
     const cfConnectingIp = firstHeaderValue(req.header("cf-connecting-ip"));
     if (cfConnectingIp) return cfConnectingIp;
 
@@ -62,7 +63,7 @@ export function requestIp(req: Request, trustProxy: boolean): string | undefined
     if (forwardedFor) return forwardedFor;
   }
 
-  return req.ip ?? req.socket.remoteAddress;
+  return req.ip ?? remoteAddress;
 }
 
 export function isLoopbackProxyPeer(address: string | undefined): boolean {
@@ -87,25 +88,31 @@ export function identifierHash(identifier: string | undefined): string | undefin
     : undefined;
 }
 
-/** Stable, privacy-safe reference for one OAuth client registration. */
-export function connectionRef(clientId: string | undefined): string | undefined {
-  const hash = identifierHash(clientId);
+/** Stable, privacy-safe reference for one local connection principal. */
+export function connectionRef(connectionPrincipalId: string | undefined): string | undefined {
+  const hash = identifierHash(connectionPrincipalId);
   return hash ? `conn_${hash}` : undefined;
 }
 
+/** Stable, privacy-safe reference for one OAuth dynamic client registration. */
+export function oauthClientRef(clientId: string | undefined): string | undefined {
+  const hash = identifierHash(clientId);
+  return hash ? `oauth_${hash}` : undefined;
+}
+
 /**
- * Stable reference for work performed through one OAuth registration and
- * workspace handle. This is an operational activity key, not a ChatGPT thread
- * or account claim.
+ * Stable reference for work performed through one local connection principal
+ * and Workspace handle. This is an operational activity key, not a ChatGPT
+ * thread or verified account claim.
  */
 export function workspaceActivityRef(
-  clientId: string | undefined,
+  connectionPrincipalId: string | undefined,
   workspaceId: string | undefined,
 ): string | undefined {
-  if (!clientId || !workspaceId) return undefined;
+  if (!connectionPrincipalId || !workspaceId) return undefined;
   const hash = createHash("sha256")
     .update("devspace:workspace-activity:v1\0")
-    .update(clientId)
+    .update(connectionPrincipalId)
     .update("\0")
     .update(workspaceId)
     .digest("hex")

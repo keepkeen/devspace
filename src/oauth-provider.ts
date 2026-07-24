@@ -1,5 +1,6 @@
 import { timingSafeEqual, randomBytes, randomUUID, createHash } from "node:crypto";
-import type { Response } from "express";
+import { isIP } from "node:net";
+import type { Request, Response } from "express";
 import type { OAuthRegisteredClientsStore } from "@modelcontextprotocol/sdk/server/auth/clients.js";
 import type { OAuthServerProvider, AuthorizationParams } from "@modelcontextprotocol/sdk/server/auth/provider.js";
 import { AccessDeniedError, InvalidGrantError, InvalidRequestError, InvalidTokenError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
@@ -13,10 +14,17 @@ import { checkResourceAllowed, resourceUrlFromServerUrl } from "@modelcontextpro
 import {
   SqliteOAuthClientsStore,
   SqliteOAuthStore,
+  PrincipalReconnectError,
+  type OAuthAuthorizationLimitInput,
   type OAuthDiagnosticSnapshot,
   type OAuthCleanupCounts,
   type OAuthRevocationCounts,
 } from "./oauth-store.js";
+import { requestIp } from "./logger.js";
+import {
+  defaultOAuthAuthorizationScopes,
+  oauthScopeDescription,
+} from "./oauth-scopes.js";
 
 export interface OAuthConfig {
   ownerToken: string;
@@ -24,6 +32,7 @@ export interface OAuthConfig {
   refreshTokenTtlSeconds: number;
   scopes: string[];
   allowedRedirectHosts: string[];
+  trustProxy?: boolean;
 }
 
 export type OAuthAuditEventName =
@@ -31,6 +40,7 @@ export type OAuthAuditEventName =
   | "oauth_authorization_succeeded"
   | "oauth_authorization_failed"
   | "oauth_authorization_rate_limited"
+  | "oauth_principal_linked"
   | "oauth_token_issued"
   | "oauth_token_refreshed";
 
@@ -46,8 +56,34 @@ interface AuthorizationCodeRecord {
 }
 
 const CODE_TTL_MS = 5 * 60 * 1000;
-const AUTH_FAILURE_WINDOW_MS = 5 * 60 * 1000;
-const MAX_AUTH_FAILURES_PER_WINDOW = 5;
+const AUTHORIZATION_LIMIT_TTL_MS = 24 * 60 * 60_000;
+
+const AUTHORIZATION_LIMIT_POLICIES = {
+  session: {
+    capacity: 5,
+    refillIntervalMs: 30_000,
+    baseBackoffMs: 1_000,
+    maxBackoffMs: 5 * 60_000,
+  },
+  client: {
+    capacity: 20,
+    refillIntervalMs: 10_000,
+    baseBackoffMs: 1_000,
+    maxBackoffMs: 10 * 60_000,
+  },
+  ip: {
+    capacity: 40,
+    refillIntervalMs: 5_000,
+    baseBackoffMs: 1_000,
+    maxBackoffMs: 10 * 60_000,
+  },
+  global: {
+    capacity: 200,
+    refillIntervalMs: 100,
+    baseBackoffMs: 250,
+    maxBackoffMs: 30_000,
+  },
+} as const;
 
 function randomToken(): string {
   return randomBytes(32).toString("base64url");
@@ -76,7 +112,11 @@ function formHtml(params: {
   resource?: URL;
   fields: Record<string, string | undefined>;
 }): string {
-  const scopeText = params.scopes.length > 0 ? params.scopes.join(" ") : "devspace";
+  const scopes = params.scopes.length > 0 ? params.scopes : ["devspace"];
+  const scopeItems = scopes
+    .map((scope) =>
+      `<li><code>${htmlEscape(scope)}</code><span>${htmlEscape(oauthScopeDescription(scope))}</span></li>`)
+    .join("");
   const resourceText = params.resource?.href ?? "DevSpace MCP endpoint";
   const error = params.error
     ? `<p class="error">${htmlEscape(params.error)}</p>`
@@ -100,8 +140,14 @@ function formHtml(params: {
       dl { padding: 16px; background: #020617; border-radius: 12px; }
       dt { color: #94a3b8; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; }
       dd { margin: 4px 0 12px; word-break: break-word; }
+      ul { margin: 4px 0 12px; padding-left: 18px; }
+      li { margin: 8px 0; }
+      li code { display: block; color: #bae6fd; }
+      li span { color: #cbd5e1; font-size: 13px; }
       label { display: block; margin: 18px 0 8px; font-weight: 600; }
       input { box-sizing: border-box; width: 100%; padding: 12px 14px; border-radius: 10px; border: 1px solid #475569; background: #020617; color: #e2e8f0; font-size: 16px; }
+      .optional { margin-top: 22px; padding-top: 18px; border-top: 1px solid #334155; }
+      .help { margin: 6px 0 0; color: #94a3b8; font-size: 13px; }
       button { margin-top: 18px; width: 100%; border: 0; border-radius: 10px; padding: 12px 14px; font-weight: 700; color: #020617; background: #38bdf8; cursor: pointer; }
       .error { color: #fecaca; background: #7f1d1d; border-radius: 10px; padding: 10px 12px; }
       .warning { color: #fde68a; }
@@ -114,13 +160,18 @@ function formHtml(params: {
       ${error}
       <dl>
         <dt>Client</dt><dd>${htmlEscape(params.clientName)}</dd>
-        <dt>Scope</dt><dd>${htmlEscape(scopeText)}</dd>
+        <dt>Capabilities</dt><dd><ul>${scopeItems}</ul></dd>
         <dt>Resource</dt><dd>${htmlEscape(resourceText)}</dd>
       </dl>
       <form method="post">
 ${hiddenFields}
         <label for="owner_token">Owner password</label>
         <input id="owner_token" name="owner_token" type="password" autocomplete="current-password" autofocus required />
+        <div class="optional">
+          <label for="reconnect_code">Reconnect code (optional)</label>
+          <input id="reconnect_code" name="reconnect_code" type="text" autocomplete="off" spellcheck="false" />
+          <p class="help">Use a short-lived code created locally with <code>devspace auth reconnect-code</code> to recover an earlier connection principal. New registrations remain isolated by default.</p>
+        </div>
         <button type="submit">Authorize DevSpace</button>
       </form>
     </main>
@@ -130,6 +181,93 @@ ${hiddenFields}
 
 function requestedScopesAllowed(requested: string[], supported: string[]): boolean {
   return requested.every((scope) => supported.includes(scope));
+}
+
+function authorizationSessionKey(
+  client: OAuthClientInformationFull,
+  params: AuthorizationParams,
+): string {
+  return createHash("sha256")
+    .update("devspace-oauth-authorization-session-v1\0")
+    .update(client.client_id)
+    .update("\0")
+    .update(params.redirectUri)
+    .update("\0")
+    .update(params.codeChallenge)
+    .update("\0")
+    .update([...(params.scopes ?? [])].sort().join(" "))
+    .update("\0")
+    .update(params.state ?? "")
+    .digest("base64url");
+}
+
+function authorizationRequestIp(req: Request, trustProxy: boolean): string {
+  return normalizeIp(requestIp(req, trustProxy));
+}
+
+function normalizeIp(value: string | undefined): string {
+  if (!value) return "unknown";
+  const withoutZone = value.split("%", 1)[0]!;
+  const normalized = withoutZone.startsWith("::ffff:")
+    ? withoutZone.slice(7)
+    : withoutZone;
+  return isIP(normalized) > 0 ? normalized : "unknown";
+}
+
+function authorizationLimitInputs(
+  client: OAuthClientInformationFull,
+  params: AuthorizationParams,
+  req: Request,
+  trustProxy: boolean,
+): OAuthAuthorizationLimitInput[] {
+  const sessionKey = authorizationSessionKey(client, params);
+  const ip = authorizationRequestIp(req, trustProxy);
+  const common = { ttlMs: AUTHORIZATION_LIMIT_TTL_MS };
+  return [
+    {
+      scope: "session",
+      key: `${ip}\0${client.client_id}\0${sessionKey}`,
+      ...AUTHORIZATION_LIMIT_POLICIES.session,
+      ...common,
+    },
+    {
+      scope: "client",
+      key: client.client_id,
+      ...AUTHORIZATION_LIMIT_POLICIES.client,
+      ...common,
+    },
+    {
+      scope: "ip",
+      key: ip,
+      ...AUTHORIZATION_LIMIT_POLICIES.ip,
+      ...common,
+    },
+    {
+      scope: "global",
+      key: "all-authorizations",
+      ...AUTHORIZATION_LIMIT_POLICIES.global,
+      ...common,
+    },
+  ];
+}
+
+function sendAuthorizationRateLimit(
+  res: Response,
+  retryAfterMs: number,
+  client: OAuthClientInformationFull,
+  params: AuthorizationParams,
+): void {
+  res.status(429).setHeader("Retry-After", String(Math.max(1, Math.ceil(retryAfterMs / 1_000))));
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(
+    formHtml({
+      error: "Too many failed attempts for this authorization context. Wait before trying again.",
+      clientName: client.client_name ?? client.client_id,
+      scopes: params.scopes ?? [],
+      resource: params.resource,
+      fields: authorizationFormFields(client, params),
+    }),
+  );
 }
 
 function setAuthorizationResponseHeaders(res: Response, redirectUri: string): void {
@@ -154,14 +292,13 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
   private readonly codes = new Map<string, AuthorizationCodeRecord>();
   private readonly oauthStore: SqliteOAuthStore;
   private readonly resourceServerUrl: URL;
-  private readonly authorizationFailures: number[] = [];
 
   constructor(
     private readonly config: OAuthConfig,
     resourceServerUrl: URL,
     stateDir: string,
     private readonly onAuditEvent?: (event: OAuthAuditEvent) => void,
-    private readonly onAuthorizationEpochChanged?: (clientId: string) => void,
+    private readonly onAuthorizationEpochChanged?: (connectionPrincipalId: string) => void,
   ) {
     this.resourceServerUrl = resourceUrlFromServerUrl(resourceServerUrl);
     this.oauthStore = new SqliteOAuthStore(stateDir);
@@ -178,11 +315,15 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     params: AuthorizationParams,
     res: Response,
   ): Promise<void> {
-    setAuthorizationResponseHeaders(res, params.redirectUri);
-    if (!params.resource || !checkResourceAllowed({ requestedResource: params.resource, configuredResource: this.resourceServerUrl })) {
+    const scopes = params.scopes?.length
+      ? [...params.scopes]
+      : defaultOAuthAuthorizationScopes(this.config.scopes);
+    const authorizedParams: AuthorizationParams = { ...params, scopes };
+    setAuthorizationResponseHeaders(res, authorizedParams.redirectUri);
+    if (!authorizedParams.resource || !checkResourceAllowed({ requestedResource: authorizedParams.resource, configuredResource: this.resourceServerUrl })) {
       throw new InvalidRequestError("Invalid or missing OAuth resource");
     }
-    if (!requestedScopesAllowed(params.scopes ?? [], this.config.scopes)) {
+    if (!requestedScopesAllowed(scopes, this.config.scopes)) {
       throw new InvalidRequestError("Requested scope is not supported");
     }
 
@@ -191,71 +332,92 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
       res.send(
         formHtml({
           clientName: client.client_name ?? client.client_id,
-          scopes: params.scopes ?? this.config.scopes,
-          resource: params.resource,
-          fields: authorizationFormFields(client, params),
+          scopes,
+          resource: authorizedParams.resource,
+          fields: authorizationFormFields(client, authorizedParams),
         }),
       );
       return;
     }
 
-    const providedToken = String(res.req.body?.owner_token ?? "");
     const now = Date.now();
-    const tokenMatches = safeEquals(providedToken, this.config.ownerToken);
-    while (
-      this.authorizationFailures.length > 0 &&
-      this.authorizationFailures[0]! <= now - AUTH_FAILURE_WINDOW_MS
-    ) {
-      this.authorizationFailures.shift();
-    }
-    if (!tokenMatches && this.authorizationFailures.length >= MAX_AUTH_FAILURES_PER_WINDOW) {
+    const authorizationLimits = authorizationLimitInputs(
+      client,
+      authorizedParams,
+      res.req,
+      this.config.trustProxy === true,
+    );
+    const preflight = this.oauthStore.checkAuthorizationLimits(authorizationLimits, now);
+    if (preflight.limited) {
       this.emitAudit("oauth_authorization_rate_limited", client.client_id);
-      const retryAfterSeconds = Math.max(
-        1,
-        Math.ceil((this.authorizationFailures[0]! + AUTH_FAILURE_WINDOW_MS - now) / 1_000),
-      );
-      res.status(429).setHeader("Retry-After", String(retryAfterSeconds));
-      res.setHeader("Content-Type", "text/html; charset=utf-8");
-      res.send(
-        formHtml({
-          error: "Too many failed attempts. Wait before trying again.",
-          clientName: client.client_name ?? client.client_id,
-          scopes: params.scopes ?? this.config.scopes,
-          resource: params.resource,
-          fields: authorizationFormFields(client, params),
-        }),
-      );
+      sendAuthorizationRateLimit(res, preflight.retryAfterMs, client, authorizedParams);
       return;
     }
+
+    const providedToken = String(res.req.body?.owner_token ?? "");
+    const tokenMatches = safeEquals(providedToken, this.config.ownerToken);
     if (!tokenMatches) {
-      this.authorizationFailures.push(now);
       this.emitAudit("oauth_authorization_failed", client.client_id);
+      const failure = this.oauthStore.recordAuthorizationFailure(authorizationLimits, now);
+      if (failure.limited) {
+        this.emitAudit("oauth_authorization_rate_limited", client.client_id);
+        sendAuthorizationRateLimit(res, failure.retryAfterMs, client, authorizedParams);
+        return;
+      }
       res.status(401).setHeader("Content-Type", "text/html; charset=utf-8");
       res.send(
         formHtml({
           error: "The Owner password was not accepted.",
           clientName: client.client_name ?? client.client_id,
-          scopes: params.scopes ?? this.config.scopes,
-          resource: params.resource,
-          fields: authorizationFormFields(client, params),
+          scopes,
+          resource: authorizedParams.resource,
+          fields: authorizationFormFields(client, authorizedParams),
         }),
       );
       return;
     }
-    this.authorizationFailures.length = 0;
-    this.onAuthorizationEpochChanged?.(client.client_id);
+    this.oauthStore.clearAuthorizationLimit(
+      "session",
+      authorizationLimits[0]!.key,
+    );
+    const reconnectCode = String(res.req.body?.reconnect_code ?? "").trim();
+    let connectionPrincipalId: string;
+    if (reconnectCode) {
+      try {
+        const linked = this.oauthStore.consumeReconnectCode(reconnectCode, client.client_id);
+        connectionPrincipalId = linked.targetPrincipalId;
+        if (linked.changed) this.emitAudit("oauth_principal_linked", client.client_id);
+      } catch (error) {
+        if (!(error instanceof PrincipalReconnectError)) throw error;
+        res.status(400).setHeader("Content-Type", "text/html; charset=utf-8");
+        res.send(
+          formHtml({
+            error: error.message,
+            clientName: client.client_name ?? client.client_id,
+            scopes,
+            resource: authorizedParams.resource,
+            fields: authorizationFormFields(client, authorizedParams),
+          }),
+        );
+        return;
+      }
+    } else {
+      connectionPrincipalId = this.oauthStore.ensurePrincipalForClient(client.client_id);
+    }
+    this.oauthStore.touchPrincipal(connectionPrincipalId);
+    this.onAuthorizationEpochChanged?.(connectionPrincipalId);
     this.emitAudit("oauth_authorization_succeeded", client.client_id);
 
     const code = `code-${randomUUID()}`;
     this.codes.set(code, {
       clientId: client.client_id,
-      params,
+      params: authorizedParams,
       expiresAtMs: Date.now() + CODE_TTL_MS,
     });
 
-    const redirectUrl = new URL(params.redirectUri);
+    const redirectUrl = new URL(authorizedParams.redirectUri);
     redirectUrl.searchParams.set("code", code);
-    if (params.state !== undefined) redirectUrl.searchParams.set("state", params.state);
+    if (authorizedParams.state !== undefined) redirectUrl.searchParams.set("state", authorizedParams.state);
     res.redirect(302, redirectUrl.href);
   }
 
@@ -283,7 +445,9 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     }
 
     this.codes.delete(authorizationCode);
+    const principalId = this.oauthStore.ensurePrincipalForClient(client.client_id);
     const tokens = this.issueTokens(client.client_id, record.params.scopes ?? this.config.scopes, record.params.resource);
+    this.oauthStore.touchPrincipal(principalId);
     this.emitAudit("oauth_token_issued", client.client_id);
     return tokens;
   }
@@ -314,6 +478,8 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
       resource ?? (record.resource ? new URL(record.resource) : undefined),
       refreshTokenHash,
     );
+    const principalId = this.oauthStore.principalForClient(client.client_id);
+    if (principalId) this.oauthStore.touchPrincipal(principalId);
     this.emitAudit("oauth_token_refreshed", client.client_id);
     return tokens;
   }
@@ -331,6 +497,10 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
       expiresAt: record.expiresAt,
       resource: record.resource ? new URL(record.resource) : undefined,
     };
+  }
+
+  principalForClient(clientId: string): string | undefined {
+    return this.oauthStore.principalForClient(clientId);
   }
 
   async revokeToken(_client: OAuthClientInformationFull, request: OAuthTokenRevocationRequest): Promise<void> {

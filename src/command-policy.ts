@@ -9,7 +9,7 @@
  *
  * - segment evaluation so a broad allow rule never authorizes a destructive tail
  * - a small built-in denylist for commands that are dangerous even for a
- *   trusted OAuth-authenticated connection (forced/recursive `rm`, `sudo`, pipe-to-shell)
+ *   trusted OAuth-authenticated connection (`sudo` and pipe-to-shell)
  * - wrapper recursion through `sudo` / `env` / `trap` / `nohup`
  * - an optional workspace prefix-allow list for auto-approved command prefixes
  *
@@ -67,19 +67,6 @@ interface DangerousPattern {
   test: (tokens: string[]) => boolean;
 }
 
-const rmDangerous: DangerousPattern = {
-  id: "rm-dangerous",
-  reason: "Forced or recursive rm commands are not permitted (unpredictable destructive deletion).",
-  test: (tokens) => {
-    if (commandBasename(tokens[0]) !== "rm") return false;
-    return tokens.slice(1).some((token) =>
-      token === "--force" ||
-      token === "--recursive" ||
-      (/^-[^-]/u.test(token) && /[fFrR]/u.test(token))
-    );
-  },
-};
-
 const pipeToShell: DangerousPattern = {
   id: "pipe-to-shell",
   reason: "Piping remote or untrusted content into a shell is not permitted.",
@@ -96,7 +83,7 @@ const sudoRoot: DangerousPattern = {
   test: (tokens) => commandBasename(tokens[0]) === "sudo",
 };
 
-const dangerousPatterns: DangerousPattern[] = [rmDangerous, sudoRoot];
+const dangerousPatterns: DangerousPattern[] = [sudoRoot];
 
 export function unwrapCommandWrappers(tokens: string[]): string[] {
   return unwrapShellWrappers(tokens);
@@ -172,7 +159,7 @@ function evaluateSegment(
   }
 
   // Explicit allow rules may bypass ordinary workflow checks, but never the
-  // hard sudo/deletion rules above.
+  // hard sudo rule above.
   for (const prefix of allowPrefixes) {
     if (matchesPrefix(tokens, prefix)) {
       return { decision: "allow", reason: "" };

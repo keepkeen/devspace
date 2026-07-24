@@ -275,11 +275,13 @@ The expected workflow is:
    cannot read, inspect, execute, or modify local files.
 2. It passes that receipt to `get_workspace_context` with
    `contextMode: "full"` to receive the v3 structured instructions, Skill
-   catalog, and a refreshed context-loaded receipt. Only explicit
-   `contextMode: "retained"` permits revision-based body suppression.
+   catalog, and a refreshed context-loaded receipt. Revision-based suppression
+   is allowed only when `get_workspace_context(retained)` refreshes that exact
+   current context-loaded receipt. Open, resume, new conversations, and
+   compacted contexts must use `full`.
 3. ChatGPT passes the current receipt to reads, searches, edits, and commands.
-   The receipt binds the OAuth connection, Workspace and generation, context
-   phase, a private context session, and both context revisions.
+   The receipt binds the local connection principal, Workspace and generation,
+   context phase, a private context session, and both context revisions.
 4. Each ChatGPT tool call may use a fresh stateless HTTP transport. Continuity
    comes from the persisted Workspace record, so reconnects and stale MCP
    session headers do not interrupt the workspace. The same authorized client
@@ -287,9 +289,21 @@ The expected workflow is:
    conversation calls
    `list_workspaces`, then `resume_workspace(alias, full)`, without resending an
    absolute host path.
-   If the ChatGPT app is deleted, refreshed, or re-authorized as a new OAuth
-   client, rejected old receipts and aliases belong to the earlier connection;
-   call `open_workspace` again.
+   A deleted and re-added ChatGPT app receives a new dynamic OAuth registration
+   and creates a new connection principal on its first successful approval, so
+   it cannot see old aliases. To
+   deliberately recover the earlier local identity, run `devspace auth
+   principals`, generate `devspace auth reconnect-code <principal-id>`, and
+   enter that one-time short-lived code on the new OAuth approval page. Old
+   receipts never transfer between registrations.
+   One connection principal can retain several project aliases. ChatGPT does
+   not provide DevSpace with a trusted conversation ID, so each conversation
+   must treat its selected alias as the continuity key: after a later-day turn,
+   platform disconnect, or fresh transport, list and resume that alias instead
+   of opening a replacement worktree. If a managed worktree path disappears,
+   its alias remains `recovery_required`; resume recreates the same Workspace at
+   the original path and prefers Git's latest recorded commit. Lost uncommitted
+   files cannot be guaranteed and the result reports `dataLossPossible=true`.
 5. `close_workspace` is used only when you explicitly ask to release it.
    Unused workspaces may also expire after the configured idle period.
 
@@ -302,13 +316,31 @@ Do not tell ChatGPT to use hosted Python or Code Interpreter to inspect a local
 path. Those tools are still fine for unrelated calculations or generated data;
 local project work should go through DevSpace.
 
-### Two ChatGPT accounts
+### A connection principal is not a ChatGPT account identity
 
-Different OAuth clients receive different workspace IDs and process sessions.
-If both accounts open the same approved checkout, they still edit the same files
-on disk. This fork isolates identities and resources, but it does not merge or
-lock concurrent edits to the same file. Avoid simultaneous writes unless you
-use separate Git worktrees.
+DevSpace does not receive a verified ChatGPT account `sub`. Dynamic OAuth
+registration alone creates no identity; its first successful Owner approval
+creates an isolated local connection principal. This is connection-level
+isolation, not proof of account identity. A new registration
+joins an older principal only after the owner enters a locally generated,
+one-time reconnect code.
+
+Two principals can still open the same physical checkout. Within one DevSpace
+instance, normalized-root read/write locks allow concurrent inspection but put
+patches, commands, writable process input, review checkpoints, close, and revoke
+through one write queue. The lock covers the MCP call, not the entire lifetime
+of a returned background process. Later process effects remain explicitly
+`unknown`, and strict `ifMatch` preconditions prevent silent patch overwrites.
+Close and revoke stop tracked processes. Prefer separate Git worktrees for
+parallel work.
+
+### OAuth capability scopes
+
+DevSpace supports `workspace:read`, `workspace:write`, `process:execute`,
+`network:access`, `worktree:create`, and `workspace:revoke`. The approval page
+shows these capabilities and every tool checks them again before execution.
+The legacy `devspace` scope remains a compatibility alias for all capabilities;
+new deployments can restrict the requestable set with `DEVSPACE_OAUTH_SCOPES`.
 
 ### `AGENTS.md` and Skills
 
@@ -333,9 +365,9 @@ gated when a running process may enter a newly instructed directory. Each
 full-context result includes a `sha256-v1:` `instructionRevision` over the
 ordered initial path/content pairs so clients can recognize an unchanged chain.
 The Skill catalog has an independent `skillRevision`; pass
-`knownSkillRevision` only with explicit `contextMode: "retained"` while the
-prior catalog is still retained. Use `full` after a new conversation or context
-compaction.
+`knownSkillRevision` only when refreshing the exact current context-loaded
+receipt with `get_workspace_context(retained)` while the prior catalog is still
+retained. Use `full` after a new conversation or context compaction.
 
 DevSpace also advertises matching local Skills; `list_skills` adds bounded
 search and pagination. ChatGPT web has no Codex
@@ -379,15 +411,16 @@ from a command that never started.
 repeating the stored result body.
 
 Every Workspace-scoped tool requires the current v3 `receipt`. The unified
-registration layer validates ownership, generation, context phase, and private
+registration layer validates the connection principal, OAuth capabilities,
+generation, context phase, and private
 context-session binding before the handler starts. Metadata receipts can only
 promote context or close/revoke the Workspace. Restarts, OAuth
 reauthorization, allowed-root changes, and close/reopen cycles stale old
 receipts. `read` returns `contentHash` and exact string `mtimeNs`. By default,
 `apply_patch` requires an `ifMatch` entry for every touched path: use the latest
 read version for an existing path and explicit `null` for a path expected not
-to exist. Blind mode requires `preconditionMode: "blind"` plus a
-`blindWriteReason`, and should only follow explicit user authorization.
+to exist. A patch with any missing path precondition is rejected before it
+starts.
 
 Workspace-scoped results use a common `workspace` and `context` envelope.
 Mutations add `operation` with `not_started`, `committed`, or
@@ -395,8 +428,8 @@ Mutations add `operation` with `not_started`, `committed`, or
 their evidence as `observed`, `declared`, or `unknown` rather than claiming a
 precise file list for arbitrary process behavior.
 
-Equivalent managed-worktree opens reuse the same active worktree for one OAuth
-connection and base commit; set `forceNew: true` only for an explicitly separate
+Equivalent managed-worktree opens reuse the same active worktree for one
+connection principal and base commit; set `forceNew: true` only for an explicitly separate
 isolation. `list_workspaces` returns persisted `dirtySource`, while compact
 `project` context reports an empty project, bounded top-level names, and
 best-effort Git branch/dirty state. Expiry removes only clean worktrees and
@@ -501,8 +534,8 @@ The comparison is against upstream commit
 | Clear GPT instructions | Tool descriptions explain that local paths belong to DevSpace, when to reuse a workspace, when not to close it, and when batch tools help. |
 | Faster inspection | `batch_read`, `batch_inspect`, lazy instruction discovery, and caches remove many avoidable MCP round trips and large-directory scans. |
 | Safer lifecycle | Workspace operation leases, exclusive close, request draining, process termination, and cleanup rules prevent resources from being closed while still in use. |
-| Real resource limits | Global and per-client limits cover MCP sessions, workspaces, processes, worktrees, output, and command runtime. Hung commands receive `SIGTERM` and then `SIGKILL` after a grace period. |
-| Client isolation | OAuth ownership is enforced for MCP sessions, workspaces, processes, and stored state. One client cannot reuse another client's IDs. |
+| Real resource limits | Global and per-connection-principal limits cover MCP sessions, workspaces, processes, worktrees, output, and command runtime. Hung commands receive `SIGTERM` and then `SIGKILL` after a grace period. |
+| Principal isolation | MCP sessions, workspaces, processes, and stored state are owned by a local connection principal. Different principals cannot reuse each other's IDs; OAuth `client_id` identifies only a dynamic registration. |
 | Compact context protocol | v3 receipts separate metadata from context-loaded capabilities and isolate instruction acknowledgements in private context sessions, avoiding repeated root instructions and cross-conversation state resets. |
 | Project instructions | Instructions are structured with source, scope, and revision; reads advertise availability only, mutations explicitly load and acknowledge them, empty files are skipped, and the chain is capped at 32 KiB. |
 | Local Skills | Skills come from repository ancestors within an approved root plus user, Admin, and DevSpace bundled scopes; duplicate names remain visible, the catalog is capped at 8,000 UTF-8 bytes, and ChatGPT web loads a selected Skill through `load_skill`. |
@@ -522,7 +555,7 @@ DevSpace enforces:
 
 - a narrow allowlist for dedicated file tools;
 - canonical-path and symlink checks;
-- OAuth approval and per-client ownership;
+- OAuth approval and connection-principal ownership;
 - Host and redirect allowlists;
 - bounded sessions, processes, output, and command runtime;
 - a localhost-only admin panel;
@@ -641,6 +674,7 @@ npm run build
 
 - [Setup guide](./docs/setup.md)
 - [ChatGPT coding workflow](./docs/chatgpt-coding-workflow.md)
+- [Real ChatGPT host acceptance matrix](./docs/chatgpt-host-acceptance.md)
 - [Configuration reference](./docs/configuration.md)
 - [Security model](./docs/security.md)
 - [Troubleshooting](./docs/gotchas.md)

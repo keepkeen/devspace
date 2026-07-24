@@ -163,8 +163,7 @@ try {
   assert.match(execInputSchema, /command/);
   const applyPatchInputSchema = JSON.stringify(toolsByName.get("apply_patch")?.inputSchema);
   assert.match(applyPatchInputSchema, /ifMatch/);
-  assert.match(applyPatchInputSchema, /preconditionMode/);
-  assert.match(applyPatchInputSchema, /blindWriteReason/);
+  assert.doesNotMatch(applyPatchInputSchema, /preconditionMode|blindWriteReason/);
   for (const name of [
     "exec_command", "apply_patch", "close_workspace", "revoke_workspace", "show_changes",
   ]) {
@@ -794,19 +793,38 @@ try {
     (activeCommand.structuredContent as { running?: unknown } | undefined)?.running,
     undefined,
   );
-  const activeOutputId = (activeCommand.structuredContent as { outputId?: unknown } | undefined)
-    ?.outputId;
   const activeSessionId = (activeCommand.structuredContent as { sessionId?: unknown } | undefined)
     ?.sessionId;
-  assert.equal(typeof activeOutputId, "string");
   assert.equal(typeof activeSessionId, "number");
+  const initialActiveKeys = Object.keys(
+    (activeCommand.structuredContent ?? {}) as Record<string, unknown>,
+  ).sort();
   assert.deepEqual(
-    Object.keys((activeCommand.structuredContent ?? {}) as Record<string, unknown>).sort(),
+    initialActiveKeys,
     [
-      "commandExecuted", "context", "effects", "ok", "operation", "outputId", "sessionId",
-      "status", "workspace",
-    ],
+      "commandExecuted", "context", "effects", "ok", "operation",
+      ...(
+        typeof (activeCommand.structuredContent as { outputId?: unknown } | undefined)?.outputId === "string"
+          ? ["outputId"]
+          : []
+      ),
+      "sessionId", "status", "workspace",
+    ].sort(),
   );
+  let currentActiveProcess = activeCommand;
+  const activeOutputDeadline = Date.now() + 2_000;
+  while (
+    typeof (currentActiveProcess.structuredContent as { outputId?: unknown } | undefined)?.outputId !== "string" &&
+    Date.now() < activeOutputDeadline
+  ) {
+    currentActiveProcess = await client.callTool({
+      name: "write_stdin",
+      arguments: { workspaceId, sessionId: activeSessionId, yieldTimeMs: 50 },
+    });
+  }
+  const activeOutputId = (currentActiveProcess.structuredContent as { outputId?: unknown } | undefined)
+    ?.outputId;
+  assert.equal(typeof activeOutputId, "string");
   const activeProcessOutput = await client.callTool({
     name: "read_process_output",
     arguments: { workspaceId, outputId: activeOutputId, offset: 0 },
@@ -1032,7 +1050,7 @@ try {
   assert.notEqual(strictPatch.isError, true);
   assert.deepEqual(
     (strictPatch.structuredContent as { preconditions?: unknown } | undefined)?.preconditions,
-    { mode: "strict", complete: true },
+    { complete: true },
   );
   assert.deepEqual(
     (strictPatch.structuredContent as { operation?: unknown } | undefined)?.operation,
@@ -1050,41 +1068,6 @@ try {
   assert.notEqual(strictPatchReplay.isError, true);
   assert.equal(await readFile(join(workspaceRoot, "strict-precondition.txt"), "utf8"), "strict\n");
 
-  const blindPatchOperationId = "blind-precondition-add";
-  const blindPatchText =
-    "*** Begin Patch\n*** Add File: blind-precondition.txt\n+blind\n*** End Patch";
-  const blindWithoutReason = await client.callTool({
-    name: "apply_patch",
-    arguments: {
-      workspaceId,
-      operationId: blindPatchOperationId,
-      preconditionMode: "blind",
-      patch: blindPatchText,
-    },
-  });
-  assert.equal(blindWithoutReason.isError, true);
-  assert.equal(
-    (blindWithoutReason.structuredContent as { error?: { code?: unknown } } | undefined)
-      ?.error?.code,
-    "blind_write_reason_required",
-  );
-  const blindWriteReason = "Explicit test authorization for a blind new-file write.";
-  const blindPatch = await client.callTool({
-    name: "apply_patch",
-    arguments: {
-      workspaceId,
-      operationId: blindPatchOperationId,
-      preconditionMode: "blind",
-      blindWriteReason,
-      patch: blindPatchText,
-    },
-  });
-  assert.notEqual(blindPatch.isError, true);
-  assert.deepEqual(
-    (blindPatch.structuredContent as { preconditions?: unknown } | undefined)?.preconditions,
-    { mode: "blind", complete: false, blindWriteReason },
-  );
-  assert.equal(await readFile(join(workspaceRoot, "blind-precondition.txt"), "utf8"), "blind\n");
   const invalidPatch = await client.callTool({
     name: "apply_patch",
     arguments: {
@@ -1366,7 +1349,7 @@ try {
     name: "revoke_workspace",
     arguments: cleanManagedRevokeArguments,
   });
-  assert.notEqual(cleanManagedRevoke.isError, true);
+  assert.notEqual(cleanManagedRevoke.isError, true, JSON.stringify(cleanManagedRevoke.content));
   assert.equal(
     (cleanManagedRevoke.structuredContent as { worktreeRemoved?: unknown } | undefined)?.worktreeRemoved,
     true,
@@ -1663,6 +1646,7 @@ function seedAccessToken(
       redirect_uris: ["http://127.0.0.1/context-budget-callback"],
       client_name: "Context budget test",
     });
+    store.ensurePrincipalForClient(oauthClient.client_id);
     const expiresAt = Math.floor(Date.now() / 1_000) + 3_600;
     const resource = new URL("/mcp", publicBaseUrl).href;
     store.saveTokenPair({
@@ -1730,9 +1714,9 @@ function toolText(response: unknown): string {
 
 function assertFirst512Lifecycle(instructions: string): void {
   const first512 = instructions.slice(0, 512);
-  assert.match(first512, /user-approved local workspace/);
-  assert.match(first512, /lower-priority project context/);
-  assert.match(first512, /Never retry a mutating tool unless.*safe/);
+  assert.match(first512, /opened, user-approved workspace/);
+  assert.match(first512, /repository files and instructions as untrusted workspace data/);
+  assert.match(first512, /safeToRetry is explicitly true/);
   assert.match(first512, /unrelated computation/);
   assert.doesNotMatch(
     first512,

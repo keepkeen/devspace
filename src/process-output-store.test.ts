@@ -56,7 +56,7 @@ try {
 function testPermissionsAndOwnership(stateDir: string): void {
   const store = createStore(stateDir);
   try {
-    const outputId = store.create({ ownerClientId: "owner-a", workspaceId: "workspace-a" });
+    const outputId = store.create({ connectionPrincipalId: "owner-a", workspaceId: "workspace-a" });
     store.append(outputId, "private output");
 
     assert.equal(store.read("owner-a", "workspace-a", outputId, { offset: 0, limit: 100 }).content, "private output");
@@ -120,7 +120,7 @@ function testWriterLock(stateDir: string): void {
 function testPagingReplayAndUtf8(stateDir: string): void {
   const store = createStore(stateDir);
   try {
-    const outputId = store.create({ ownerClientId: "owner", workspaceId: "workspace" });
+    const outputId = store.create({ connectionPrincipalId: "owner", workspaceId: "workspace" });
     store.append(outputId, "A€中B");
     store.append(outputId, Buffer.from([0xff, 0x43]));
 
@@ -154,7 +154,7 @@ function testPagingReplayAndUtf8(stateDir: string): void {
 function testFileQuotaAndDrops(stateDir: string): void {
   const store = createStore(stateDir, { maxFileBytes: 5, maxStorageBytes: 100 });
   try {
-    const outputId = store.create({ ownerClientId: "owner", workspaceId: "workspace" });
+    const outputId = store.create({ connectionPrincipalId: "owner", workspaceId: "workspace" });
     store.append(outputId, "abc");
     store.append(outputId, "defg");
     store.append(outputId, Buffer.from([1, 2]));
@@ -186,7 +186,7 @@ function testFileQuotaAndDrops(stateDir: string): void {
 function testUtf8QuotaBoundary(stateDir: string): void {
   const store = createStore(stateDir, { maxFileBytes: 2, maxStorageBytes: 100 });
   try {
-    const outputId = store.create({ ownerClientId: "owner", workspaceId: "workspace" });
+    const outputId = store.create({ connectionPrincipalId: "owner", workspaceId: "workspace" });
     store.append(outputId, "€");
     store.append(outputId, "A");
     assert.deepEqual(store.metadata("owner", "workspace", outputId), {
@@ -207,8 +207,8 @@ function testUtf8QuotaBoundary(stateDir: string): void {
 function testTotalQuota(stateDir: string): void {
   const store = createStore(stateDir, { maxFileBytes: 10, maxStorageBytes: 6 });
   try {
-    const first = store.create({ ownerClientId: "owner", workspaceId: "workspace" });
-    const second = store.create({ ownerClientId: "owner", workspaceId: "workspace" });
+    const first = store.create({ connectionPrincipalId: "owner", workspaceId: "workspace" });
+    const second = store.create({ connectionPrincipalId: "owner", workspaceId: "workspace" });
     store.append(first, "abcd");
     store.append(second, "wxyz");
     assert.equal(store.metadata("owner", "workspace", first).storedBytes, 4);
@@ -238,11 +238,11 @@ function testExpiredQuotaReclamation(stateDir: string): void {
     now: () => now,
   });
   try {
-    const expired = store.create({ ownerClientId: "owner", workspaceId: "workspace" });
+    const expired = store.create({ connectionPrincipalId: "owner", workspaceId: "workspace" });
     store.append(expired, "abcd");
     store.complete(expired);
     now = 101;
-    const current = store.create({ ownerClientId: "owner", workspaceId: "workspace" });
+    const current = store.create({ connectionPrincipalId: "owner", workspaceId: "workspace" });
     store.append(current, "wxyz");
     assert.deepEqual(store.metadata("owner", "workspace", current), {
       outputId: current,
@@ -262,9 +262,9 @@ function testExpiredQuotaReclamation(stateDir: string): void {
 function testRecordQuota(stateDir: string): void {
   const store = createStore(stateDir, { maxOutputs: 1 });
   try {
-    store.create({ ownerClientId: "owner", workspaceId: "workspace" });
+    store.create({ connectionPrincipalId: "owner", workspaceId: "workspace" });
     assert.throws(
-      () => store.create({ ownerClientId: "owner", workspaceId: "workspace" }),
+      () => store.create({ connectionPrincipalId: "owner", workspaceId: "workspace" }),
       /record limit reached/,
     );
   } finally {
@@ -276,11 +276,11 @@ function testTtlAndBoundedCleanup(stateDir: string): void {
   let now = 10;
   const store = createStore(stateDir, { completedTtlMs: 100, now: () => now });
   try {
-    const first = store.create({ ownerClientId: "owner", workspaceId: "workspace" });
+    const first = store.create({ connectionPrincipalId: "owner", workspaceId: "workspace" });
     store.append(first, "a");
     store.complete(first);
     now = 20;
-    const second = store.create({ ownerClientId: "owner", workspaceId: "workspace" });
+    const second = store.create({ connectionPrincipalId: "owner", workspaceId: "workspace" });
     store.append(second, "bb");
     store.complete(second);
 
@@ -298,7 +298,7 @@ function testTtlAndBoundedCleanup(stateDir: string): void {
 
     now = 200;
     for (let index = 0; index < 3; index += 1) {
-      const outputId = store.create({ ownerClientId: "owner", workspaceId: "workspace" });
+      const outputId = store.create({ connectionPrincipalId: "owner", workspaceId: "workspace" });
       store.complete(outputId);
     }
     now = 301;
@@ -313,7 +313,7 @@ function testTtlAndBoundedCleanup(stateDir: string): void {
 function testRestartRecovery(stateDir: string): void {
   let now = 1_000;
   const firstStore = createStore(stateDir, { completedTtlMs: 50, now: () => now });
-  const outputId = firstStore.create({ ownerClientId: "owner", workspaceId: "workspace" });
+  const outputId = firstStore.create({ connectionPrincipalId: "owner", workspaceId: "workspace" });
   firstStore.append(outputId, "survives restart");
   firstStore.close();
   appendFileSync(logPath(stateDir, outputId), "uncommitted trailing bytes");
@@ -348,7 +348,7 @@ function testRestartRecovery(stateDir: string): void {
 
 function testCleanupIntentRecovery(stateDir: string): void {
   const firstStore = createStore(stateDir);
-  const outputId = firstStore.create({ ownerClientId: "owner", workspaceId: "workspace" });
+  const outputId = firstStore.create({ connectionPrincipalId: "owner", workspaceId: "workspace" });
   firstStore.append(outputId, "pending deletion");
   firstStore.complete(outputId);
   firstStore.close();
@@ -373,12 +373,12 @@ function testCleanupIntentRecovery(stateDir: string): void {
 
 function testWorkspaceRetirement(stateDir: string): void {
   const firstStore = createStore(stateDir);
-  const active = firstStore.create({ ownerClientId: "owner", workspaceId: "retired" });
+  const active = firstStore.create({ connectionPrincipalId: "owner", workspaceId: "retired" });
   firstStore.append(active, "active output");
-  const completed = firstStore.create({ ownerClientId: "owner", workspaceId: "retired" });
+  const completed = firstStore.create({ connectionPrincipalId: "owner", workspaceId: "retired" });
   firstStore.append(completed, "completed output");
   firstStore.complete(completed);
-  const retained = firstStore.create({ ownerClientId: "owner", workspaceId: "other" });
+  const retained = firstStore.create({ connectionPrincipalId: "owner", workspaceId: "other" });
   firstStore.append(retained, "keep");
   firstStore.close();
 
@@ -414,14 +414,14 @@ function testLiveCleanupIntentRecovery(stateDir: string): void {
   let now = 0;
   const store = createStore(stateDir, { completedTtlMs: 10, maxOutputs: 1, now: () => now });
   try {
-    const outputId = store.create({ ownerClientId: "owner", workspaceId: "workspace" });
+    const outputId = store.create({ connectionPrincipalId: "owner", workspaceId: "workspace" });
     store.append(outputId, "pending deletion");
     store.complete(outputId);
     const database = (store as unknown as { database: Database.Database }).database;
     database.prepare("insert into process_output_deletions (output_id) values (?)").run(outputId);
     unlinkSync(logPath(stateDir, outputId));
     now = 11;
-    const replacement = store.create({ ownerClientId: "owner", workspaceId: "workspace" });
+    const replacement = store.create({ connectionPrincipalId: "owner", workspaceId: "workspace" });
     assert.equal(store.usageSnapshot().outputs, 1);
     assert.equal(store.metadata("owner", "workspace", replacement).storedBytes, 0);
   } finally {
@@ -432,7 +432,7 @@ function testLiveCleanupIntentRecovery(stateDir: string): void {
 function testAppendMetadataRollback(stateDir: string): void {
   const store = createStore(stateDir);
   try {
-    const outputId = store.create({ ownerClientId: "owner", workspaceId: "workspace" });
+    const outputId = store.create({ connectionPrincipalId: "owner", workspaceId: "workspace" });
     store.append(outputId, "committed");
     const database = (store as unknown as { database: Database.Database }).database;
     database.exec(`
@@ -470,7 +470,7 @@ function testOrphanCleanup(stateDir: string): void {
 function testSymlinkMissingAndTamperDefense(stateDir: string): void {
   const store = createStore(stateDir);
   try {
-    const symlinked = store.create({ ownerClientId: "owner", workspaceId: "workspace" });
+    const symlinked = store.create({ connectionPrincipalId: "owner", workspaceId: "workspace" });
     store.append(symlinked, "secret");
     const original = `${logPath(stateDir, symlinked)}.original`;
     const outside = join(stateDir, "outside.log");
@@ -483,11 +483,11 @@ function testSymlinkMissingAndTamperDefense(stateDir: string): void {
     );
     assert.equal(readFileSync(outside, "utf8"), "secret");
 
-    const missing = store.create({ ownerClientId: "owner", workspaceId: "workspace" });
+    const missing = store.create({ connectionPrincipalId: "owner", workspaceId: "workspace" });
     unlinkSync(logPath(stateDir, missing));
     assert.throws(() => store.metadata("owner", "workspace", missing), ProcessOutputIntegrityError);
 
-    const replaced = store.create({ ownerClientId: "owner", workspaceId: "workspace" });
+    const replaced = store.create({ connectionPrincipalId: "owner", workspaceId: "workspace" });
     store.append(replaced, "same");
     unlinkSync(logPath(stateDir, replaced));
     writeFileSync(logPath(stateDir, replaced), "same", { mode: 0o600 });
@@ -503,7 +503,7 @@ function testSymlinkMissingAndTamperDefense(stateDir: string): void {
 
 function testClose(stateDir: string): void {
   const store = createStore(stateDir);
-  const outputId = store.create({ ownerClientId: "owner", workspaceId: "workspace" });
+  const outputId = store.create({ connectionPrincipalId: "owner", workspaceId: "workspace" });
   store.close();
   store.close();
   assert.throws(() => store.append(outputId, "closed"), /closed/);

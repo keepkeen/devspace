@@ -46,7 +46,7 @@ import {
 import { expandHomePath } from "./roots.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
 
-type Command = "serve" | "admin" | "init" | "doctor" | "config" | "agents" | "help" | "version";
+type Command = "serve" | "admin" | "init" | "doctor" | "config" | "auth" | "agents" | "help" | "version";
 const require = createRequire(import.meta.url);
 const SUPPORTED_NODE_RANGE = ">=20.12 <27";
 
@@ -74,6 +74,10 @@ async function main(argv: string[]): Promise<void> {
     case "config":
       runConfigCommand(args);
       return;
+    case "auth":
+      await ensureConfigured();
+      await runAuthCommand(args);
+      return;
     case "agents":
       await runAgentsCommand(args);
       return;
@@ -88,7 +92,14 @@ async function main(argv: string[]): Promise<void> {
 
 function normalizeCommand(command: string | undefined): Command {
   if (!command || command === "serve" || command === "start") return "serve";
-  if (command === "admin" || command === "init" || command === "doctor" || command === "config" || command === "agents") return command;
+  if (
+    command === "admin" ||
+    command === "init" ||
+    command === "doctor" ||
+    command === "config" ||
+    command === "auth" ||
+    command === "agents"
+  ) return command;
   if (command === "help" || command === "--help" || command === "-h") return "help";
   if (command === "version" || command === "--version" || command === "-v") return "version";
   throw new Error(`Unknown command: ${command}`);
@@ -361,6 +372,73 @@ function runConfigCommand(args: string[]): void {
   throw new Error("Supported config keys: publicBaseUrl.");
 }
 
+async function runAuthCommand(args: string[]): Promise<void> {
+  const [subcommand, principalId, ...rest] = args;
+  if (rest.length > 0) throw new Error(`Unexpected auth argument: ${rest[0]}`);
+  const config = loadConfig();
+  const { SqliteOAuthStore } = await import("./oauth-store.js");
+  const store = new SqliteOAuthStore(config.stateDir);
+  try {
+    switch (subcommand) {
+      case "principals":
+      case "ls":
+      case "list": {
+        const principals = store.listConnectionPrincipals();
+        if (principals.length === 0) {
+          console.log("No active connection principals.");
+          return;
+        }
+        for (const principal of principals) {
+          const aliases = principal.aliases.length > 0
+            ? ` aliases=${principal.aliases.join(",")}`
+            : "";
+          console.log(
+            `${principal.principalId} clients=${principal.clientCount}` +
+              ` activeWorkspaces=${principal.activeWorkspaces}` +
+              ` retainedWorkspaces=${principal.retainedWorkspaces}${aliases}`,
+          );
+        }
+        return;
+      }
+      case "reconnect-code": {
+        if (!principalId) {
+          throw new Error("`devspace auth reconnect-code` requires a connection principal ID.");
+        }
+        const issued = store.issueReconnectCode(principalId);
+        console.log(`Reconnect code: ${issued.code}`);
+        console.log(`Principal: ${issued.principalId}`);
+        console.log(`Expires: ${issued.expiresAt}`);
+        console.log("Enter this code once on the DevSpace OAuth approval page for the new connector registration.");
+        return;
+      }
+      case undefined:
+      case "help":
+      case "--help":
+      case "-h":
+        printAuthHelp();
+        return;
+      default:
+        throw new Error(`Unknown auth command: ${subcommand}`);
+    }
+  } finally {
+    store.close();
+  }
+}
+
+function printAuthHelp(): void {
+  console.log([
+    "DevSpace connection principals",
+    "",
+    "Usage:",
+    "  devspace auth principals",
+    "  devspace auth reconnect-code <principal-id>",
+    "",
+    "A connection principal is a local DevSpace identity shared only when you",
+    "explicitly enter a short-lived reconnect code. It is not a verified",
+    "ChatGPT account identity.",
+  ].join("\n"));
+}
+
 function printHelp(): void {
   console.log(
     [
@@ -375,6 +453,8 @@ function printHelp(): void {
       "  devspace doctor          Show config, runtime, and native dependency status",
       "  devspace config get      Print persisted config",
       "  devspace config set publicBaseUrl <url|null>",
+      "  devspace auth principals List local connection principals",
+      "  devspace auth reconnect-code <principal-id>",
       "  devspace agents ls       List subagent sessions",
       "  devspace agents run <profile-or-provider-or-id> [--model <model>] <prompt>",
       "  devspace agents show <id>",

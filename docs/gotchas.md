@@ -146,15 +146,30 @@ OAuth `client_id` that is no longer registered, usually after the Admin panel's
 Close the authorization page, remove the current DevSpace connection or app in
 ChatGPT, and add it again. Clicking **Connect** alone may reuse the stale client
 ID. DevSpace then accepts a fresh dynamic client registration and shows the
-normal Owner-password approval page.
+normal Owner-password approval page. The registration stays unassigned until a
+successful approval, which creates a new local connection principal by default.
+
+To deliberately recover aliases owned by the earlier principal, run locally:
+
+```bash
+devspace auth principals
+devspace auth reconnect-code <principal-id>
+```
+
+Enter that code once on the new approval page. Do not paste it into ChatGPT.
+Without this explicit link, reopening the project creates isolated connection
+state.
 
 ## Unknown `workspaceId`
 
-`workspaceId` values are scoped to the OAuth client that opened them. Normal MCP
-transport reconnects do not invalidate them. If ChatGPT refreshes or
-re-authorizes the app as a new OAuth client, an older ID is intentionally
-rejected; that connection cannot see the former connection's aliases, so open
-the project again with its path.
+`workspaceId` values are scoped to the local connection principal that opened
+them. Normal MCP transport reconnects do not invalidate them. If ChatGPT
+refreshes or re-authorizes the same registered client, resume the Workspace
+after the generation change. A new dynamic registration remains unassigned;
+its first successful approval creates another principal that cannot see former
+aliases unless the owner explicitly uses a reconnect code. Before opening the
+project again, always call `list_workspaces`;
+creating a replacement worktree can strand the original task.
 
 In a new conversation on the same OAuth connection, call `list_workspaces` and
 then `resume_workspace(alias, contextMode="full")`; the host path does not need
@@ -168,6 +183,28 @@ Every later Workspace tool must include that generation. If policy, credential
 epoch, or lifecycle state changes, `stale_workspace_generation` instructs the
 client to list/resume rather than guessing whether an old handle is safe.
 
+## Managed Worktree Is Missing Or Platform Closed The Session
+
+The MCP transport, receipt, and browser conversation connection are not the
+Workspace. A platform-side session closure should be handled by opening a new
+transport, calling `list_workspaces`, and resuming the alias selected by that
+conversation. The same connection principal may have several project aliases;
+do not pick another project's alias merely because both are visible.
+
+If the managed worktree directory cannot be found, DevSpace keeps the Workspace
+active and lists it as `recovery_required`. `resume_workspace` attempts to
+recreate the original path under the same Workspace ID. It first uses Git's
+registered worktree HEAD, which preserves committed work even when the folder
+was removed, then falls back to the saved base commit. The recovery result marks
+`dataLossPossible=true`: uncommitted files that disappeared with the directory
+cannot be reconstructed from Git.
+
+When `open_workspace(mode="worktree")` finds exactly one active worktree for the
+same source repository, it reuses it even if the source branch has moved. When
+several exist, `workspace_selection_required` returns their aliases. Resume the
+correct alias or explicitly use `forceNew=true`; do not enter a loop of creating
+new branches to replace an inaccessible one.
+
 `open_workspace` is for the first use of a host path. Its default metadata mode
 does not return an operational `workspaceId`; call
 `get_workspace_context(alias, contextMode="full")` before work. Revision hints
@@ -179,13 +216,26 @@ session header does not invalidate or consume the workspace. Non-ChatGPT MCP
 hosts remain stateful; an unknown transport session returns a dedicated 404 and
 the server records a redacted `unknown_mcp_session` diagnostic.
 
-For log correlation, `connectionRef` identifies the OAuth registration rather
-than a verified ChatGPT account. `workspaceActivityRef` identifies that
-registration plus the workspace handle, which separates the common case of one
-account running conversations against different projects. ChatGPT does not
-currently provide DevSpace a documented thread/conversation ID, so two
-conversations using the same connection and reused workspace cannot be labeled
-as separate threads without adding an explicit client handshake.
+For log correlation, `oauthClientRef` identifies the dynamic OAuth
+registration, while `connectionRef` identifies the local principal. Neither is
+a verified ChatGPT account. `workspaceActivityRef` identifies the principal
+plus Workspace handle, which separates work against different projects.
+ChatGPT does not currently provide DevSpace a documented thread/conversation
+ID, so two conversations using the same principal and reused Workspace cannot
+be labeled as separate threads without an explicit client handshake.
+
+## `insufficient_scope`
+
+The access token authenticated successfully but lacks a capability required by
+that tool. Reauthorize with the indicated scope rather than retrying the tool.
+Common combinations are:
+
+- writable checkout: `workspace:read workspace:write`
+- managed worktree: add `worktree:create`
+- command execution: add `process:execute network:access`
+- close/revoke: add `workspace:revoke`
+
+The legacy `devspace` scope grants all capabilities for backward compatibility.
 
 ## Workspace Path Rejected
 

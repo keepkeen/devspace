@@ -266,6 +266,35 @@ function validateCommand(
     }
     if (!program) continue;
 
+    if (program === "rm" && hasDestructiveRmFlag(effective.slice(1))) {
+      const operands = nonOptionOperands(effective.slice(1));
+      if (operands.length === 0) {
+        return {
+          target: "<missing-rm-target>",
+          reason: "Forced or recursive rm requires an explicit workspace target",
+        };
+      }
+      const ambiguous = operands.find((target) =>
+        !isCheckableTarget(target) && !isWorkspaceRelativePattern(target)
+      );
+      if (ambiguous) {
+        return {
+          target: ambiguous,
+          reason: `Forced or recursive rm target is not safely workspace-relative: ${ambiguous}`,
+        };
+      }
+      const workspaceRootTarget = operands.find((target) =>
+        isCheckableTarget(target) &&
+        resolvePotentialTarget(resolveLiteralPath(target, currentCwd)) === canonicalRoot
+      );
+      if (workspaceRootTarget) {
+        return {
+          target: workspaceRootTarget,
+          reason: "Forced or recursive rm cannot delete the workspace root itself",
+        };
+      }
+    }
+
     const heredocShell = isShellProgram(effective[0]) && !shellIsParseOnly(tokens);
     if (heredocShell) {
       for (const payload of extractHereStringPayloads(segment)) {
@@ -474,6 +503,19 @@ function programBasename(program: string | undefined): string {
 
 function isCheckableTarget(target: string): boolean {
   return Boolean(target) && !/[\$`*?\[\]{}]/u.test(target) && !target.startsWith("~");
+}
+
+function hasDestructiveRmFlag(args: string[]): boolean {
+  return args.some((argument) =>
+    argument === "--force" ||
+    argument === "--recursive" ||
+    (/^-[^-]/u.test(argument) && /[fFrR]/u.test(argument))
+  );
+}
+
+function isWorkspaceRelativePattern(target: string): boolean {
+  if (!target || isAbsolute(target) || target.startsWith("~") || /[\$`]/u.test(target)) return false;
+  return !target.split(/[\\/]/u).includes("..");
 }
 
 function literalPathCandidates(tokens: string[]): string[] {

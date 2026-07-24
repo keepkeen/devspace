@@ -268,19 +268,30 @@ OpenAI 目前把自定义 MCP 集成称为 **developer-mode app（开发者模�
    不把项目指令或 Skill 目录立即塞入上下文，同时返回短期 `receipt`。metadata
    receipt 只能继续加载上下文或关闭/撤销 Workspace，不能直接读取、搜索、执行或修改文件。
 2. 模型用这个 `receipt` 调用 `get_workspace_context`，取得 v3 结构化项目指令、
-   Skill 目录和刷新后的 `receipt`。只有显式的 `contextMode: "retained"` 才会按
-   revision 跳过正文。
-3. 后续读取、搜索、编辑和命令调用只传当前 `receipt`。它已经绑定 OAuth 客户端、
-   Workspace、代次、上下文阶段、私有 context session 及两类上下文修订号，模型不需要
-   在每次调用里重复绝对路径或内部 ID。
+   Skill 目录和刷新后的 `receipt`。只有用当前 context-loaded receipt 刷新
+   `get_workspace_context` 时，显式的 `contextMode: "retained"` 才会按已绑定的
+   revision 跳过正文；打开、恢复、新对话和上下文压缩后必须使用 `full`。
+3. 后续读取、搜索、编辑和命令调用只传当前 `receipt`。它已经绑定本机
+   connection principal、Workspace、代次、上下文阶段、私有 context session 及两类
+   上下文修订号，模型不需要在每次调用里重复绝对路径或内部 ID。
 4. ChatGPT 的每次工具调用都可以使用新的无状态 HTTP 传输；真正需要复用的是
    Workspace 的持久化记录，不是 MCP transport session。传输重连或旧 MCP session
    header 不会中断 workspace。
    新对话不需要再次发送绝对路径：先调用 `list_workspaces`，再通过
    `resume_workspace(alias, full)` 恢复并取得新 `receipt`。服务重启后旧 receipt 会失效，
    但 alias 和 Workspace 记录仍可恢复。
-   如果你删除、刷新或重新授权了 ChatGPT 应用，新的 OAuth 客户端不能复用旧
-   alias 或 receipt，应重新打开项目。
+   如果你删除并重新添加 ChatGPT 应用，新的动态 OAuth 注册会在首次成功授权时建立新的
+   connection principal，因此看不到旧 alias。需要明确恢复旧连接时，先在本机运行
+   `devspace auth principals`，再用
+   `devspace auth reconnect-code <principal-id>` 生成一次性短期代码，并在新的 OAuth
+   授权页面输入。旧 receipt 永远不能跨注册复用。
+   同一 connection principal 下可以同时保留多个项目 alias。ChatGPT 不会向 DevSpace
+   提供可信的对话 ID，因此每个对话应把自己的 alias 当作持续性键：隔天继续、平台
+   断线或打开新 transport 后先 `list_workspaces`，再恢复原 alias，不要新建替代 worktree。
+   如果原 managed worktree 路径暂时丢失，alias 会保留为 `recovery_required`；恢复时
+   DevSpace 会优先在原路径重建同一 Workspace，并尽量使用 Git 记录的最新提交。物理目录
+   连同未提交内容一并丢失时，无法保证找回未提交修改，结果会明确标记
+   `dataLossPossible=true`。
 5. 只有你明确要求释放 workspace 时，模型才应调用 `close_workspace`。长时间
    未使用的 workspace 也可能在达到配置的空闲期限后自动过期。
 
@@ -291,12 +302,25 @@ OpenAI 目前把自定义 MCP 集成称为 **developer-mode app（开发者模�
 不要让 ChatGPT 使用云端 Python 或 Code Interpreter 去检查本地路径。它们仍可
 用于与本地项目无关的计算和数据处理；本地项目操作应通过 DevSpace 完成。
 
-### 两个 ChatGPT 账号
+### 连接主体不是 ChatGPT 账户身份
 
-不同 OAuth 客户端会得到各自独立的 workspace ID 和进程会话。如果两个账号都
-打开同一个本地 checkout，它们修改的仍然是磁盘上的同一份文件。本分支实现了
-身份和资源隔离，但不会自动合并或锁定同一文件的并发修改。除非使用独立 Git
-worktree，否则不建议两个账号同时写入同一个项目。
+DevSpace 看不到经过验证的 ChatGPT 账户 `sub`。动态 OAuth 注册本身不创建身份；只有
+首次成功的 Owner 授权才为它建立独立的本机 connection principal。这提供的是
+**连接级隔离**，不是 ChatGPT 账户级证明。
+只有输入本机生成的一次性 reconnect code，新的注册才会显式绑定到旧 principal。
+
+两个 principal 即使资源彼此不可见，仍可打开同一个物理 checkout。本 DevSpace
+实例会按规范化根目录让读取共享锁、让补丁、命令、可写进程输入、变更 checkpoint、
+关闭和撤销进入同一写队列。锁只覆盖 MCP 工具调用本身；返回的后台进程可以继续产生
+无法完整观测的副作用，因此结果会标记为 `unknown`，后续补丁仍依赖 `ifMatch` 防止
+静默覆盖。关闭和撤销会先终止受跟踪进程。并行工作仍优先使用独立 Git worktree。
+
+### OAuth 能力范围
+
+DevSpace 支持 `workspace:read`、`workspace:write`、`process:execute`、
+`network:access`、`worktree:create` 和 `workspace:revoke`。授权页面会展示这些能力，
+工具执行前还会再次校验。旧的 `devspace` scope 继续作为“全部能力”兼容别名；新部署
+可以用 `DEVSPACE_OAUTH_SCOPES` 缩小可申请范围。
 
 ### `AGENTS.md` 和 Skill
 
@@ -317,8 +341,9 @@ worktree，否则不建议两个账号同时写入同一个项目。
 同一套指令确认。完整上下文返回基于初始指令路径和内容生成的
 `sha256-v1:` `instructionRevision`，便于客户端识别未变化的指令链，避免重复污染上下文。
 Skill 目录使用独立的 `skillRevision`；只有模型仍保留旧目录时才传
-`knownSkillRevision`，目录未变化便不会重复返回。revision 只在显式
-`contextMode: "retained"` 时生效；新对话和上下文压缩后应使用 `full`。
+`knownSkillRevision`，目录未变化便不会重复返回。revision 只在当前
+context-loaded receipt 的 `get_workspace_context(retained)` 刷新中生效；新对话和
+上下文压缩后应使用 `full`。
 
 DevSpace 也会告诉 ChatGPT 当前可用的本地 Skill；`list_skills` 支持搜索和分页。ChatGPT 网页端没有 Codex 的
 `$skill`/`/skills` 界面，因此模型通过 `load_skill` 完整加载对应 `SKILL.md`；
@@ -357,15 +382,14 @@ DevSpace 只提供一套稳定的 Codex 风格工具：`read`、`batch_read`、
 不会在 24 小时后重新变成一次新操作。
 
 所有 Workspace 工具都要求当前上下文 `receipt`；统一注册层会在工具执行前解析它并校验
-OAuth 所有权、Workspace 代次、context phase 与私有 context session。metadata receipt
+connection principal、OAuth capability、Workspace 代次、context phase 与私有 context session。metadata receipt
 只能升级上下文或执行关闭/撤销；读取、搜索、进程和修改工具必须使用 context-loaded receipt。
 receipt 还绑定签发时的两类上下文修订号，供恢复和缓存去重使用；项目内文件变化仍由指令
 门禁、Skill 重载和文件版本锁分别检查。服务重启、OAuth 重新授权、授权根变更和
 关闭/重新打开会使旧 receipt 失效，此时用 alias 恢复并获取新的 receipt。`read` 返回
 `contentHash` 和精确字符串形式的
 `mtimeNs`。`apply_patch` 默认要求每个 touched path 都有 `ifMatch`：已有文件使用最新读取
-版本，预期不存在的新路径显式传 `null`。只有用户明确授权后，才可使用
-`preconditionMode: "blind"` 并提供 `blindWriteReason`。
+版本，预期不存在的新路径显式传 `null`。缺少任一路径的前置条件时，补丁不会开始执行。
 
 写入、命令、进程交互、变更展示、关闭和撤销操作还会返回统一的 `workspace`、`context`、
 `operation` 和 `effects`。operation 明确给出 `not_started`、`committed` 或
@@ -373,7 +397,7 @@ receipt 还绑定签发时的两类上下文修订号，供恢复和缓存去重
 DevSpace 直接测得的版本或生命周期状态为 `observed`，策略声明为 `declared`，任意进程可能
 产生而无法枚举的副作用为 `unknown`，不会伪造精确文件清单。
 
-同一 OAuth 连接重复打开相同提交的 managed worktree 时会默认复用；只有明确需要另一份
+同一 connection principal 重复打开相同提交的 managed worktree 时会默认复用；只有明确需要另一份
 隔离环境时才设置 `forceNew: true`。`list_workspaces` 会返回持久化的 `dirtySource`，
 空项目、顶层条目以及 Git 分支/脏状态则通过紧凑的 `project` 字段返回。过期清理只删除
 干净 worktree，绝不自动删除带修改的 worktree。
@@ -468,8 +492,8 @@ DEVSPACE_LAUNCHD_SERVICE_LABEL=com.waishnav.devspace node dist/cli.js admin
 | 更清楚的模型提示 | 每个工具用精简的 Use/Avoid/Needs/Returns 描述说明选择边界；全局提示只保留安全不变量。 |
 | 更快的项目检查 | `batch_read`、`batch_inspect`、懒加载项目指令和缓存减少了不必要的 MCP 往返及大目录扫描。 |
 | 完整生命周期 | workspace 操作租约、独占关闭、请求排空、进程终止和统一清理，避免资源仍在使用时被提前关闭。 |
-| 真正的资源限制 | 全局和单客户端配额覆盖 MCP 会话、workspace、进程、worktree、输出和命令时间。超时命令先接收 `SIGTERM`，宽限期后仍未退出则使用 `SIGKILL`。 |
-| 客户端身份隔离 | MCP 会话、workspace、进程和持久化状态都校验 OAuth 所有权，一个客户端不能复用另一个客户端的 ID。 |
+| 真正的资源限制 | 全局和单 connection principal 配额覆盖 MCP 会话、workspace、进程、worktree、输出和命令时间。超时命令先接收 `SIGTERM`，宽限期后仍未退出则使用 `SIGKILL`。 |
+| 连接主体隔离 | MCP 会话、workspace、进程和持久化状态都校验本机 connection principal；不同主体不能复用彼此的 ID。OAuth `client_id` 只标识动态注册。 |
 | 紧凑上下文协议 | v3 上下文按 metadata/context-loaded phase 签发短期 receipt，并把指令确认隔离到私有 context session；根指令不重复发送，新对话也不会清除旧 receipt 的确认状态。 |
 | 可核验副作用 | 写入、命令、进程、变更展示和 Workspace 生命周期工具统一返回机器可读 effects，并明确区分精确观测与 Shell 无法完整跟踪的副作用。 |
 | 可靠撤销 | 撤销全部 OAuth 客户端时先阻止新调用并排空进行中的调用，再用持久化任务回收进程、输出、review 和干净 worktree；脏 worktree 留作可审计记录。 |
@@ -490,7 +514,7 @@ DevSpace 会强制执行：
 
 - 专用文件工具的目录允许列表；
 - 真实路径和符号链接检查；
-- OAuth 授权和单客户端资源所有权；
+- OAuth 授权和 connection principal 资源所有权；
 - Host 与 OAuth 重定向地址允许列表；
 - MCP 会话、进程、输出和命令时间限制；
 - 只监听 localhost 的管理面板；
@@ -608,6 +632,7 @@ npm run build
 
 - [安装指南](./docs/setup.md)
 - [ChatGPT 编码工作流](./docs/chatgpt-coding-workflow.md)
+- [真实 ChatGPT 宿主验收矩阵](./docs/chatgpt-host-acceptance.md)
 - [配置参考](./docs/configuration.md)
 - [安全模型](./docs/security.md)
 - [故障排查](./docs/gotchas.md)

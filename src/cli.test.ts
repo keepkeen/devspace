@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "./config.js";
 import { LocalAgentStore } from "./local-agent-store.js";
+import { SqliteOAuthClientsStore, SqliteOAuthStore } from "./oauth-store.js";
+import { SqliteWorkspaceStore } from "./workspace-store.js";
 
 const packageJson = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
   version: string;
@@ -64,6 +66,67 @@ assert.throws(
   /Command failed/,
 );
 rmSync(configCommandDir, { recursive: true, force: true });
+
+const authRoot = mkdtempSync(join(tmpdir(), "devspace-cli-auth-test-"));
+try {
+  const stateDir = join(authRoot, "state");
+  const projectRoot = join(authRoot, "project");
+  mkdirSync(projectRoot, { recursive: true });
+  const oauth = new SqliteOAuthStore(stateDir);
+  const clients = new SqliteOAuthClientsStore(oauth, ["chatgpt.com"]);
+  const client = clients.registerClient({
+    redirect_uris: ["https://chatgpt.com/connector_platform_oauth_redirect"],
+    client_name: "CLI principal fixture",
+  });
+  const principalId = oauth.ensurePrincipalForClient(client.client_id);
+  const workspaces = new SqliteWorkspaceStore(stateDir);
+  workspaces.createSession({
+    id: "cli-auth-workspace",
+    connectionPrincipalId: principalId,
+    alias: "cli-primary",
+    root: projectRoot,
+  });
+  workspaces.close();
+  oauth.close();
+
+  const authEnv = {
+    ...process.env,
+    DEVSPACE_CONFIG_DIR: join(authRoot, "config"),
+    DEVSPACE_STATE_DIR: stateDir,
+    DEVSPACE_ALLOWED_ROOTS: projectRoot,
+    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+    DEVSPACE_PUBLIC_BASE_URL: "https://devspace.example.com",
+    PORT: "1",
+  };
+  const principalOutput = execFileSync(
+    "node",
+    ["--import", "tsx", "src/cli.ts", "auth", "principals"],
+    { encoding: "utf8", env: authEnv },
+  );
+  assert.match(principalOutput, new RegExp(principalId.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")));
+  assert.match(principalOutput, /aliases=cli-primary/);
+
+  const reconnectOutput = execFileSync(
+    "node",
+    ["--import", "tsx", "src/cli.ts", "auth", "reconnect-code", principalId],
+    { encoding: "utf8", env: authEnv },
+  );
+  const reconnectCode = /^Reconnect code: (reconnect-[A-Za-z0-9_-]+)$/mu.exec(reconnectOutput)?.[1];
+  assert.ok(reconnectCode);
+
+  const restored = new SqliteOAuthStore(stateDir);
+  try {
+    const replacement = new SqliteOAuthClientsStore(restored, ["chatgpt.com"]).registerClient({
+      redirect_uris: ["https://chatgpt.com/connector_platform_oauth_redirect"],
+    });
+    assert.equal(restored.consumeReconnectCode(reconnectCode, replacement.client_id).targetPrincipalId, principalId);
+    assert.equal(restored.principalForClient(replacement.client_id), principalId);
+  } finally {
+    restored.close();
+  }
+} finally {
+  rmSync(authRoot, { recursive: true, force: true });
+}
 
 const root = mkdtempSync(join(tmpdir(), "devspace-cli-agents-test-"));
 try {

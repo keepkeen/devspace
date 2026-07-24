@@ -32,12 +32,12 @@ try {
   workspaceStore = new SqliteWorkspaceStore(stateDir);
   workspaceStore.createSession({
     id: "workspace-a",
-    ownerClientId: "owner-a",
+    connectionPrincipalId: "owner-a",
     root: workspaceRoot,
   });
   mutationStore = new MutationOperationStore(stateDir);
   const key = {
-    ownerClientId: "owner-a",
+    connectionPrincipalId: "owner-a",
     workspaceId: "workspace-a",
     tool: "exec_command",
     operationId: "live-operation",
