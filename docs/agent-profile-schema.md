@@ -72,7 +72,7 @@ Unsupported or custom providers are rejected. DevSpace maps providers to their
 native integration:
 
 - `codex`: Codex SDK
-- `claude`: Claude Code SDK
+- `claude`: Claude Code CLI (`claude`, or `CLAUDE_COMMAND`)
 - `opencode`: OpenCode SDK
 - `pi`: Pi RPC mode
 - `cursor`: ACP
@@ -101,7 +101,7 @@ thinking: xhigh
 
 DevSpace passes this through to providers that expose a matching control:
 
-- `claude`: SDK effort with adaptive thinking.
+- `claude`: CLI `--effort`.
 - `codex`: SDK model reasoning effort.
 - `pi`: `--thinking`.
 - `opencode`: model variant.

@@ -15,7 +15,7 @@ import {
   registerAppResource,
   registerAppTool as registerSdkAppTool,
   RESOURCE_MIME_TYPE,
-} from "@modelcontextprotocol/ext-apps/server";
+} from "./mcp-apps-server.js";
 import express from "express";
 import type { Request, Response } from "express";
 import * as z from "zod/v4";

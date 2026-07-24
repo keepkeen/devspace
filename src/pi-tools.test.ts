@@ -1,11 +1,16 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   PI_TOOL_ERROR_MAX_CHARACTERS,
+  editFileTool,
+  findFilesTool,
+  grepFilesTool,
+  listDirectoryTool,
   readFileTool,
   sanitizePiToolError,
+  writeFileTool,
 } from "./pi-tools.js";
 
 const context = {
@@ -59,6 +64,72 @@ assert.equal(sanitizePiToolError({}, context), "Tool operation failed.");
 
 const adapterRoot = await mkdtemp(join(tmpdir(), "devspace-pi-error-report-"));
 try {
+  await mkdir(join(adapterRoot, "src", "nested"), { recursive: true });
+  await mkdir(join(adapterRoot, "node_modules", "ignored"), { recursive: true });
+  await writeFile(join(adapterRoot, "src", "a.ts"), "zero\nMATCH\npost\n");
+  await writeFile(join(adapterRoot, "src", "nested", "b.ts"), "nested MATCH\n");
+  await writeFile(join(adapterRoot, "node_modules", "ignored", "hidden.ts"), "MATCH\n");
+  await writeFile(join(adapterRoot, ".env"), "visible\n");
+
+  const readPage = await readFileTool(
+    { path: "src/a.ts", offset: 2, limit: 1 },
+    { cwd: adapterRoot, root: adapterRoot },
+  );
+  assert.equal(readPage.isError, undefined);
+  assert.equal(readPage.content[0]?.type, "text");
+  assert.match(readPage.content[0]?.type === "text" ? readPage.content[0].text : "", /^MATCH/u);
+  assert.match(JSON.stringify(readPage.content), /Use offset=3 to continue/);
+
+  const grep = await grepFilesTool(
+    { pattern: "MATCH", path: "src", context: 1 },
+    { cwd: adapterRoot, root: adapterRoot },
+  );
+  assert.equal(grep.isError, undefined);
+  const grepText = grep.content[0]?.type === "text" ? grep.content[0].text : "";
+  assert.match(grepText, /a\.ts:2: MATCH/);
+  assert.match(grepText, /a\.ts-1- zero/);
+  assert.match(grepText, /nested\/b\.ts:1: nested MATCH/);
+  assert.doesNotMatch(grepText, /node_modules|hidden\.ts/);
+
+  const found = await findFilesTool(
+    { pattern: "*.ts", path: "." },
+    { cwd: adapterRoot, root: adapterRoot },
+  );
+  const foundText = found.content[0]?.type === "text" ? found.content[0].text : "";
+  assert.match(foundText, /src\/a\.ts/);
+  assert.match(foundText, /src\/nested\/b\.ts/);
+  assert.doesNotMatch(foundText, /node_modules|hidden\.ts/);
+
+  const listed = await listDirectoryTool(
+    { path: "." },
+    { cwd: adapterRoot, root: adapterRoot },
+  );
+  const listedText = listed.content[0]?.type === "text" ? listed.content[0].text : "";
+  assert.match(listedText, /^\.env/mu);
+  assert.match(listedText, /^src\/$/mu);
+
+  const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00]);
+  await writeFile(join(adapterRoot, "image.png"), png);
+  const image = await readFileTool(
+    { path: "image.png" },
+    { cwd: adapterRoot, root: adapterRoot },
+  );
+  assert.deepEqual(image.content, [
+    { type: "text", text: "Read image file [image/png]" },
+    { type: "image", data: png.toString("base64"), mimeType: "image/png" },
+  ]);
+
+  assert.equal((await writeFileTool(
+    { path: "generated/new.txt", content: "before\n" },
+    { cwd: adapterRoot, root: adapterRoot },
+  )).isError, undefined);
+  const edited = await editFileTool(
+    { path: "generated/new.txt", edits: [{ oldText: "before", newText: "after" }] },
+    { cwd: adapterRoot, root: adapterRoot },
+  );
+  assert.equal(edited.isError, undefined);
+  assert.equal(await readFile(join(adapterRoot, "generated", "new.txt"), "utf8"), "after\n");
+
   let reportedError: unknown;
   const response = await readFileTool(
     { path: "missing.txt" },

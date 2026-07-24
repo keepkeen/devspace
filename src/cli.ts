@@ -8,7 +8,6 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as prompts from "@clack/prompts";
-import { getShellConfig } from "@earendil-works/pi-coding-agent";
 import { satisfies } from "semver";
 import { DEVSPACE_VERSION } from "./version.js";
 import { loadConfig } from "./config.js";
@@ -846,7 +845,10 @@ function checkGitAvailable(): string {
 
 function checkBashShell(): string {
   try {
-    const { shell, args } = getShellConfig();
+    const shell = process.platform === "win32"
+      ? process.env.BASH ?? "bash"
+      : process.env.BASH ?? "/bin/bash";
+    const args = ["-c"];
     return `${shell} ${args.join(" ")}`;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

@@ -1,7 +1,5 @@
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { resolve } from "node:path";
 import { Readable, Writable } from "node:stream";
-import type { EffortLevel } from "@anthropic-ai/claude-agent-sdk";
 import type { LocalAgentProvider } from "./local-agent-profiles.js";
 import { removeDevspaceNodeModulesBinFromPath } from "./local-agent-path.js";
 import {
@@ -20,6 +18,7 @@ const ACP_COMMANDS: Record<"cursor" | "copilot", [string, ...string[]]> = {
   copilot: ["copilot", "--acp"],
 };
 const PI_AGENT_TIMEOUT_MS = 120_000;
+const CLAUDE_AGENT_TIMEOUT_MS = 120_000;
 
 export async function runLocalAgentProvider(
   provider: LocalAgentProvider,
@@ -57,33 +56,39 @@ class ClaudeLocalAgentAdapter implements LocalAgentAdapter {
   readonly provider = "claude" as const;
 
   async run(input: LocalAgentRunInput): Promise<LocalAgentRunResult> {
-    const { query } = await import("@anthropic-ai/claude-agent-sdk");
-    const claudeExecutable = process.env.CLAUDE_COMMAND ?? resolveExecutable("claude");
-    const messages = query({
-      prompt: input.prompt,
-      options: {
-        cwd: input.workspace,
-        model: input.model,
-        ...(input.thinking ? { thinking: { type: "adaptive" } as const, effort: input.thinking as EffortLevel } : {}),
-        resume: input.providerSessionId,
-        permissionMode: "bypassPermissions",
-        allowDangerouslySkipPermissions: true,
-        env: claudeCommandEnvironment(process.env),
-        ...(claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}),
-      },
+    const command = process.env.CLAUDE_COMMAND ?? resolveExecutable("claude") ?? "claude";
+    const args = [
+      "--print",
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      "--dangerously-skip-permissions",
+    ];
+    if (input.model) args.push("--model", input.model);
+    if (input.thinking) args.push("--effort", input.thinking);
+    if (input.providerSessionId) args.push("--resume", input.providerSessionId);
+    const child = spawn(command, args, {
+      cwd: input.workspace,
+      env: claudeCommandEnvironment(process.env),
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
     });
-
+    assertPipedChild(child);
+    const messages = await collectJsonLineProcess(
+      child,
+      input.prompt,
+      "Claude",
+      CLAUDE_AGENT_TIMEOUT_MS,
+    );
     let providerSessionId = input.providerSessionId ?? null;
     let finalResponse = "";
-    const items: unknown[] = [];
-    for await (const message of messages) {
-      items.push(message);
+    for (const message of messages) {
       const record = message as Record<string, unknown>;
       if (typeof record.session_id === "string") providerSessionId = record.session_id;
-      if (record.type === "result" && typeof record.result === "string") {
+      if (record.type === "result") {
         const resultError = claudeResultError(record);
         if (resultError) throw new Error(resultError);
-        finalResponse = record.result;
+        if (typeof record.result === "string") finalResponse = record.result;
       }
     }
 
@@ -92,9 +97,61 @@ class ClaudeLocalAgentAdapter implements LocalAgentAdapter {
       provider: this.provider,
       providerSessionId,
       finalResponse,
-      items,
+      items: messages,
     };
   }
+}
+
+async function collectJsonLineProcess(
+  child: ChildProcessWithoutNullStreams,
+  stdin: string,
+  provider: string,
+  timeoutMs: number,
+): Promise<unknown[]> {
+  return new Promise((resolve, reject) => {
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const timer = setTimeout(() => {
+      child.kill("SIGTERM");
+      finish(() => reject(new Error(`${provider} CLI timed out after ${timeoutMs}ms.`)));
+    }, timeoutMs);
+    const finish = (callback: () => void): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      callback();
+    };
+    child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString("utf8"); });
+    child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString("utf8"); });
+    child.on("error", (error) => finish(() => reject(error)));
+    child.on("close", (code, signal) => finish(() => {
+      const items: unknown[] = [];
+      const malformed: string[] = [];
+      for (const rawLine of stdout.split(/\r?\n/u)) {
+        const line = rawLine.trim();
+        if (!line) continue;
+        try {
+          items.push(JSON.parse(line));
+        } catch {
+          malformed.push(line);
+        }
+      }
+      if (code !== 0) {
+        reject(new Error(
+          `${provider} CLI exited with code ${code ?? "null"} and signal ${signal ?? "null"}. ` +
+          `${stderr.trim() || malformed.at(-1) || "No error output."}`,
+        ));
+        return;
+      }
+      if (malformed.length > 0 && items.length === 0) {
+        reject(new Error(`${provider} CLI emitted malformed JSON: ${malformed[0]}`));
+        return;
+      }
+      resolve(items);
+    }));
+    child.stdin.end(stdin);
+  });
 }
 
 function claudeResultError(record: Record<string, unknown>): string | undefined {

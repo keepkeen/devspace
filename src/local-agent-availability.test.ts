@@ -17,6 +17,15 @@ assert.equal(checkLocalAgentProviderAvailability("codex").available, true);
 }
 
 {
+  const availability = checkLocalAgentProviderAvailability("claude", {
+    ...process.env,
+    CLAUDE_COMMAND: "/definitely/missing/devspace-claude",
+  });
+  assert.equal(availability.available, false);
+  assert.match(availability.reason ?? "", /executable not found/);
+}
+
+{
   const snapshot = getLocalAgentProviderAvailabilitySnapshot({
     ...process.env,
     PI_COMMAND: "/definitely/missing/devspace-pi",

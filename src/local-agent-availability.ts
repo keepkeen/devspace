@@ -26,7 +26,9 @@ export function checkLocalAgentProviderAvailability(
     case "codex":
       return packageAvailability(provider, "@openai/codex-sdk");
     case "claude":
-      return packageAvailability(provider, "@anthropic-ai/claude-agent-sdk");
+      return commandAvailability(provider, env.CLAUDE_COMMAND ?? "claude", {
+        env: claudeAvailabilityEnvironment(env),
+      });
     case "opencode":
       return packageAvailability(provider, "@opencode-ai/sdk/v2");
     case "pi":
@@ -142,6 +144,16 @@ function executableExists(command: string, env: NodeJS.ProcessEnv): boolean {
 
 function piAvailabilityEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   if (env.PI_COMMAND) return env;
+  const path = env.PATH;
+  if (!path) return env;
+  return {
+    ...env,
+    PATH: removeDevspaceNodeModulesBinFromPath(path),
+  };
+}
+
+function claudeAvailabilityEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  if (env.CLAUDE_COMMAND) return env;
   const path = env.PATH;
   if (!path) return env;
   return {

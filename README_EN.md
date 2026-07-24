@@ -28,6 +28,7 @@
   <a href="#quick-start">Quick start</a> ·
   <a href="#connect-chatgpt">Connect ChatGPT</a> ·
   <a href="#how-to-use-it">How to use it</a> ·
+  <a href="#recommended-project-organization">Project organization</a> ·
   <a href="#why-this-fork">Fork highlights</a> ·
   <a href="#security">Security</a>
 </p>
@@ -486,6 +487,79 @@ fields must follow these result locations; see the
 [ChatGPT coding workflow](./docs/chatgpt-coding-workflow.md) for the full contract.
 Each loaded `SKILL.md` is capped at 64 KiB.
 
+## Recommended project organization
+
+DevSpace persists work as a **Workspace alias under one connection principal**.
+The most predictable layout is one Git project per directory, one continuing
+task per alias, and one managed worktree whenever parallel work needs file-level
+isolation. Do not use the whole home directory as one project root.
+
+Recommended layout:
+
+```text
+~/code/                              # DevSpace allowed root
+├── billing-api/                     # one independent Git project
+│   ├── AGENTS.md                    # short, stable repository-wide rules
+│   ├── docs/
+│   │   └── agent-architecture.md    # detailed background outside root context
+│   ├── services/
+│   │   └── payments/
+│   │       └── AGENTS.md            # incremental rules for this subtree
+│   ├── .agents/
+│   │   └── skills/
+│   │       └── release-check/
+│   │           ├── SKILL.md         # repository Skill, explicit-only by default
+│   │           └── references/
+│   └── package.json
+└── mobile-app/                      # another project with another alias
+
+~/.agents/skills/                    # trusted personal Skills outside repositories
+└── company-review/
+    └── SKILL.md
+```
+
+Choose a Workspace this way:
+
+| Need | Recommended action |
+| --- | --- |
+| Continue the same task tomorrow | Call `list_workspaces` and resume the original alias; do not resend the path. |
+| Continue the same task in a new chat | Resume the same alias; both conversations observe the same Workspace state. |
+| Start an independent task in the same repository | Create a new managed worktree and alias, such as `billing-api-auth-fix`. |
+| Review the current checkout | Use the default read-only checkout without write authority. |
+| Let two accounts or principals modify the same repository | Give each one a managed worktree; do not share one writable checkout. |
+| Work on several projects | Keep a distinct alias for each project and avoid moving one conversation among unrelated aliases. |
+
+Organize the projects themselves with these rules:
+
+1. **Allowlist a project collection, not your home directory.** Prefer
+   `~/code` or `~/work`; do not approve `~`, `/`, a cloud-drive root, or a
+   directory containing broad private data.
+2. **Create a Git baseline commit first.** Managed worktrees require a valid
+   commit. Commit important checkpoints: when a physical worktree disappears,
+   DevSpace can reconstruct committed content but cannot guarantee recovery of
+   uncommitted files lost with the directory.
+3. **Keep the root `AGENTS.md` concise.** Put build commands, test requirements,
+   architecture boundaries, and prohibitions there. Put detailed design in
+   `docs/` and subsystem rules in nested `AGENTS.md` files. The effective chain
+   is capped at 32 KiB; shorter instructions preserve model context.
+4. **Separate Skills by trust source.** Repository Skills are untrusted and
+   explicit-only by default. Put trusted personal or administrator Skills in
+   user/Admin roots. Add an exact directory to `DEVSPACE_SKILL_PATHS` only when
+   implicit selection is intentional. Keep descriptions on one line and long
+   material under `references/`.
+5. **Do not store secrets in instructions or Skills.** Tokens, SSH keys, cloud
+   credentials, and private environment values belong in the OS keychain or
+   process environment and should be passed only to commands that need them.
+6. **Keep generated data inside the project.** Put `dist`, `coverage`, caches,
+   and temporary test output under the repository and add them to `.gitignore`,
+   so normal cleanup never targets paths outside the Workspace.
+7. **Open a monorepo at its root by default.** Use nested instructions for
+   package differences. Open a subproject separately only when it needs an
+   independent authority boundary, lifecycle, or task history.
+8. **A conversation branch is not a Git branch.** A ChatGPT branch copies the
+   receipt but still points at the same Workspace. Use a managed worktree when
+   file-level isolation is required.
+
 ## Keep it running
 
 For an always-available ChatGPT connection, both processes must stay alive:
@@ -564,20 +638,24 @@ The comparison is against upstream commit
 
 | Area | What this fork adds |
 | --- | --- |
-| Long-lived workspaces | Workspace state is independent of short-lived ChatGPT MCP connections and survives server restarts. Reopening the same checkout reuses the workspace instead of creating endless duplicates. |
-| Clear GPT instructions | Tool descriptions explain that local paths belong to DevSpace, when to reuse a workspace, when not to close it, and when batch tools help. |
-| Faster inspection | `batch_read`, `batch_inspect`, lazy instruction discovery, and caches remove many avoidable MCP round trips and large-directory scans. |
-| Safer lifecycle | Workspace operation leases, exclusive close, request draining, process termination, and cleanup rules prevent resources from being closed while still in use. |
-| Real resource limits | Global and per-connection-principal limits cover MCP sessions, workspaces, processes, worktrees, output, and command runtime. Hung commands receive `SIGTERM` and then `SIGKILL` after a grace period. |
-| Principal isolation | MCP sessions, workspaces, processes, and stored state are owned by a local connection principal. Different principals cannot reuse each other's IDs; OAuth `client_id` identifies only a dynamic registration. |
-| Compact context protocol | v3 receipts separate metadata from context-loaded capabilities and isolate instruction acknowledgements in private context sessions, avoiding repeated root instructions and cross-conversation state resets. |
-| Project instructions | Instructions are structured with source, scope, and revision; reads advertise availability only, mutations explicitly load and acknowledge them, empty files are skipped, and the chain is capped at 32 KiB. |
-| Local Skills | Skills come from repository ancestors within an approved root plus user, Admin, and DevSpace bundled scopes; duplicate names remain visible, the catalog is capped at 8,000 UTF-8 bytes, and ChatGPT web loads a selected Skill through `load_skill`. |
-| Safer shell workflow | High-risk command patterns are blocked and inline output stays bounded; background/PTY sessions can be polled or interrupted, while available durable output is replayable by opaque `outputId` through `read_process_output`. |
-| Admin panel | A localhost-only React panel manages roots and limits, detects concurrent config edits with revision/ETag checks, verifies restarts, and exposes sanitized diagnostics. |
-| OAuth hardening | Approval pages cannot be framed, expired records are cleaned up, the owner can revoke every client and token in one action, and tokens are stored as hashes. |
-| Observable behavior | Structured request/tool logs use `connectionRef` for OAuth registrations and `workspaceActivityRef` for different project activities under one connection, alongside readiness generations, resource usage, sanitized failures, and downloadable diagnostics. |
-| Tested distribution | Node 24/26 CI, macOS/Linux/Windows process tests, real browser tests, `npm pack`, installed-package CLI startup, and SQLite native-module checks. |
+| Conversation and project continuity | Workspaces are independent of short-lived MCP transports. Visible aliases, persistent `workspaceRef` values, and HMAC `projectFingerprint` values let several conversations under one connection retain different projects and resume them precisely later. |
+| Worktree recovery | A missing managed-worktree directory does not create an endless sequence of replacement branches. The original Workspace ID and alias remain `recovery_required`; recovery prefers the latest Git worktree metadata commit and explicitly reports possible uncommitted-data loss. |
+| Stable connection principals | Dynamic OAuth registration receives a connection principal only after successful Owner approval. A one-time reconnect code can deliberately restore an earlier principal after a connector is removed and re-added. Principals cannot reuse one another's Workspace, process, output, or operation IDs. |
+| Granular OAuth | `workspace:read`, `workspace:write`, `process:execute`, `network:access`, `worktree:create`, and `workspace:revoke` are enforced independently. Reapproving the same client with unchanged authority no longer advances every Workspace generation. |
+| Visible continuation | Every Workspace tool echoes the current `workspace` and `continuation`, including fixed `expiresAt`. Ordinary calls do not issue another receipt; context load/refresh renews it, and mutation replay attaches the current continuation dynamically. |
+| Fair receipt cache | Receipt storage has global and per-principal quotas, removes expired entries before eviction, and updates LRU order without sliding the fixed TTL, preventing one connection from crowding out others. |
+| Compact model context | Metadata/full/retained phases, lazy instructions, explicit-only repository Skills, one canonical body location, and compact envelopes keep tool context bounded. Full multi-turn, branched-chat, and multi-principal simulations measure model-visible bytes continuously. |
+| File consistency | `read` and `batch_read` share before/after version checks and return `contentHash`/`mtimeNs`. `apply_patch` requires a complete `ifMatch` entry for every touched path; there is no blind-write mode. |
+| Idempotent mutations | Writes, commands, mutating process input, lifecycle changes, and checkpoint advancement use durable operation IDs. Lost responses replay results without executing twice, while unknown outcomes are never rerun automatically. |
+| Simpler change review | `show_changes` is a read-only preview by default, requiring neither write scope nor an operation ID and leaving its checkpoint unchanged. Only explicit `advanceCheckpoint` becomes an idempotent write. |
+| Command and process boundaries | Normal builds, tests, Git, package commands, and project-local cleanup remain usable. Writes outside the Workspace, root deletion, protected state, `sudo`, and remote-content pipe-to-shell are blocked. Child processes inherit a minimal environment, and background processes do not hold a lifetime Workspace lock. |
+| Process output | Commands have hard runtime limits, termination grace, and resource quotas. Large output is retained under an owned `outputId` and paged; ownership binds both principal and Workspace. |
+| Instruction gates | User/root/nested instructions return as structured source/trust/scope/hash/revision records. Root instructions are acknowledged per private context session; new subtree rules load explicitly before mutation. The full effective chain is capped at 32 KiB. |
+| Skill trust boundary | Repository Skills are always `repository_untrusted` and explicit-only by default and cannot self-enable implicit invocation. Catalog descriptions strip controls, HTML, and code blocks, while untrusted bodies stay separate from fixed server text. |
+| Same-root coordination | A fair lock keyed by canonical physical root permits concurrent reads and serializes MCP write calls. Long-running development servers do not hold a lifetime global lease; strict file versions prevent silent overwrite. |
+| Revocation and cleanup | Close/revoke blocks new calls, stops tracked processes, and drains active requests. Durable cleanup resumes after crashes. Clean worktrees may be deleted; dirty ones remain auditable. |
+| Management and observability | The localhost panel hot-reloads allowed roots, controls quotas, exports redacted diagnostics, and performs controlled restarts. Logs use `connectionRef`, `oauthClientRef`, and `workspaceActivityRef` without raw tokens or host paths. |
+| Release supply chain | Claude and Pi use user-installed CLIs, so dormant providers no longer force Claude/Pi/Google SDK trees into every installation; the core file tools are implemented locally with Node. The MCP SDK ships with its audited dependency tree, and minimatch/brace are fixed to safe releases to avoid the upstream Hono 1.x advisory. `test:pack` performs a default fresh-consumer install, runs CLI/SQLite/server smoke tests, and requires `npm audit --omit=dev` to report zero vulnerabilities. |
 
 ## Security
 
@@ -702,7 +780,13 @@ npm run typecheck
 npm test
 npm run test:browser
 npm run build
+npm run test:pack
 ```
+
+`test:pack` does more than create a tarball: it installs the package in a fresh
+temporary consumer project, exercises the CLI, native SQLite, and server
+startup, then runs a production dependency audit. Any consumer-visible
+vulnerability fails the release gate.
 
 ## Documentation
 

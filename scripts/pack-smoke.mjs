@@ -1,5 +1,13 @@
-import { execFileSync, spawn } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import {
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { createRequire } from "node:module";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -32,6 +40,8 @@ try {
     cwd: installRoot,
     stdio: "inherit",
   });
+  assertInstalledDependencyTree(installRoot);
+  await assertConsumerAuditClean(installRoot);
 
   const installedPackage = JSON.parse(
     readFileSync(join(installRoot, "node_modules", "@waishnav", "devspace", "package.json"), "utf8"),
@@ -57,6 +67,123 @@ try {
   process.stdout.write(`Packed CLI smoke test passed (${installedVersion}).\n`);
 } finally {
   rmSync(scratchRoot, { recursive: true, force: true });
+}
+
+function assertInstalledDependencyTree(installRoot) {
+  const packageRoot = join(installRoot, "node_modules", "@waishnav", "devspace");
+  const bundledPackages = installedPackageVersions(join(packageRoot, "node_modules"));
+  const mcpVersions = bundledPackages.get("@modelcontextprotocol/sdk") ?? [];
+  const honoVersions = bundledPackages.get("@hono/node-server") ?? [];
+  if (!mcpVersions.includes("1.29.0")) {
+    throw new Error(`Packed dependency tree is missing @modelcontextprotocol/sdk 1.29.0.`);
+  }
+  if (!honoVersions.includes("2.0.11") || honoVersions.some((version) => version.startsWith("1."))) {
+    throw new Error(
+      `Packed MCP SDK contains unexpected @hono/node-server version(s): ${honoVersions.join(", ") || "none"}.`,
+    );
+  }
+  for (const unwanted of [
+    "@anthropic-ai/claude-agent-sdk",
+    "@earendil-works/pi-coding-agent",
+    "@modelcontextprotocol/ext-apps",
+  ]) {
+    try {
+      createRequire(join(installRoot, "package.json")).resolve(`${unwanted}/package.json`);
+      throw new Error(`Fresh consumer unexpectedly installed optional provider dependency ${unwanted}.`);
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith("Fresh consumer unexpectedly")) throw error;
+    }
+  }
+  process.stdout.write("Packed dependency tree uses the audited MCP SDK and omits optional provider SDKs.\n");
+}
+
+function installedPackageVersions(root) {
+  const versions = new Map();
+  const pending = [root];
+  let visited = 0;
+  while (pending.length > 0) {
+    const directory = pending.pop();
+    let entries;
+    try {
+      entries = readdirSync(directory, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (entry.isSymbolicLink()) continue;
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) {
+        pending.push(path);
+        visited += 1;
+        if (visited > 20_000) throw new Error("Packed dependency tree traversal exceeded its safety limit.");
+        continue;
+      }
+      if (entry.name !== "package.json") continue;
+      try {
+        const metadata = JSON.parse(readFileSync(path, "utf8"));
+        if (typeof metadata.name !== "string" || typeof metadata.version !== "string") continue;
+        const current = versions.get(metadata.name) ?? [];
+        if (!current.includes(metadata.version)) current.push(metadata.version);
+        versions.set(metadata.name, current);
+      } catch {
+        // A malformed unrelated package is handled by npm install itself.
+      }
+    }
+  }
+  return versions;
+}
+
+async function assertConsumerAuditClean(installRoot) {
+  const command = npmCli ? process.execPath : npmCommand;
+  const args = npmCli
+    ? [npmCli, "audit", "--omit=dev", "--audit-level=low", "--json"]
+    : ["audit", "--omit=dev", "--audit-level=low", "--json"];
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    const audit = spawnSync(command, args, {
+      cwd: installRoot,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let parsed;
+    try {
+      parsed = JSON.parse(audit.stdout || "{}");
+    } catch {
+      if (attempt < 3) {
+        await new Promise((resolve) => setTimeout(resolve, attempt * 1_000));
+        continue;
+      }
+      throw new Error(
+        `Consumer dependency audit returned invalid JSON: ${(audit.stderr || audit.stdout).slice(-2_000)}`,
+      );
+    }
+    const vulnerabilities = parsed?.metadata?.vulnerabilities;
+    if (vulnerabilities) {
+      const total = Number(vulnerabilities.total ?? 0);
+      if (audit.status === 0 && total === 0) {
+        process.stdout.write("Fresh consumer production audit passed (0 vulnerabilities).\n");
+        return;
+      }
+      const affected = Object.entries(parsed?.vulnerabilities ?? {})
+        .map(([name, value]) => `${name} (${value?.severity ?? "unknown"})`)
+        .join(", ");
+      throw new Error(
+        `Fresh consumer audit found ${total} production vulnerability(ies)` +
+        `${affected ? `: ${affected}` : "."}`,
+      );
+    }
+    const statusCode = Number(parsed?.statusCode ?? 0);
+    const transient = statusCode >= 500 || /Service Unavailable|endpoint returned an error/iu.test(
+      `${parsed?.message ?? ""}\n${audit.stderr ?? ""}`,
+    );
+    if (transient && attempt < 3) {
+      await new Promise((resolve) => setTimeout(resolve, attempt * 1_000));
+      continue;
+    }
+    throw new Error(
+      `Fresh consumer audit could not complete${statusCode ? ` (HTTP ${statusCode})` : ""}: ` +
+      `${parsed?.message ?? audit.stderr ?? "unknown audit failure"}`,
+    );
+  }
 }
 
 async function smokeServe(cliPath, installRoot) {

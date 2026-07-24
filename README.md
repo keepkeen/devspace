@@ -28,6 +28,7 @@
   <a href="#快速开始">快速开始</a> ·
   <a href="#连接-chatgpt">连接 ChatGPT</a> ·
   <a href="#怎么使用">怎么使用</a> ·
+  <a href="#推荐的项目组织">项目组织</a> ·
   <a href="#这个分支改进了什么">分支亮点</a> ·
   <a href="#安全边界">安全边界</a>
 </p>
@@ -441,6 +442,69 @@ ChatGPT 组件信息，普通 MCP 客户端可以忽略。依赖旧重复字段�
 归属读取结果；详细契约见[ChatGPT 编码工作流](./docs/chatgpt-coding-workflow.md)。
 单个 `SKILL.md` 的加载上限为 64 KiB。
 
+## 推荐的项目组织
+
+DevSpace 的持久化单位是 **connection principal 下的 Workspace alias**。最稳定的
+使用方式是：一个 Git 项目一个目录、一个持续任务一个 alias、需要并行隔离时一个
+managed worktree。不要把整个 Home 目录当成项目根。
+
+推荐结构：
+
+```text
+~/code/                              # DevSpace allowed root
+├── billing-api/                     # 一个独立 Git 项目
+│   ├── AGENTS.md                    # 简短、稳定、适用于整个仓库的规则
+│   ├── docs/
+│   │   └── agent-architecture.md    # 详细背景资料，不塞进根指令
+│   ├── services/
+│   │   └── payments/
+│   │       └── AGENTS.md            # 只作用于该子目录的增量规则
+│   ├── .agents/
+│   │   └── skills/
+│   │       └── release-check/
+│   │           ├── SKILL.md         # 仓库 Skill，默认 explicit-only
+│   │           └── references/
+│   └── package.json
+└── mobile-app/                      # 另一个项目，使用另一个 alias
+
+~/.agents/skills/                    # 个人可信 Skill，不属于任何仓库
+└── company-review/
+    └── SKILL.md
+```
+
+建议按下面的方式选择 Workspace：
+
+| 需求 | 建议做法 |
+| --- | --- |
+| 隔天继续同一任务 | `list_workspaces` 后恢复原 alias，不重新发送路径。 |
+| 新对话继续原任务 | 恢复同一个 alias；两个对话会看到同一个 Workspace 状态。 |
+| 同一仓库开启独立新任务 | 使用新的 managed worktree 和新 alias，例如 `billing-api-auth-fix`。 |
+| 只审查当前 checkout | 使用默认只读 checkout，不授予写权限。 |
+| 两个账号或 principal 并行修改同一仓库 | 使用两个 managed worktree；不要共享同一个可写 checkout。 |
+| 同时处理多个项目 | 每个项目保留独立 alias；不要让一个对话在多个 alias 之间来回漂移。 |
+
+项目本身建议遵循这些规则：
+
+1. **Allowed root 只放项目集合。** 推荐授权 `~/code`、`~/work` 之类的目录，
+   不要授权 `~`、`/`、云盘根目录或包含大量私人文件的目录。
+2. **Git 仓库先有一个基线提交。** managed worktree 需要有效提交；重要阶段及时
+   commit。物理 worktree 丢失时，DevSpace 能恢复已提交内容，不能保证恢复随目录
+   一同消失的未提交文件。
+3. **根 `AGENTS.md` 保持短小。** 只写构建命令、测试要求、架构边界和禁止事项。
+   详细设计放入 `docs/`；子系统规则放在对应目录的嵌套 `AGENTS.md`。完整有效指令链
+   上限为 32 KiB，越短越不容易挤占模型上下文。
+4. **Skill 按信任来源分层。** 仓库 Skill 默认不可信且必须显式加载；个人或管理员
+   可信 Skill 放在用户/Admin Skill 根。只有确实需要隐式选择时，才把精确 Skill
+   目录加入 `DEVSPACE_SKILL_PATHS`。description 保持一行，长资料放入 `references/`。
+5. **不要把秘密写进指令或 Skill。** Token、SSH key、云凭据和私有环境变量应留在
+   系统密钥链或进程环境中；只有命令明确需要时才通过受控环境覆盖传入。
+6. **生成物留在项目内。** `dist`、`coverage`、缓存和临时测试输出放在仓库目录中并
+   加入 `.gitignore`，这样正常清理命令不会碰到 Workspace 外部路径。
+7. **Monorepo 默认打开仓库根。** 用嵌套指令描述 package 差异。只有某个子项目需要
+   独立权限、独立生命周期或完全不同的任务历史时，才单独打开子目录。
+8. **对话分支不是 Git 分支。** ChatGPT 的对话分支会复制 receipt，但仍指向同一个
+   Workspace。需要文件级隔离时必须创建 managed worktree。
+
 ## 保持长期在线
 
 要让 ChatGPT 随时连接到本地，需要同时保持两个进程运行：
@@ -513,22 +577,24 @@ DEVSPACE_LAUNCHD_SERVICE_LABEL=com.waishnav.devspace node dist/cli.js admin
 
 | 方面 | 这个分支的改进 |
 | --- | --- |
-| 持久 workspace | workspace 生命周期不再绑定短暂的 ChatGPT MCP 连接，并能跨服务重启恢复。再次打开相同 checkout 会复用记录，不会不断创建重复 workspace。 |
-| 更清楚的模型提示 | 每个工具用精简的 Use/Avoid/Needs/Returns 描述说明选择边界；全局提示只保留安全不变量。 |
-| 更快的项目检查 | `batch_read`、`batch_inspect`、懒加载项目指令和缓存减少了不必要的 MCP 往返及大目录扫描。 |
-| 完整生命周期 | workspace 操作租约、独占关闭、请求排空、进程终止和统一清理，避免资源仍在使用时被提前关闭。 |
-| 真正的资源限制 | 全局和单 connection principal 配额覆盖 MCP 会话、workspace、进程、worktree、输出和命令时间。超时命令先接收 `SIGTERM`，宽限期后仍未退出则使用 `SIGKILL`。 |
-| 连接主体隔离 | MCP 会话、workspace、进程和持久化状态都校验本机 connection principal；不同主体不能复用彼此的 ID。OAuth `client_id` 只标识动态注册。 |
-| 紧凑上下文协议 | v3 上下文按 metadata/context-loaded phase 签发短期 receipt，并把指令确认隔离到私有 context session；根指令不重复发送，新对话也不会清除旧 receipt 的确认状态。 |
-| 可核验副作用 | 写入、命令、进程、变更展示和 Workspace 生命周期工具统一返回机器可读 effects，并明确区分精确观测与 Shell 无法完整跟踪的副作用。 |
-| 可靠撤销 | 撤销全部 OAuth 客户端时先阻止新调用并排空进行中的调用，再用持久化任务回收进程、输出、review 和干净 worktree；脏 worktree 留作可审计记录。 |
-| 项目指令 | 指令以带来源、作用域和修订号的结构化记录返回；只读工具只提示可用性，修改前通过 `load_workspace_instructions` 显式加载并确认；空文件跳过，全链限制为 32 KiB。 |
-| 本地 Skill | 在已批准根目录内从项目祖先发现 Skill，并支持用户、Admin 和 DevSpace bundled 来源；保留同名项并显示来源；8,000 UTF-8 字节目录预算避免挤占上下文；`load_skill` 为 ChatGPT 网页端提供可审计的显式加载。 |
-| 更安全的命令流程 | 阻止高风险命令模式，限制内联输出大小，并支持轮询或中断后台/PTY 进程；持久存储可用时，完整输出以受限 `outputId` 保存，可用 `read_process_output` 分页恢复。 |
-| 管理面板 | localhost React 面板可管理目录和配额，通过 revision/ETag 防止覆盖并发配置，验证重启结果并提供脱敏诊断。 |
-| OAuth 加固 | 授权页面禁止 iframe 嵌套，自动清理过期记录，Owner 可一键撤销全部客户端和 Token，Token 以哈希形式存储。 |
-| 可观测性 | 结构化请求/工具日志通过 `connectionRef` 区分 OAuth 连接，通过 `workspaceActivityRef` 区分同一连接下的不同项目活动，并提供进程代次、资源使用率、近期脱敏失败和可下载诊断报告。 |
-| 完整发布测试 | Node 24/26 CI、macOS/Linux/Windows 进程测试、真实浏览器测试、`npm pack`、安装后 CLI 启动和 SQLite 原生模块检查。 |
+| 对话与项目连续性 | Workspace 不绑定短暂 MCP transport。alias、`workspaceRef` 和 HMAC `projectFingerprint` 可见；同一连接的多个对话可分别保留多个项目，隔天或新 transport 后精确恢复。 |
+| worktree 恢复 | managed worktree 路径丢失时不创建无穷新分支；原 Workspace ID/alias 保留为 `recovery_required`，恢复时优先使用 Git worktree metadata 中的最新提交，并明确标记未提交数据风险。 |
+| 稳定连接主体 | 动态 OAuth 注册在首次成功 Owner 批准后才获得 connection principal；删除并重加连接时可用一次性 reconnect code 明确恢复旧主体。不同 principal 不能复用 Workspace、进程、输出或 operation ID。 |
+| 细粒度 OAuth | `workspace:read`、`workspace:write`、`process:execute`、`network:access`、`worktree:create`、`workspace:revoke` 分别校验。相同权限重新批准不会无故推进全部 Workspace generation。 |
+| 可见 continuation | 所有 Workspace 工具回显 `workspace` 和当前 `continuation`，包括固定 `expiresAt`。普通调用不重复签发 receipt；上下文加载或刷新才续期，mutation 重放动态附加当前 continuation。 |
+| 公平 receipt 缓存 | receipt 有全局和单 principal 配额，过期记录先清理，LRU 使用不滑动固定 TTL，避免一个连接挤掉其他连接的上下文。 |
+| 紧凑模型上下文 | metadata/full/retained phase、延迟加载指令、explicit-only Repository Skill、单一正文位置和精简 envelope 控制工具上下文；完整多轮/分支/多 principal 模拟持续测量模型可见字节。 |
+| 文件一致性 | `read` 与 `batch_read` 共用读前/读后版本校验并返回 `contentHash`/`mtimeNs`；`apply_patch` 对每个 touched path 强制完整 `ifMatch`，不存在 blind write。 |
+| 幂等 mutation | 写入、命令、可写进程输入、生命周期和 checkpoint 推进使用持久 operation ID。响应丢失时可重放结果，不会重复执行；未知结果不会自动重跑。 |
+| 变更预览做减法 | `show_changes` 默认是只读预览，不要求 write scope 或 operation ID，也不推进 checkpoint；只有显式 `advanceCheckpoint` 才成为幂等写操作。 |
+| 命令与进程边界 | 普通 build/test/Git/package 命令和项目内清理可正常执行；Workspace 外写入、根目录删除、受保护状态、`sudo` 和远程内容 pipe-to-shell 被阻止。子进程只继承最小安全环境，后台进程不长期锁死 Workspace。 |
+| 进程输出 | 命令有硬超时、终止宽限和资源配额；大输出按 `outputId` 持久保存并分页读取，所有权同时绑定 principal 和 Workspace。 |
+| 指令门禁 | 用户/根/嵌套指令以结构化来源、trust、scope、hash 和 revision 返回。根指令按私有 context session 确认，进入新目录修改前显式加载增量规则，全链限制为 32 KiB。 |
+| Skill 信任边界 | Repository Skill 永远是 `repository_untrusted`、默认 explicit-only，不能通过自身 metadata 提权；catalog description 会清洗控制字符/HTML/代码块，正文与固定服务端文本分离。 |
+| 同根并发协调 | 规范化物理根上的公平读写锁允许并行读取并串行化 MCP 写调用；长期 dev server 不持有生命周期级全局锁，严格文件版本防止静默覆盖。 |
+| 撤销和清理 | revoke/close 先阻止新调用、终止受跟踪进程并排空活动请求；持久化清理任务在崩溃后继续。干净 worktree 可删除，脏 worktree 保留为可审计结果。 |
+| 管理与可观测性 | localhost 管理面板支持热更新 allowed roots、配额、脱敏诊断和受控服务重启；日志使用 `connectionRef`、`oauthClientRef` 和 `workspaceActivityRef`，不记录原始 Token 或主机路径。 |
+| 发布供应链 | Claude/Pi 改用用户已安装的 CLI，不再为未启用 provider 强制安装 Claude/Pi/Google SDK；基础文件工具由本地纯 Node 实现。MCP SDK 以已审计依赖树打包，minimatch/brace 固定为安全版本，规避上游 Hono 1.x advisory。`test:pack` 在全新消费者项目中默认安装 tarball、运行 CLI/SQLite/服务烟测并强制 `npm audit --omit=dev` 为 0。 |
 
 ## 安全边界
 
@@ -651,7 +717,11 @@ npm run typecheck
 npm test
 npm run test:browser
 npm run build
+npm run test:pack
 ```
+
+`test:pack` 不只是生成 tarball：它会在全新临时消费者项目中安装发布包，运行
+CLI、SQLite 和服务启动烟测，并执行生产依赖审计。任何消费者可见漏洞都会让发布门禁失败。
 
 ## 文档
 
