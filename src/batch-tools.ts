@@ -4,6 +4,10 @@ export const BATCH_READ_MAX_LINES = 2_000;
 export const BATCH_ERROR_MAX_CHARACTERS = 1_000;
 export const BATCH_ITEM_MAX_CHARACTERS = 16_000;
 export const BATCH_TOTAL_MAX_CHARACTERS = 48_000;
+export const BATCH_ITEM_MIN_CHARACTERS = 512;
+export const BATCH_ALLOCATION_CHUNK_CHARACTERS = 1_024;
+
+export type BatchOmittedReason = "aggregate_budget_exhausted";
 
 export interface BatchWorkItem {
   operation: string;
@@ -19,6 +23,8 @@ export interface BatchItemResult {
   ok: boolean;
   result: string;
   truncated: boolean;
+  omitted?: true;
+  omittedReason?: BatchOmittedReason;
 }
 
 export interface BatchResult {
@@ -29,6 +35,9 @@ export interface BatchResult {
 
 export interface BatchOptions<T extends BatchWorkItem> {
   onError?: (error: unknown, item: T, index: number) => void;
+  totalMaxCharacters?: number;
+  minItemCharacters?: number;
+  allocationChunkCharacters?: number;
 }
 
 export function limitBatchText(
@@ -52,7 +61,7 @@ export async function runBoundedBatch<T extends BatchWorkItem>(
   }
 
   const seen = new Set<string>();
-  const results = await Promise.all(items.map(async (item, index): Promise<BatchItemResult> => {
+  const rawResults = await Promise.all(items.map(async (item, index): Promise<BatchItemResult> => {
     const { ref: _ref, ...operationIdentity } = item;
     const duplicateKey = JSON.stringify(operationIdentity);
     if (seen.has(duplicateKey)) {
@@ -101,19 +110,29 @@ export async function runBoundedBatch<T extends BatchWorkItem>(
     }
   }));
 
-  let remaining = BATCH_TOTAL_MAX_CHARACTERS;
-  let aggregateTruncated = false;
-  for (const item of results) {
-    const limited = limitText(item.result, remaining);
-    item.result = limited.text;
-    item.truncated ||= limited.truncated;
-    aggregateTruncated ||= limited.truncated;
-    remaining = Math.max(0, remaining - item.result.length);
-  }
+  const totalMaxCharacters = nonNegativeInteger(
+    options.totalMaxCharacters ?? BATCH_TOTAL_MAX_CHARACTERS,
+    "totalMaxCharacters",
+  );
+  const minItemCharacters = nonNegativeInteger(
+    options.minItemCharacters ?? BATCH_ITEM_MIN_CHARACTERS,
+    "minItemCharacters",
+  );
+  const allocationChunkCharacters = positiveInteger(
+    options.allocationChunkCharacters ?? BATCH_ALLOCATION_CHUNK_CHARACTERS,
+    "allocationChunkCharacters",
+  );
+  const results = allocateBatchTextFairly(
+    rawResults,
+    totalMaxCharacters,
+    minItemCharacters,
+    allocationChunkCharacters,
+  );
+  const aggregateTruncated = results.some((item) => item.truncated || item.omitted === true);
 
   const formatted = limitText(
     results.map(formatBatchItem).join("\n\n"),
-    BATCH_TOTAL_MAX_CHARACTERS,
+    totalMaxCharacters,
   );
   return {
     items: results,
@@ -142,7 +161,90 @@ function publicBatchError(error: unknown): string {
 function formatBatchItem(item: BatchItemResult): string {
   const status = item.ok ? "ok" : "error";
   const truncation = item.truncated ? ", truncated" : "";
-  return `## ${item.index + 1}. ${item.operation} ${item.path} (${status}${truncation})\n${item.result}`;
+  const omitted = item.omitted ? ", omitted" : "";
+  return `## ${item.index + 1}. ${item.operation} ${item.path} (${status}${truncation}${omitted})\n${item.result}`;
+}
+
+function allocateBatchTextFairly(
+  items: BatchItemResult[],
+  maximum: number,
+  minimumPerItem: number,
+  chunkSize: number,
+): BatchItemResult[] {
+  if (items.length === 0) return [];
+  const allocations = Array.from({ length: items.length }, () => 0);
+  const baseline = Math.min(minimumPerItem, Math.floor(maximum / items.length));
+  let remaining = maximum;
+
+  for (let index = 0; index < items.length; index += 1) {
+    const allocation = Math.min(items[index]!.result.length, baseline);
+    allocations[index] = allocation;
+    remaining -= allocation;
+  }
+
+  // Bring every item toward the minimum one character per round. This keeps a
+  // very small aggregate budget from being consumed entirely by the first
+  // result while still producing explicit omitted markers when mathematically
+  // unavoidable.
+  let progress = true;
+  while (remaining > 0 && progress) {
+    progress = false;
+    for (let index = 0; index < items.length && remaining > 0; index += 1) {
+      const desiredMinimum = Math.min(items[index]!.result.length, minimumPerItem);
+      if (allocations[index]! >= desiredMinimum) continue;
+      allocations[index]! += 1;
+      remaining -= 1;
+      progress = true;
+    }
+  }
+
+  // Distribute the rest in bounded round-robin chunks. The maximum difference
+  // caused by input order is one chunk instead of the whole aggregate budget.
+  progress = true;
+  while (remaining > 0 && progress) {
+    progress = false;
+    for (let index = 0; index < items.length && remaining > 0; index += 1) {
+      const needed = items[index]!.result.length - allocations[index]!;
+      if (needed <= 0) continue;
+      const granted = Math.min(needed, chunkSize, remaining);
+      allocations[index]! += granted;
+      remaining -= granted;
+      progress = true;
+    }
+  }
+
+  return items.map((item, index) => {
+    const allocation = allocations[index]!;
+    if (item.result.length > 0 && allocation === 0) {
+      return {
+        ...item,
+        result: "",
+        truncated: true,
+        omitted: true,
+        omittedReason: "aggregate_budget_exhausted",
+      };
+    }
+    const limited = limitText(item.result, allocation);
+    return {
+      ...item,
+      result: limited.text,
+      truncated: item.truncated || limited.truncated,
+    };
+  });
+}
+
+function nonNegativeInteger(value: number, name: string): number {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new RangeError(`${name} must be a non-negative safe integer.`);
+  }
+  return value;
+}
+
+function positiveInteger(value: number, name: string): number {
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new RangeError(`${name} must be a positive safe integer.`);
+  }
+  return value;
 }
 
 function limitText(text: string, maxCharacters: number): { text: string; truncated: boolean } {

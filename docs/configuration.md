@@ -87,6 +87,7 @@ does not start, stop, or adopt `cloudflared` processes.
 | `DEVSPACE_STATE_DIR` | Directory for SQLite state. Defaults to `~/.local/share/devspace`. |
 | `DEVSPACE_USER_INSTRUCTIONS_PATH` | Optional user-level instruction file loaded before project instructions. Supports `~` or an absolute path; unset by default. |
 | `DEVSPACE_LAUNCHD_SERVICE_LABEL` | Explicitly enrolled user launchd service that the local panel may restart; unset/empty disables control. |
+| `DEVSPACE_MCP_HTTP_TRANSPORT` | `stateless` (default) or explicit `stateful`; never inferred from redirect hosts. |
 
 ## OAuth
 
@@ -106,35 +107,29 @@ MCP clients discover metadata from:
 /.well-known/oauth-authorization-server
 ```
 
-Workspace, process, operation, and MCP quota state is owned by a local
-connection principal, not directly by the dynamic OAuth `client_id`. A public
-dynamic registration is unassigned until its first successful Owner approval,
-which creates a new principal by default. DevSpace does not receive a
-verified ChatGPT account subject, so this is connection-level isolation rather
-than account-level identity.
+OAuth `client_id` identifies a dynamic registration. Authorization belongs to
+a durable grant that records the connection principal, granted scopes, and
+authorization epoch. Authorization codes and access/refresh tokens reference the
+grant directly; refresh rotation preserves it and does not derive a principal
+from `clientId`.
 
-Use `devspace auth principals` to list local principals. To intentionally bind a
-fresh connector registration to an earlier principal, generate
-`devspace auth reconnect-code <principal-id>` and enter the one-time short-lived
-code on the OAuth approval page. Relinking is rejected after the fresh source
-principal has retained Workspace state, and any tokens issued before the
-relink are revoked. Reauthorizing the same registered client with the same
-principal and authority preserves active Workspace generations and receipts.
-Only a real authority-boundary change such as principal creation/relink,
-revocation, Owner-credential rotation, root authority change, or Workspace
-write-access change advances the affected generation.
+The first successful Owner approval normally creates a new grant and principal.
+Use `devspace auth principals` and
+`devspace auth reconnect-code <principal-id>` to deliberately attach a fresh
+grant to an earlier principal. The one-time code is consumed once, and tokens
+issued before a relink are revoked. A new grant remains isolated by default.
 
-ChatGPT does not provide a trusted conversation identifier. A Workspace alias
-is therefore the durable conversation-to-project key. Multiple conversations
-under one principal may retain different aliases; after a disconnect, later-day
-turn, or new transport, each conversation should list and resume its own saved
-entry by alias or workspaceRef.
-Do not create a replacement managed worktree merely because an old receipt or
-MCP session disappeared.
-`list_workspaces` also returns a persistent `workspaceRef` and an opaque
-HMAC-based `projectFingerprint`; `resume_workspace` accepts exactly one alias or
-workspaceRef, while the fingerprint distinguishes same-named projects without
-exposing their absolute roots.
+Tool-call metadata may contain `openai/subject`, `openai/organization`, and
+`openai/session`. DevSpace persists only purpose-separated HMAC values. Subject
+and organization are consistency, anonymous audit, and rate-limit dimensions;
+they are not credentials. Session HMAC participates in the server-side Workspace
+binding used by ChatGPT-style hosts.
+
+A Workspace alias remains the durable project key. In a new conversation or
+after restart, call `list_workspaces`, then `resume_workspace` by one alias or
+`workspaceRef`. Do not reopen a remembered path merely because a receipt or
+transport session disappeared. `projectFingerprint` distinguishes projects
+without exposing absolute paths.
 
 Managed Workspace records remain active when their worktree directory is
 missing. `list_workspaces` reports `recovery_required`, and
@@ -144,6 +139,10 @@ path under the same Workspace ID. DevSpace prefers the latest commit retained
 in Git's worktree metadata, falling back to the saved base commit. If the
 physical directory and its uncommitted files were lost, recovery reports
 `dataLossPossible=true` rather than pretending those files were restored.
+
+If an authorization request omits `scope`, DevSpace grants only `workspace:read`.
+Elevated capabilities must be explicitly requested. tools/list is filtered by the
+current grant and handlers repeat scope checks.
 
 The granular scopes mean:
 
@@ -180,7 +179,7 @@ orphan Workspace authority.
 
 | Variable | Default | Purpose |
 | --- | ---: | --- |
-| `DEVSPACE_MCP_SESSION_IDLE_TIMEOUT_SECONDS` | `1800` | Close inactive stateful MCP transports. ChatGPT OAuth clients use stateless POST requests; workspace state is unaffected. |
+| `DEVSPACE_MCP_SESSION_IDLE_TIMEOUT_SECONDS` | `1800` | Close inactive transports when `DEVSPACE_MCP_HTTP_TRANSPORT=stateful`; stateless is the default. |
 | `DEVSPACE_MCP_SESSION_CLOSE_TIMEOUT_SECONDS` | `5` | Maximum wait for one transport to close. |
 | `DEVSPACE_RESOURCE_CLEANUP_INTERVAL_SECONDS` | `300` | Sweep interval for idle resources. |
 | `DEVSPACE_MAX_MCP_SESSIONS` | `64` | Combined cap for live stateful transports and concurrent stateless ChatGPT requests. |
@@ -198,6 +197,14 @@ orphan Workspace authority.
 | `DEVSPACE_MAX_RESIDENT_WORKSPACES` | `256` | Maximum workspaces retained in memory. |
 | `DEVSPACE_MAX_ACTIVE_WORKSPACES_PER_CLIENT` | `32` | Maximum active persisted workspaces owned by one connection principal. |
 | `DEVSPACE_MAX_MANAGED_WORKTREES` | `64` | Maximum managed worktrees retained on disk. |
+
+Stateless request capacity is released through one idempotent path when the
+request is aborted, the HTTP response closes, or normal request cleanup runs.
+Releasing the capacity slot does not cancel a tool handler that already began:
+active-request barriers, process tracking, and mutation-operation records keep
+tracking its real outcome. Protected internal diagnostics report current
+stateless lease ages and occupancy grouped by anonymous `connectionRef` and
+`oauthClientRef`, without exposing principal IDs or OAuth client IDs.
 
 Clients must not call `close_workspace` as routine turn or conversation cleanup.
 Call it only after the user explicitly asks to close or release that workspace.
@@ -229,25 +236,20 @@ instruction chain has a combined 32 KiB UTF-8 budget and is never silently
 truncated. Blank candidates are scanned with a 1 MiB hard limit so a huge file
 cannot consume unbounded memory while being classified as empty.
 
-Full workspace context computes a stable `sha256-v1:` `instructionRevision`
-from the ordered initial instruction paths and contents. It independently
-computes `skillRevision` over the full discovered Skill set. Revision hints are
-honored only when the caller explicitly selects `contextMode: "retained"` and
-still retains the corresponding bodies. `contextMode: "full"` ignores hints.
-`open_workspace` returns metadata by default so a host can select a project
-without injecting repository context. That metadata receipt must be promoted
-through `get_workspace_context` with `contextMode: "full"` before ordinary
-Workspace tools can run.
+Full Workspace context computes stable instruction and Skill revisions, but it
+is manifest-first. `instructionManifest.files[]` contains source, trust, scope,
+relative path, hash, and UTF-8 byte count, not instruction bodies.
+`open_workspace` returns `selected` by default; explicit full mode or
+`get_workspace_context(full)` advances to `context_loaded`. Retained mode is
+valid only while refreshing the exact context whose revisions remain available.
 
-Full context represents instructions as structured `instructions.items[]`
-records and returns `instructions.acknowledged=true` after binding the root
-chain to the receipt's private context session. The root chain therefore does
-not need to be sent a second time before the first root-scoped mutation.
-Read/search tools only advertise `scopedInstructionsAvailable=true`; they never
-append instruction Markdown to file or search output. Call
-`load_workspace_instructions` for newly entered nested mutation paths to receive
-only the additional records and a one-time token. The token is valid only for
-the context session that requested it.
+Before handling concrete target paths, call
+`load_workspace_instructions(paths)`. It returns only the applicable chain, a
+`reviewedRevision`, and a one-use token when mutation gating requires one. The
+context advances to `target_scoped`. `loadedForScope` means that the server
+returned that revision; it is not a claim that a model agreed to obey it.
+Read/search output never includes instruction Markdown and only advertises
+`scopedInstructionsAvailable=true` when another scope must be loaded.
 
 Configure fallbacks in `~/.devspace/config.json`:
 
@@ -275,46 +277,38 @@ returning a process session.
 
 ## Fixed Tool Surface
 
-DevSpace exposes one Codex-style surface: `open_workspace`, `list_workspaces`,
-`resume_workspace`, `get_workspace_context`, `load_workspace_instructions`,
-`get_operation_status`, `close_workspace`, `revoke_workspace`, `read`,
-`batch_read`, `batch_inspect`, optional `list_skills`/`load_skill`,
-`apply_patch`, `exec_command`, `write_stdin`, and `read_process_output`.
+DevSpace exposes a stable surface filtered by the current OAuth grant. A default
+read-only authorization receives the compact lifecycle and file/batch
+inspection profile plus read-only change preview. Skills and operation status are
+loaded only in the elevated coding profile to keep default tools/list bounded;
+mutation, process, network, worktree, and revocation tools additionally require
+matching capabilities. A cached old tools/list cannot bypass handler scope checks.
 
-Every Workspace-scoped call requires the current v4 context `receipt`. The
-receipt binds the OAuth connection, Workspace ID, alias, project fingerprint,
-and generation, a private
-context session, context phase, both context revisions at issuance, and server
-process generation. A metadata receipt may only call `get_workspace_context`,
-`close_workspace`, or `revoke_workspace`; read, inspection, process, and mutation
-tools require a context-loaded receipt. The unified registration layer validates
-ownership, integrity, phase, and generation before the tool handler starts.
-Each context session owns its instruction acknowledgements, so resuming a new
-conversation cannot clear another valid receipt's state. Every scoped result
-exposes model-visible `workspace` and `continuation` fields with the current
-receipt and fixed `expiresAt`; ordinary tools echo them without renewing the
-deadline, while explicit context load/refresh renews it. Receipt storage is
-bounded globally and per principal, and LRU access does not slide expiry. A
-same-authority OAuth reapproval leaves generations intact; authority-boundary
-changes and a restart invalidate affected receipts without deleting resumable
-aliases.
+ChatGPT-style hosts normally use the server-side binding for
+`(principal, HMAC(openai/session))`. Generic MCP clients pass a `wctx5`
+receipt. Workspace IDs and generations are identifiers, not authority handles.
+Explicitly supplying an invalid receipt never falls back to host state.
 
-Commands run without a PTY by default. Prefer `program` plus `args` for direct
-execution; argument boundaries reach `spawn`/PTY unchanged. Use `shell: true`
-plus `command` for shell syntax and interactive shells; direct argv shells are
-rejected so `write_stdin` cannot bypass command checks. Version 2.0 accepts no
-`cmd` or `cwd` aliases; use `workingDirectory`. Set `tty: true` on
-`exec_command` for interactive terminal programs. PTY support uses the optional
-`node-pty` dependency; `write_stdin` can send input, poll output, and resize PTY
-sessions.
+Lifecycle tools share a versioned result envelope with `schemaVersion: 1`,
+Workspace identity, the three-phase state, `contextChanged`, and structured
+errors. Workspace context uses `contextSchemaVersion: 5`. Ordinary tools return
+only a compact `workspaceAlias`/`contextChanged: false` envelope plus their
+result; they do not echo receipt, expiry, revisions, ID, or generation. A new
+continuation is returned only when context phase, revision, or generation changes.
+Receipts are bounded, fixed-expiry, in-process compatibility handles.
 
-`exec_command` accepts a bounded `stdin` string for multiline Python, SQL, SSH,
-and similar payloads. Supplying `stdin` closes the pipe by default so
-programs waiting for EOF can finish; set `closeStdin: false` when additional
-`write_stdin` calls will follow. `write_stdin` can later set `closeStdin: true`.
-PTY input must remain open because DevSpace does not emulate EOF with Ctrl-D.
-`network: "deny"` is rejected on this runtime because DevSpace does not claim
-network isolation without an operating-system sandbox.
+Commands run without a PTY by default. Prefer `program` plus `args`; use
+`shell: true` plus `command` only for shell syntax. `cmd` and `cwd` are not
+aliases. `stdin` is bounded and closes by default unless
+`closeStdin: false` is set.
+
+Runtime capabilities are reported in lifecycle output and on the OAuth approval
+page. The default runtime has no process sandbox or per-process network isolation
+and uses guardrail-only filesystem confinement. Consequently, unsupported
+`network: "deny"` is removed from the advertised schema rather than offered as
+a parameter that always fails. HTTP transport defaults to stateless and may be
+explicitly configured as stateful; redirect URI, User-Agent, location, and other
+host hints do not select authorization or transport behavior.
 
 ### Command policy
 
@@ -370,26 +364,28 @@ an existing path and explicit `null` for a path expected not to exist. Missing
 preconditions are rejected before the patch starts; there is no blind-write
 bypass.
 
-Workspace operations also use a fair process-local read/write lock keyed by the
-canonical physical root. Reads and inspections may share the read side.
-The default `show_changes` preview also uses the read side. `apply_patch`,
-`exec_command`, mutating `write_stdin`, explicit review-checkpoint advancement,
-close, and revoke use the write side, including when different principals opened the
-same checkout. The DevSpace process-output writer lease permits only one server
-process for a state directory, so this lock is global within the supported
-single-server deployment. Separate DevSpace instances using different state
-directories are not coordinated; use distinct worktrees or OS-level isolation
-in that topology.
+Workspace operations first use a fair process-local read/write queue keyed by
+the canonical physical root and then coordinate through a cross-process lock in
+a per-user lock directory. Reads and inspections may share the read side;
+`show_changes` preview also uses it and is available to every `workspace:read`
+grant.
+`apply_patch`, `exec_command`, mutating `write_stdin`, explicit checkpoint
+advancement, close, and revoke use the write side even when different principals
+or different DevSpace state directories opened the same checkout. A live
+background or interactive process retains the write lease until its complete
+process tree exits. External editors are outside this protocol, so strict
+`ifMatch` file versions remain required.
 
 ## Widgets
 
-`DEVSPACE_WIDGETS` controls ChatGPT Apps iframe usage.
+`DEVSPACE_WIDGETS` controls only ChatGPT Apps iframe usage. It does not add or
+remove model-callable tools; OAuth scopes determine the tool surface.
 
 | Value | Behavior |
 | --- | --- |
-| `full` | Default. Widget UI is attached to exposed workspace, file, edit, and shell tools. |
-| `changes` | Enables the aggregate `show_changes` tool and attaches widget UI to `open_workspace` and `show_changes`. |
-| `off` | Disables widget UI. |
+| `full` | Default. Widget UI is attached to all eligible exposed tools, including `show_changes`. |
+| `changes` | Limits widget UI to `open_workspace` and `show_changes`; the tool remains exposed independently of this setting. |
+| `off` | Disables widget resources and descriptor metadata. Tools, including `show_changes`, remain available according to OAuth scopes. |
 
 Widget `_meta` is presentation-only. DevSpace does not duplicate heavy body
 text in `_meta.card.payload.content`; widgets consume the top-level tool result.

@@ -65,12 +65,19 @@ import {
   listDirectoryTool,
   readFileTool,
 } from "./pi-tools.js";
-import { SingleUserOAuthProvider } from "./oauth-provider.js";
+import {
+  SingleUserOAuthProvider,
+  type OAuthRequestAuthorization,
+} from "./oauth-provider.js";
+import { hashOpenAiHostIdentity } from "./host-identity.js";
+import {
+  HostWorkspaceBindingStore,
+  type HostAuthorizationContext,
+} from "./host-workspace-bindings.js";
 import {
   McpSessionRegistry,
   type McpSessionCloseResult,
   type McpSessionReservation,
-  type StatelessMcpRequestLease,
 } from "./mcp-sessions.js";
 import {
   isInteractiveShellCommand,
@@ -117,7 +124,12 @@ import {
 } from "./workspaces.js";
 import { GitWorktreeError, removeManagedWorktree } from "./git-worktrees.js";
 import { RuntimeDiagnostics } from "./runtime-diagnostics.js";
+import {
+  runtimeCapabilities as buildRuntimeCapabilities,
+  type RuntimeCapabilities,
+} from "./runtime-capabilities.js";
 import { ActiveRequestBarrier } from "./request-barrier.js";
+import { WorkspaceRootLockTimeoutError } from "./workspace-root-locks.js";
 import { createRuntimeControlPlane } from "./runtime-control-plane.js";
 import { AccessDeniedError, allowedRootsRevision, isPathInsideRoot } from "./roots.js";
 import { DEVSPACE_SERVER_INFO } from "./version.js";
@@ -134,6 +146,7 @@ import {
   createWorkspaceContextReceiptManager,
   serializeWorkspaceContext,
   type WorkspaceContextInstructionItem,
+  type WorkspaceContextInstructionManifestItem,
   type WorkspaceContextReceiptBinding,
   type WorkspaceContextReceiptManager,
 } from "./workspace-context-protocol.js";
@@ -148,6 +161,7 @@ import {
   type ToolEffects,
 } from "./tool-effects.js";
 import {
+  DEVSPACE_CAPABILITY_SCOPES,
   missingOAuthScopes,
   type DevSpaceCapabilityScope,
 } from "./oauth-scopes.js";
@@ -166,14 +180,43 @@ interface RequestCorrelationState {
 const requestContext = new AsyncLocalStorage<{
   connectionPrincipalId: string;
   oauthClientId: string;
+  oauthGrantId: string;
+  authorizationEpoch: number;
   scopes: string[];
+  hostAuthorization: HostAuthorizationContext;
+  hostSubjectHash?: string;
+  hostOrganizationHash?: string;
   requestId?: string;
   correlation: RequestCorrelationState;
   workspaceBinding?: WorkspaceContextReceiptBinding;
   workspaceReceipt?: { receipt: string; expiresAt: number };
+  retainWorkspaceRootLease?: () => () => void;
 }>();
 const toolHandlerBarriers = new WeakMap<McpServer, ActiveRequestBarrier>();
 const toolErrorReporters = new WeakMap<McpServer, (tool: string, error: unknown) => void>();
+
+function createStatelessRequestLeaseRelease(
+  req: Request,
+  res: Response,
+  releaseLease: () => void,
+): () => void {
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    req.off("aborted", release);
+    res.off("close", release);
+    releaseLease();
+  };
+
+  if (req.aborted || res.destroyed) {
+    release();
+  } else {
+    req.once("aborted", release);
+    res.once("close", release);
+  }
+  return release;
+}
 
 interface PublicToolError {
   code: string;
@@ -355,6 +398,17 @@ function publicToolError(error: unknown, toolName: string): PublicToolError | un
       safeToRetry: true,
       recovery: "close_workspace",
       phase: "not_started",
+    };
+  }
+  if (error instanceof WorkspaceRootLockTimeoutError) {
+    return {
+      code: error.code,
+      text: `${error.code}: ${error.publicText}`,
+      retryable: true,
+      safeToRetry: true,
+      recovery: "retry_after_workspace_process",
+      phase: "not_started",
+      effectsKnown: true,
     };
   }
   if (error instanceof WorkspaceAliasConflictError) {
@@ -560,48 +614,17 @@ function attachWorkspaceEnvelope(
   const context = requestContext.getStore();
   const binding = context?.workspaceBinding;
   if (!binding) return structured;
-  const existingWorkspace = structured.workspace &&
-      typeof structured.workspace === "object" &&
-      !Array.isArray(structured.workspace)
-    ? structured.workspace as Record<string, unknown>
-    : undefined;
-  const existingContext = structured.context &&
-      typeof structured.context === "object" &&
-      !Array.isArray(structured.context)
-    ? structured.context as Record<string, unknown>
-    : undefined;
-  const existingContinuation = structured.continuation &&
-      typeof structured.continuation === "object" &&
-      !Array.isArray(structured.continuation)
-    ? structured.continuation as Record<string, unknown>
-    : undefined;
-  const currentReceipt = context.workspaceReceipt;
+  if (structured.continuation || structured.state) return structured;
+  if (structured.contextChanged === true) {
+    return {
+      ...structured,
+      workspaceAlias: structured.workspaceAlias ?? binding.alias,
+    };
+  }
   return {
     ...structured,
-    workspace: {
-      ...(existingWorkspace ?? {}),
-      ref: binding.workspaceId,
-      alias: binding.alias,
-      projectFingerprint: binding.projectFingerprint,
-      generation: binding.generation,
-    },
-    ...(existingContext ? { context: existingContext } : {}),
-    ...(currentReceipt || existingContinuation
-      ? {
-          continuation: {
-            ...(currentReceipt
-              ? {
-                  receipt: currentReceipt.receipt,
-                  expiresAt: new Date(currentReceipt.expiresAt).toISOString(),
-                }
-              : {}),
-            phase: binding.phase,
-            instructionRevision: binding.instructionRevision,
-            skillRevision: binding.skillRevision,
-            ...(existingContinuation ?? {}),
-          },
-        }
-      : {}),
+    workspaceAlias: binding.alias,
+    contextChanged: false,
   };
 }
 
@@ -802,30 +825,40 @@ async function runMutationOperation<T>(options: {
   return await result;
 }
 
-export function isChatGptOAuthClient(
-  client: { redirect_uris?: readonly string[] } | undefined,
-): boolean {
-  const redirectUris = client?.redirect_uris;
-  if (!redirectUris?.length) return false;
-  return redirectUris.every((redirectUri) => {
-    try {
-      const parsed = new URL(redirectUri);
-      return parsed.protocol === "https:" && parsed.hostname.toLowerCase() === "chatgpt.com";
-    } catch {
-      return false;
-    }
-  });
-}
-
 export function isExpectedPiToolError(error: unknown): boolean {
   if (!error || typeof error !== "object" || !("code" in error)) return false;
   const code = (error as { code?: unknown }).code;
   return code === "ENOENT" || code === "ENOTDIR" || code === "EISDIR";
 }
 
+const LIFECYCLE_TOOL_NAMES = new Set<string>([
+  "open_workspace",
+  "list_workspaces",
+  "resume_workspace",
+  "get_workspace_context",
+  "load_workspace_instructions",
+  "get_operation_status",
+  "close_workspace",
+  "revoke_workspace",
+]);
+const enabledToolsByServer = new WeakMap<McpServer, ReadonlySet<string>>();
+
+function attachToolContractVersion(
+  toolName: string,
+  structured: Record<string, unknown>,
+): Record<string, unknown> {
+  return LIFECYCLE_TOOL_NAMES.has(toolName)
+    ? { ...structured, schemaVersion: 1 }
+    : structured;
+}
+
 const registerAppTool: typeof registerSdkAppTool = ((...args: unknown[]) => {
   const server = args[0] as McpServer;
   const toolName = typeof args[1] === "string" ? args[1] : "unknown";
+  const enabledTools = enabledToolsByServer.get(server);
+  if (enabledTools && !enabledTools.has(toolName)) {
+    return undefined as never;
+  }
   const handlerIndex = args.length - 1;
   const handler = args[handlerIndex];
   const barrier = toolHandlerBarriers.get(server);
@@ -875,7 +908,9 @@ const registerAppTool: typeof registerSdkAppTool = ((...args: unknown[]) => {
             : {};
           return {
             ...record,
-            structuredContent: attachWorkspaceEnvelope({ ...structured, ok: false, error }),
+            structuredContent: attachWorkspaceEnvelope(
+              attachToolContractVersion(toolName, { ...structured, ok: false, error }),
+            ),
             _meta: { ...meta, tool: toolName, error },
           };
         }
@@ -886,7 +921,13 @@ const registerAppTool: typeof registerSdkAppTool = ((...args: unknown[]) => {
           : undefined;
         return {
           ...record,
-          ...(structured ? { structuredContent: attachWorkspaceEnvelope(structured) } : {}),
+          ...(structured
+            ? {
+                structuredContent: attachWorkspaceEnvelope(
+                  attachToolContractVersion(toolName, structured),
+                ),
+              }
+            : {}),
           _meta: { ...meta, tool: toolName },
         };
       } catch (error) {
@@ -901,7 +942,9 @@ const registerAppTool: typeof registerSdkAppTool = ((...args: unknown[]) => {
         const result = {
           content: [{ type: "text" as const, text: publicError.text }],
           isError: true,
-          structuredContent: attachWorkspaceEnvelope({ ok: false, error: structuredError }),
+          structuredContent: attachWorkspaceEnvelope(
+            attachToolContractVersion(toolName, { ok: false, error: structuredError }),
+          ),
           _meta: { tool: toolName, error: structuredError },
         };
         return publicError.operationId
@@ -962,7 +1005,7 @@ function workspaceToolRegistrar(
         ...toolInput
       } = input;
       record.inputSchema = {
-        receipt: z.string().regex(/^wctx4\.[A-Za-z0-9_-]{43}$/u),
+        receipt: z.string().regex(/^wctx5\.[A-Za-z0-9_-]{43}$/u).optional(),
         ...toolInput,
       };
     }
@@ -1222,29 +1265,62 @@ function toolDescription(parts: {
   requires: string;
   returns: string;
 }): string {
-  return `Use when ${parts.use} Needs ${parts.requires} Returns ${parts.returns}`;
+  const disambiguatingAvoids = new Set([
+    "retained aliases.",
+    "host paths.",
+    "file reads.",
+    "search.",
+    "known-file reads.",
+    "shell mode without shell syntax.",
+    "polling a live session.",
+    "treating a missing result as no effects.",
+  ]);
+  const avoid = disambiguatingAvoids.has(parts.avoid)
+    ? ` Avoid ${parts.avoid}`
+    : "";
+  return `Use when ${parts.use}${avoid} Needs ${parts.requires} Returns ${parts.returns}`;
 }
 
-export function toolSurface(config: Pick<ServerConfig, "widgets" | "skillsEnabled">): string[] {
-  const tools: string[] = [
-    toolNames.openWorkspace,
-    toolNames.listWorkspaces,
-    toolNames.resumeWorkspace,
-    toolNames.getWorkspaceContext,
-    toolNames.loadWorkspaceInstructions,
-    toolNames.getOperationStatus,
-    toolNames.closeWorkspace,
-    toolNames.revokeWorkspace,
-    toolNames.read,
-    toolNames.batchRead,
-    toolNames.batchInspect,
-    toolNames.applyPatch,
-    toolNames.execCommand,
-    toolNames.writeStdin,
-    toolNames.readProcessOutput,
-  ];
-  if (config.skillsEnabled) tools.push(toolNames.listSkills, toolNames.loadSkill);
-  if (config.widgets === "changes") tools.push("show_changes");
+export function toolSurface(
+  config: Pick<ServerConfig, "widgets" | "skillsEnabled">,
+  grantedScopes: readonly string[] = DEVSPACE_CAPABILITY_SCOPES,
+): string[] {
+  const granted = new Set(grantedScopes);
+  const permits = (...scopes: DevSpaceCapabilityScope[]) =>
+    scopes.every((scope) => granted.has(scope));
+  const elevated = grantedScopes.some((scope) => scope !== "workspace:read");
+  const tools: string[] = [];
+  if (permits("workspace:read")) {
+    tools.push(
+      toolNames.openWorkspace,
+      toolNames.listWorkspaces,
+      toolNames.resumeWorkspace,
+      toolNames.getWorkspaceContext,
+      toolNames.loadWorkspaceInstructions,
+      toolNames.read,
+      toolNames.batchRead,
+      toolNames.batchInspect,
+      "show_changes",
+    );
+    if (config.skillsEnabled && elevated) {
+      tools.push(toolNames.listSkills, toolNames.loadSkill);
+    }
+  }
+  if (permits("workspace:read") && elevated) {
+    tools.push(toolNames.getOperationStatus);
+  }
+  if (permits("workspace:read", "workspace:write")) {
+    tools.push(toolNames.applyPatch);
+  }
+  if (permits("workspace:revoke")) {
+    tools.push(toolNames.closeWorkspace, toolNames.revokeWorkspace);
+  }
+  if (permits("workspace:read", "process:execute")) {
+    tools.push(toolNames.writeStdin, toolNames.readProcessOutput);
+  }
+  if (permits("workspace:read", "workspace:write", "process:execute", "network:access")) {
+    tools.push(toolNames.execCommand);
+  }
   return tools.sort();
 }
 
@@ -1281,7 +1357,7 @@ const workspaceSkillOutputSchema = z.object({
   explicitOnly: z.literal(true).optional(),
 });
 
-export const MAX_SKILL_CATALOG_BYTES = 8_000;
+export const MAX_SKILL_CATALOG_BYTES = 4_000;
 
 export interface WorkspaceSkillCatalogEntry {
   skillId: string;
@@ -1322,8 +1398,17 @@ function workspaceInstructionRecord(
     scope: relativeScope === "." ? "." : relativeScope.split(sep).join("/"),
     path,
     hash: `sha256-v1:${createHash("sha256").update(file.content).digest("hex")}`,
+    bytes: Buffer.byteLength(file.content, "utf8"),
     content: file.content,
   };
+}
+
+function workspaceInstructionManifestRecord(
+  file: Pick<ApplicableAgentsFile, "path" | "content">,
+  workspaceRoot: string,
+): WorkspaceContextInstructionManifestItem {
+  const { content: _content, ...manifest } = workspaceInstructionRecord(file, workspaceRoot);
+  return manifest;
 }
 
 function truncateCatalogDescription(description: string, maximum: number): string {
@@ -1465,7 +1550,6 @@ function renderWorkspaceContext(
   knownInstructionRevision: string | undefined,
   knownSkillRevision: string | undefined,
   contextSessionId: string,
-  instructionsAcknowledged: boolean,
   projectFingerprint: string,
   receipts: WorkspaceContextReceiptManager,
 ) {
@@ -1484,14 +1568,15 @@ function renderWorkspaceContext(
   const skillsIncluded = contextMode === "full" || (
     contextMode === "retained" && knownSkillRevision !== skillRevision
   );
-  const loadedInstructions = agentsFiles.map((file) => workspaceInstructionRecord(file, workspace.root));
-  const returnedInstructions = instructionsIncluded ? loadedInstructions : [];
+  const instructionManifest = agentsFiles.map((file) =>
+    workspaceInstructionManifestRecord(file, workspace.root));
+  const returnedManifest = instructionsIncluded ? instructionManifest : [];
   const visibleSkills = skillsIncluded ? skillCatalog.skills : [];
   const serialized = serializeWorkspaceContext({
     connectionPrincipalId: workspace.connectionPrincipalId,
     workspaceId: workspace.id,
     contextSessionId,
-    phase: contextMode === "metadata" ? "metadata" : "context_loaded",
+    phase: contextMode === "metadata" ? "selected" : "context_loaded",
     workspace: {
       ref: workspace.id,
       alias: workspace.alias,
@@ -1500,12 +1585,12 @@ function renderWorkspaceContext(
       mode: workspace.mode,
       writeAccess: workspace.writeAccess,
     },
-    instructions: {
+    instructionManifest: {
       revision: instructionRevision,
       complete: instructionScan.complete,
       included: instructionsIncluded,
-      acknowledged: instructionsAcknowledged,
-      items: returnedInstructions,
+      loadedForScope: false,
+      files: returnedManifest,
       ...(instructionScan.reason ? { incompleteReason: instructionScan.reason } : {}),
     },
     skills: {
@@ -1520,8 +1605,8 @@ function renderWorkspaceContext(
   return {
     ...serialized,
     summary: {
-      workspaceInstructions: returnedInstructions.length,
-      instructionsIncluded,
+      workspaceInstructions: returnedManifest.length,
+      instructionManifestIncluded: instructionsIncluded,
       skills: visibleSkills.length,
       skillsIncluded,
       skillDiagnostics: workspace.skillDiagnostics.length,
@@ -1540,6 +1625,17 @@ const structuredToolErrorFields = {
   error: z.unknown().optional(),
 };
 
+function lifecycleOutputSchema() {
+  return z.object({
+    schemaVersion: z.literal(1),
+    ok: z.boolean(),
+    workspace: z.unknown().optional(),
+    state: z.unknown().optional(),
+    contextChanged: z.boolean().optional(),
+    error: z.unknown().optional(),
+  }).passthrough();
+}
+
 const workspaceHandleInputSchema = {
   workspaceId: z.string(),
   workspaceGeneration: z.number().int().positive(),
@@ -1553,6 +1649,12 @@ const batchItemOutputSchema = z.object({
   ref: z.string().optional(),
   result: z.string(),
   truncated: z.literal(true).optional(),
+  omitted: z.literal(true).optional(),
+  omittedReason: z.literal("aggregate_budget_exhausted").optional(),
+  continuation: z.object({
+    action: z.enum(["increase_limit", "refine_query"]),
+    message: z.string(),
+  }).optional(),
 });
 
 const batchReadItemOutputSchema = z.object({
@@ -1566,6 +1668,8 @@ const batchReadItemOutputSchema = z.object({
   offset: z.number().int().positive().optional(),
   nextOffset: z.number().int().positive().optional(),
   truncated: z.literal(true).optional(),
+  omitted: z.literal(true).optional(),
+  omittedReason: z.literal("aggregate_budget_exhausted").optional(),
 });
 
 interface StableWorkspaceFileRead {
@@ -1649,12 +1753,29 @@ async function readStableWorkspaceFile(input: {
 }
 
 function compactBatchItems(items: BatchItemResult[]) {
-  return items.map((item) => ({
-    ok: item.ok,
-    ...(item.ref ? { ref: item.ref } : {}),
-    result: item.result,
-    ...(item.truncated ? { truncated: true as const } : {}),
-  }));
+  return items.map((item) => {
+    const hitOperationLimit = /\b(?:matches|results|entries) limit reached\b/iu.test(item.result);
+    const continuation = item.omitted || item.truncated
+      ? {
+          action: "refine_query" as const,
+          message: "Narrow the path or pattern and run this inspection again.",
+        }
+      : hitOperationLimit
+        ? {
+            action: "increase_limit" as const,
+            message: "Increase this operation's limit or narrow the path or pattern.",
+          }
+        : undefined;
+    return {
+      ok: item.ok,
+      ...(item.ref ? { ref: item.ref } : {}),
+      result: item.result,
+      ...(item.truncated ? { truncated: true as const } : {}),
+      ...(item.omitted ? { omitted: true as const } : {}),
+      ...(item.omittedReason ? { omittedReason: item.omittedReason } : {}),
+      ...(continuation ? { continuation } : {}),
+    };
+  });
 }
 
 function sendJsonRpcError(
@@ -1681,6 +1802,7 @@ function sendCallToolErrorResult(
     receipt?: { receipt: string; expiresAt: number };
     operationId?: string;
     recovery?: string;
+    hasRetainedWorkspaces?: boolean;
   } = {},
 ): void {
   const structuredError = code
@@ -1698,16 +1820,16 @@ function sendCallToolErrorResult(
     : undefined;
   const structuredContent = structuredError
     ? {
+        schemaVersion: 1,
         ok: false,
         error: structuredError,
+        contextChanged: true,
+        ...(options.hasRetainedWorkspaces === undefined
+          ? {}
+          : { hasRetainedWorkspaces: options.hasRetainedWorkspaces }),
         ...(options.binding
           ? {
-              workspace: {
-                ref: options.binding.workspaceId,
-                alias: options.binding.alias,
-                projectFingerprint: options.binding.projectFingerprint,
-                generation: options.binding.generation,
-              },
+              workspaceAlias: options.binding.alias,
               ...(options.receipt
                 ? {
                     continuation: {
@@ -1763,13 +1885,10 @@ export function recoverableWorkspaceError(error: unknown): string | undefined {
     : undefined;
 }
 
-export function workspaceOperationId(body: unknown): string | undefined {
-  return workspaceToolLease(body) === "shared" ? toolCallWorkspaceId(body) : undefined;
-}
-
 interface ToolCallRequest {
   name: string;
   arguments: Record<string, unknown>;
+  meta?: Record<string, unknown>;
 }
 
 function toolCallRequest(body: unknown): ToolCallRequest | undefined {
@@ -1778,7 +1897,7 @@ function toolCallRequest(body: unknown): ToolCallRequest | undefined {
   if (request.method !== "tools/call" || !request.params || typeof request.params !== "object") {
     return undefined;
   }
-  const params = request.params as { name?: unknown; arguments?: unknown };
+  const params = request.params as { name?: unknown; arguments?: unknown; _meta?: unknown };
   if (typeof params.name !== "string") return undefined;
   const args = params.arguments;
   return {
@@ -1786,7 +1905,14 @@ function toolCallRequest(body: unknown): ToolCallRequest | undefined {
     arguments: args && typeof args === "object" && !Array.isArray(args)
       ? args as Record<string, unknown>
       : {},
+    ...(params._meta && typeof params._meta === "object" && !Array.isArray(params._meta)
+      ? { meta: params._meta as Record<string, unknown> }
+      : {}),
   };
+}
+
+export function toolCallMeta(body: unknown): Record<string, unknown> | undefined {
+  return toolCallRequest(body)?.meta;
 }
 
 export function toolCallName(body: unknown): string | undefined {
@@ -1828,14 +1954,10 @@ export function workspaceToolRootLockMode(
 ): "read" | "write" | undefined {
   const request = toolCallRequest(body);
   if (!request || !WORKSPACE_SCOPED_TOOL_NAMES.has(request.name)) return undefined;
-  if (request.name === toolNames.writeStdin) {
-    const input = request.arguments;
-    const mutates = input.chars !== undefined ||
-      input.closeStdin === true ||
-      input.columns !== undefined ||
-      input.rows !== undefined;
-    return mutates ? "write" : "read";
-  }
+  if (
+    request.name === toolNames.writeStdin ||
+    request.name === toolNames.readProcessOutput
+  ) return undefined;
   if (request.name === "show_changes") {
     return request.arguments.advanceCheckpoint === true ? "write" : "read";
   }
@@ -1861,14 +1983,8 @@ export function toolCallOperationId(body: unknown): string | undefined {
     : undefined;
 }
 
-export function workspaceOperationGeneration(body: unknown): number | undefined {
-  const generation = toolCallRequest(body)?.arguments.workspaceGeneration;
-  return typeof generation === "number" && Number.isSafeInteger(generation) && generation > 0
-    ? generation
-    : undefined;
-}
-
-export function toolCallWorkspaceId(body: unknown): string | undefined {
+/** Non-authoritative legacy input used only to correlate stale-client logs. */
+export function legacyWorkspaceIdHint(body: unknown): string | undefined {
   const workspaceId = toolCallRequest(body)?.arguments.workspaceId;
   return typeof workspaceId === "string" && workspaceId.length > 0 ? workspaceId : undefined;
 }
@@ -2977,7 +3093,11 @@ function registerProcessTools(
   mutationOperations: MutationOperationStore,
   pendingMutationOperations: Map<string, PendingMutationOperation>,
   connectionPrincipalId: string,
+  capabilities: RuntimeCapabilities,
 ): void {
+  const networkModeSchema = capabilities.networkIsolation
+    ? z.enum(["inherit", "deny"])
+    : z.literal("inherit");
   registerWorkspaceTool(
     server,
     "exec_command",
@@ -3013,7 +3133,7 @@ function registerProcessTools(
           .string()
           .optional(),
         environment: z.record(z.string(), z.string().max(65_536)).optional(),
-        network: z.enum(["inherit", "deny"]).optional(),
+        network: networkModeSchema.optional(),
         yieldTimeMs: z
           .number()
           .int()
@@ -3045,7 +3165,7 @@ function registerProcessTools(
         workspaceGeneration,
       );
       workspaces.assertWorkspaceWritable(workspace);
-      if (network === "deny") {
+      if (network === "deny" && !capabilities.networkIsolation) {
         throw new PublicActionError(
           "network_control_unavailable",
           "This DevSpace runtime cannot enforce per-process network denial; run under an OS sandbox or omit network=deny.",
@@ -3238,6 +3358,19 @@ function registerProcessTools(
           stdin,
           closeStdin,
         });
+        if (snapshot.running && snapshot.sessionId !== undefined) {
+          const retainRootLease = requestContext.getStore()?.retainWorkspaceRootLease;
+          if (!retainRootLease) {
+            processSessions.terminate(connectionPrincipalId, workspaceId, snapshot.sessionId);
+            throw new Error("The running process could not retain its workspace root lease.");
+          }
+          processSessions.attachWorkspaceRootLease(
+            connectionPrincipalId,
+            workspaceId,
+            snapshot.sessionId,
+            retainRootLease(),
+          );
+        }
         logToolCall(config, {
           tool: "exec_command",
           workspaceId,
@@ -3279,20 +3412,12 @@ function registerProcessTools(
     },
   );
 
-  registerWriteStdinTool(
-    server,
-    config,
-    workspaces,
-    processSessions,
-    mutationOperations,
-    pendingMutationOperations,
-    connectionPrincipalId,
-  );
 }
 
 function createMcpServer(
   config: ServerConfig,
   connectionPrincipalId: string,
+  grantedScopes: readonly string[],
   workspaces: WorkspaceRegistry,
   reviewCheckpoints: ReturnType<typeof createReviewCheckpointManager>,
   processSessions: ProcessSessionManager,
@@ -3302,7 +3427,9 @@ function createMcpServer(
   localAgentProviders: LocalAgentProviderAvailability[],
   runtimeDiagnostics: RuntimeDiagnostics,
   activeToolHandlers: ActiveRequestBarrier,
+  capabilities: RuntimeCapabilities,
   contextReceipts: WorkspaceContextReceiptManager,
+  hostWorkspaceBindings: HostWorkspaceBindingStore,
 ): McpServer {
   const server = new McpServer(
     DEVSPACE_SERVER_INFO,
@@ -3310,7 +3437,8 @@ function createMcpServer(
       instructions: serverInstructions(),
     },
   );
-  const enabledTools = new Set(toolSurface(config));
+  const enabledTools = new Set(toolSurface(config, grantedScopes));
+  enabledToolsByServer.set(server, enabledTools);
   toolHandlerBarriers.set(server, activeToolHandlers);
   toolErrorReporters.set(server, (tool, error) => {
     runtimeDiagnostics.recordFailure("mcp_tool_error", error);
@@ -3342,6 +3470,15 @@ function createMcpServer(
     workspaces,
     processSessions,
     processOutputStore,
+    connectionPrincipalId,
+  );
+  registerWriteStdinTool(
+    server,
+    config,
+    workspaces,
+    processSessions,
+    mutationOperations,
+    pendingMutationOperations,
     connectionPrincipalId,
   );
 
@@ -3402,32 +3539,22 @@ function createMcpServer(
         ? currentBinding.contextSessionId
         : undefined,
     );
-    const instructionsIncluded = contextMode === "full" || (
-      contextMode === "retained" && knownInstructionRevision !== context.instructionRevision
-    );
-    if (instructionsIncluded) {
-      await workspaces.markAgentsFilesAcknowledged(
-        workspace,
-        contextSessionId,
-        context.agentsFiles,
-      );
-    }
-    const instructionsAcknowledged = contextMode !== "metadata" &&
-      workspaces.instructionsAcknowledged(
-        workspace,
-        contextSessionId,
-        context.agentsFiles,
-      );
     const rendered = renderWorkspaceContext(
       context,
       contextMode,
       knownInstructionRevision,
       knownSkillRevision,
       contextSessionId,
-      instructionsAcknowledged,
       workspaces.projectFingerprint(workspace),
       contextReceipts,
     );
+    const issuedBinding = contextReceipts.resolve(
+      rendered.structuredContent.continuation.receipt,
+    )?.binding;
+    const hostAuthorization = requestContext.getStore()?.hostAuthorization;
+    if (issuedBinding && hostAuthorization) {
+      hostWorkspaceBindings.bind(hostAuthorization, issuedBinding);
+    }
     logToolCall(config, {
       tool,
       workspaceId: workspace.id,
@@ -3455,6 +3582,11 @@ function createMcpServer(
       },
       structuredContent: {
         ...rendered.structuredContent,
+        schemaVersion: 1,
+        contextSchemaVersion: rendered.structuredContent.schemaVersion,
+        ok: true,
+        runtimeCapabilities: capabilities,
+        contextChanged: true,
         ...(context.recovery ? { recovery: context.recovery } : {}),
         ...(tool === toolNames.openWorkspace
           ? {
@@ -3472,12 +3604,13 @@ function createMcpServer(
   registerAppTool(server, toolNames.listWorkspaces, {
     title: "List workspaces",
     description: toolDescription({
-      use: "finding resumable workspace aliases or refs.",
+      use: "finding retained aliases or refs.",
       avoid: "filesystem discovery.",
-      requires: "an authorized connection.",
-      returns: "aliases, refs, project fingerprints, generations, and state.",
+      requires: "authorization.",
+      returns: "retained Workspace summaries.",
     }),
     inputSchema: {},
+    outputSchema: lifecycleOutputSchema(),
     ...toolWidgetDescriptorMeta(config, "workspace"),
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async () => {
@@ -3502,6 +3635,7 @@ function createMcpServer(
     inputSchema: {
       operationId: z.string().min(1).max(128),
     },
+    outputSchema: lifecycleOutputSchema(),
     ...toolWidgetDescriptorMeta(config, "workspace"),
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async ({ operationId }) => {
@@ -3559,7 +3693,7 @@ function createMcpServer(
     const binding = requestContext.getStore()?.workspaceBinding;
     if (
       !binding ||
-      binding.phase !== "context_loaded" ||
+      binding.phase === "selected" ||
       binding.workspaceId !== workspaceId ||
       binding.generation !== workspaceGeneration ||
       (knownInstructionRevision === undefined && knownSkillRevision === undefined) ||
@@ -3579,12 +3713,13 @@ function createMcpServer(
   registerAppTool(server, toolNames.resumeWorkspace, {
     title: "Resume workspace",
     description: toolDescription({
-      use: "resuming by alias or workspaceRef after a new chat or restart.",
-      avoid: "reopening the host path.",
-      requires: "exactly one listed alias or workspaceRef.",
-      returns: "v3 context and fresh receipt.",
+      use: "resuming retained Workspace state.",
+      avoid: "host paths.",
+      requires: "one alias or ref.",
+      returns: "manifest and continuation.",
     }),
     inputSchema: resumeInputSchema,
+    outputSchema: lifecycleOutputSchema(),
     ...toolWidgetDescriptorMeta(config, "workspace"),
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async ({ alias, workspaceRef, contextMode, knownInstructionRevision, knownSkillRevision }) => {
@@ -3612,12 +3747,13 @@ function createMcpServer(
   registerContextWorkspaceTool(server, toolNames.getWorkspaceContext, {
     title: "Get workspace context",
     description: toolDescription({
-      use: "reloading an active workspace's context.",
-      avoid: "ordinary file reads.",
-      requires: "a valid receipt.",
-      returns: "v3 context and fresh receipt.",
+      use: "refreshing Workspace context.",
+      avoid: "file reads.",
+      requires: "current binding.",
+      returns: "manifest and continuation.",
     }),
     inputSchema: { ...workspaceHandleInputSchema, ...contextOptionsInputSchema },
+    outputSchema: lifecycleOutputSchema(),
     ...toolWidgetDescriptorMeta(config, "workspace"),
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async ({ workspaceId, workspaceGeneration, contextMode, knownInstructionRevision, knownSkillRevision }) => {
@@ -3647,10 +3783,10 @@ function createMcpServer(
   registerAppTool(server, toolNames.openWorkspace, {
     title: "Open workspace",
     description: toolDescription({
-      use: "opening an approved project; metadata-only by default.",
-      avoid: "reopening a resumable alias.",
-      requires: "a user-approved path.",
-      returns: "metadata continuation; then load full context.",
+      use: "selecting an approved project.",
+      avoid: "retained aliases.",
+      requires: "approved path.",
+      returns: "selected state or manifest.",
     }),
     inputSchema: {
       path: z.string(),
@@ -3663,6 +3799,7 @@ function createMcpServer(
       knownInstructionRevision: z.string().max(128).optional(),
       knownSkillRevision: z.string().max(128).optional(),
     },
+    outputSchema: lifecycleOutputSchema(),
     ...toolWidgetDescriptorMeta(config, "workspace", {
       invoking: "Opening workspace…",
       invoked: "Workspace opened",
@@ -3708,19 +3845,29 @@ function createMcpServer(
   registerWorkspaceTool(server, toolNames.loadWorkspaceInstructions, {
     title: "Load workspace instructions",
     description: toolDescription({
-      use: "loading scoped instructions before mutation.",
+      use: "loading target-path instructions.",
       avoid: "unrelated directories.",
-      requires: "receipt and intended paths.",
-      returns: "instruction items and one-use token.",
+      requires: "binding and paths.",
+      returns: "scoped chain and token.",
     }),
     inputSchema: {
       ...workspaceHandleInputSchema,
       paths: z.array(z.string().min(1).max(1_024)).min(1).max(16),
     },
+    outputSchema: lifecycleOutputSchema(),
     ...toolWidgetDescriptorMeta(config, "read"),
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async ({ workspaceId, paths }) => {
     const workspace = workspaces.getWorkspace(connectionPrincipalId, workspaceId);
+    const requestState = requestContext.getStore();
+    const currentBinding = requestState?.workspaceBinding;
+    if (
+      !currentBinding ||
+      currentBinding.workspaceId !== workspace.id ||
+      currentBinding.generation !== workspace.stateGeneration
+    ) {
+      throw new WorkspaceContextSessionError();
+    }
     const contextSessionId = currentWorkspaceContextSessionId();
     const files = await workspaces.loadApplicableAgentsFiles(
       workspace,
@@ -3730,18 +3877,51 @@ function createMcpServer(
     const instructionToken = files.length > 0
       ? await workspaces.createInstructionAcknowledgement(workspace, contextSessionId, files)
       : undefined;
+    await workspaces.markAgentsFilesDelivered(workspace, contextSessionId, files);
+    const targetBinding: WorkspaceContextReceiptBinding = {
+      ...currentBinding,
+      phase: "target_scoped",
+    };
+    const continuation = contextReceipts.issue(targetBinding);
+    if (requestState?.hostAuthorization) {
+      hostWorkspaceBindings.bind(requestState.hostAuthorization, targetBinding);
+    }
     return {
       content: [textBlock(
         files.length > 0
-          ? "Workspace instructions loaded."
-          : "No new workspace instructions apply.",
+          ? "Target-scoped workspace instructions loaded."
+          : "The target scope has no new workspace instructions.",
       )],
       structuredContent: {
-        schemaVersion: 2,
-        instructions: {
+        schemaVersion: 1,
+        contextSchemaVersion: 5,
+        ok: true,
+        state: { phase: "target_scoped" as const },
+        workspace: {
+          ref: workspace.id,
+          alias: workspace.alias,
+          projectFingerprint: currentBinding.projectFingerprint,
+          generation: workspace.stateGeneration,
+        },
+        instructionManifest: {
+          revision: currentBinding.instructionRevision,
+          loadedForScope: true,
+          reviewedRevision: currentBinding.instructionRevision,
+          files: files.map((file) =>
+            workspaceInstructionManifestRecord(file, workspace.root)),
+        },
+        workspaceInstructions: {
           items: files.map((file) => workspaceInstructionRecord(file, workspace.root)),
         },
         ...(instructionToken ? { instructionToken } : {}),
+        continuation: {
+          receipt: continuation.receipt,
+          phase: "target_scoped" as const,
+          expiresAt: new Date(continuation.expiresAt).toISOString(),
+          instructionRevision: currentBinding.instructionRevision,
+          skillRevision: currentBinding.skillRevision,
+        },
+        contextChanged: true,
       },
     };
   });
@@ -3910,6 +4090,7 @@ function createMcpServer(
         ...workspaceHandleInputSchema,
         operationId: z.string().min(1).max(128),
       },
+      outputSchema: lifecycleOutputSchema(),
       ...toolWidgetDescriptorMeta(config, "workspace", {
         invoking: "Closing workspace…",
         invoked: "Workspace close processed",
@@ -3979,6 +4160,9 @@ function createMcpServer(
             closeLease.abort();
             throw error;
           }
+          if (closed) {
+            hostWorkspaceBindings.clearWorkspace(connectionPrincipalId, workspaceId);
+          }
           logToolCall(config, {
             tool: "close_workspace",
             workspaceId,
@@ -3994,6 +4178,7 @@ function createMcpServer(
             )],
             structuredContent: {
               ok: !worktreeRetainedReason,
+              contextChanged: closed,
               effects: createWorkspaceCloseEffects({
                 observedAt: new Date().toISOString(),
                 closed,
@@ -4058,6 +4243,7 @@ function createMcpServer(
       ...workspaceHandleInputSchema,
       operationId: z.string().min(1).max(128),
     },
+    outputSchema: lifecycleOutputSchema(),
     ...toolWidgetDescriptorMeta(config, "workspace"),
     annotations: { destructiveHint: true, idempotentHint: true, openWorldHint: false },
   }, async ({ workspaceId, workspaceGeneration, operationId }) => {
@@ -4129,6 +4315,7 @@ function createMcpServer(
             if (!closeLease.commit({ revoke: true })) {
               throw new UnknownWorkspaceError(workspaceId);
             }
+            hostWorkspaceBindings.clearWorkspace(connectionPrincipalId, workspaceId);
             return {
               content: [textBlock(
                 worktreeRemoved
@@ -4137,6 +4324,7 @@ function createMcpServer(
               )],
               structuredContent: {
                 ok: true,
+                contextChanged: true,
                 processesTerminated,
                 worktreeRemoved,
                 effects: createWorkspaceRevokeEffects({
@@ -4173,10 +4361,10 @@ function createMcpServer(
     {
       title: "Read file",
       description: toolDescription({
-        use: "reading one known workspace file.",
-        avoid: "discovery; use batch_inspect.",
-        requires: "receipt and known path.",
-        returns: "content and version hash.",
+        use: "reading a known file.",
+        avoid: "discovery.",
+        requires: "binding and path.",
+        returns: "content and version.",
       }),
       inputSchema: {
         ...workspaceHandleInputSchema,
@@ -4282,9 +4470,9 @@ function createMcpServer(
       title: "Batch read files",
       description: toolDescription({
         use: `reading up to ${BATCH_MAX_ITEMS} known files.`,
-        avoid: "search or directory discovery.",
-        requires: "receipt and file paths.",
-        returns: "versioned file items and partial status.",
+        avoid: "search.",
+        requires: "binding and paths.",
+        returns: "versioned items.",
       }),
       inputSchema: {
         ...workspaceHandleInputSchema,
@@ -4372,6 +4560,8 @@ function createMcpServer(
             : {}),
           ...(stable?.nextOffset ? { nextOffset: stable.nextOffset } : {}),
           ...(truncated ? { truncated: true as const } : {}),
+          ...(item.omitted ? { omitted: true as const } : {}),
+          ...(item.omittedReason ? { omittedReason: item.omittedReason } : {}),
         };
       });
       const failed = batch.items.filter((item) => !item.ok).length;
@@ -4420,10 +4610,10 @@ function createMcpServer(
     {
       title: "Batch inspect workspace",
       description: toolDescription({
-        use: `combining up to ${BATCH_MAX_ITEMS} grep, glob, or list operations.`,
-        avoid: "reading known files.",
-        requires: "a receipt.",
-        returns: "ref-keyed items and partial status.",
+        use: `running up to ${BATCH_MAX_ITEMS} grep/glob/list items.`,
+        avoid: "known-file reads.",
+        requires: "current binding.",
+        returns: "ref-keyed results.",
       }),
       inputSchema: {
         ...workspaceHandleInputSchema,
@@ -4435,17 +4625,23 @@ function createMcpServer(
               pattern: z.string().min(1).max(1_000),
               path: z.string().min(1).max(1_024).optional(),
               include: z.string().max(1_000).optional(),
+              limit: z.number().int().min(1).max(5_000).optional(),
+              context: z.number().int().min(0).max(20).optional(),
+              ignoreCase: z.boolean().optional(),
+              literal: z.boolean().optional(),
             }),
             z.object({
               operation: z.literal("glob"),
               ref: z.string().min(1).max(64).optional(),
               pattern: z.string().min(1).max(1_000),
               path: z.string().min(1).max(1_024).optional(),
+              limit: z.number().int().min(1).max(5_000).optional(),
             }),
             z.object({
               operation: z.literal("ls"),
               ref: z.string().min(1).max(64).optional(),
               path: z.string().min(1).max(1_024),
+              limit: z.number().int().min(1).max(5_000).optional(),
             }),
           ]))
           .min(1)
@@ -4462,7 +4658,7 @@ function createMcpServer(
         truncated: z.literal(true).optional(),
       }),
       ...toolWidgetDescriptorMeta(config, "search"),
-      annotations: { readOnlyHint: true },
+      annotations: { readOnlyHint: true, openWorldHint: false },
     },
     async ({ workspaceId, operations }) => {
       const startedAt = performance.now();
@@ -4480,16 +4676,28 @@ function createMcpServer(
         workspaces.confineWorkspacePath(workspace, operation.path);
         const response = operation.operation === "grep"
           ? await grepFilesTool(
-              { pattern: operation.pattern, path: operation.path, glob: operation.include },
+              {
+                pattern: operation.pattern,
+                path: operation.path,
+                glob: operation.include,
+                limit: operation.limit,
+                context: operation.context,
+                ignoreCase: operation.ignoreCase,
+                literal: operation.literal,
+              },
               { cwd: workspace.root, root: workspace.root, onError: reportPiToolError },
             )
           : operation.operation === "glob"
             ? await findFilesTool(
-                { pattern: operation.pattern, path: operation.path },
+                {
+                  pattern: operation.pattern,
+                  path: operation.path,
+                  limit: operation.limit,
+                },
                 { cwd: workspace.root, root: workspace.root, onError: reportPiToolError },
               )
             : await listDirectoryTool(
-                { path: operation.path },
+                { path: operation.path, limit: operation.limit },
                 { cwd: workspace.root, root: workspace.root, onError: reportPiToolError },
               );
         return { ok: !response.isError, result: contentText(response.content) };
@@ -4676,10 +4884,10 @@ function createMcpServer(
       {
         title: "Show changes",
         description: toolDescription({
-          use: "reviewing changes since the checkpoint.",
+          use: "reviewing checkpoint changes.",
           avoid: "ordinary file discovery.",
-          requires: "a receipt; advancing the checkpoint also needs write scope and operationId.",
-          returns: "a read-only preview by default, or explicit checkpoint effects.",
+          requires: "binding; write scope to advance.",
+          returns: "preview or checkpoint effects.",
         }),
         inputSchema: {
           ...workspaceHandleInputSchema,
@@ -4774,6 +4982,7 @@ function createMcpServer(
       mutationOperations,
       pendingMutationOperations,
       connectionPrincipalId,
+      capabilities,
     );
   }
 
@@ -4785,8 +4994,12 @@ export { readinessSnapshot } from "./runtime-control-plane.js";
 export function createServer(configInput?: ServerConfig): RunningServer {
   const managesRuntimeConfig = configInput === undefined;
   const config = configInput ?? loadConfig();
+  const capabilities = buildRuntimeCapabilities({
+    mcpHttpTransport: config.mcpHttpTransport,
+  });
   const processGeneration = randomUUID();
   const contextReceipts = createWorkspaceContextReceiptManager({ processGeneration });
+  const hostWorkspaceBindings = new HostWorkspaceBindingStore();
   const runtimeDiagnostics = new RuntimeDiagnostics();
   const activeMcpRequests = new ActiveRequestBarrier();
   const activeToolHandlers = new ActiveRequestBarrier();
@@ -4817,7 +5030,7 @@ export function createServer(configInput?: ServerConfig): RunningServer {
   const workspaceStore = createWorkspaceStore(config.stateDir);
   const workspaces = new WorkspaceRegistry(config, workspaceStore);
   const oauthProvider = new SingleUserOAuthProvider(
-    config.oauth,
+    { ...config.oauth, runtimeCapabilities: capabilities },
     mcpUrl,
     config.stateDir,
     ({ event, clientId }) => {
@@ -4826,6 +5039,7 @@ export function createServer(configInput?: ServerConfig): RunningServer {
       });
     },
     ({ connectionPrincipalId, reason }) => {
+      hostWorkspaceBindings.invalidatePrincipal(connectionPrincipalId);
       const bumpedWorkspaces = workspaces.bumpAuthorityGenerations(connectionPrincipalId);
       logEvent(config.logging, "info", "oauth_authorization_epoch_changed", {
         ...correlationLogFields(connectionPrincipalId),
@@ -4894,6 +5108,10 @@ export function createServer(configInput?: ServerConfig): RunningServer {
       const update = workspaces.applyAllowedRoots(nextRoots);
       const persistencePending = update.persistenceFailures > 0;
       for (const invalidated of update.invalidated) {
+        hostWorkspaceBindings.clearWorkspace(
+          invalidated.connectionPrincipalId,
+          invalidated.workspaceId,
+        );
         pendingRootsCleanup.set(
           `${invalidated.connectionPrincipalId}\0${invalidated.workspaceId}`,
           invalidated,
@@ -5031,6 +5249,7 @@ export function createServer(configInput?: ServerConfig): RunningServer {
         const job = claimJob(pending.id);
         if (!job?.claimToken) continue;
         processSessions.blockWorkspace(job.connectionPrincipalId, job.workspaceId);
+        hostWorkspaceBindings.clearWorkspace(job.connectionPrincipalId, job.workspaceId);
         workspaces.evictRevokedWorkspace(job.connectionPrincipalId, job.workspaceId, job.workspaceRoot);
         try {
           await processSessions.terminateWorkspace(job.connectionPrincipalId, job.workspaceId);
@@ -5235,6 +5454,7 @@ export function createServer(configInput?: ServerConfig): RunningServer {
       const closeResults = await transports.closeActive();
       logSessionCloseResults("global_revocation", closeResults);
       await activeToolHandlers.waitForIdle();
+      hostWorkspaceBindings.clearAll();
     },
     revokeAll: () => oauthProvider.revokeAll(),
     runtimeDiagnostics,
@@ -5274,9 +5494,30 @@ export function createServer(configInput?: ServerConfig): RunningServer {
     if (res.headersSent) return;
 
     const oauthClientId = req.auth?.clientId;
-    const connectionPrincipalId = oauthClientId
-      ? oauthProvider.principalForClient(oauthClientId)
-      : undefined;
+    const hostIdentity = hashOpenAiHostIdentity(
+      toolCallMeta(req.body),
+      config.oauth.ownerToken,
+    );
+    let oauthAuthorization: OAuthRequestAuthorization | undefined;
+    try {
+      if (req.auth) {
+        oauthAuthorization = oauthProvider.authorizeRequest(req.auth, hostIdentity, {
+          requireHostIdentity: Boolean(toolCallRequest(req.body)),
+        });
+      }
+    } catch (error) {
+      logEvent(config.logging, "warn", "auth_denied", {
+        requestId,
+        method: req.method,
+        path: requestPath(req),
+        reason: "oauth_grant_or_host_identity_mismatch",
+        ...correlationLogFields(undefined, undefined, oauthClientId),
+        ...errorFields(error),
+      });
+      sendJsonRpcError(res, 401, -32001, "Unauthorized");
+      return;
+    }
+    const connectionPrincipalId = oauthAuthorization?.connectionPrincipalId;
     if (oauthClientId) {
       res.locals.oauthClientRef = oauthClientRef(oauthClientId);
     }
@@ -5285,6 +5526,7 @@ export function createServer(configInput?: ServerConfig): RunningServer {
     }
     if (
       !oauthClientId ||
+      !oauthAuthorization ||
       !connectionPrincipalId ||
       !req.auth?.resource ||
       !checkResourceAllowed({ requestedResource: req.auth.resource, configuredResource: resourceServerUrl })
@@ -5295,12 +5537,12 @@ export function createServer(configInput?: ServerConfig): RunningServer {
         path: requestPath(req),
         reason: !oauthClientId
           ? "missing_oauth_client"
-          : !connectionPrincipalId
-            ? "missing_connection_principal"
+          : !oauthAuthorization || !connectionPrincipalId
+            ? "missing_oauth_grant"
             : "invalid_oauth_resource",
         ...correlationLogFields(
           connectionPrincipalId,
-          toolCallWorkspaceId(req.body),
+          legacyWorkspaceIdHint(req.body),
           oauthClientId,
         ),
         ...requestLogFields(req, config),
@@ -5309,30 +5551,20 @@ export function createServer(configInput?: ServerConfig): RunningServer {
       return;
     }
 
-    const requestWorkspaceId = toolCallWorkspaceId(req.body);
+    const requestWorkspaceId = legacyWorkspaceIdHint(req.body);
     const correlation: RequestCorrelationState = {
       workspaceId: requestWorkspaceId,
       workspaceActivityRef: workspaceActivityRef(connectionPrincipalId, requestWorkspaceId),
     };
     res.locals.correlation = correlation;
+    const hostAuthorization: HostAuthorizationContext = {
+      principalId: connectionPrincipalId,
+      grantId: oauthAuthorization.grantId,
+      authorizationEpoch: oauthAuthorization.authorizationEpoch,
+      ...(hostIdentity.sessionHash ? { sessionHash: hostIdentity.sessionHash } : {}),
+    };
 
-    let transportMode: McpTransportMode = "stateful";
-    try {
-      const oauthClient = oauthProvider.clientsStore.getClient
-        ? await oauthProvider.clientsStore.getClient(oauthClientId)
-        : undefined;
-      if (isChatGptOAuthClient(oauthClient)) transportMode = "stateless";
-    } catch (error) {
-      logEvent(config.logging, "warn", "mcp_transport_classification_failed", {
-        requestId,
-        ...correlationLogFields(
-          connectionPrincipalId,
-          toolCallWorkspaceId(req.body),
-          oauthClientId,
-        ),
-        ...errorFields(error),
-      });
-    }
+    const transportMode: McpTransportMode = config.mcpHttpTransport;
 
     logEvent(config.logging, "debug", "mcp_request", {
       requestId,
@@ -5343,7 +5575,7 @@ export function createServer(configInput?: ServerConfig): RunningServer {
       transportMode,
       ...correlationLogFields(
         connectionPrincipalId,
-        toolCallWorkspaceId(req.body),
+        legacyWorkspaceIdHint(req.body),
         oauthClientId,
       ),
     });
@@ -5362,7 +5594,7 @@ export function createServer(configInput?: ServerConfig): RunningServer {
     let acquiredSessionId: string | undefined;
     let newTransport: Transport | undefined;
     let statelessServer: McpServer | undefined;
-    let statelessRequestLease: StatelessMcpRequestLease | undefined;
+    let releaseStatelessRequestLease: (() => void) | undefined;
     try {
       let transport: Transport | undefined;
 
@@ -5372,27 +5604,45 @@ export function createServer(configInput?: ServerConfig): RunningServer {
           sendJsonRpcError(res, 405, -32000, "Method not allowed; stateless MCP accepts POST only.");
           return;
         }
-        statelessRequestLease = transports.tryAcquireStatelessRequest(connectionPrincipalId);
+        const statelessRequestLease = transports.tryAcquireStatelessRequest(
+          connectionPrincipalId,
+          {
+            principalRef: connectionRef(connectionPrincipalId)!,
+            clientRef: oauthClientRef(oauthClientId)!,
+          },
+        );
         if (!statelessRequestLease) {
+          const usage = transports.usageSnapshot(connectionPrincipalId);
           logEvent(config.logging, "warn", "mcp_session_rejected", {
             reason: "stateless_request_capacity",
             ...correlationLogFields(
               connectionPrincipalId,
-              toolCallWorkspaceId(req.body),
+              legacyWorkspaceIdHint(req.body),
               oauthClientId,
             ),
             maxSessions: config.resources.maxMcpSessions,
             maxSessionsPerClient: config.resources.maxMcpSessionsPerClient,
+            activeStatelessRequests: usage.statelessRequests,
+            clientStatelessRequests: usage.owner?.statelessRequests,
+            oldestStatelessRequestAgeMs: usage.statelessLeases.agesMs[0],
           });
           sendJsonRpcError(res, 503, -32000, "MCP request capacity reached");
           return;
         }
+        releaseStatelessRequestLease = createStatelessRequestLeaseRelease(
+          req,
+          res,
+          () => {
+            transports.releaseStatelessRequest(statelessRequestLease);
+          },
+        );
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: undefined,
         });
         statelessServer = createMcpServer(
           config,
           connectionPrincipalId,
+          oauthAuthorization.scopes,
           workspaces,
           reviewCheckpoints,
           processSessions,
@@ -5402,7 +5652,9 @@ export function createServer(configInput?: ServerConfig): RunningServer {
           localAgentProviders,
           runtimeDiagnostics,
           activeToolHandlers,
+          capabilities,
           contextReceipts,
+          hostWorkspaceBindings,
         );
         await statelessServer.connect(transport);
       } else if (sessionId) {
@@ -5414,7 +5666,7 @@ export function createServer(configInput?: ServerConfig): RunningServer {
             sessionIdPrefix: sessionIdPrefix(sessionId),
             ...correlationLogFields(
               connectionPrincipalId,
-              toolCallWorkspaceId(req.body),
+              legacyWorkspaceIdHint(req.body),
               oauthClientId,
             ),
             reason: "not_found_or_not_owned",
@@ -5438,7 +5690,7 @@ export function createServer(configInput?: ServerConfig): RunningServer {
             reason: "capacity",
             ...correlationLogFields(
               connectionPrincipalId,
-              toolCallWorkspaceId(req.body),
+              legacyWorkspaceIdHint(req.body),
               oauthClientId,
             ),
             maxSessions: config.resources.maxMcpSessions,
@@ -5466,7 +5718,7 @@ export function createServer(configInput?: ServerConfig): RunningServer {
               sessionIdPrefix: sessionIdPrefix(newSessionId),
               ...correlationLogFields(
                 connectionPrincipalId,
-                toolCallWorkspaceId(req.body),
+                legacyWorkspaceIdHint(req.body),
                 oauthClientId,
               ),
               ...requestLogFields(req, config),
@@ -5486,7 +5738,7 @@ export function createServer(configInput?: ServerConfig): RunningServer {
               sessionIdPrefix: sessionIdPrefix(closedSessionId),
               ...correlationLogFields(
                 connectionPrincipalId,
-                toolCallWorkspaceId(req.body),
+                legacyWorkspaceIdHint(req.body),
                 oauthClientId,
               ),
             });
@@ -5496,6 +5748,7 @@ export function createServer(configInput?: ServerConfig): RunningServer {
         const server = createMcpServer(
           config,
           connectionPrincipalId,
+          oauthAuthorization.scopes,
           workspaces,
           reviewCheckpoints,
           processSessions,
@@ -5505,7 +5758,9 @@ export function createServer(configInput?: ServerConfig): RunningServer {
           localAgentProviders,
           runtimeDiagnostics,
           activeToolHandlers,
+          capabilities,
           contextReceipts,
+          hostWorkspaceBindings,
         );
         await server.connect(transport);
       } else {
@@ -5524,47 +5779,64 @@ export function createServer(configInput?: ServerConfig): RunningServer {
       const requiredCallScopes = requiredOAuthScopesForToolCall(req.body);
       const lacksRequiredOAuthScope = requiredCallScopes.length > 0 &&
         missingOAuthScopes(
-          req.auth?.scopes ?? [],
+          oauthAuthorization.scopes,
           requiredCallScopes,
         ).length > 0;
       const receipt = lease ? toolCallWorkspaceReceipt(req.body) : undefined;
       const resolvedWorkspaceReceipt = receipt
         ? contextReceipts.resolve(receipt)
         : undefined;
+      const resolvedHostWorkspace = receipt
+        ? undefined
+        : hostWorkspaceBindings.resolve(hostAuthorization);
       const effectiveReceipt = receipt;
-      const workspaceBinding = resolvedWorkspaceReceipt?.binding;
+      const workspaceBinding = resolvedWorkspaceReceipt?.binding
+        ?? resolvedHostWorkspace?.binding;
       if (
         lease &&
-        (!workspaceBinding || workspaceBinding.connectionPrincipalId !== connectionPrincipalId)
+        (
+          !workspaceBinding ||
+          workspaceBinding.connectionPrincipalId !== connectionPrincipalId ||
+          (receipt !== undefined && !resolvedWorkspaceReceipt)
+        )
       ) {
+        const hasRetainedWorkspaces = workspaces.listWorkspaces(connectionPrincipalId).length > 0;
+        const recovery = hasRetainedWorkspaces ? "list_then_resume" : "open_workspace_full";
         logEvent(config.logging, "warn", "workspace_context_rejected", {
           requestId,
           ...correlationLogFields(connectionPrincipalId, undefined, oauthClientId),
           tool: toolCallName(req.body),
-          reason: receipt ? "invalid_or_expired_receipt" : "missing_receipt",
+          reason: receipt
+            ? "invalid_or_expired_receipt"
+            : hostIdentity.sessionHash
+              ? "missing_host_session_binding"
+              : "missing_receipt_and_host_session",
           hasReceipt: Boolean(receipt),
           hasWorkspaceId: false,
           hasWorkspaceGeneration: false,
         });
         sendCallToolErrorResult(
           res,
-          "workspace_context_required: Call open_workspace on the approved project with contextMode=\"full\", then retry once with its continuation receipt. If ChatGPT does not expose the current receipt tools, refresh the connector tools first.",
+          hasRetainedWorkspaces
+            ? "workspace_context_required: List retained workspaces, then resume the intended alias or workspaceRef."
+            : "workspace_context_required: Open a user-approved project with contextMode=\"full\".",
           jsonRpcRequestId(req.body),
           "workspace_context_required",
           {
             operationId: toolCallOperationId(req.body),
-            recovery: "open_workspace_full",
+            recovery,
+            hasRetainedWorkspaces,
           },
         );
         return;
       }
       if (
-        workspaceBinding?.phase === "metadata" &&
+        workspaceBinding?.phase === "selected" &&
         contextRequirement === "context_loaded"
       ) {
         sendCallToolErrorResult(
           res,
-          "workspace_context_incomplete: Call get_workspace_context with this receipt and contextMode=\"full\". If that tool is unavailable, call open_workspace on the approved project with contextMode=\"full\"; then retry once with the returned receipt.",
+          "workspace_context_incomplete: Load the selected workspace context with contextMode=\"full\".",
           jsonRpcRequestId(req.body),
           "workspace_context_incomplete",
           {
@@ -5573,7 +5845,7 @@ export function createServer(configInput?: ServerConfig): RunningServer {
               ? { receipt, expiresAt: resolvedWorkspaceReceipt.expiresAt }
               : undefined,
             operationId: toolCallOperationId(req.body),
-            recovery: "get_workspace_context_or_open_full",
+            recovery: "get_workspace_context_full",
           },
         );
         return;
@@ -5585,42 +5857,75 @@ export function createServer(configInput?: ServerConfig): RunningServer {
           workspaceBinding.workspaceId,
         );
       }
+      let retainWorkspaceRootLease: (() => () => void) | undefined;
       const handleRequest = () => requestContext.run(
         {
           connectionPrincipalId,
           oauthClientId,
-          scopes: [...(req.auth?.scopes ?? [])],
+          oauthGrantId: oauthAuthorization.grantId,
+          authorizationEpoch: oauthAuthorization.authorizationEpoch,
+          scopes: [...oauthAuthorization.scopes],
+          hostAuthorization,
+          ...(oauthAuthorization.subjectHash
+            ? { hostSubjectHash: oauthAuthorization.subjectHash }
+            : {}),
+          ...(oauthAuthorization.organizationHash
+            ? { hostOrganizationHash: oauthAuthorization.organizationHash }
+            : {}),
           requestId,
           correlation,
           workspaceBinding,
           workspaceReceipt: resolvedWorkspaceReceipt && effectiveReceipt
             ? { receipt: effectiveReceipt, expiresAt: resolvedWorkspaceReceipt.expiresAt }
             : undefined,
+          ...(retainWorkspaceRootLease ? { retainWorkspaceRootLease } : {}),
         },
         () => transport.handleRequest(req, res, req.body),
       );
-      if (lease === "shared" && workspaceBinding && !lacksRequiredOAuthScope) {
+      if (
+        lease === "shared" &&
+        workspaceBinding &&
+        !lacksRequiredOAuthScope &&
+        rootLockMode !== undefined
+      ) {
         await workspaces.withWorkspaceOperation(
           connectionPrincipalId,
           workspaceBinding.workspaceId,
           workspaceBinding.generation,
-          handleRequest,
-          rootLockMode ?? "read",
+          (_workspace, operationLease) => {
+            retainWorkspaceRootLease = () => operationLease.retain();
+            return handleRequest();
+          },
+          rootLockMode,
         );
       } else {
         await handleRequest();
       }
     } catch (error) {
+      if (error instanceof WorkspaceRootLockTimeoutError && !res.headersSent) {
+        sendCallToolErrorResult(
+          res,
+          `${error.code}: ${error.publicText}`,
+          jsonRpcRequestId(req.body),
+          error.code,
+          {
+            operationId: toolCallOperationId(req.body),
+            recovery: "retry_after_workspace_process",
+          },
+        );
+        return;
+      }
       const workspaceError = recoverableWorkspaceError(error);
       if (workspaceError && !res.headersSent) {
+        const hasRetainedWorkspaces = workspaces.listWorkspaces(connectionPrincipalId).length > 0;
         logEvent(config.logging, "warn", "workspace_reopen_required", {
           requestId,
           ...correlationLogFields(
             connectionPrincipalId,
-            toolCallWorkspaceId(req.body),
+            legacyWorkspaceIdHint(req.body),
             oauthClientId,
           ),
-          workspaceId: workspaceOperationId(req.body),
+          workspaceId: legacyWorkspaceIdHint(req.body),
         });
         sendCallToolErrorResult(
           res,
@@ -5631,7 +5936,11 @@ export function createServer(configInput?: ServerConfig): RunningServer {
             : error instanceof StaleWorkspaceGenerationError
               ? "stale_workspace_generation"
             : "unknown_workspace",
-          { operationId: toolCallOperationId(req.body) },
+          {
+            operationId: toolCallOperationId(req.body),
+            recovery: hasRetainedWorkspaces ? "list_then_resume" : "open_workspace_full",
+            hasRetainedWorkspaces,
+          },
         );
         return;
       }
@@ -5640,7 +5949,7 @@ export function createServer(configInput?: ServerConfig): RunningServer {
         requestId,
         ...correlationLogFields(
           connectionPrincipalId,
-          toolCallWorkspaceId(req.body),
+          legacyWorkspaceIdHint(req.body),
           oauthClientId,
         ),
         ...errorFields(error),
@@ -5661,10 +5970,8 @@ export function createServer(configInput?: ServerConfig): RunningServer {
         }
       }
       if (acquiredSessionId) transports.release(acquiredSessionId, connectionPrincipalId);
-      if (statelessRequestLease) {
-        transports.releaseStatelessRequest(statelessRequestLease);
-        statelessRequestLease = undefined;
-      }
+      releaseStatelessRequestLease?.();
+      releaseStatelessRequestLease = undefined;
       if (statelessServer) {
         try {
           await statelessServer.close();
@@ -5674,7 +5981,7 @@ export function createServer(configInput?: ServerConfig): RunningServer {
             requestId,
             ...correlationLogFields(
               connectionPrincipalId,
-              toolCallWorkspaceId(req.body),
+              legacyWorkspaceIdHint(req.body),
               oauthClientId,
             ),
             ...errorFields(error),

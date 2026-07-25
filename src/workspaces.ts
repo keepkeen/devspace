@@ -48,6 +48,7 @@ import {
   type LocalAgentProfile,
 } from "./local-agent-profiles.js";
 import {
+  defaultWorkspaceRootLockDirectory,
   WorkspaceRootLockManager,
   type WorkspaceRootLockMode,
 } from "./workspace-root-locks.js";
@@ -174,6 +175,14 @@ export interface WorkspaceCloseLease {
   workspace: Workspace;
   commit(options?: { delete?: boolean; revoke?: boolean }): boolean;
   abort(): void;
+}
+
+export interface WorkspaceOperationLease {
+  /**
+   * Transfers the already-held physical-root lease to a longer-lived owner.
+   * The returned release function is idempotent. Call at most once.
+   */
+  retain(): () => void;
 }
 
 export interface WorkspaceUsageSnapshot {
@@ -355,7 +364,7 @@ export class WorkspaceRegistry {
   private readonly pendingManagedWorkspaces = new Map<string, Promise<WorkspaceContext>>();
   private readonly pendingHydrations = new Map<string, Promise<WorkspaceContext>>();
   private readonly lifecycleStates = new Map<string, WorkspaceLifecycleState>();
-  private readonly rootLocks = new WorkspaceRootLockManager();
+  private readonly rootLocks: WorkspaceRootLockManager;
   private readonly instructionDirectoryCache = new Map<string, {
     fingerprint: string;
     files: string[];
@@ -371,7 +380,11 @@ export class WorkspaceRegistry {
   constructor(
     private readonly config: ServerConfig,
     private readonly store?: WorkspaceStore,
-  ) {}
+  ) {
+    this.rootLocks = new WorkspaceRootLockManager({
+      crossProcessLockRoot: defaultWorkspaceRootLockDirectory(),
+    });
+  }
 
   async openWorkspace(
     connectionPrincipalId: string,
@@ -406,7 +419,7 @@ export class WorkspaceRegistry {
     } catch (error) {
       if (!(error instanceof AccessDeniedError)) throw error;
       throw new AccessDeniedError(
-        `${error.message}. Open the original approved project path. For an isolated checkout, use mode="worktree" and reuse the returned workspaceId; do not open DevSpace's internal worktree directory. If this is a different project, ask the user to add its project root.`,
+        `${error.message}. Open the original approved project path. For an isolated checkout, use mode="worktree" and retain the returned Workspace alias or reference; do not open DevSpace's internal worktree directory. If this is a different project, ask the user to add its project root.`,
       );
     }
   }
@@ -1017,17 +1030,6 @@ export class WorkspaceRegistry {
     if (changed) instructionContext.acknowledgementGeneration += 1;
   }
 
-  instructionsAcknowledged(
-    workspace: Workspace,
-    contextSessionId: string,
-    files: ApplicableAgentsFile[],
-  ): boolean {
-    const instructionContext = this.instructionContext(workspace, contextSessionId);
-    return files.every(
-      (file) => instructionContext.acknowledgedInstructionVersions.get(file.path) === file.fingerprint,
-    );
-  }
-
   instructionAcknowledgementGeneration(
     workspace: Workspace,
     contextSessionId: string,
@@ -1146,7 +1148,10 @@ export class WorkspaceRegistry {
     connectionPrincipalId: string,
     workspaceId: string,
     workspaceGeneration: number,
-    callback: (workspace: Workspace) => T | Promise<T>,
+    callback: (
+      workspace: Workspace,
+      operationLease: WorkspaceOperationLease,
+    ) => T | Promise<T>,
     lockMode: WorkspaceRootLockMode = "read",
   ): Promise<T> {
     const initialWorkspace = this.getWorkspace(
@@ -1155,7 +1160,10 @@ export class WorkspaceRegistry {
       workspaceGeneration,
     );
     const lockKey = this.workspaceRootLockKey(initialWorkspace);
-    return this.rootLocks.withLock(lockKey, lockMode, async () => {
+    const releaseRoot = await this.rootLocks.acquire(lockKey, lockMode);
+    let retained = false;
+    let lifecycle: WorkspaceLifecycleState | undefined;
+    try {
       const existingLifecycle = this.lifecycleStates.get(workspaceId);
       if (
         existingLifecycle?.connectionPrincipalId === connectionPrincipalId &&
@@ -1166,13 +1174,21 @@ export class WorkspaceRegistry {
       // Revalidate after waiting for the root lock. A close, revoke, allowed-root
       // edit, or generation bump may have invalidated the original handle.
       const workspace = this.getWorkspace(connectionPrincipalId, workspaceId, workspaceGeneration);
-      const lifecycle = this.ensureLifecycleState(workspace);
+      lifecycle = this.ensureLifecycleState(workspace);
       if (lifecycle.phase === "closing") {
         throw new Error(`Workspace ${workspaceId} is closing and cannot accept new operations.`);
       }
       lifecycle.activeOperations += 1;
       try {
-        return await callback(workspace);
+        return await callback(workspace, {
+          retain: () => {
+            if (retained) {
+              throw new Error("Workspace root operation lease was already retained.");
+            }
+            retained = true;
+            return releaseRoot;
+          },
+        });
       } finally {
         lifecycle.activeOperations -= 1;
         if (lifecycle.activeOperations < 0) {
@@ -1181,7 +1197,9 @@ export class WorkspaceRegistry {
         if (lifecycle.activeOperations === 0) lifecycle.resolveDrained?.();
         this.evictResidentWorkspaces();
       }
-    });
+    } finally {
+      if (!retained) releaseRoot();
+    }
   }
 
   async withExclusiveWorkspaceRoot<T>(

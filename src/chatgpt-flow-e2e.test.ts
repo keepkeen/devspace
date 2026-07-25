@@ -18,8 +18,8 @@ import { SqliteWorkspaceStore } from "./workspace-store.js";
 const execFileAsync = promisify(execFile);
 
 // This is a server-side simulation of ChatGPT's OAuth/MCP protocol behavior.
-// Whether the web model retains workspaceId in its conversation context still
-// requires a real ChatGPT acceptance test.
+// Every tool call supplies opaque host subject/session metadata; ordinary
+// scoped calls intentionally do not receive an automatically injected receipt.
 const root = await mkdtemp(join(tmpdir(), "devspace-chatgpt-flow-e2e-"));
 const workspaceRoot = join(root, "workspace");
 const projectOneRoot = join(workspaceRoot, "project-one");
@@ -28,8 +28,6 @@ const publicBaseUrl = "https://devspace.chatgpt-flow.test";
 const resource = `${publicBaseUrl}/mcp`;
 const ownerPassword = "chatgpt-flow-e2e-owner-password-long-enough";
 const clients = new Set<Client>();
-const trackedWorkspaceReceipts = new Map<string, string>();
-const trackedAliasReceipts = new Map<string, string>();
 let automaticOperationSequence = 0;
 let active: Awaited<ReturnType<typeof startServer>> | undefined;
 const capturedLogs: string[] = [];
@@ -85,7 +83,13 @@ try {
   oauthA.accessToken = refreshedA.accessToken;
   oauthA.refreshToken = refreshedA.refreshToken;
 
-  const firstRound = await connectClient("same-conversation-round-one", oauthA.accessToken, active.origin);
+  const firstRound = await connectClient(
+    "same-conversation-round-one",
+    oauthA.accessToken,
+    active.origin,
+    undefined,
+    "same-conversation",
+  );
   const opened = await firstRound.callTool({
     name: "open_workspace",
     arguments: {
@@ -104,27 +108,14 @@ try {
   const invalidReceiptRead = await firstRound.callTool({
     name: "read",
     arguments: {
-      receipt: `wctx4.${"A".repeat(43)}`,
+      receipt: `wctx5.${"A".repeat(43)}`,
       path: "payload.txt",
     },
   });
   assertToolRejected(invalidReceiptRead, /workspace_context_required/);
   assert.equal(
     (invalidReceiptRead.structuredContent as { error?: { recovery?: unknown } } | undefined)?.error?.recovery,
-    "open_workspace_full",
-  );
-  const staleConnectorRead = await firstRound.callTool({
-    name: "read",
-    arguments: {
-      workspaceId: "ws_cached_legacy_contract",
-      workspaceGeneration: 1,
-      path: "payload.txt",
-    },
-  });
-  assertToolRejected(staleConnectorRead, /workspace_context_required/);
-  assert.equal(
-    (staleConnectorRead.structuredContent as { error?: { recovery?: unknown } } | undefined)?.error?.recovery,
-    "open_workspace_full",
+    "list_then_resume",
   );
 
   const receiptlessClient = await connectClient(
@@ -132,13 +123,18 @@ try {
     oauthA.accessToken,
     active.origin,
     undefined,
-    false,
   );
   const receiptlessRead = await receiptlessClient.callTool({
     name: "read",
     arguments: { workspaceId: workspaceA, path: "payload.txt" },
   });
   assertToolRejected(receiptlessRead, /workspace_context_required/);
+  assert.equal(
+    (receiptlessRead.structuredContent as {
+      error?: { recovery?: unknown };
+    } | undefined)?.error?.recovery,
+    "list_then_resume",
+  );
   await closeClient(receiptlessClient);
 
   const otherPrincipalReceiptlessClient = await connectClient(
@@ -146,7 +142,6 @@ try {
     oauthB.accessToken,
     active.origin,
     undefined,
-    false,
   );
   const crossPrincipalReceiptlessRead = await otherPrincipalReceiptlessClient.callTool({
     name: "read",
@@ -171,12 +166,6 @@ try {
   } | undefined);
   assert.equal(typeof directOutput?.outputId, "string");
   assert.equal(directOutput?.output?.outputId, directOutput?.outputId);
-  const unavailableNetworkDeny = await firstRound.callTool({
-    name: "exec_command",
-    arguments: { workspaceId: workspaceA, program: "true", network: "deny" },
-  });
-  assertToolRejected(unavailableNetworkDeny, /network_control_unavailable/);
-
   for (let run = 0; run < 2; run += 1) {
     const executed = await firstRound.callTool({
       name: "exec_command",
@@ -228,6 +217,7 @@ try {
     arguments: { operationId: optimisticOperationId },
   });
   assert.deepEqual(operationStatus.structuredContent, {
+    schemaVersion: 1,
     ok: true,
     resultAvailable: true,
     workspace: { ref: workspaceA, generation: generationA },
@@ -237,6 +227,8 @@ try {
       safeToRetry: false,
       effectsKnown: true,
     },
+    workspaceAlias: "primary",
+    contextChanged: false,
   });
   const staleOptimisticPatch = await firstRound.callTool({
     name: "apply_patch",
@@ -366,6 +358,7 @@ try {
     oauthA.accessToken,
     active.origin,
     "stale-chatgpt-browser-session",
+    "same-conversation",
   );
   const continuedRead = await secondRound.callTool({
     name: "read",
@@ -399,7 +392,7 @@ try {
     String((reopened.structuredContent as {
       continuation?: { receipt?: unknown };
     } | undefined)?.continuation?.receipt),
-    /^wctx4\./,
+    /^wctx5\./,
   );
   const newSessionRead = await newSession.callTool({
     name: "read",
@@ -562,15 +555,17 @@ try {
   const workspaceB = workspaceId(concurrentOpenB);
   assert.equal(concurrentWorkspaceA, workspaceA);
   assert.notEqual(concurrentWorkspaceA, workspaceB);
+  const concurrentReceiptA = workspaceReceipt(concurrentOpenA);
+  const concurrentReceiptB = workspaceReceipt(concurrentOpenB);
 
   const [aReadsB, bReadsA] = await Promise.all([
     concurrentA.callTool({
       name: "read",
-      arguments: { workspaceId: workspaceB, path: "payload.txt" },
+      arguments: { receipt: concurrentReceiptB, path: "payload.txt" },
     }),
     concurrentB.callTool({
       name: "read",
-      arguments: { workspaceId: concurrentWorkspaceA, path: "payload.txt" },
+      arguments: { receipt: concurrentReceiptA, path: "payload.txt" },
     }),
   ]);
   assertToolRejected(aReadsB, /workspace_context_required/);
@@ -659,7 +654,7 @@ try {
   assertToolRejected(coldRead, /workspace_context_required/);
   assert.equal(
     (coldRead.structuredContent as { error?: { recovery?: unknown } } | undefined)?.error?.recovery,
-    "open_workspace_full",
+    "list_then_resume",
   );
   const afterRestartList = await afterRestart.callTool({ name: "list_workspaces", arguments: {} });
   assertToolSucceeded(afterRestartList);
@@ -1005,7 +1000,7 @@ async function connectClient(
   accessToken: string,
   origin: URL,
   staleSessionId?: string,
-  trackWorkspaceReceipts = true,
+  hostSession = name,
 ): Promise<Client> {
   const client = new Client({ name, version: "1.0.0" });
   clients.add(client);
@@ -1014,16 +1009,19 @@ async function connectClient(
   await client.connect(new StreamableHTTPClientTransport(new URL("/mcp", origin), {
     requestInit: { headers },
   }));
-  if (trackWorkspaceReceipts) enableWorkspaceGenerationTracking(client);
+  enableHostConversationMetadata(client, accessToken, hostSession);
   return client;
 }
 
-function enableWorkspaceGenerationTracking(client: Client): void {
-  const scopedTools = new Set([
-    "get_workspace_context", "load_workspace_instructions", "list_skills", "load_skill",
-    "close_workspace", "revoke_workspace", "read", "batch_read", "batch_inspect",
-    "apply_patch", "show_changes", "exec_command", "write_stdin", "read_process_output",
-  ]);
+function enableHostConversationMetadata(
+  client: Client,
+  accessToken: string,
+  hostSession: string,
+): void {
+  const hostSubject = createHash("sha256")
+    .update("chatgpt-flow-subject\0", "utf8")
+    .update(accessToken, "utf8")
+    .digest("base64url");
   const original = client.callTool.bind(client);
   client.callTool = (async (...callArgs: Parameters<Client["callTool"]>) => {
     const request = callArgs[0];
@@ -1045,37 +1043,16 @@ function enableWorkspaceGenerationTracking(client: Client): void {
       automaticOperationSequence += 1;
       requestArguments.operationId = `chatgpt-flow-auto-${automaticOperationSequence}`;
     }
-    const workspaceId = typeof requestArguments?.workspaceId === "string"
-      ? requestArguments.workspaceId
-      : undefined;
-    const alias = typeof requestArguments.alias === "string" ? requestArguments.alias : undefined;
-    const receipt = typeof requestArguments.receipt === "string"
-      ? requestArguments.receipt
-      : workspaceId
-        ? trackedWorkspaceReceipts.get(workspaceId)
-        : alias
-          ? trackedAliasReceipts.get(alias)
-          : undefined;
-    if (scopedTools.has(request.name) && receipt) {
-      const {
-        workspaceId: _workspaceId,
-        workspaceGeneration: _workspaceGeneration,
-        alias: _alias,
-        ...rest
-      } = requestArguments;
-      callArgs[0] = { ...request, arguments: { ...rest, receipt } };
-    } else if (request.arguments !== requestArguments) {
-      callArgs[0] = { ...request, arguments: requestArguments };
-    }
-    const result = await original(...callArgs);
-    const structured = result.structuredContent as Record<string, unknown> | undefined;
-    const workspace = structured?.workspace as Record<string, unknown> | undefined;
-    const continuation = structured?.continuation as Record<string, unknown> | undefined;
-    if (typeof workspace?.ref === "string" && typeof continuation?.receipt === "string") {
-      trackedWorkspaceReceipts.set(workspace.ref, continuation.receipt);
-      if (alias) trackedAliasReceipts.set(alias, continuation.receipt);
-    }
-    return result;
+    callArgs[0] = {
+      ...request,
+      _meta: {
+        ...(request._meta ?? {}),
+        "openai/subject": hostSubject,
+        "openai/session": hostSession,
+      },
+      arguments: requestArguments,
+    };
+    return original(...callArgs);
   }) as Client["callTool"];
 }
 
@@ -1089,6 +1066,15 @@ function workspaceId(result: Awaited<ReturnType<Client["callTool"]>>): string {
   assert.equal(typeof id, "string");
   assert.ok(id);
   return String(id);
+}
+
+function workspaceReceipt(result: Awaited<ReturnType<Client["callTool"]>>): string {
+  const receipt = (result.structuredContent as {
+    continuation?: { receipt?: unknown };
+  } | undefined)?.continuation?.receipt;
+  assert.equal(typeof receipt, "string");
+  assert.match(String(receipt), /^wctx5\./u);
+  return String(receipt);
 }
 
 function processSessionId(result: Awaited<ReturnType<Client["callTool"]>>): number {

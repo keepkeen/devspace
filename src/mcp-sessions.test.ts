@@ -390,6 +390,7 @@ assert.deepEqual(perClient.usageSnapshot("client-a"), {
   sessions: 2,
   reservations: 0,
   statelessRequests: 0,
+  statelessLeases: { agesMs: [], byOwner: [] },
   limit: 3,
   owner: { sessions: 1, reservations: 0, statelessRequests: 0, limit: 1 },
 });
@@ -415,28 +416,49 @@ assert(perClientActive.acquire("active-client-a", "client-a"));
 assert.deepEqual(await perClientActive.reserveWithIdleReclaim("client-a"), {});
 await perClientActive.closeAll();
 
+let statelessNow = 1_000;
 const statelessLimited = new McpSessionRegistry<FakeTransport>({
+  now: () => statelessNow,
   maxSessions: 2,
   maxSessionsPerClient: 1,
 });
-const clientARequest = statelessLimited.tryAcquireStatelessRequest("client-a");
+const clientARequest = statelessLimited.tryAcquireStatelessRequest("client-a", {
+  principalRef: "conn_a",
+  clientRef: "oauth_a",
+});
 assert(clientARequest);
-assert.equal(statelessLimited.tryAcquireStatelessRequest("client-a"), undefined);
-const clientBRequest = statelessLimited.tryAcquireStatelessRequest("client-b");
+assert.equal(statelessLimited.tryAcquireStatelessRequest("client-a", {
+  principalRef: "conn_a",
+  clientRef: "oauth_a",
+}), undefined);
+statelessNow = 1_250;
+const clientBRequest = statelessLimited.tryAcquireStatelessRequest("client-b", {
+  principalRef: "conn_b",
+  clientRef: "oauth_b",
+});
 assert(clientBRequest);
 assert.equal(statelessLimited.tryReserve("client-c"), undefined);
+statelessNow = 2_000;
 assert.deepEqual(statelessLimited.usageSnapshot("client-a"), {
   sessions: 0,
   reservations: 0,
   statelessRequests: 2,
+  statelessLeases: {
+    agesMs: [1_000, 750],
+    byOwner: [
+      { principalRef: "conn_a", clientRef: "oauth_a", active: 1, oldestLeaseAgeMs: 1_000 },
+      { principalRef: "conn_b", clientRef: "oauth_b", active: 1, oldestLeaseAgeMs: 750 },
+    ],
+  },
   limit: 2,
   owner: { sessions: 0, reservations: 0, statelessRequests: 1, limit: 1 },
 });
-statelessLimited.releaseStatelessRequest(clientARequest);
+assert.equal(statelessLimited.releaseStatelessRequest(clientARequest), true);
+assert.equal(statelessLimited.releaseStatelessRequest(clientARequest), false);
 const clientAReservationAfterRelease = statelessLimited.tryReserve("client-a");
 assert(clientAReservationAfterRelease);
 statelessLimited.releaseReservation(clientAReservationAfterRelease);
-statelessLimited.releaseStatelessRequest(clientBRequest);
-assert.equal(statelessLimited.usageSnapshot().statelessRequests, 0);
+assert.equal(statelessLimited.releaseStatelessRequest(clientBRequest), true);
+assert.deepEqual(statelessLimited.usageSnapshot().statelessLeases, { agesMs: [], byOwner: [] });
 assert.deepEqual(await detachedHungRegistry.closeAll(), []);
 assert.equal(detachedHungRegistry.size, 0);

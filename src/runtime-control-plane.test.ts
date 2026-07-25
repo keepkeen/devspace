@@ -26,7 +26,21 @@ app.use(createRuntimeControlPlane({
   isClosing: () => false,
   workspaceDatabaseReady: () => true,
   oauthDatabaseReady: () => true,
-  mcpUsage: () => ({ sessions: 2, reservations: 1, statelessRequests: 1, limit: 8 }),
+  mcpUsage: () => ({
+    sessions: 2,
+    reservations: 1,
+    statelessRequests: 1,
+    statelessLeases: {
+      agesMs: [1_250],
+      byOwner: [{
+        principalRef: "conn_test",
+        clientRef: "oauth_test",
+        active: 1,
+        oldestLeaseAgeMs: 1_250,
+      }],
+    },
+    limit: 8,
+  }),
   processUsage: () => ({ sessions: 3, running: 1, limit: 16 }),
   processOutputUsage: () => ({ outputs: 4, activeOutputs: 1, storedBytes: 1024, droppedBytes: 12, maxStorageBytes: 4096 }),
   workspaceUsage: () => ({ activePersisted: 4, resident: 2, closing: 0, leased: 1, maxResident: 32 }),
@@ -92,6 +106,15 @@ try {
     statelessRequests: 1,
     reserved: 1,
     limit: 8,
+    statelessLeases: {
+      agesMs: [1_250],
+      byOwner: [{
+        principalRef: "conn_test",
+        clientRef: "oauth_test",
+        active: 1,
+        oldestLeaseAgeMs: 1_250,
+      }],
+    },
   });
   assert.deepEqual(body.usage.processOutput, {
     active: 1024,

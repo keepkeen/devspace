@@ -18,9 +18,27 @@ export interface McpSessionReservation {
   readonly connectionPrincipalId?: string;
 }
 
+export interface StatelessMcpRequestOwnerRefs {
+  readonly principalRef: string;
+  readonly clientRef: string;
+}
+
 export interface StatelessMcpRequestLease {
   readonly id: symbol;
   readonly connectionPrincipalId: string;
+  readonly acquiredAt: number;
+  readonly principalRef: string;
+  readonly clientRef: string;
+}
+
+export interface StatelessMcpRequestLeaseUsage {
+  agesMs: number[];
+  byOwner: Array<{
+    principalRef: string;
+    clientRef: string;
+    active: number;
+    oldestLeaseAgeMs: number;
+  }>;
 }
 
 interface McpSessionEntry<TTransport> {
@@ -48,6 +66,7 @@ export interface McpSessionUsageSnapshot {
   sessions: number;
   reservations: number;
   statelessRequests: number;
+  statelessLeases: StatelessMcpRequestLeaseUsage;
   limit: number;
   owner?: {
     sessions: number;
@@ -97,7 +116,10 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
     return reservation;
   }
 
-  tryAcquireStatelessRequest(connectionPrincipalId: string): StatelessMcpRequestLease | undefined {
+  tryAcquireStatelessRequest(
+    connectionPrincipalId: string,
+    ownerRefs: StatelessMcpRequestOwnerRefs,
+  ): StatelessMcpRequestLease | undefined {
     if (
       this.sealed ||
       this.occupiedSlots() >= this.maxSessions ||
@@ -105,13 +127,18 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
     ) {
       return undefined;
     }
-    const lease = { id: Symbol("stateless-mcp-request"), connectionPrincipalId };
+    const lease = {
+      id: Symbol("stateless-mcp-request"),
+      connectionPrincipalId,
+      acquiredAt: this.now(),
+      ...ownerRefs,
+    };
     this.statelessRequests.add(lease);
     return lease;
   }
 
-  releaseStatelessRequest(lease: StatelessMcpRequestLease): void {
-    this.statelessRequests.delete(lease);
+  releaseStatelessRequest(lease: StatelessMcpRequestLease): boolean {
+    return this.statelessRequests.delete(lease);
   }
 
   async reserveWithIdleReclaim(connectionPrincipalId: string): Promise<McpSessionReservationResult> {
@@ -265,6 +292,7 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
       sessions: this.size,
       reservations: this.reservations.size,
       statelessRequests: this.statelessRequests.size,
+      statelessLeases: this.statelessLeaseUsage(),
       limit: this.maxSessions,
       ...(connectionPrincipalId === undefined ? {} : {
         owner: {
@@ -275,6 +303,36 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
         },
       }),
     };
+  }
+
+  private statelessLeaseUsage(): StatelessMcpRequestLeaseUsage {
+    const now = this.now();
+    const agesMs: number[] = [];
+    const groups = new Map<string, StatelessMcpRequestLeaseUsage["byOwner"][number]>();
+
+    for (const lease of this.statelessRequests) {
+      const ageMs = Math.max(0, now - lease.acquiredAt);
+      agesMs.push(ageMs);
+      const key = `${lease.principalRef}\0${lease.clientRef}`;
+      const current = groups.get(key);
+      if (current) {
+        current.active += 1;
+        current.oldestLeaseAgeMs = Math.max(current.oldestLeaseAgeMs, ageMs);
+      } else {
+        groups.set(key, {
+          principalRef: lease.principalRef,
+          clientRef: lease.clientRef,
+          active: 1,
+          oldestLeaseAgeMs: ageMs,
+        });
+      }
+    }
+
+    agesMs.sort((left, right) => right - left);
+    const byOwner = [...groups.values()].sort((left, right) =>
+      left.principalRef.localeCompare(right.principalRef) ||
+      left.clientRef.localeCompare(right.clientRef));
+    return { agesMs, byOwner };
   }
 
   private beginClosing(

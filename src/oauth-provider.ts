@@ -15,13 +15,18 @@ import {
   SqliteOAuthClientsStore,
   SqliteOAuthStore,
   PrincipalReconnectError,
+  OAuthGrantIdentityError,
   type OAuthAuthorizationLimitInput,
   type OAuthDiagnosticSnapshot,
   type OAuthCleanupCounts,
+  type OAuthGrantRecord,
   type OAuthRevocationCounts,
 } from "./oauth-store.js";
+import type { HashedHostIdentity } from "./host-identity.js";
 import { requestIp } from "./logger.js";
+import type { RuntimeCapabilities } from "./runtime-capabilities.js";
 import {
+  DEFAULT_AUTHORIZATION_SCOPES,
   DEFAULT_DEVSPACE_OAUTH_SCOPES,
   defaultOAuthAuthorizationScopes,
   oauthScopeDescription,
@@ -34,6 +39,7 @@ export interface OAuthConfig {
   scopes: string[];
   allowedRedirectHosts: string[];
   trustProxy?: boolean;
+  runtimeCapabilities?: RuntimeCapabilities;
 }
 
 export type OAuthAuditEventName =
@@ -48,6 +54,10 @@ export type OAuthAuditEventName =
 export interface OAuthAuditEvent {
   event: OAuthAuditEventName;
   clientId: string;
+  grantId?: string;
+  connectionPrincipalId?: string;
+  subjectHash?: string;
+  organizationHash?: string;
 }
 
 export interface OAuthAuthorizationBoundaryChange {
@@ -57,9 +67,26 @@ export interface OAuthAuthorizationBoundaryChange {
 
 interface AuthorizationCodeRecord {
   clientId: string;
+  grantId: string;
+  connectionPrincipalId: string;
+  authorizationEpoch: number;
   params: AuthorizationParams;
   expiresAtMs: number;
 }
+
+export interface OAuthRequestAuthorization {
+  clientId: string;
+  grantId: string;
+  connectionPrincipalId: string;
+  authorizationEpoch: number;
+  scopes: string[];
+  subjectHash?: string;
+  organizationHash?: string;
+}
+
+const AUTH_EXTRA_GRANT_ID = "devspace/grant-id";
+const AUTH_EXTRA_PRINCIPAL_ID = "devspace/principal-id";
+const AUTH_EXTRA_AUTHORIZATION_EPOCH = "devspace/authorization-epoch";
 
 const CODE_TTL_MS = 5 * 60 * 1000;
 const AUTHORIZATION_LIMIT_TTL_MS = 24 * 60 * 60_000;
@@ -117,8 +144,9 @@ function formHtml(params: {
   scopes: string[];
   resource?: URL;
   fields: Record<string, string | undefined>;
+  runtimeCapabilities?: RuntimeCapabilities;
 }): string {
-  const scopes = params.scopes.length > 0 ? params.scopes : [...DEFAULT_DEVSPACE_OAUTH_SCOPES];
+  const scopes = params.scopes.length > 0 ? params.scopes : [...DEFAULT_AUTHORIZATION_SCOPES];
   const scopeItems = scopes
     .map((scope) =>
       `<li><code>${htmlEscape(scope)}</code><span>${htmlEscape(oauthScopeDescription(scope))}</span></li>`)
@@ -131,6 +159,15 @@ function formHtml(params: {
     .filter((entry): entry is [string, string] => entry[1] !== undefined)
     .map(([name, value]) => `        <input type="hidden" name="${htmlEscape(name)}" value="${htmlEscape(value)}" />`)
     .join("\n");
+  const runtimeWarnings = authorizationRuntimeWarnings(
+    scopes,
+    params.runtimeCapabilities,
+  );
+  const runtimePosture = runtimeWarnings.length > 0
+    ? `<section class="risk"><strong>Runtime security posture</strong><ul>${runtimeWarnings
+        .map((warning) => `<li>${htmlEscape(warning)}</li>`)
+        .join("")}</ul></section>`
+    : "";
 
   return `<!doctype html>
 <html lang="en">
@@ -157,6 +194,9 @@ function formHtml(params: {
       button { margin-top: 18px; width: 100%; border: 0; border-radius: 10px; padding: 12px 14px; font-weight: 700; color: #020617; background: #38bdf8; cursor: pointer; }
       .error { color: #fecaca; background: #7f1d1d; border-radius: 10px; padding: 10px 12px; }
       .warning { color: #fde68a; }
+      .risk { margin: 16px 0; padding: 14px; color: #fde68a; background: #422006; border: 1px solid #a16207; border-radius: 12px; }
+      .risk strong { display: block; margin-bottom: 6px; }
+      .risk ul { margin-bottom: 0; }
     </style>
   </head>
   <body>
@@ -164,6 +204,7 @@ function formHtml(params: {
       <h1>Connect DevSpace</h1>
       <p class="warning">Only approve this if you are intentionally connecting your own ChatGPT or MCP client to this local machine.</p>
       ${error}
+      ${runtimePosture}
       <dl>
         <dt>Client</dt><dd>${htmlEscape(params.clientName)}</dd>
         <dt>Capabilities</dt><dd><ul>${scopeItems}</ul></dd>
@@ -183,6 +224,33 @@ ${hiddenFields}
     </main>
   </body>
 </html>`;
+}
+
+function authorizationRuntimeWarnings(
+  scopes: readonly string[],
+  capabilities: RuntimeCapabilities | undefined,
+): string[] {
+  if (!capabilities) return [];
+  const warnings: string[] = [];
+  if (scopes.includes("process:execute") && !capabilities.processSandbox) {
+    warnings.push(
+      "Executed commands run with the local operating-system user's permissions; DevSpace command checks are guardrails, not a process sandbox.",
+    );
+  }
+  if (
+    scopes.includes("process:execute") &&
+    capabilities.filesystemIsolation === "guardrail_only"
+  ) {
+    warnings.push(
+      "Dedicated file tools are workspace-confined, but executed programs may access files outside the workspace that the local user can access.",
+    );
+  }
+  if (scopes.includes("network:access") && !capabilities.networkIsolation) {
+    warnings.push(
+      "Executed programs can use the host network; this runtime cannot enforce per-process network denial.",
+    );
+  }
+  return warnings;
 }
 
 function requestedScopesAllowed(requested: string[], supported: string[]): boolean {
@@ -262,6 +330,7 @@ function sendAuthorizationRateLimit(
   retryAfterMs: number,
   client: OAuthClientInformationFull,
   params: AuthorizationParams,
+  runtimeCapabilities?: RuntimeCapabilities,
 ): void {
   res.status(429).setHeader("Retry-After", String(Math.max(1, Math.ceil(retryAfterMs / 1_000))));
   res.setHeader("Content-Type", "text/html; charset=utf-8");
@@ -272,6 +341,7 @@ function sendAuthorizationRateLimit(
       scopes: params.scopes ?? [],
       resource: params.resource,
       fields: authorizationFormFields(client, params),
+      runtimeCapabilities,
     }),
   );
 }
@@ -343,6 +413,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
           scopes,
           resource: authorizedParams.resource,
           fields: authorizationFormFields(client, authorizedParams),
+          runtimeCapabilities: this.config.runtimeCapabilities,
         }),
       );
       return;
@@ -358,7 +429,13 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     const preflight = this.oauthStore.checkAuthorizationLimits(authorizationLimits, now);
     if (preflight.limited) {
       this.emitAudit("oauth_authorization_rate_limited", client.client_id);
-      sendAuthorizationRateLimit(res, preflight.retryAfterMs, client, authorizedParams);
+      sendAuthorizationRateLimit(
+        res,
+        preflight.retryAfterMs,
+        client,
+        authorizedParams,
+        this.config.runtimeCapabilities,
+      );
       return;
     }
 
@@ -369,7 +446,13 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
       const failure = this.oauthStore.recordAuthorizationFailure(authorizationLimits, now);
       if (failure.limited) {
         this.emitAudit("oauth_authorization_rate_limited", client.client_id);
-        sendAuthorizationRateLimit(res, failure.retryAfterMs, client, authorizedParams);
+        sendAuthorizationRateLimit(
+          res,
+          failure.retryAfterMs,
+          client,
+          authorizedParams,
+          this.config.runtimeCapabilities,
+        );
         return;
       }
       res.status(401).setHeader("Content-Type", "text/html; charset=utf-8");
@@ -380,6 +463,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
           scopes,
           resource: authorizedParams.resource,
           fields: authorizationFormFields(client, authorizedParams),
+          runtimeCapabilities: this.config.runtimeCapabilities,
         }),
       );
       return;
@@ -389,47 +473,48 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
       authorizationLimits[0]!.key,
     );
     const reconnectCode = String(res.req.body?.reconnect_code ?? "").trim();
-    let connectionPrincipalId: string;
-    let boundaryChangeReason: OAuthAuthorizationBoundaryChange["reason"] | undefined;
-    if (reconnectCode) {
-      try {
-        const linked = this.oauthStore.consumeReconnectCode(reconnectCode, client.client_id);
-        connectionPrincipalId = linked.targetPrincipalId;
-        if (linked.changed) {
-          boundaryChangeReason = "principal_relinked";
-          this.emitAudit("oauth_principal_linked", client.client_id);
-        }
-      } catch (error) {
-        if (!(error instanceof PrincipalReconnectError)) throw error;
-        res.status(400).setHeader("Content-Type", "text/html; charset=utf-8");
-        res.send(
-          formHtml({
-            error: error.message,
-            clientName: client.client_name ?? client.client_id,
-            scopes,
-            resource: authorizedParams.resource,
-            fields: authorizationFormFields(client, authorizedParams),
-          }),
-        );
-        return;
-      }
-    } else {
-      const assignment = this.oauthStore.ensurePrincipalAssignmentForClient(client.client_id);
-      connectionPrincipalId = assignment.principalId;
-      if (assignment.created) boundaryChangeReason = "principal_created";
+    let grant;
+    try {
+      grant = this.oauthStore.createAuthorizationGrant({
+        clientId: client.client_id,
+        scopes,
+        ...(reconnectCode ? { reconnectCode } : {}),
+      });
+    } catch (error) {
+      if (!(error instanceof PrincipalReconnectError)) throw error;
+      res.status(400).setHeader("Content-Type", "text/html; charset=utf-8");
+      res.send(
+        formHtml({
+          error: error.message,
+          clientName: client.client_name ?? client.client_id,
+          scopes,
+          resource: authorizedParams.resource,
+          fields: authorizationFormFields(client, authorizedParams),
+          runtimeCapabilities: this.config.runtimeCapabilities,
+        }),
+      );
+      return;
     }
-    this.oauthStore.touchPrincipal(connectionPrincipalId);
-    if (boundaryChangeReason) {
+    const boundaryChangeReason: OAuthAuthorizationBoundaryChange["reason"] = grant.reconnected
+      ? "principal_relinked"
+      : "principal_created";
+    if (grant.reconnected) {
+      this.emitAudit("oauth_principal_linked", client.client_id, grant);
+    }
+    if (grant.principalCreated || grant.reconnected) {
       this.onAuthorizationBoundaryChanged?.({
-        connectionPrincipalId,
+        connectionPrincipalId: grant.principalId,
         reason: boundaryChangeReason,
       });
     }
-    this.emitAudit("oauth_authorization_succeeded", client.client_id);
+    this.emitAudit("oauth_authorization_succeeded", client.client_id, grant);
 
     const code = `code-${randomUUID()}`;
     this.codes.set(code, {
       clientId: client.client_id,
+      grantId: grant.grantId,
+      connectionPrincipalId: grant.principalId,
+      authorizationEpoch: grant.authorizationEpoch,
       params: authorizedParams,
       expiresAtMs: Date.now() + CODE_TTL_MS,
     });
@@ -464,10 +549,19 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     }
 
     this.codes.delete(authorizationCode);
-    const principalId = this.oauthStore.ensurePrincipalForClient(client.client_id);
-    const tokens = this.issueTokens(client.client_id, record.params.scopes ?? this.config.scopes, record.params.resource);
-    this.oauthStore.touchPrincipal(principalId);
-    this.emitAudit("oauth_token_issued", client.client_id);
+    const grant = this.requireActiveGrant({
+      clientId: client.client_id,
+      grantId: record.grantId,
+      principalId: record.connectionPrincipalId,
+      authorizationEpoch: record.authorizationEpoch,
+    });
+    const tokens = this.issueTokens(
+      grant,
+      record.params.scopes ?? this.config.scopes,
+      record.params.resource,
+    );
+    this.oauthStore.touchPrincipal(grant.principalId);
+    this.emitAudit("oauth_token_issued", client.client_id, grant);
     return tokens;
   }
 
@@ -491,15 +585,23 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
       throw new AccessDeniedError("Refresh token cannot grant requested scopes");
     }
 
+    if (!record.grantId || !record.principalId || !record.authorizationEpoch) {
+      throw new InvalidGrantError("Refresh token has no active authorization grant");
+    }
+    const grant = this.requireActiveGrant({
+      clientId: client.client_id,
+      grantId: record.grantId,
+      principalId: record.principalId,
+      authorizationEpoch: record.authorizationEpoch,
+    });
     const tokens = this.issueTokens(
-      client.client_id,
+      grant,
       requestedScopes,
       resource ?? (record.resource ? new URL(record.resource) : undefined),
       refreshTokenHash,
     );
-    const principalId = this.oauthStore.principalForClient(client.client_id);
-    if (principalId) this.oauthStore.touchPrincipal(principalId);
-    this.emitAudit("oauth_token_refreshed", client.client_id);
+    this.oauthStore.touchPrincipal(grant.principalId);
+    this.emitAudit("oauth_token_refreshed", client.client_id, grant);
     return tokens;
   }
 
@@ -508,6 +610,9 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     if (!record || record.expiresAt < Math.floor(Date.now() / 1000)) {
       throw new InvalidTokenError("Invalid or expired access token");
     }
+    if (!record.grantId || !record.principalId || !record.authorizationEpoch) {
+      throw new InvalidTokenError("Access token has no active authorization grant");
+    }
 
     return {
       token,
@@ -515,6 +620,62 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
       scopes: record.scopes,
       expiresAt: record.expiresAt,
       resource: record.resource ? new URL(record.resource) : undefined,
+      extra: {
+        [AUTH_EXTRA_GRANT_ID]: record.grantId,
+        [AUTH_EXTRA_PRINCIPAL_ID]: record.principalId,
+        [AUTH_EXTRA_AUTHORIZATION_EPOCH]: record.authorizationEpoch,
+      },
+    };
+  }
+
+  authorizeRequest(
+    authInfo: AuthInfo,
+    hostIdentity: HashedHostIdentity = {},
+    options: { requireHostIdentity?: boolean } = {},
+  ): OAuthRequestAuthorization {
+    const grantId = authInfo.extra?.[AUTH_EXTRA_GRANT_ID];
+    const principalId = authInfo.extra?.[AUTH_EXTRA_PRINCIPAL_ID];
+    const authorizationEpoch = authInfo.extra?.[AUTH_EXTRA_AUTHORIZATION_EPOCH];
+    if (
+      typeof grantId !== "string" ||
+      typeof principalId !== "string" ||
+      !Number.isSafeInteger(authorizationEpoch) ||
+      (authorizationEpoch as number) < 1
+    ) {
+      throw new InvalidTokenError("Access token authorization context is missing");
+    }
+    let grant: OAuthGrantRecord;
+    try {
+      grant = this.oauthStore.bindOrValidateGrantHostIdentity({
+        grantId,
+        clientId: authInfo.clientId,
+        authorizationEpoch: authorizationEpoch as number,
+        ...(hostIdentity.subjectHash ? { subjectHash: hostIdentity.subjectHash } : {}),
+        ...(hostIdentity.organizationHash
+          ? { organizationHash: hostIdentity.organizationHash }
+          : {}),
+        requireSubject: options.requireHostIdentity === true,
+      });
+    } catch (error) {
+      if (error instanceof OAuthGrantIdentityError) {
+        throw new InvalidTokenError(error.message);
+      }
+      throw error;
+    }
+    if (
+      grant.principalId !== principalId ||
+      authInfo.scopes.some((scope) => !grant.grantedScopes.includes(scope))
+    ) {
+      throw new InvalidTokenError("Access token does not match its authorization grant");
+    }
+    return {
+      clientId: authInfo.clientId,
+      grantId: grant.grantId,
+      connectionPrincipalId: grant.principalId,
+      authorizationEpoch: grant.authorizationEpoch,
+      scopes: [...authInfo.scopes],
+      ...(grant.subjectHash ? { subjectHash: grant.subjectHash } : {}),
+      ...(grant.organizationHash ? { organizationHash: grant.organizationHash } : {}),
     };
   }
 
@@ -574,7 +735,10 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
   }
 
   private issueTokens(
-    clientId: string,
+    grant: Pick<
+      OAuthGrantRecord,
+      "grantId" | "clientId" | "principalId" | "authorizationEpoch"
+    >,
     scopes: string[],
     resource?: URL,
     consumedRefreshTokenHash?: string,
@@ -589,14 +753,20 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
       {
         accessTokenHash: hashToken(accessToken),
         accessToken: {
-          clientId,
+          grantId: grant.grantId,
+          clientId: grant.clientId,
+          principalId: grant.principalId,
+          authorizationEpoch: grant.authorizationEpoch,
           scopes,
           expiresAt: accessExpiresAt,
           resource: resource?.href,
         },
         refreshTokenHash: hashToken(refreshToken),
         refreshToken: {
-          clientId,
+          grantId: grant.grantId,
+          clientId: grant.clientId,
+          principalId: grant.principalId,
+          authorizationEpoch: grant.authorizationEpoch,
           scopes,
           expiresAt: refreshExpiresAt,
           resource: resource?.href,
@@ -617,9 +787,47 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     };
   }
 
-  private emitAudit(event: OAuthAuditEventName, clientId: string): void {
+  private requireActiveGrant(input: {
+    clientId: string;
+    grantId: string;
+    principalId: string;
+    authorizationEpoch: number;
+  }): OAuthGrantRecord {
+    const grant = this.oauthStore.getAuthorizationGrant(input.grantId);
+    if (
+      !grant ||
+      grant.clientId !== input.clientId ||
+      grant.principalId !== input.principalId ||
+      grant.authorizationEpoch !== input.authorizationEpoch
+    ) {
+      throw new InvalidGrantError("OAuth authorization grant is no longer active");
+    }
+    return grant;
+  }
+
+  private emitAudit(
+    event: OAuthAuditEventName,
+    clientId: string,
+    grant?: Pick<
+      OAuthGrantRecord,
+      "grantId" | "principalId" | "subjectHash" | "organizationHash"
+    >,
+  ): void {
     try {
-      this.onAuditEvent?.({ event, clientId });
+      this.onAuditEvent?.({
+        event,
+        clientId,
+        ...(grant
+          ? {
+              grantId: grant.grantId,
+              connectionPrincipalId: grant.principalId,
+              ...(grant.subjectHash ? { subjectHash: grant.subjectHash } : {}),
+              ...(grant.organizationHash
+                ? { organizationHash: grant.organizationHash }
+                : {}),
+            }
+          : {}),
+      });
     } catch {
       // Observability must never change committed OAuth state or client results.
     }

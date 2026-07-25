@@ -316,11 +316,13 @@ try {
   const diagnosticsBody = JSON.parse(diagnostics.body);
   assert.equal(diagnosticsBody.diagnostics.generation, "test-generation");
   assert.equal(typeof diagnosticsBody.security.confirmationToken, "string");
-  assert.doesNotMatch(diagnostics.body, /must-be-redacted|999/);
+  // Other diagnostics may legitimately contain the number 999; the fixture's
+  // private process identifier must not survive as a pid field.
+  assert.doesNotMatch(diagnostics.body, /must-be-redacted|"pid"\s*:\s*999/);
   const bundle = await request(url, { path: "/api/diagnostics/bundle", headers: { cookie } });
   assert.equal(bundle.status, 200);
   assert.match(String(bundle.headers["content-disposition"]), /attachment/);
-  assert.doesNotMatch(bundle.body, /must-be-redacted|999/);
+  assert.doesNotMatch(bundle.body, /must-be-redacted|"pid"\s*:\s*999/);
 
   const revoke = await request(url, {
     method: "POST",

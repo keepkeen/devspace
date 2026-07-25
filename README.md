@@ -265,189 +265,110 @@ OpenAI 目前把自定义 MCP 集成称为 **developer-mode app（开发者模�
 
 正常的调用流程是：
 
-1. ChatGPT 用本地项目路径和别名调用 `open_workspace`。默认返回精简的 v4 metadata
-   continuation，不立即注入项目指令或 Skill 目录。metadata receipt 只能加载上下文或
-   关闭/撤销 Workspace，不能读取、搜索、执行或修改文件。
-2. 模型用 metadata receipt 调用 `get_workspace_context(contextMode: "full")`，取得
-   结构化项目指令、Skill 目录和新的 context-loaded receipt。结果中的模型可见
-   `workspace` 会包含
-   `ref`、`alias`、不暴露本机路径的 `projectFingerprint` 和 generation；
-   `continuation` 会包含 receipt、阶段、固定过期时间以及两类 revision。只有用当前 context-loaded receipt 刷新
-   `get_workspace_context` 时，显式的 `contextMode: "retained"` 才会按已绑定的
-   revision 跳过正文；打开、恢复、新对话和上下文压缩后必须使用 `full`。
-3. 后续读取、搜索、编辑和命令调用只传当前 `receipt`。每个 Workspace-scoped
-   结果都会在模型可见的 `structuredContent` 中回显同一个 `workspace` 和
-   `continuation`，普通工具不会自行签发或续期 receipt；只有显式加载/刷新上下文
-   才更新其固定到期时间。receipt 已经绑定本机
-   connection principal、Workspace、代次、上下文阶段、私有 context session 及两类
-   上下文修订号，模型不需要在每次调用里重复绝对路径或内部 ID。
-4. ChatGPT 的每次工具调用都可以使用新的无状态 HTTP 传输；真正需要复用的是
-   Workspace 的持久化记录，不是 MCP transport session。传输重连或旧 MCP session
-   header 不会中断 workspace。
-   新对话不需要再次发送绝对路径：先调用 `list_workspaces`，再通过 alias 或持久化的
-   `workspaceRef` 调用 `resume_workspace`（二选一）恢复并取得新 `receipt`。
-   `list_workspaces` 还返回稳定的 `projectFingerprint`，用于区分同名项目而不泄露主机路径。
-   服务重启后旧 receipt 会失效，
-   但 alias 和 Workspace 记录仍可恢复。
-   如果你删除并重新添加 ChatGPT 应用，新的动态 OAuth 注册会在首次成功授权时建立新的
-   connection principal，因此看不到旧 alias。需要明确恢复旧连接时，先在本机运行
-   `devspace auth principals`，再用
-   `devspace auth reconnect-code <principal-id>` 生成一次性短期代码，并在新的 OAuth
-   授权页面输入。旧 receipt 永远不能跨注册复用。
-   同一 connection principal 下可以同时保留多个项目 alias。ChatGPT 不会向 DevSpace
-   提供可信的对话 ID，因此每个对话应把自己的 alias 当作持续性键：隔天继续、平台
-   断线或打开新 transport 后先 `list_workspaces`，再恢复原 alias，不要新建替代 worktree。
-   如果原 managed worktree 路径暂时丢失，alias 会保留为 `recovery_required`；恢复时
-   DevSpace 会优先在原路径重建同一 Workspace，并尽量使用 Git 记录的最新提交。物理目录
-   连同未提交内容一并丢失时，无法保证找回未提交修改，结果会明确标记
-   `dataLossPossible=true`。
-5. 只有你明确要求释放 workspace 时，模型才应调用 `close_workspace`。长时间
-   未使用的 workspace 也可能在达到配置的空闲期限后自动过期。
+1. ChatGPT 用用户批准的本地路径和别名调用 `open_workspace`。默认只完成选择并返回
+   `state.phase: "selected"`。如果用户已经明确指定项目，而且当前任务确实需要仓库上下文，
+   第一次调用可直接使用 `contextMode: "full"`。
+2. selected Workspace 通过 `get_workspace_context(contextMode: "full")` 加载根上下文。
+   v5 full context 返回 `instructionManifest` 和 Skill 目录，不返回 AGENTS 正文；
+   `state.phase` 变为 `context_loaded`。只有刷新同一份已保留上下文时才使用
+   `contextMode: "retained"` 和 revision 提示。
+3. 准备处理具体路径时调用 `load_workspace_instructions(paths)`。它只返回对这些路径生效的
+   指令链，并在需要时返回一次性 `instructionToken`；上下文推进到 `target_scoped`。
+   修改或执行工具必须把该 token 用于对应操作。
+4. ChatGPT 风格 host 会把 Workspace 绑定到
+   `(principal, HMAC(openai/session))`，普通文件和进程工具不需要模型重复传 receipt。
+   没有 `openai/session` 的通用 MCP client 使用当前 `wctx5` receipt。显式传入无效 receipt
+   永远不会回退到 host session。普通工具只返回 `workspaceAlias`、
+   `contextChanged: false` 和工具自身结果；只有 lifecycle、revision、generation 或 phase
+   变化时才返回 continuation。
+5. 新对话、上下文丢失或服务重启后先调用 `list_workspaces`，再按一个 alias 或
+   `workspaceRef` 调用 `resume_workspace`。如果 principal 没有 retained Workspace，才重新
+   `open_workspace` 用户批准的路径。错误结果会用 `recovery: "list_then_resume"` 或
+   `open_workspace_full` 明确区分。只有用户明确要求释放时才调用 `close_workspace`。
+
+如果删除并重新添加 ChatGPT 应用，新的 Owner 授权会创建新的 authorization grant 和
+connection principal，因此默认看不到旧 alias。需要恢复旧 principal 时，在本机使用
+`devspace auth reconnect-code <principal-id>`，并在授权页输入一次性代码。
+服务重启会使进程内 receipt 和 host session binding 失效，但持久化 alias/Workspace 仍可恢复。
+managed worktree 路径丢失时，alias 保留为 `recovery_required`；无法恢复的未提交内容会以
+`dataLossPossible=true` 明示。
 
 新建 checkout 默认只读。需要直接修改当前 checkout 时，明确使用
 `writeAccess: "read_write"`；更推荐使用 `mode: "worktree"` 获得隔离的可写工作区。
-从 1.x 迁移的 checkout 会把历史权限显式写入 v14 数据库；新 checkout 仍默认只读。
+从 1.x 迁移的 checkout 会把历史权限显式写入 v15 数据库；新 checkout 仍默认只读。
 
 不要让 ChatGPT 使用云端 Python 或 Code Interpreter 去检查本地路径。它们仍可
 用于与本地项目无关的计算和数据处理；本地项目操作应通过 DevSpace 完成。
 
 ### 连接主体不是 ChatGPT 账户身份
 
-DevSpace 看不到经过验证的 ChatGPT 账户 `sub`。动态 OAuth 注册本身不创建身份；只有
-首次成功的 Owner 授权才为它建立独立的本机 connection principal。这提供的是
-**连接级隔离**，不是 ChatGPT 账户级证明。
-只有输入本机生成的一次性 reconnect code，新的注册才会显式绑定到旧 principal。
+DevSpace 看不到经过验证的 ChatGPT 账户 `sub`。OAuth `client_id` 只标识动态注册，
+授权主体绑定到每一次 authorization grant：grant 固定保存 principal、能力集合和
+authorization epoch，access/refresh token 直接引用该 grant。刷新 token 沿用原 grant，
+不会通过 `clientId` 临时寻找 principal。
 
-两个 principal 即使资源彼此不可见，仍可打开同一个物理 checkout。本 DevSpace
-实例会按规范化根目录让读取和默认变更预览共享锁，让补丁、命令、可写进程输入、
-显式 checkpoint 推进、关闭和撤销进入同一写队列。锁只覆盖 MCP 工具调用本身；返回的后台进程可以继续产生
-无法完整观测的副作用，因此结果会标记为 `unknown`，后续补丁仍依赖 `ifMatch` 防止
-静默覆盖。关闭和撤销会先终止受跟踪进程。并行工作仍优先使用独立 Git worktree。
+工具调用可携带 `openai/subject`、`openai/organization` 和 `openai/session`。服务端只保存
+带用途分离的 HMAC，用于 grant 一致性、匿名审计/限流和 host session 绑定；这些字段不是
+授权凭证，也不会取代 OAuth token。新的注册只有使用一次性 reconnect code 才能显式连接到
+旧 principal。
+
+不同 principal 仍可能打开同一物理 checkout。DevSpace 使用跨进程的 canonical-root 读写锁：
+读取可并发，补丁、命令、可写进程交互、checkpoint 推进、关闭和撤销串行。返回后台进程时，
+写租约会持续到完整进程树退出。外部编辑器不受该锁控制，所以 `ifMatch` 仍然是所有补丁的
+强制前置条件；并行写任务仍优先使用独立 Git worktree。
 
 ### OAuth 能力范围
 
 DevSpace 支持 `workspace:read`、`workspace:write`、`process:execute`、
-`network:access`、`worktree:create` 和 `workspace:revoke`。授权页面会展示这些能力，
-工具执行前还会再次校验。2.0 不再接受模糊的 `devspace` 全权限 scope；
-`DEVSPACE_OAUTH_SCOPES` 只能包含上述六个能力中的非空子集。
+`network:access`、`worktree:create` 和 `workspace:revoke`。授权请求省略 scope 时只授予
+`workspace:read`；更高权限必须显式请求。tools/list 会按当前 grant 的能力动态隐藏不可用工具，
+handler 仍会再次校验权限，旧缓存 schema 不能绕过授权。2.0 不接受模糊的 `devspace`
+全权限 scope。
 
 ### `AGENTS.md` 和 Skill
 
-首次 `open_workspace` 默认只返回 metadata。模型随后用 receipt 调用
-`get_workspace_context(contextMode: "full")` 取得 `instructions.items[]`。每项包含来源、
-信任级别、作用域、相对路径、内容哈希和正文，不再把 Markdown 标题与服务端提示拼在一起。
-仓库指令明确标记为 `repository_untrusted`，不能覆盖用户要求或 DevSpace 安全策略。
-需要用户级指令时，可在管理面板或
-`DEVSPACE_USER_INSTRUCTIONS_PATH` 中显式指定一个文件；默认不会读取
-`~/.codex/AGENTS.md`。可信个人 Skill 使用 `~/.agents/skills`，DevSpace 自己管理的
-Skill 使用 `~/.devspace/skills`，其他本机 allowlist 使用 `DEVSPACE_SKILL_PATHS`。full context 返回的根级
-指令会直接绑定并确认到该 receipt 的私有 context session，第一次在根目录修改或执行前
-不必再次发送。读取嵌套目录时只返回 `scopedInstructionsAvailable=true`；准备进入新的
-嵌套指令作用域修改或执行前，模型调用 `load_workspace_instructions` 获取增量结构化指令和
-一次性确认 Token。Token 只能由签发它的 context session 使用；新对话恢复 Workspace
-不会清除旧有效 receipt 的确认状态。
-纯空白指令文件会跳过，用户、根目录和嵌套
-指令链合计最多 32 KiB；后台进程后续通过 `write_stdin` 进入新目录时也会先经过
-同一套指令确认。完整上下文返回基于初始指令路径和内容生成的
-`sha256-v1:` `instructionRevision`，便于客户端识别未变化的指令链，避免重复污染上下文。
-Skill 目录使用独立的 `skillRevision`；只有模型仍保留旧目录时才传
-`knownSkillRevision`，目录未变化便不会重复返回。revision 只在当前
-context-loaded receipt 的 `get_workspace_context(retained)` 刷新中生效；新对话和
-上下文压缩后应使用 `full`。
+`open_workspace/full`、`resume_workspace/full` 和 `get_workspace_context/full` 采用
+manifest-first：`instructionManifest.files[]` 只包含来源、信任、作用域、相对路径、哈希和
+UTF-8 字节数，不让仓库指令正文长期驻留在整个对话中。准备处理具体路径时，
+`load_workspace_instructions(paths)` 才返回适用链的正文、`reviewedRevision` 和一次性 token。
+字段 `loadedForScope` 表示服务端确认该 revision 已被返回，不表示模型“同意服从”。仓库指令
+始终是 `repository_untrusted`，不能覆盖用户意图或 DevSpace 安全策略。
 
-DevSpace 也会告诉 ChatGPT 当前可用的本地 Skill；`list_skills` 支持搜索和分页。ChatGPT 网页端没有 Codex 的
-`$skill`/`/skills` 界面，因此模型通过 `load_skill` 完整加载对应 `SKILL.md`；
-加载成功后才允许读取支持文件并执行工作流。同名 Skill 不会被覆盖，模型使用
-`skillId`、隐私安全的逻辑路径和作用域区分。加载后可通过
-`skill://<skillId>/references/example.md` 读取 reference、script 等支持文件，
-无需向模型暴露本机 Skill 绝对路径。详细规则见
-[ChatGPT 编码工作流](./docs/chatgpt-coding-workflow.md)。
-仓库来源 Skill 始终标记为 `repository_untrusted` 并默认 `explicitOnly=true`；仓库自己的
-`agents/openai.yaml` 不能为自身开启隐式调用。`load_skill` 把正文放入结构化
-`skill.content`，固定文本只说明来源和信任边界，避免把服务端话术与不可信正文混在一起。
-explicit-only Skill 不进入自动 full-context 目录；用户明确提到 Skill 时，模型先用
-`list_skills(query=<精确名称>)` 取得清洗后的描述和 `skillId`，再调用 `load_skill`。
-如需本机显式信任某一个仓库 Skill，可把它的精确目录或 `SKILL.md` 路径加入
-`DEVSPACE_SKILL_PATHS`；该本机 allowlist 优先于自动仓库发现，同时不会重复加载同一清单。
+用户级指令必须通过管理面板或 `DEVSPACE_USER_INSTRUCTIONS_PATH` 显式配置；默认不会读取
+`~/.codex/AGENTS.md`。指令链总预算为 32 KiB，空白候选会跳过。读取进入新作用域时只提示
+`scopedInstructionsAvailable=true`；修改、命令及可能改变目录的交互输入都经过同一指令门禁。
+
+Skill 使用独立 revision。`list_skills` 提供有界搜索和分页，`load_skill` 按 `skillId`
+显式加载正文；支持文件通过 `skill://` 路径读取，不暴露本机绝对路径。仓库 Skill 始终
+`repository_untrusted` 且默认 `explicitOnly=true`，仓库不能自行提升信任。
+详细规则见[ChatGPT 编码工作流](./docs/chatgpt-coding-workflow.md)。
 
 ### 固定工具协议
 
-DevSpace 只提供一套稳定的 Codex 风格工具：`read`、`batch_read`、
-`batch_inspect`、`apply_patch`、`exec_command`、`write_stdin` 和
-`read_process_output`，再加 `list_workspaces`、`resume_workspace`、
-`get_workspace_context`、`load_workspace_instructions`、`get_operation_status`、
-`revoke_workspace` 和可选 Skill 工具。不再按模式切换
-`bash`、`exec_command` 或文件工具名称，避免 ChatGPT 对旧工具表产生缓存混淆。
+DevSpace 暴露稳定但按 OAuth capability 过滤的工具集合。默认只读 grant 的 tools/list 保持在
+12 KB 内；完整能力 profile 才暴露写入、进程、网络、worktree 和撤销工具。lifecycle 工具具有
+统一的版本化 output schema：`schemaVersion: 1`、`ok`、`workspace`、三阶段 `state`、
+`contextChanged` 和结构化 `error`。Workspace context 自身使用 `contextSchemaVersion: 5`。
 
-`exec_command` 优先使用 `program` + `args` 直接启动程序，参数不会经过 Shell
-重新解析。只有需要管道、重定向等 Shell 语法时才使用 `shell: true` + `command`；
-交互式 Shell 也必须走这一模式，不能用 `program: "bash"` 绕过逐次输入检查。
-2.0 不再接受 `cmd` 或 `cwd` 别名；工作目录只使用 `workingDirectory`。需要发送多行
-Python、SQL 或 SSH 脚本时，模型可使用结构化 `stdin` 字段，避免多层引号在远端解析失败。提供 `stdin` 后默认自动
-关闭输入流；需要继续交互时可设 `closeStdin: false`，之后通过 `write_stdin`
-追加内容或关闭输入流。PTY 不模拟 Ctrl-D 作为 EOF。
+ChatGPT host 的普通工具依赖服务端 session binding；通用 MCP client 传 `wctx5` receipt。
+`workspaceId` 和 generation 是结果标识，不是授权句柄。普通结果不回显 continuation；
+只有 context、revision、generation 或 phase 变化才返回新的 continuation。receipt 默认 6 小时、
+进程内有效，访问不会滑动延期。
 
-`apply_patch`、`exec_command`、`close_workspace` 和 `revoke_workspace`
-必须提供 `operationId`；`show_changes` 默认是只读预览，不推进 checkpoint，也不需要
-write scope 或 operation ID。只有显式设置 `advanceCheckpoint: true` 时才需要
-`operationId` 和 `workspace:write`。`write_stdin` 在发送输入、关闭 stdin 或调整终端
-尺寸时也必须提供，纯轮询不需要。每次新操作使用新 ID；网络响应丢失时用同一 ID 重试，
-服务端会重放已保存结果而不会再次执行。所有失败均返回结构化 `error.code`、
-`retryable`、`safeToRetry`、`recovery`、`phase` 和 `effectsKnown`。命令非零退出不是
-“命令未执行”：结果会返回
-`ok: false`、`status: "exited"`、`commandExecuted: true` 和 `exitCode`。
-`get_operation_status(operationId)` 可查询保留状态而不会重新执行或重复返回大结果。
-结果正文到期后会被清除，但该 ID 的轻量去重记录会保留到 Workspace 记录删除；旧 ID
-不会在 24 小时后重新变成一次新操作。
+`exec_command` 优先使用 `program` + `args`，只有需要 shell 语法时才使用
+`shell: true` + `command`。运行时会公布 `runtimeCapabilities`；当前默认环境没有
+per-process 网络隔离、进程 sandbox，文件隔离是 guardrail-only，因此 schema 不广告必然失败的
+`network: "deny"`。授权页也会明确这些风险。
 
-所有 Workspace 工具都要求当前 v4 上下文 `receipt`；统一注册层会在工具执行前解析它并校验
-connection principal、OAuth capability、Workspace 代次、context phase 与私有 context session。metadata receipt
-只能升级上下文或执行关闭/撤销；读取、搜索、进程和修改工具必须使用 context-loaded receipt。
-2.0 不再从 `workspaceId` 或 generation 猜测最近 receipt；缺少
-`continuation.receipt` 的调用会在 handler 开始前失败。升级后必须在 ChatGPT 中 Refresh
-应用工具定义。
-receipt 还绑定签发时的 alias、项目指纹和两类上下文修订号，供恢复和缓存去重使用；
-receipt 缓存同时具有全局上限和单 principal 公平上限，使用只刷新 LRU 顺序，不延长固定
-期限。项目内文件变化仍由指令门禁、Skill 重载和文件版本锁分别检查。服务重启、principal
-relink/revoke、Owner 凭据或授权根等真实权限边界变更以及
-关闭/重新打开会使旧 receipt 失效，此时用 alias 恢复并获取新的 receipt。`read` 返回
-`contentHash` 和精确字符串形式的
-`mtimeNs`。`apply_patch` 默认要求每个 touched path 都有 `ifMatch`：已有文件使用最新读取
-版本，预期不存在的新路径显式传 `null`。缺少任一路径的前置条件时，补丁不会开始执行。
+`apply_patch`、`exec_command`、`close_workspace` 和 `revoke_workspace` 必须使用
+`operationId`；可写 `write_stdin` 和显式 checkpoint 推进也一样。`read` 返回
+`contentHash`/`mtimeNs`，补丁对每个 touched path 都要求 `ifMatch`，新文件使用 `null`。
+失败统一返回 `code`、`phase`、`safeToRetry`、`effectsKnown` 和机器可读 recovery。
 
-所有 Workspace-scoped 工具都会返回统一的 `workspace` 和 `continuation`；只有
-`open_workspace`、`resume_workspace` 与 `get_workspace_context` 的上下文载荷保留独立
-`context.phase`，避免普通工具重复两份 revision。
-写入、命令、可写进程交互、显式推进的变更 checkpoint、关闭和撤销还会返回
-`operation` 和 `effects`。operation 明确给出 `not_started`、`committed` 或
-`outcome_unknown`，以及是否可安全重试和副作用是否已知。每项 effect 还标记证据可信度：
-DevSpace 直接测得的版本或生命周期状态为 `observed`，策略声明为 `declared`，任意进程可能
-产生而无法枚举的副作用为 `unknown`，不会伪造精确文件清单。
-
-同一 connection principal 重复打开相同提交的 managed worktree 时会默认复用；只有明确需要另一份
-隔离环境时才设置 `forceNew: true`。`list_workspaces` 会返回持久化的 `dirtySource`，
-空项目、顶层条目以及 Git 分支/脏状态则通过紧凑的 `project` 字段返回。过期清理只删除
-干净 worktree，绝不自动删除带修改的 worktree。
-
-如果已经明确知道多个相互独立的文件或搜索目标，`batch_read` 和
-`batch_inspect` 可以减少 MCP 往返。输入可携带短 `ref`，输出会回显 `ref` 并明确给出
-`completed`、`partial` 或 `failed` 以及成功/失败数量。如果下一个目标依赖上一次搜索结果，模型
-仍应按顺序检查，而不是强行批量处理。
-`batch_read.items[]` 的成功项直接包含 `path`、`content`、`contentHash`、精确
-`mtimeNs`、`offset`、可选 `nextOffset`/`truncated`；它与单文件 `read` 共用读前/读后
-稳定性校验，因此版本可直接用于后续 `apply_patch.ifMatch`。
-
-DevSpace 对较大的工具结果只保留一份模型可见正文，避免同一文件或命令输出在
-`content` 和 `structuredContent` 中重复占用上下文。单项文件读取只在 `content`
-返回正文；Skill 正文位于带来源/信任字段的结构化 `skill.content`；
-命令和进程轮询把合并后的 stdout/stderr 放在
-`structuredContent.output.text`，分页读取放在
-`structuredContent.page.text`，而 `content` 只返回简短状态说明；`batch_read` 使用上述
-版本化文件项，`batch_inspect` 保留 `ref/ok/result`，两者都不返回主机绝对路径或拼接后的
-聚合 `result`。`_meta` 只承载可选的
-ChatGPT 组件信息，普通 MCP 客户端可以忽略。依赖旧重复字段的客户端需要按上述
-归属读取结果；详细契约见[ChatGPT 编码工作流](./docs/chatgpt-coding-workflow.md)。
-单个 `SKILL.md` 的加载上限为 64 KiB。
+`batch_inspect` 的 grep 支持 `path/include/limit/context/ignoreCase/literal`，glob 和 ls
+也支持 limit。批处理先给每项保留最小预算，再 round-robin 分配剩余预算；没有空间的 item
+返回 `omittedReason: "aggregate_budget_exhausted"`，read 保留 `nextOffset`，搜索结果给出
+继续缩小范围或增加 limit 的提示。
 
 ## 推荐的项目组织
 
@@ -586,19 +507,19 @@ DEVSPACE_LAUNCHD_SERVICE_LABEL=com.waishnav.devspace node dist/cli.js admin
 | --- | --- |
 | 对话与项目连续性 | Workspace 不绑定短暂 MCP transport。alias、`workspaceRef` 和 HMAC `projectFingerprint` 可见；同一连接的多个对话可分别保留多个项目，隔天或新 transport 后精确恢复。 |
 | worktree 恢复 | managed worktree 路径丢失时不创建无穷新分支；原 Workspace ID/alias 保留为 `recovery_required`，恢复时优先使用 Git worktree metadata 中的最新提交，并明确标记未提交数据风险。 |
-| 稳定连接主体 | 动态 OAuth 注册在首次成功 Owner 批准后才获得 connection principal；删除并重加连接时可用一次性 reconnect code 明确恢复旧主体。不同 principal 不能复用 Workspace、进程、输出或 operation ID。 |
-| 细粒度 OAuth | `workspace:read`、`workspace:write`、`process:execute`、`network:access`、`worktree:create`、`workspace:revoke` 分别校验。相同权限重新批准不会无故推进全部 Workspace generation。 |
-| 可见 continuation | 所有 Workspace 工具回显 `workspace` 和当前 `continuation`，包括固定 `expiresAt`。普通调用不重复签发 receipt；上下文加载或刷新才续期，mutation 重放动态附加当前 continuation。 |
+| 稳定授权主体 | OAuth principal 绑定 authorization grant 而不是 client；authorization code、access token 和 refresh token 固定携带 grant/principal/epoch。一次性 reconnect code 可显式恢复旧 principal。不同 principal 不能复用 Workspace、进程、输出或 operation ID。 |
+| 细粒度 OAuth | 省略 scope 时只授予 `workspace:read`；六类能力分别校验并动态裁剪 tools/list。匿名 subject/organization HMAC 只做 grant 一致性与审计，不能替代 OAuth token。 |
+| Host session binding | ChatGPT 风格宿主通过 HMAC `openai/session` 服务端绑定 Workspace/context；普通调用不重复 receipt。通用 MCP client 使用 v5 receipt，显式无效 receipt 不会回退。 |
 | 公平 receipt 缓存 | receipt 有全局和单 principal 配额，过期记录先清理，LRU 使用不滑动固定 TTL，避免一个连接挤掉其他连接的上下文。 |
-| 紧凑模型上下文 | metadata/full/retained phase、延迟加载指令、explicit-only Repository Skill、单一正文位置和精简 envelope 控制工具上下文；完整多轮/分支/多 principal 模拟持续测量模型可见字节。 |
+| 紧凑模型上下文 | `selected/context_loaded/target_scoped`、manifest-first 指令、explicit-only Repository Skill、按能力裁剪工具和精简 ordinary envelope 控制上下文；默认只读 tools/list 持续限制在 12 KB 内。 |
 | 文件一致性 | `read` 与 `batch_read` 共用读前/读后版本校验并返回 `contentHash`/`mtimeNs`；`apply_patch` 对每个 touched path 强制完整 `ifMatch`，不存在 blind write。 |
 | 幂等 mutation | 写入、命令、可写进程输入、生命周期和 checkpoint 推进使用持久 operation ID。响应丢失时可重放结果，不会重复执行；未知结果不会自动重跑。 |
-| 变更预览做减法 | `show_changes` 默认是只读预览，不要求 write scope 或 operation ID，也不推进 checkpoint；只有显式 `advanceCheckpoint` 才成为幂等写操作。 |
-| 命令与进程边界 | 普通 build/test/Git/package 命令和项目内清理可正常执行；Workspace 外写入、根目录删除、受保护状态、`sudo` 和远程内容 pipe-to-shell 被阻止。子进程只继承最小安全环境，后台进程不长期锁死 Workspace。 |
+| 变更预览做减法 | 只要授权包含 `workspace:read`，`show_changes` 始终出现在工具表中；Widget 开关只控制 UI。默认预览不要求 write scope 或 operation ID，也不推进 checkpoint；只有显式 `advanceCheckpoint` 才成为幂等写操作。 |
+| 命令与进程边界 | 普通 build/test/Git/package 命令和项目内清理可正常执行；Workspace 外写入、根目录删除、受保护状态、`sudo` 和远程内容 pipe-to-shell 被阻止。后台进程持有同根写租约直到完整进程树退出。 |
 | 进程输出 | 命令正文位于模型可见的结构化 `output.text`，分页正文位于 `page.text`；有持久输出时始终返回 `outputId`。命令还有硬超时、终止宽限和资源配额，输出所有权同时绑定 principal 和 Workspace。 |
-| 指令门禁 | 用户/根/嵌套指令以结构化来源、trust、scope、hash 和 revision 返回。根指令按私有 context session 确认，进入新目录修改前显式加载增量规则，全链限制为 32 KiB。 |
+| 指令门禁 | Full context 只返回 manifest；具体目标通过 `load_workspace_instructions(paths)` 获取适用正文、reviewed revision 和一次性 token。仓库指令始终是 untrusted data，全链限制为 32 KiB。 |
 | Skill 信任边界 | Repository Skill 永远是 `repository_untrusted`、默认 explicit-only，不能通过自身 metadata 提权；catalog description 会清洗控制字符/HTML/代码块，正文与固定服务端文本分离。 |
-| 同根并发协调 | 规范化物理根上的公平读写锁允许并行读取并串行化 MCP 写调用；长期 dev server 不持有生命周期级全局锁，严格文件版本防止静默覆盖。 |
+| 同根并发协调 | 跨进程 canonical-root 锁允许并行读取并串行化写调用；运行中的后台进程继续持锁，外部编辑器则由严格 `ifMatch` 防止静默覆盖。 |
 | 撤销和清理 | revoke/close 先阻止新调用、终止受跟踪进程并排空活动请求；持久化清理任务在崩溃后继续。干净 worktree 可删除，脏 worktree 保留为可审计结果。 |
 | 管理与可观测性 | localhost 管理面板支持热更新 allowed roots、配额、脱敏诊断和受控服务重启；日志使用 `connectionRef`、`oauthClientRef` 和 `workspaceActivityRef`，不记录原始 Token 或主机路径。 |
 | 发布供应链 | Claude/Pi 改用用户已安装的 CLI，不再为未启用 provider 强制安装 Claude/Pi/Google SDK；基础文件工具由本地纯 Node 实现。MCP SDK 以已审计依赖树打包，minimatch/brace 固定为安全版本，规避上游 Hono 1.x advisory。`test:pack` 在全新消费者项目中默认安装 tarball、运行 CLI/SQLite/服务烟测并强制 `npm audit --omit=dev` 为 0。 |
@@ -723,11 +644,12 @@ node dist/cli.js doctor
 
 首次启动 2.0 时：
 
-- 主 `devspace.sqlite` 会在临时文件中转换为唯一的 canonical v14 schema，完成
+- 主 `devspace.sqlite` 会在临时文件中转换为唯一的 canonical v15 schema，完成
   integrity/foreign-key 校验后再原子替换；原文件保留为
-  `devspace.sqlite.pre-v14.<timestamp>.bak`。
+  `devspace.sqlite.pre-v15.<timestamp>.bak`。
 - 历史 `devspace` Token scope 只在迁移时展开为六个明确能力；2.0 运行时不再
   接受该 scope。
+- OAuth client 会迁移为独立 grant；token 固定关联 grant、principal 和 authorization epoch。
 - Workspace 会补齐 principal、alias、canonical root、write access 和 generation；
   不存在的 checkout 会关闭，同 principal 的重复 active checkout 只保留一个。
 - mutation replay 会移除旧 receipt/continuation 快照；claimed cleanup job 会回到

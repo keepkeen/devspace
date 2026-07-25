@@ -53,7 +53,7 @@ const config = loadConfig({
   DEVSPACE_ALLOWED_HOSTS: "*",
   DEVSPACE_PUBLIC_BASE_URL: publicBaseUrl,
   DEVSPACE_OAUTH_OWNER_TOKEN: "oauth-scope-test-owner-token-long-enough",
-  DEVSPACE_WIDGETS: "changes",
+  DEVSPACE_WIDGETS: "off",
   DEVSPACE_LOG_LEVEL: "silent",
   PORT: "1",
 });
@@ -84,6 +84,39 @@ const clients: Client[] = [];
 
 try {
   const readClient = await connect("scope-read", tokens.read);
+  const readToolsList = await readClient.listTools();
+  const readTools = new Set(readToolsList.tools.map((tool) => tool.name));
+  for (const name of [
+    "open_workspace",
+    "list_workspaces",
+    "resume_workspace",
+    "get_workspace_context",
+    "load_workspace_instructions",
+    "read",
+    "batch_read",
+    "batch_inspect",
+    "show_changes",
+  ]) {
+    assert.equal(readTools.has(name), true, `${name} must be visible to workspace:read grants`);
+  }
+  assert.equal(
+    readToolsList.tools.find((tool) => tool.name === "show_changes")?._meta,
+    undefined,
+    "widgets=off must expose show_changes without widget metadata",
+  );
+  for (const name of [
+    "get_operation_status",
+    "list_skills",
+    "load_skill",
+    "apply_patch",
+    "exec_command",
+    "write_stdin",
+    "read_process_output",
+    "close_workspace",
+    "revoke_workspace",
+  ]) {
+    assert.equal(readTools.has(name), false, `${name} must be hidden from workspace:read grants`);
+  }
   const readOpen = await readClient.callTool({
     name: "open_workspace",
     arguments: { path: workspaceRoot, alias: "read", contextMode: "full" },
@@ -99,6 +132,10 @@ try {
     arguments: { receipt: readReceipt },
   });
   assertSucceeded(readOnlyChangePreview);
+  assert.ok(
+    Array.isArray(readOnlyChangePreview.content) && readOnlyChangePreview.content.length > 0,
+    "widgets=off must still return ordinary model-visible change text",
+  );
   assert.equal(
     (readOnlyChangePreview.structuredContent as {
       effects?: { reviewCheckpoint?: { advanced?: unknown } };
@@ -113,7 +150,7 @@ try {
       operationId: "read-scope-review-advance",
     },
   }), "workspace:write");
-  assertScopeDenied(await readClient.callTool({
+  await assertToolUnavailable(readClient.callTool({
     name: "apply_patch",
     arguments: {
       receipt: readReceipt,
@@ -121,7 +158,7 @@ try {
       ifMatch: { "read-denied.txt": null },
       patch: "*** Begin Patch\n*** Add File: read-denied.txt\n+denied\n*** End Patch",
     },
-  }), "workspace:write");
+  }), "apply_patch");
   assertScopeDenied(await readClient.callTool({
     name: "open_workspace",
     arguments: {
@@ -134,12 +171,17 @@ try {
     name: "open_workspace",
     arguments: { path: workspaceRoot, alias: "worktree-denied", mode: "worktree" },
   }), "workspace:write");
-  assertScopeDenied(await readClient.callTool({
+  await assertToolUnavailable(readClient.callTool({
     name: "close_workspace",
     arguments: { receipt: readReceipt, operationId: "read-close-denied" },
-  }), "workspace:revoke");
+  }), "close_workspace");
 
   const writeClient = await connect("scope-write", tokens.write);
+  const writeTools = new Set((await writeClient.listTools()).tools.map((tool) => tool.name));
+  assert.equal(writeTools.has("apply_patch"), true);
+  assert.equal(writeTools.has("show_changes"), true);
+  assert.equal(writeTools.has("exec_command"), false);
+  assert.equal(writeTools.has("close_workspace"), false);
   const writeOpen = await writeClient.callTool({
     name: "open_workspace",
     arguments: {
@@ -186,7 +228,7 @@ try {
     } | undefined)?.effects?.reviewCheckpoint?.advanced,
     true,
   );
-  assertScopeDenied(await writeClient.callTool({
+  await assertToolUnavailable(writeClient.callTool({
     name: "exec_command",
     arguments: {
       receipt: writeReceipt,
@@ -194,13 +236,17 @@ try {
       program: process.execPath,
       args: ["-e", "console.log('denied')"],
     },
-  }), "process:execute");
+  }), "exec_command");
   assertScopeDenied(await writeClient.callTool({
     name: "open_workspace",
     arguments: { path: workspaceRoot, alias: "worktree-create-denied", mode: "worktree" },
   }), "worktree:create");
 
   const processClient = await connect("scope-process", tokens.processNoNetwork);
+  const processTools = new Set((await processClient.listTools()).tools.map((tool) => tool.name));
+  assert.equal(processTools.has("write_stdin"), true, JSON.stringify([...processTools]));
+  assert.equal(processTools.has("read_process_output"), true, JSON.stringify([...processTools]));
+  assert.equal(processTools.has("exec_command"), false);
   const processOpen = await processClient.callTool({
     name: "open_workspace",
     arguments: {
@@ -211,7 +257,7 @@ try {
     },
   });
   assertSucceeded(processOpen);
-  assertScopeDenied(await processClient.callTool({
+  await assertToolUnavailable(processClient.callTool({
     name: "exec_command",
     arguments: {
       receipt: receipt(processOpen),
@@ -219,7 +265,7 @@ try {
       program: process.execPath,
       args: ["-e", "console.log('network capability required')"],
     },
-  }), "network:access");
+  }), "exec_command");
 
   const sharedFullClient = await connect("scope-shared-full", tokens.sharedFull);
   const sharedNoNetworkClient = await connect(
@@ -227,6 +273,7 @@ try {
     tokens.sharedNoNetwork,
   );
   const sharedNoReadClient = await connect("scope-shared-no-read", tokens.sharedNoRead);
+  await assert.rejects(sharedNoReadClient.listTools(), /Method not found/u);
   const sharedOpen = await sharedFullClient.callTool({
     name: "open_workspace",
     arguments: {
@@ -257,7 +304,7 @@ try {
     sessionId?: unknown;
   } | undefined)?.sessionId;
   assert.equal(typeof sharedSessionId, "number");
-  assertScopeDenied(await sharedNoReadClient.callTool({
+  await assertToolUnavailable(sharedNoReadClient.callTool({
     name: "exec_command",
     arguments: {
       receipt: sharedReceipt,
@@ -265,16 +312,16 @@ try {
       program: process.execPath,
       args: ["-e", "console.log('denied')"],
     },
-  }), "workspace:read");
-  assertScopeDenied(await sharedNoReadClient.callTool({
+  }), "exec_command");
+  await assertToolUnavailable(sharedNoReadClient.callTool({
     name: "read_process_output",
     arguments: {
       receipt: sharedReceipt,
       outputId: "scope-denied-output",
       offset: 0,
     },
-  }), "workspace:read");
-  assertScopeDenied(await sharedNoReadClient.callTool({
+  }), "read_process_output");
+  await assertToolUnavailable(sharedNoReadClient.callTool({
     name: "write_stdin",
     arguments: {
       receipt: sharedReceipt,
@@ -282,7 +329,7 @@ try {
       sessionId: sharedSessionId,
       chars: "input",
     },
-  }), "workspace:read");
+  }), "write_stdin");
   assertScopeDenied(await sharedNoNetworkClient.callTool({
     name: "write_stdin",
     arguments: {
@@ -447,6 +494,22 @@ function assertScopeDenied(
   assert.equal(error?.code, "insufficient_scope");
   assert.equal(error?.recovery, "reauthorize_oauth");
   assert.match(JSON.stringify(result.content), new RegExp(expectedScope.replace(":", "\\:")));
+}
+
+async function assertToolUnavailable(
+  resultPromise: Promise<Awaited<ReturnType<Client["callTool"]>>>,
+  toolName: string,
+): Promise<void> {
+  let result: Awaited<ReturnType<Client["callTool"]>>;
+  try {
+    result = await resultPromise;
+  } catch (error) {
+    assert.match(String(error), /Method not found/u);
+    return;
+  }
+  assert.equal(result.isError, true, JSON.stringify(result.content));
+  assert.match(JSON.stringify(result.content), new RegExp(`Tool ${toolName} not found`));
+  assert.equal(result.structuredContent, undefined);
 }
 
 function hashToken(token: string): string {

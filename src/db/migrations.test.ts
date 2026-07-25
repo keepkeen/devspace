@@ -13,13 +13,16 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import Database from "better-sqlite3";
 import { DEVSPACE_CAPABILITY_SCOPES } from "../oauth-scopes.js";
-import { CURRENT_DATABASE_SCHEMA_VERSION } from "./canonical-schema.js";
+import {
+  CURRENT_DATABASE_SCHEMA_NAME,
+  CURRENT_DATABASE_SCHEMA_VERSION,
+} from "./canonical-schema.js";
 import { prepareDatabaseFile } from "./migrations.js";
 
-const root = mkdtempSync(join(tmpdir(), "devspace-v14-migrations-"));
+const root = mkdtempSync(join(tmpdir(), "devspace-v15-migrations-"));
 
 try {
-  for (const version of [1, 4, 5, 7, 8, 10, 11, 13]) {
+  for (const version of [1, 4, 5, 7, 8, 10, 11, 13, 14]) {
     testHistoricalVersion(version);
   }
   testAmbiguousOwnershipIsAtomic();
@@ -46,7 +49,7 @@ function testHistoricalVersion(version: number): void {
     assert.deepEqual(database.pragma("foreign_key_check"), []);
     assert.deepEqual(
       database.prepare("select version, name from devspace_schema_migrations").all(),
-      [{ version: CURRENT_DATABASE_SCHEMA_VERSION, name: "canonical-state-v14" }],
+      [{ version: CURRENT_DATABASE_SCHEMA_VERSION, name: CURRENT_DATABASE_SCHEMA_NAME }],
     );
     const columns = database.prepare("pragma table_info(workspace_sessions)").all() as Array<{
       name: string;
@@ -55,6 +58,10 @@ function testHistoricalVersion(version: number): void {
     assert.equal(columns.some((column) => column.name === "connection_principal_id"), true);
     assert.equal(columns.some((column) => column.name === "owner_client_id"), false);
     assert.equal(columns.find((column) => column.name === "alias")?.notnull, 1);
+    const clientColumns = database.prepare("pragma table_info(oauth_clients)").all() as Array<{
+      name: string;
+    }>;
+    assert.equal(clientColumns.some((column) => column.name === "principal_id"), false);
 
     const workspace = database.prepare(`
       select
@@ -83,6 +90,27 @@ function testHistoricalVersion(version: number): void {
     assert.equal(workspace.writeAccess, "read_write");
     assert.equal(workspace.stateGeneration, version >= 7 ? 7 : 1);
 
+    const grant = database.prepare(`
+      select
+        grant_id as grantId,
+        client_id as clientId,
+        principal_id as principalId,
+        authorization_epoch as authorizationEpoch,
+        granted_scopes_json as scopesJson
+      from oauth_grants
+    `).get() as {
+      grantId: string;
+      clientId: string;
+      principalId: string;
+      authorizationEpoch: number;
+      scopesJson: string;
+    };
+    assert.match(grant.grantId, /^grant-[A-Za-z0-9_-]+$/u);
+    assert.equal(grant.clientId, "client-a");
+    assert.equal(grant.principalId, version >= 11 ? "principal-a" : "client-a");
+    assert.equal(grant.authorizationEpoch, 1);
+    assert.deepEqual(JSON.parse(grant.scopesJson), [...DEVSPACE_CAPABILITY_SCOPES]);
+
     if (version === 7) {
       const result = JSON.parse(database.prepare(
         "select result_json from mutation_operations where operation_id = 'operation-v7'",
@@ -105,6 +133,18 @@ function testHistoricalVersion(version: number): void {
         "select scopes_json from oauth_access_tokens where token_hash = 'legacy-full-token'",
       ).pluck().get() as string);
       assert.deepEqual(scopes, [...DEVSPACE_CAPABILITY_SCOPES]);
+      assert.deepEqual(database.prepare(`
+        select
+          grant_id as grantId,
+          principal_id as principalId,
+          authorization_epoch as authorizationEpoch
+        from oauth_access_tokens
+        where token_hash = 'legacy-full-token'
+      `).get(), {
+        grantId: grant.grantId,
+        principalId: "principal-a",
+        authorizationEpoch: 1,
+      });
       assert.equal(
         database.prepare(
           "select count(*) from oauth_access_tokens where token_hash = 'invalid-token'",
@@ -136,7 +176,7 @@ function testAmbiguousOwnershipIsAtomic(): void {
   );
   assert.equal(fileHash(databasePath), before);
   assert.equal(
-    readdirSync(directory).some((name) => name.includes("v14-migrating") || name.includes("pre-v14")),
+    readdirSync(directory).some((name) => name.includes("v15-migrating") || name.includes("pre-v15")),
     false,
   );
 }
@@ -339,4 +379,4 @@ function fileHash(path: string): string {
   return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
 
-console.log("canonical v14 migration matrix passed");
+console.log("canonical v15 migration matrix passed");

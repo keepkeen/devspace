@@ -6,6 +6,7 @@ import type { OAuthConfig } from "./oauth-provider.js";
 import {
   DEFAULT_DEVSPACE_OAUTH_SCOPES,
   DEVSPACE_CAPABILITY_SCOPES,
+  FULL_DEVSPACE_OAUTH_SCOPES,
 } from "./oauth-scopes.js";
 import { MAX_TIMER_MS, RESOURCE_LIMIT_MAXIMUMS } from "./resource-limits.js";
 import { normalizeProjectDocFallbackFilenames } from "./project-instructions.js";
@@ -17,6 +18,7 @@ import {
 } from "./user-config.js";
 
 export type WidgetMode = "off" | "changes" | "full";
+export type McpHttpTransportMode = "stateless" | "stateful";
 const DEFAULT_OAUTH_ACCESS_TOKEN_TTL_SECONDS = 60 * 60;
 const DEFAULT_OAUTH_REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
 
@@ -48,6 +50,7 @@ export interface ServerConfig {
   allowedRoots: string[];
   allowedHosts: string[];
   publicBaseUrl: string;
+  mcpHttpTransport: McpHttpTransportMode;
   widgets: WidgetMode;
   stateDir: string;
   worktreeRoot: string;
@@ -160,7 +163,7 @@ function parseStringList(value: string | undefined, fallback: string[]): string[
 }
 
 function parseOAuthScopes(value: string | undefined): string[] {
-  const scopes = [...new Set(parseStringList(value, [...DEFAULT_DEVSPACE_OAUTH_SCOPES]))];
+  const scopes = [...new Set(parseStringList(value, [...FULL_DEVSPACE_OAUTH_SCOPES]))];
   const invalid = scopes.filter(
     (scope) => !DEVSPACE_CAPABILITY_SCOPES.includes(scope as never),
   );
@@ -322,6 +325,18 @@ function parseWidgetMode(value: string | undefined, configuredMode?: WidgetMode)
   throw new Error(`Invalid DEVSPACE_WIDGETS: ${value}`);
 }
 
+function parseMcpHttpTransport(
+  value: string | undefined,
+  configuredMode?: McpHttpTransportMode,
+): McpHttpTransportMode {
+  const mode = value?.trim().toLowerCase();
+  if (!mode) return configuredMode ?? "stateless";
+  if (mode === "stateless" || mode === "stateful") return mode;
+  throw new Error(
+    `Invalid DEVSPACE_MCP_HTTP_TRANSPORT: ${value} (expected stateless or stateful)`,
+  );
+}
+
 function parseRequiredSecret(value: string | undefined, name: string): string {
   const secret = value?.trim();
   if (!secret) {
@@ -394,6 +409,10 @@ export function loadConfigForAdmin(env: NodeJS.ProcessEnv = process.env): Server
     allowedRoots: parseAllowedRoots(env.DEVSPACE_ALLOWED_ROOTS ?? files.config.allowedRoots),
     allowedHosts: parseAllowedHosts(env.DEVSPACE_ALLOWED_HOSTS, derivedAllowedHosts),
     publicBaseUrl,
+    mcpHttpTransport: parseMcpHttpTransport(
+      env.DEVSPACE_MCP_HTTP_TRANSPORT,
+      files.config.mcpHttpTransport,
+    ),
     widgets: parseWidgetMode(env.DEVSPACE_WIDGETS, files.config.widgets),
     stateDir: resolve(expandHomePath(env.DEVSPACE_STATE_DIR ?? files.config.stateDir ?? defaultStateDir())),
     worktreeRoot: resolve(expandHomePath(env.DEVSPACE_WORKTREE_ROOT ?? files.config.worktreeRoot ?? defaultWorktreeRoot())),

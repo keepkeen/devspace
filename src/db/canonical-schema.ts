@@ -1,8 +1,8 @@
 import type Database from "better-sqlite3";
 import { DEVSPACE_CAPABILITY_SCOPES } from "../oauth-scopes.js";
 
-export const CURRENT_DATABASE_SCHEMA_VERSION = 14 as const;
-export const CURRENT_DATABASE_SCHEMA_NAME = "canonical-state-v14";
+export const CURRENT_DATABASE_SCHEMA_VERSION = 15 as const;
+export const CURRENT_DATABASE_SCHEMA_NAME = "canonical-state-v15";
 
 export function createCanonicalSchema(sqlite: Database.Database): void {
   sqlite.exec(`
@@ -24,18 +24,40 @@ export function createCanonicalSchema(sqlite: Database.Database): void {
 
     create table if not exists oauth_clients (
       client_id text primary key,
-      principal_id text,
       client_json text not null,
-      issued_at integer not null,
-      foreign key (principal_id)
-        references connection_principals(principal_id)
+      issued_at integer not null
     );
 
     create index if not exists oauth_clients_issued_at_idx
       on oauth_clients(issued_at desc);
 
-    create index if not exists oauth_clients_principal_id_idx
-      on oauth_clients(principal_id);
+    create table if not exists oauth_grants (
+      grant_id text primary key,
+      client_id text not null,
+      principal_id text not null,
+      subject_hash text,
+      organization_hash text,
+      granted_scopes_json text not null,
+      authorization_epoch integer not null check (authorization_epoch >= 1),
+      created_at text not null,
+      last_used_at text not null,
+      revoked_at text,
+      foreign key (client_id)
+        references oauth_clients(client_id)
+        on delete cascade,
+      foreign key (principal_id)
+        references connection_principals(principal_id),
+      unique (grant_id, principal_id, client_id)
+    );
+
+    create index if not exists oauth_grants_client_id_idx
+      on oauth_grants(client_id, last_used_at desc);
+
+    create index if not exists oauth_grants_principal_id_idx
+      on oauth_grants(principal_id, last_used_at desc);
+
+    create index if not exists oauth_grants_subject_hash_idx
+      on oauth_grants(subject_hash);
 
     create table if not exists workspace_sessions (
       id text primary key,
@@ -118,34 +140,56 @@ export function createCanonicalSchema(sqlite: Database.Database): void {
 
     create table if not exists oauth_access_tokens (
       token_hash text primary key,
+      grant_id text not null,
       client_id text not null,
+      principal_id text not null,
+      authorization_epoch integer not null check (authorization_epoch >= 1),
       scopes_json text not null,
       expires_at integer not null,
       resource text,
       foreign key (client_id)
         references oauth_clients(client_id)
+        on delete cascade,
+      foreign key (principal_id)
+        references connection_principals(principal_id),
+      foreign key (grant_id, principal_id, client_id)
+        references oauth_grants(grant_id, principal_id, client_id)
         on delete cascade
     );
 
     create index if not exists oauth_access_tokens_client_id_idx
       on oauth_access_tokens(client_id);
 
+    create index if not exists oauth_access_tokens_grant_id_idx
+      on oauth_access_tokens(grant_id);
+
     create index if not exists oauth_access_tokens_expires_at_idx
       on oauth_access_tokens(expires_at);
 
     create table if not exists oauth_refresh_tokens (
       token_hash text primary key,
+      grant_id text not null,
       client_id text not null,
+      principal_id text not null,
+      authorization_epoch integer not null check (authorization_epoch >= 1),
       scopes_json text not null,
       expires_at integer not null,
       resource text,
       foreign key (client_id)
         references oauth_clients(client_id)
+        on delete cascade,
+      foreign key (principal_id)
+        references connection_principals(principal_id),
+      foreign key (grant_id, principal_id, client_id)
+        references oauth_grants(grant_id, principal_id, client_id)
         on delete cascade
     );
 
     create index if not exists oauth_refresh_tokens_client_id_idx
       on oauth_refresh_tokens(client_id);
+
+    create index if not exists oauth_refresh_tokens_grant_id_idx
+      on oauth_refresh_tokens(grant_id);
 
     create index if not exists oauth_refresh_tokens_expires_at_idx
       on oauth_refresh_tokens(expires_at);
@@ -273,20 +317,19 @@ export function createCanonicalSchema(sqlite: Database.Database): void {
         select raise(abort, 'revoked workspace session is terminal');
       end;
 
-    create trigger if not exists oauth_clients_principal_insert_check
-      before insert on oauth_clients
-      when new.principal_id is not null
-        and not exists (
-          select 1 from connection_principals
-          where principal_id = new.principal_id and revoked_at is null
-        )
+    create trigger if not exists oauth_grants_principal_insert_check
+      before insert on oauth_grants
+      when not exists (
+        select 1 from connection_principals
+        where principal_id = new.principal_id and revoked_at is null
+      )
       begin
         select raise(abort, 'invalid connection principal');
       end;
 
-    create trigger if not exists oauth_clients_principal_update_check
-      before update of principal_id on oauth_clients
-      when new.principal_id is not null
+    create trigger if not exists oauth_grants_principal_update_check
+      before update of principal_id on oauth_grants
+      when new.principal_id is not old.principal_id
         and not exists (
           select 1 from connection_principals
           where principal_id = new.principal_id and revoked_at is null
@@ -298,7 +341,7 @@ export function createCanonicalSchema(sqlite: Database.Database): void {
     create trigger if not exists connection_principals_delete_check
       before delete on connection_principals
       when exists (
-        select 1 from oauth_clients where principal_id = old.principal_id
+        select 1 from oauth_grants where principal_id = old.principal_id
       )
       or exists (
         select 1 from workspace_sessions
@@ -344,12 +387,19 @@ export function validateCanonicalDatabase(sqlite: Database.Database): void {
     throw new Error("Database does not use the canonical DevSpace schema.");
   }
 
-  const legacyColumns = sqlite.prepare(`
+  const legacyWorkspaceColumns = sqlite.prepare(`
     select name
     from pragma_table_info('workspace_sessions')
     where name in ('owner_client_id')
   `).all() as Array<{ name: string }>;
-  if (legacyColumns.length > 0) throw new Error("Canonical database still contains legacy owner columns.");
+  const legacyClientColumns = sqlite.prepare(`
+    select name
+    from pragma_table_info('oauth_clients')
+    where name = 'principal_id'
+  `).all() as Array<{ name: string }>;
+  if (legacyWorkspaceColumns.length > 0 || legacyClientColumns.length > 0) {
+    throw new Error("Canonical database still contains legacy owner columns.");
+  }
 
   const invalidWorkspace = sqlite.prepare(`
     select id
@@ -387,19 +437,69 @@ export function validateCanonicalDatabase(sqlite: Database.Database): void {
     throw new Error("Canonical database contains cleanup claims owned by an earlier process.");
   }
 
+  const grants = sqlite.prepare(`
+    select grant_id as grantId, granted_scopes_json as scopesJson
+    from oauth_grants
+    where authorization_epoch < 1
+       or not exists (
+         select 1 from connection_principals as principal
+         where principal.principal_id = oauth_grants.principal_id
+           and principal.revoked_at is null
+       )
+  `).all() as Array<{ grantId: string; scopesJson: string }>;
+  if (grants.length > 0) {
+    throw new Error(`Canonical OAuth grant invariant failed for ${grants[0]!.grantId}.`);
+  }
+
+  for (const row of sqlite.prepare(`
+    select grant_id as grantId, granted_scopes_json as scopesJson
+    from oauth_grants
+  `).all() as Array<{ grantId: string; scopesJson: string }>) {
+    assertCanonicalScopes(row.scopesJson, `grant ${row.grantId}`);
+  }
+
   for (const table of ["oauth_access_tokens", "oauth_refresh_tokens"] as const) {
     const rows = sqlite
-      .prepare(`select token_hash as tokenHash, scopes_json as scopesJson from ${table}`)
-      .all() as Array<{ tokenHash: string; scopesJson: string }>;
+      .prepare(`
+        select
+          token.token_hash as tokenHash,
+          token.scopes_json as scopesJson,
+          token.authorization_epoch as authorizationEpoch,
+          grant.authorization_epoch as grantEpoch,
+          grant.revoked_at as grantRevokedAt
+        from ${table} as token
+        left join oauth_grants as grant
+          on grant.grant_id = token.grant_id
+         and grant.principal_id = token.principal_id
+         and grant.client_id = token.client_id
+      `)
+      .all() as Array<{
+        tokenHash: string;
+        scopesJson: string;
+        authorizationEpoch: number;
+        grantEpoch: number | null;
+        grantRevokedAt: string | null;
+      }>;
     for (const row of rows) {
-      const scopes = JSON.parse(row.scopesJson) as unknown;
+      assertCanonicalScopes(row.scopesJson, `token ${row.tokenHash}`);
       if (
-        !Array.isArray(scopes) ||
-        scopes.length === 0 ||
-        scopes.some((scope) => !DEVSPACE_CAPABILITY_SCOPES.includes(scope as never))
+        row.grantEpoch === null ||
+        row.grantRevokedAt !== null ||
+        row.authorizationEpoch !== row.grantEpoch
       ) {
-        throw new Error(`Canonical OAuth scope invariant failed for token ${row.tokenHash}.`);
+        throw new Error(`Canonical OAuth token grant invariant failed for ${row.tokenHash}.`);
       }
     }
+  }
+}
+
+function assertCanonicalScopes(scopesJson: string, context: string): void {
+  const scopes = JSON.parse(scopesJson) as unknown;
+  if (
+    !Array.isArray(scopes) ||
+    scopes.length === 0 ||
+    scopes.some((scope) => !DEVSPACE_CAPABILITY_SCOPES.includes(scope as never))
+  ) {
+    throw new Error(`Canonical OAuth scope invariant failed for ${context}.`);
   }
 }

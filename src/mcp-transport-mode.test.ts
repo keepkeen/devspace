@@ -7,30 +7,10 @@ import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { loadConfig } from "./config.js";
+import { internalDiagnosticsToken } from "./internal-auth.js";
 import { DEFAULT_DEVSPACE_OAUTH_SCOPES } from "./oauth-scopes.js";
 import { SqliteOAuthClientsStore, SqliteOAuthStore } from "./oauth-store.js";
-import { createServer, isChatGptOAuthClient } from "./server.js";
-
-assert.equal(isChatGptOAuthClient({
-  redirect_uris: ["https://chatgpt.com/connector/oauth/test"],
-}), true);
-assert.equal(isChatGptOAuthClient({
-  redirect_uris: ["https://chatgpt.com.evil.example/connector/oauth/test"],
-}), false);
-assert.equal(isChatGptOAuthClient({
-  redirect_uris: [
-    "https://chatgpt.com/connector/oauth/test",
-    "http://127.0.0.1/callback",
-  ],
-}), false);
-assert.equal(isChatGptOAuthClient({ redirect_uris: [] }), false);
-assert.equal(isChatGptOAuthClient({
-  redirect_uris: ["http://127.0.0.1/callback"],
-}), false);
-assert.equal(isChatGptOAuthClient({
-  redirect_uris: ["http://chatgpt.com/connector/oauth/test"],
-}), false);
-assert.equal(isChatGptOAuthClient({ redirect_uris: ["not-a-url"] }), false);
+import { createServer } from "./server.js";
 
 const root = await mkdtemp(join(tmpdir(), "devspace-mcp-transport-mode-"));
 const workspaceRoot = join(root, "workspace");
@@ -61,9 +41,9 @@ const config = loadConfig({
   DEVSPACE_LOG_FORMAT: "json",
   DEVSPACE_MAX_MCP_SESSIONS: "2",
   DEVSPACE_MAX_MCP_SESSIONS_PER_CLIENT: "1",
+  DEVSPACE_MCP_HTTP_TRANSPORT: "stateless",
 });
-seedClient(chatGptToken, "https://chatgpt.com/connector/oauth/transport-test", "chatgpt");
-seedClient(statefulToken, "http://127.0.0.1/stateful-callback", "stateful");
+seedClient(chatGptToken, "https://chatgpt.com/connector/oauth/transport-test", "chatgpt", stateDir, config);
 
 const running = createServer(config);
 const httpServer = createHttpServer(running.app);
@@ -93,9 +73,11 @@ try {
     } | undefined)?.continuation?.receipt ?? "",
   );
   const firstContextReceipt = receipt;
-  assert.match(receipt, /^wctx4\./);
+  assert.match(receipt, /^wctx5\./);
   const instructionRevision = String(
-    (opened.structuredContent as { instructions?: { revision?: unknown } } | undefined)?.instructions?.revision ?? "",
+    (opened.structuredContent as {
+      instructionManifest?: { revision?: unknown };
+    } | undefined)?.instructionManifest?.revision ?? "",
   );
   assert.ok(instructionRevision);
   const unverifiedRetainedOpen = await firstChatGpt.callTool({
@@ -122,9 +104,9 @@ try {
     },
   });
   const compactStructured = compactReopen.structuredContent as {
-    instructions?: { items?: unknown };
+    instructionManifest?: { files?: unknown };
   } | undefined;
-  assert.deepEqual(compactStructured?.instructions?.items, []);
+  assert.deepEqual(compactStructured?.instructionManifest?.files, []);
 
   const getResponse = await fetch(new URL("/mcp", origin), {
     headers: { authorization: `Bearer ${chatGptToken}` },
@@ -147,7 +129,7 @@ try {
   const instructionToken = String(
     (loadedInstructions.structuredContent as { instructionToken?: unknown } | undefined)?.instructionToken ?? "",
   );
-  assert.equal(instructionToken, "");
+  assert.match(instructionToken, /^instructions_/);
   const nestedInstructions = await firstChatGpt.callTool({
     name: "load_workspace_instructions",
     arguments: { receipt, paths: ["nested"] },
@@ -160,7 +142,13 @@ try {
 
   const heldCommand = firstChatGpt.callTool({
     name: "exec_command",
-    arguments: { receipt, shell: true, command: "sleep 0.25", yieldTimeMs: 1_000 },
+    arguments: {
+      receipt,
+      instructionToken,
+      shell: true,
+      command: "sleep 0.25",
+      yieldTimeMs: 1_000,
+    },
   });
   await delay(50);
   const overCapacity = await rawMcpPost(origin, chatGptToken, "concurrent-chatgpt-session");
@@ -170,12 +158,104 @@ try {
   const afterCapacityRelease = await rawMcpPost(origin, chatGptToken, "released-chatgpt-session");
   assert.equal(afterCapacityRelease.status, 200);
 
+  const disconnectProcess = await firstChatGpt.callTool({
+    name: "exec_command",
+    arguments: {
+      receipt,
+      program: process.execPath,
+      args: [
+        "-e",
+        "process.stdin.once('data', () => process.exit(0)); setInterval(() => {}, 1000);",
+      ],
+      closeStdin: false,
+      yieldTimeMs: 0,
+    },
+  });
+  const disconnectSessionId = (disconnectProcess.structuredContent as {
+    sessionId?: unknown;
+  } | undefined)?.sessionId;
+  assert.equal(typeof disconnectSessionId, "number");
+
   await firstChatGpt.close();
+
+  for (let index = 0; index < 8; index += 1) {
+    await abortStatelessToolCallAfterLease({
+      origin,
+      accessToken: chatGptToken,
+      ownerToken: config.oauth.ownerToken,
+      requestId: 200 + index,
+      body: {
+        jsonrpc: "2.0",
+        id: 200 + index,
+        method: "tools/call",
+        params: {
+          name: "write_stdin",
+          _meta: {
+            "openai/subject": `subject-${chatGptToken}`,
+            "openai/session": "chatgpt-one",
+          },
+          arguments: {
+            receipt,
+            sessionId: disconnectSessionId,
+            yieldTimeMs: 5_000,
+          },
+        },
+      },
+    });
+  }
+
+  const listAfterEightDisconnects = await fetch(new URL("/mcp", origin), {
+    method: "POST",
+    headers: {
+      accept: "application/json, text/event-stream",
+      authorization: `Bearer ${chatGptToken}`,
+      "content-type": "application/json",
+      "mcp-protocol-version": "2025-06-18",
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 300,
+      method: "tools/call",
+      params: {
+        name: "list_workspaces",
+        _meta: {
+          "openai/subject": `subject-${chatGptToken}`,
+          "openai/session": "chatgpt-one",
+        },
+        arguments: {},
+      },
+    }),
+  });
+  assert.equal(
+    listAfterEightDisconnects.status,
+    200,
+    "eight canceled stateless polls must not exhaust the client request limit",
+  );
+  assert.doesNotMatch(await listAfterEightDisconnects.text(), /MCP request capacity reached/);
 
   const secondObserved: ObservedResponse[] = [];
   const secondChatGpt = await connectClient("chatgpt-two", chatGptToken, origin, secondObserved);
   clients.push(secondChatGpt);
   assert.equal(secondObserved.some((entry) => entry.sessionId !== null), false);
+  const processAfterDisconnects = await secondChatGpt.callTool({
+    name: "write_stdin",
+    arguments: { receipt, sessionId: disconnectSessionId, yieldTimeMs: 0 },
+  });
+  assert.notEqual(
+    processAfterDisconnects.isError,
+    true,
+    "releasing a disconnected HTTP lease must not cancel the tracked process",
+  );
+  const stopDisconnectProcess = await secondChatGpt.callTool({
+    name: "write_stdin",
+    arguments: {
+      receipt,
+      sessionId: disconnectSessionId,
+      chars: "x",
+      yieldTimeMs: 1_000,
+    },
+  });
+  assert.notEqual(stopDisconnectProcess.isError, true);
   const directReuseAfterTransportClose = await secondChatGpt.callTool({
     name: "read",
     arguments: { receipt, path: "payload.txt" },
@@ -187,16 +267,36 @@ try {
   });
   const freshStructured = freshConversationOpen.structuredContent as {
     continuation?: { receipt?: unknown };
-    instructions?: { items?: unknown[] };
+    instructionManifest?: { files?: unknown[] };
   } | undefined;
-  assert.ok((freshStructured?.instructions?.items?.length ?? 0) > 0);
+  assert.ok((freshStructured?.instructionManifest?.files?.length ?? 0) > 0);
   receipt = String(freshStructured?.continuation?.receipt ?? "");
-  assert.match(receipt, /^wctx4\./);
+  assert.match(receipt, /^wctx5\./);
   const resumedMutationWithoutReload = await secondChatGpt.callTool({
     name: "exec_command",
     arguments: { receipt, shell: true, command: "pwd" },
   });
-  assert.notEqual(resumedMutationWithoutReload.isError, true);
+  assert.equal(resumedMutationWithoutReload.isError, true);
+  assert.equal(
+    (resumedMutationWithoutReload.structuredContent as {
+      error?: { code?: unknown };
+    } | undefined)?.error?.code,
+    "instructions_required",
+  );
+  const freshRootInstructions = await secondChatGpt.callTool({
+    name: "load_workspace_instructions",
+    arguments: { receipt, paths: ["."] },
+  });
+  const freshRootToken = String(
+    (freshRootInstructions.structuredContent as { instructionToken?: unknown } | undefined)
+      ?.instructionToken ?? "",
+  );
+  assert.match(freshRootToken, /^instructions_/);
+  const resumedMutationAfterLoad = await secondChatGpt.callTool({
+    name: "exec_command",
+    arguments: { receipt, instructionToken: freshRootToken, shell: true, command: "pwd" },
+  });
+  assert.notEqual(resumedMutationAfterLoad.isError, true);
   const originalContextStillAcknowledged = await secondChatGpt.callTool({
     name: "exec_command",
     arguments: { receipt: firstContextReceipt, shell: true, command: "pwd" },
@@ -237,9 +337,44 @@ try {
   });
   assert.match(JSON.stringify(reusedRead.content), /transport-mode-ok/);
 
+} finally {
+  for (const client of clients.reverse()) await client.close().catch(() => undefined);
+  await closeHttpServer(httpServer);
+  await running.close();
+}
+
+const statefulStateDir = join(root, "stateful-state");
+const statefulConfig = loadConfig({
+  DEVSPACE_CONFIG_DIR: join(root, "stateful-config"),
+  DEVSPACE_STATE_DIR: statefulStateDir,
+  DEVSPACE_ALLOWED_ROOTS: workspaceRoot,
+  DEVSPACE_ALLOWED_HOSTS: "*",
+  DEVSPACE_PUBLIC_BASE_URL: publicBaseUrl,
+  DEVSPACE_OAUTH_OWNER_TOKEN: "mcp-transport-owner-token-long-enough",
+  DEVSPACE_SKILLS: "0",
+  DEVSPACE_WIDGETS: "off",
+  DEVSPACE_LOG_LEVEL: "warn",
+  DEVSPACE_LOG_FORMAT: "json",
+  DEVSPACE_MCP_HTTP_TRANSPORT: "stateful",
+});
+seedClient(
+  statefulToken,
+  "http://127.0.0.1/stateful-callback",
+  "stateful",
+  statefulStateDir,
+  statefulConfig,
+);
+const statefulRunning = createServer(statefulConfig);
+const statefulHttpServer = createHttpServer(statefulRunning.app);
+try {
+  const statefulOrigin = await listen(statefulHttpServer);
   const statefulObserved: ObservedResponse[] = [];
-  const stateful = await connectClient("stateful-client", statefulToken, origin, statefulObserved);
-  clients.push(stateful);
+  const stateful = await connectClient(
+    "stateful-client",
+    statefulToken,
+    statefulOrigin,
+    statefulObserved,
+  );
   const statefulSessionId = statefulObserved.find((entry) => entry.sessionId)?.sessionId;
   assert.equal(typeof statefulSessionId, "string");
   await stateful.listTools();
@@ -251,7 +386,11 @@ try {
     warningLines.push(values.map(String).join(" "));
   };
   try {
-    staleStatefulResponse = await rawMcpPost(origin, statefulToken, "stale-stateful-session");
+    staleStatefulResponse = await rawMcpPost(
+      statefulOrigin,
+      statefulToken,
+      "stale-stateful-session",
+    );
   } finally {
     console.warn = originalWarn;
   }
@@ -266,10 +405,10 @@ try {
   const serializedLog = JSON.stringify(unknownSessionLog);
   assert.doesNotMatch(serializedLog, /stale-stateful-session/);
   assert.doesNotMatch(serializedLog, new RegExp(statefulToken));
+  await stateful.close();
 } finally {
-  for (const client of clients.reverse()) await client.close().catch(() => undefined);
-  await closeHttpServer(httpServer);
-  await running.close();
+  await closeHttpServer(statefulHttpServer);
+  await statefulRunning.close();
   await rm(root, { recursive: true, force: true });
 }
 
@@ -320,7 +459,15 @@ async function connectClient(
       operationSequence += 1;
       requestArguments.operationId = `${name}-auto-${operationSequence}`;
     }
-    callArgs[0] = { ...request, arguments: requestArguments };
+    callArgs[0] = {
+      ...request,
+      _meta: {
+        ...(request._meta ?? {}),
+        "openai/subject": `subject-${accessToken}`,
+        "openai/session": name,
+      },
+      arguments: requestArguments,
+    };
     return originalCallTool(...callArgs);
   }) as Client["callTool"];
   return client;
@@ -340,10 +487,81 @@ function rawMcpPost(origin: URL, accessToken: string, sessionId: string): Promis
   });
 }
 
-function seedClient(accessToken: string, redirectUri: string, name: string): void {
-  const store = new SqliteOAuthStore(stateDir);
+async function abortStatelessToolCallAfterLease(options: {
+  origin: URL;
+  accessToken: string;
+  ownerToken: string;
+  requestId: number;
+  body: Record<string, unknown>;
+}): Promise<void> {
+  await waitForStatelessRequestCount(options.origin, options.ownerToken, 0);
+  const controller = new AbortController();
+  const request = fetch(new URL("/mcp", options.origin), {
+    method: "POST",
+    headers: {
+      accept: "application/json, text/event-stream",
+      authorization: `Bearer ${options.accessToken}`,
+      "content-type": "application/json",
+      "mcp-protocol-version": "2025-06-18",
+    },
+    body: JSON.stringify(options.body),
+    signal: controller.signal,
+  });
+
+  await waitForStatelessRequestCount(options.origin, options.ownerToken, 1);
+  controller.abort();
+  const abortError = await request.then(
+    async (response) => {
+      try {
+        await response.text();
+        return undefined;
+      } catch (error) {
+        return error;
+      }
+    },
+    (error: unknown) => error,
+  );
+  assert.equal(
+    abortError instanceof Error ? abortError.name : undefined,
+    "AbortError",
+    `request ${options.requestId} must observe the client abort`,
+  );
+  await waitForStatelessRequestCount(options.origin, options.ownerToken, 0);
+}
+
+async function waitForStatelessRequestCount(
+  origin: URL,
+  ownerToken: string,
+  expected: number,
+): Promise<void> {
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
+    const response = await fetch(new URL("/internal/diagnostics", origin), {
+      headers: { "x-devspace-internal-token": internalDiagnosticsToken(ownerToken) },
+    });
+    assert.equal(response.status, 200);
+    const body = await response.json() as {
+      usage?: { mcpSessions?: { statelessRequests?: unknown } };
+    };
+    if (body.usage?.mcpSessions?.statelessRequests === expected) return;
+    await delay(10);
+  }
+  assert.fail(`stateless request count did not reach ${expected}`);
+}
+
+function seedClient(
+  accessToken: string,
+  redirectUri: string,
+  name: string,
+  targetStateDir: string,
+  targetConfig: ReturnType<typeof loadConfig>,
+): void {
+  const store = new SqliteOAuthStore(targetStateDir);
   try {
-    const clientsStore = new SqliteOAuthClientsStore(store, config.oauth.allowedRedirectHosts);
+    const clientsStore = new SqliteOAuthClientsStore(
+      store,
+      targetConfig.oauth.allowedRedirectHosts,
+    );
     const client = clientsStore.registerClient({
       redirect_uris: [redirectUri],
       client_name: name,

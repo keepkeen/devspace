@@ -123,7 +123,7 @@ try {
     } | undefined)?.continuation?.receipt ?? "",
   );
   assert.ok(workspaceId);
-  assert.match(receipt, /^wctx4\./);
+  assert.match(receipt, /^wctx5\./);
   const backgroundProcess = await mcpClient.callTool({
     name: "exec_command",
     arguments: {
@@ -150,10 +150,11 @@ try {
   });
   assert.equal(revocation.status, 200);
   const revoked = await revocation.json() as {
-    revoked?: { clients?: unknown; accessTokens?: unknown; refreshTokens?: unknown; workspaceCleanupJobs?: unknown };
+    revoked?: { clients?: unknown; grants?: unknown; accessTokens?: unknown; refreshTokens?: unknown; workspaceCleanupJobs?: unknown };
   };
   assert.deepEqual(revoked.revoked, {
     clients: 1,
+    grants: 2,
     accessTokens: 1,
     refreshTokens: 1,
     workspaceCleanupJobs: 1,

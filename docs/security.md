@@ -7,7 +7,7 @@ The security model is simple:
 
 - you choose a narrow filesystem allowlist
 - the MCP endpoint requires OAuth approval with your Owner password
-- local connection principals own Workspace and process state
+- OAuth authorization grants bind local principals, capabilities, and epochs
 - granular OAuth capabilities are checked again for every tool
 - Host headers are allowlisted from the configured public URL
 - every coding action happens through explicit MCP tool calls
@@ -62,41 +62,45 @@ When proxy trust is enabled, forwarded IP information is accepted only from a
 loopback direct peer. Do not expose the backend directly while also trusting
 arbitrary forwarding headers.
 
-## Connection Principals And Account Identity
+## Authorization Grants, Principals, And Host Identity
 
 OAuth `client_id` identifies a dynamic connector registration. It is not a
-verified ChatGPT account identity. Registration alone remains unassigned; after
-the Owner approves it successfully, DevSpace creates or explicitly reconnects a
-local connection principal and stores Workspace, process, output, and operation
-ownership under that principal.
+verified account identity and does not own Workspace state. Every successful
+Owner approval creates an authorization grant with a fixed local principal,
+granted scope set, and authorization epoch. Authorization codes, access tokens,
+and refresh tokens reference that grant directly. Refresh rotation preserves
+the original grant and never derives a principal from `clientId`.
 
-Newly approved registrations remain isolated by default. DevSpace does not
-claim that two principals are two different human accounts, nor that two
-registrations belong to the same account. A new registration joins an earlier principal only when
-the owner locally generates a one-time reconnect code:
+A fresh grant and principal are isolated by default. To deliberately reconnect
+a new grant to an earlier principal, generate a one-time code locally:
 
 ```bash
 devspace auth principals
 devspace auth reconnect-code <principal-id>
 ```
 
-Treat the reconnect code like a short-lived credential. Enter it only on the
-local DevSpace OAuth approval page. Do not send it through ChatGPT, commit it,
-or paste it into repository instructions. The code is stored hashed, expires,
-is consumed once, and cannot relink a source principal that already owns
-retained Workspace state. Tokens issued before a successful relink are revoked.
+Treat this code as a short-lived credential. It is stored hashed, expires, is
+consumed once, and must not be sent through ChatGPT or repository content.
+Tokens issued before a successful relink are revoked.
 
-If a future trusted identity provider supplies an authenticated issuer and
-subject, that claim can be bound to the same local principal model. No such
-ChatGPT account claim is assumed today.
+Tool calls may carry `openai/subject`, `openai/organization`, and
+`openai/session`. DevSpace stores only purpose-separated HMAC values under a
+server identity key. Subject and organization provide grant consistency,
+anonymous audit/rate-limit dimensions, and protection against using one token
+under another host subject. They are not credentials and never replace the OAuth
+bearer token. Raw values are not persisted.
 
-DevSpace also receives no trusted ChatGPT conversation ID. Conversations under
-one principal can see the same alias catalog, so the selected Workspace alias
-is the local continuity key. The model should resume that alias after reconnects
-or later turns instead of creating a replacement worktree. A missing managed
-worktree path is retained as recoverable state; rebuilding it can restore
-committed Git state but cannot guarantee recovery of physically lost,
-uncommitted files.
+For ChatGPT-style hosts, the session HMAC participates in a bounded server-side
+binding from the authorized principal/grant to one Workspace context. Generic
+MCP clients use an explicit `wctx5` receipt. An explicitly invalid receipt is
+never allowed to fall back to session state. Server restart clears these
+in-process bindings while retained aliases remain resumable.
+
+DevSpace still receives no trusted human account or conversation identity.
+Aliases are the durable local continuity key. New conversations and restarted
+servers must list and resume retained Workspaces rather than reopen remembered
+paths. Missing managed worktrees remain recoverable records; physically lost
+uncommitted files cannot be guaranteed.
 
 ## OAuth Capabilities
 
@@ -109,10 +113,12 @@ Version 2.0 uses only these explicit scopes:
 - `worktree:create`
 - `workspace:revoke`
 
-The approval page explains requested capabilities. Tool handlers enforce their
-actual combination immediately before execution, including conditional checks
-for writable checkouts, worktree creation, and mutating process input. A token
-that can read a Workspace cannot silently start a process or revoke it.
+If an authorization request omits `scope`, only `workspace:read` is granted.
+Elevated capabilities must be explicit. tools/list is filtered by the grant, and
+tool handlers enforce the actual combination immediately before execution,
+including conditional checks for writable checkouts, worktree creation, network
+inheritance, and mutating process input. A cached schema cannot turn a read token
+into process, write, or revoke authority.
 
 ## Public URL And Host Allowlist
 
@@ -178,10 +184,12 @@ writes to the user's current checkout require an explicit
 shell has been sandboxed.
 
 Direct `program` + `args` execution removes shell expansion and quoting
-ambiguity, but it is not an OS sandbox. `network: "deny"` fails closed unless a
-future runtime can enforce it. Workspace generations reject stale handles, and
-file `contentHash` preconditions reduce accidental concurrent overwrites; they
-do not replace OS isolation or coordination between users.
+ambiguity, but it is not an OS sandbox. Runtime capabilities explicitly report
+that the default implementation has no process sandbox, no per-process network
+isolation, and only guardrail-level filesystem confinement. Unsupported
+`network: "deny"` is removed from the tool schema rather than presented as a
+control that always fails. Workspace generations and file versions do not
+replace OS isolation.
 
 Spawned commands do not inherit the server's complete environment. DevSpace
 passes only basic executable-path, home/user, temporary-directory, locale, and
@@ -200,20 +208,27 @@ Do not retry a mutation unless `safeToRetry` is explicitly true.
 
 ## Concurrent Workspace Access
 
-Within one DevSpace server, Workspace-scoped calls use a fair read/write lock
-keyed by the canonical physical root rather than only by Workspace ID. Reads and
-inspection, including the default `show_changes` preview, can proceed together.
-Patches, commands, mutating `write_stdin`, explicit review-checkpoint
-advancement, close, and revoke are serialized even when different principals
-opened the same checkout.
+Workspace operations first use a fair process-local read/write queue keyed by
+the canonical physical root. Write operations additionally acquire a
+cross-process lock under a per-user lock directory, using hashed root keys so
+absolute paths are not disclosed. Reader markers, writer intent, and writer
+markers prevent writer starvation. Stale markers are reclaimed only after PID
+liveness checks, and lock timeouts return `workspace_root_busy` before effects.
 
-The write lease covers each MCP command or process-input call, not the entire
-lifetime of a returned background or interactive process. This avoids a dev
-server or shell locking the Workspace indefinitely. Later subprocess effects
-remain explicitly unknown, strict `ifMatch` protects file patches, and close or
-revoke stops tracked processes. Another independently configured DevSpace
-instance is outside the same in-process lock. Use separate managed worktrees, a
-dedicated OS account, or a container when stronger isolation is required.
+Reads and default change previews may overlap. Patches, commands, mutating
+process input, checkpoint advancement, close, and revoke serialize even when
+different principals or DevSpace state directories point at the same checkout.
+
+If `exec_command` returns a running background or interactive process, the
+write lease transfers to that process session and remains held until the entire
+process tree exits, is terminated, the Workspace closes or revokes, or the
+server shuts down. Polling and stdin tools operate on the existing lease rather
+than deadlocking by reacquiring it.
+
+This coordination covers DevSpace instances, not arbitrary external editors.
+Every patch therefore still requires strict `ifMatch` versions. Use separate
+managed worktrees, a dedicated OS account, container, or VM when stronger
+isolation is required.
 
 ## Worktrees
 
@@ -223,7 +238,9 @@ sessions.
 
 ## Logs
 
-By default, DevSpace logs requests and tool calls. Shell command previews are
-disabled unless `DEVSPACE_LOG_SHELL_COMMANDS=1`.
+By default, DevSpace logs requests and tool calls. Principal, client, grant,
+subject, organization, and session dimensions use opaque or HMAC-derived
+identifiers; raw host identity claims and bearer tokens are not logged. Shell
+command previews are disabled unless `DEVSPACE_LOG_SHELL_COMMANDS=1`.
 
 Do not enable shell command logging if commands may contain secrets.

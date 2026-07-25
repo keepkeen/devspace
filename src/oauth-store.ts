@@ -3,16 +3,23 @@ import type { OAuthRegisteredClientsStore } from "@modelcontextprotocol/sdk/serv
 import { InvalidRequestError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import type { OAuthClientInformationFull } from "@modelcontextprotocol/sdk/shared/auth.js";
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
+import { DEVSPACE_CAPABILITY_SCOPES } from "./oauth-scopes.js";
 
 export interface PersistedAccessTokenRecord {
+  grantId?: string;
   clientId: string;
+  principalId?: string;
+  authorizationEpoch?: number;
   scopes: string[];
   expiresAt: number;
   resource?: string;
 }
 
 export interface PersistedRefreshTokenRecord {
+  grantId?: string;
   clientId: string;
+  principalId?: string;
+  authorizationEpoch?: number;
   scopes: string[];
   expiresAt: number;
   resource?: string;
@@ -27,6 +34,7 @@ export interface PersistedTokenPair {
 
 export interface OAuthRevocationCounts {
   clients: number;
+  grants: number;
   accessTokens: number;
   refreshTokens: number;
   workspaceCleanupJobs: number;
@@ -44,7 +52,36 @@ export interface OAuthCleanupCounts {
   reconnectCodes: number;
   authorizationLimits: number;
   unapprovedClients: number;
+  orphanedGrants: number;
   revokedPrincipals: number;
+}
+
+export interface OAuthGrantRecord {
+  grantId: string;
+  clientId: string;
+  principalId: string;
+  subjectHash?: string;
+  organizationHash?: string;
+  grantedScopes: string[];
+  authorizationEpoch: number;
+  createdAt: string;
+  lastUsedAt: string;
+  revokedAt?: string;
+}
+
+export interface OAuthGrantCreationResult extends OAuthGrantRecord {
+  principalCreated: boolean;
+  reconnected: boolean;
+}
+
+export class OAuthGrantIdentityError extends Error {
+  constructor(
+    readonly code: "oauth_grant_invalid" | "host_identity_required" | "host_identity_mismatch",
+    message: string,
+  ) {
+    super(message);
+    this.name = "OAuthGrantIdentityError";
+  }
 }
 
 export type OAuthAuthorizationLimitScope = "session" | "client" | "ip" | "global";
@@ -120,6 +157,29 @@ interface AuthorizationLimitRow {
   blocked_until: number;
 }
 
+interface OAuthGrantRow {
+  grantId: string;
+  clientId: string;
+  principalId: string;
+  subjectHash: string | null;
+  organizationHash: string | null;
+  grantedScopesJson: string;
+  authorizationEpoch: number;
+  createdAt: string;
+  lastUsedAt: string;
+  revokedAt: string | null;
+}
+
+interface OAuthTokenRow {
+  grant_id: string;
+  client_id: string;
+  principal_id: string;
+  authorization_epoch: number;
+  scopes_json: string;
+  expires_at: number;
+  resource: string | null;
+}
+
 function redirectHostAllowed(redirectUri: string, allowedHosts: string[]): boolean {
   let parsed: URL;
   try {
@@ -151,16 +211,18 @@ export class SqliteOAuthStore {
   }
 
   principalForClient(clientId: string): string | undefined {
-    const row = this.database.sqlite
-      .prepare(`
-        select client.principal_id as principalId
-        from oauth_clients as client
-        inner join connection_principals as principal
-          on principal.principal_id = client.principal_id
-        where client.client_id = ? and principal.revoked_at is null
-      `)
-      .get(clientId) as { principalId: string } | undefined;
-    return row?.principalId;
+    const rows = this.database.sqlite.prepare(`
+      select distinct grant.principal_id as principalId
+      from oauth_grants as grant
+      inner join connection_principals as principal
+        on principal.principal_id = grant.principal_id
+      where grant.client_id = ?
+        and grant.revoked_at is null
+        and principal.revoked_at is null
+      order by grant.last_used_at desc
+      limit 2
+    `).all(clientId) as Array<{ principalId: string }>;
+    return rows.length === 1 ? rows[0]!.principalId : undefined;
   }
 
   touchPrincipal(principalId: string): boolean {
@@ -195,7 +257,10 @@ export class SqliteOAuthStore {
       const counts = this.database.sqlite.prepare(`
         select
           count(*) as total,
-          count(*) filter (where principal_id is null) as pending
+          count(*) filter (where not exists (
+            select 1 from oauth_grants as grant
+            where grant.client_id = oauth_clients.client_id
+          )) as pending
         from oauth_clients
       `).get() as { total: number; pending: number };
       if (counts.pending >= MAX_PENDING_OAUTH_CLIENTS) {
@@ -210,8 +275,8 @@ export class SqliteOAuthStore {
       }
       this.database.sqlite.prepare(`
         insert into oauth_clients (
-          client_id, principal_id, client_json, issued_at
-        ) values (?, null, ?, ?)
+          client_id, client_json, issued_at
+        ) values (?, ?, ?)
       `).run(registered.client_id, JSON.stringify(registered), now);
     });
     register.immediate();
@@ -224,38 +289,159 @@ export class SqliteOAuthStore {
   }
 
   ensurePrincipalAssignmentForClient(clientId: string): PrincipalAssignmentResult {
-    const ensure = this.database.sqlite.transaction(() => {
+    const existing = this.principalForClient(clientId);
+    if (existing) return { principalId: existing, created: false };
+    const grant = this.createAuthorizationGrant({
+      clientId,
+      scopes: [...DEVSPACE_CAPABILITY_SCOPES],
+    });
+    return { principalId: grant.principalId, created: grant.principalCreated };
+  }
+
+  createAuthorizationGrant(input: {
+    clientId: string;
+    scopes: string[];
+    reconnectCode?: string;
+  }): OAuthGrantCreationResult {
+    const scopes = normalizeGrantScopes(input.scopes);
+    const create = this.database.sqlite.transaction((): OAuthGrantCreationResult => {
       const client = this.database.sqlite.prepare(`
-        select principal_id as principalId
+        select client_id
         from oauth_clients
         where client_id = ?
-      `).get(clientId) as { principalId: string | null } | undefined;
+      `).get(input.clientId) as { client_id: string } | undefined;
       if (!client) throw new InvalidRequestError("OAuth client registration was not found");
-      if (client.principalId) {
-        const active = this.database.sqlite.prepare(`
-          select principal_id
-          from connection_principals
-          where principal_id = ? and revoked_at is null
-        `).get(client.principalId);
-        if (!active) throw new InvalidRequestError("OAuth client has no active connection principal");
-        return { principalId: client.principalId, created: false };
+
+      let principalId: string;
+      let principalCreated = false;
+      let reconnected = false;
+      if (input.reconnectCode) {
+        principalId = this.consumeReconnectCodeTarget(input.reconnectCode);
+        reconnected = true;
+      } else {
+        principalId = `principal-${randomUUID()}`;
+        const principalNow = new Date().toISOString();
+        this.database.sqlite.prepare(`
+          insert into connection_principals (
+            principal_id, created_at, last_used_at, revoked_at
+          ) values (?, ?, ?, null)
+        `).run(principalId, principalNow, principalNow);
+        principalCreated = true;
       }
 
-      const principalId = `principal-${randomUUID()}`;
+      const now = new Date().toISOString();
+      const grantId = `grant-${randomUUID()}`;
+      this.database.sqlite.prepare(`
+        insert into oauth_grants (
+          grant_id, client_id, principal_id, subject_hash, organization_hash,
+          granted_scopes_json, authorization_epoch, created_at, last_used_at, revoked_at
+        ) values (?, ?, ?, null, null, ?, 1, ?, ?, null)
+      `).run(grantId, input.clientId, principalId, JSON.stringify(scopes), now, now);
+      this.touchPrincipal(principalId);
+      return {
+        grantId,
+        clientId: input.clientId,
+        principalId,
+        grantedScopes: scopes,
+        authorizationEpoch: 1,
+        createdAt: now,
+        lastUsedAt: now,
+        principalCreated,
+        reconnected,
+      };
+    });
+    return create.immediate();
+  }
+
+  getAuthorizationGrant(grantId: string): OAuthGrantRecord | undefined {
+    const row = this.database.sqlite.prepare(`
+      select
+        grant.grant_id as grantId,
+        grant.client_id as clientId,
+        grant.principal_id as principalId,
+        grant.subject_hash as subjectHash,
+        grant.organization_hash as organizationHash,
+        grant.granted_scopes_json as grantedScopesJson,
+        grant.authorization_epoch as authorizationEpoch,
+        grant.created_at as createdAt,
+        grant.last_used_at as lastUsedAt,
+        grant.revoked_at as revokedAt
+      from oauth_grants as grant
+      inner join connection_principals as principal
+        on principal.principal_id = grant.principal_id
+      where grant.grant_id = ?
+        and grant.revoked_at is null
+        and principal.revoked_at is null
+    `).get(grantId) as OAuthGrantRow | undefined;
+    return row ? rowToOAuthGrantRecord(row) : undefined;
+  }
+
+  bindOrValidateGrantHostIdentity(input: {
+    grantId: string;
+    clientId: string;
+    authorizationEpoch: number;
+    subjectHash?: string;
+    organizationHash?: string;
+    requireSubject?: boolean;
+  }): OAuthGrantRecord {
+    const bind = this.database.sqlite.transaction(() => {
+      const grant = this.getAuthorizationGrant(input.grantId);
+      if (
+        !grant ||
+        grant.clientId !== input.clientId ||
+        grant.authorizationEpoch !== input.authorizationEpoch
+      ) {
+        throw new OAuthGrantIdentityError("oauth_grant_invalid", "The OAuth grant is no longer active.");
+      }
+      if (grant.subjectHash && input.requireSubject === true && !input.subjectHash) {
+        throw new OAuthGrantIdentityError(
+          "host_identity_required",
+          "This OAuth grant requires the previously bound host subject.",
+        );
+      }
+      if (
+        grant.subjectHash &&
+        input.subjectHash &&
+        grant.subjectHash !== input.subjectHash
+      ) {
+        throw new OAuthGrantIdentityError(
+          "host_identity_mismatch",
+          "The host subject does not match this OAuth grant.",
+        );
+      }
+      if (
+        grant.organizationHash &&
+        input.organizationHash &&
+        grant.organizationHash !== input.organizationHash
+      ) {
+        throw new OAuthGrantIdentityError(
+          "host_identity_mismatch",
+          "The host organization does not match this OAuth grant.",
+        );
+      }
+      const subjectHash = grant.subjectHash ?? input.subjectHash;
+      const organizationHash = grant.organizationHash ?? input.organizationHash;
       const now = new Date().toISOString();
       this.database.sqlite.prepare(`
-        insert into connection_principals (
-          principal_id, created_at, last_used_at, revoked_at
-        ) values (?, ?, ?, null)
-      `).run(principalId, now, now);
-      this.database.sqlite.prepare(`
-        update oauth_clients
-        set principal_id = ?
-        where client_id = ? and principal_id is null
-      `).run(principalId, clientId);
-      return { principalId, created: true };
+        update oauth_grants
+        set subject_hash = ?, organization_hash = ?, last_used_at = ?
+        where grant_id = ? and authorization_epoch = ? and revoked_at is null
+      `).run(
+        subjectHash ?? null,
+        organizationHash ?? null,
+        now,
+        grant.grantId,
+        grant.authorizationEpoch,
+      );
+      this.touchPrincipal(grant.principalId);
+      return {
+        ...grant,
+        ...(subjectHash ? { subjectHash } : {}),
+        ...(organizationHash ? { organizationHash } : {}),
+        lastUsedAt: now,
+      };
     });
-    return ensure.immediate();
+    return bind.immediate();
   }
 
   listConnectionPrincipals(): ConnectionPrincipalSummary[] {
@@ -264,8 +450,9 @@ export class SqliteOAuthStore {
         principal.principal_id as principalId,
         principal.created_at as createdAt,
         principal.last_used_at as lastUsedAt,
-        (select count(*) from oauth_clients as client
-          where client.principal_id = principal.principal_id) as clientCount,
+        (select count(distinct grant.client_id) from oauth_grants as grant
+          where grant.principal_id = principal.principal_id
+            and grant.revoked_at is null) as clientCount,
         (select count(*) from workspace_sessions as workspace
           where workspace.connection_principal_id = principal.principal_id
             and workspace.status = 'active') as activeWorkspaces,
@@ -330,88 +517,123 @@ export class SqliteOAuthStore {
   }
 
   consumeReconnectCode(code: string, clientId: string): PrincipalLinkResult {
-    if (!code.startsWith(RECONNECT_CODE_PREFIX) || code.length > 128) {
-      throw new PrincipalReconnectError("reconnect_code_invalid", "The reconnect code is invalid or expired.");
-    }
     const consume = this.database.sqlite.transaction(() => {
-      const now = Date.now();
-      this.cleanupExpiredReconnectCodes(now);
-      const codeHash = hashReconnectCode(code);
-      const target = this.database.sqlite.prepare(`
-        select reconnect.principal_id as principalId
-        from oauth_principal_reconnect_codes as reconnect
-        inner join connection_principals as principal
-          on principal.principal_id = reconnect.principal_id
-        where reconnect.code_hash = ?
-          and reconnect.expires_at > ?
-          and principal.revoked_at is null
-      `).get(codeHash, now) as { principalId: string } | undefined;
-      const source = this.database.sqlite.prepare(`
-        select principal_id as principalId
-        from oauth_clients
-        where client_id = ?
-      `).get(clientId) as { principalId: string | null } | undefined;
-      if (!target || !source) {
+      const client = this.database.sqlite.prepare(
+        "select client_id from oauth_clients where client_id = ?",
+      ).get(clientId);
+      if (!client) {
         throw new PrincipalReconnectError("reconnect_code_invalid", "The reconnect code is invalid or expired.");
       }
-      this.database.sqlite
-        .prepare("delete from oauth_principal_reconnect_codes where code_hash = ?")
-        .run(codeHash);
-      if (source.principalId === target.principalId) {
-        this.touchPrincipal(target.principalId);
-        return {
-          clientId,
-          sourcePrincipalId: source.principalId,
-          targetPrincipalId: target.principalId,
-          changed: false,
-        };
-      }
-      if (source.principalId) {
+      const sourcePrincipals = this.database.sqlite.prepare(`
+        select distinct principal_id as principalId
+        from oauth_grants
+        where client_id = ? and revoked_at is null
+      `).all(clientId) as Array<{ principalId: string }>;
+      const sourcePrincipalId = sourcePrincipals.length === 1
+        ? sourcePrincipals[0]!.principalId
+        : undefined;
+      const targetPrincipalId = this.consumeReconnectCodeTarget(code);
+      if (sourcePrincipalId && sourcePrincipalId !== targetPrincipalId) {
         const sourceUsage = this.database.sqlite.prepare(`
           select
-            (select count(*) from oauth_clients where principal_id = @principalId) as clients,
-            (select count(*) from workspace_sessions where connection_principal_id = @principalId) as workspaces
-        `).get({ principalId: source.principalId }) as { clients: number; workspaces: number };
-        if (sourceUsage.clients !== 1 || sourceUsage.workspaces !== 0) {
+            (select count(*) from oauth_grants
+              where principal_id = @principalId and revoked_at is null) as grants,
+            (select count(*) from workspace_sessions
+              where connection_principal_id = @principalId) as workspaces
+        `).get({ principalId: sourcePrincipalId }) as { grants: number; workspaces: number };
+        if (sourceUsage.grants !== sourcePrincipals.length || sourceUsage.workspaces !== 0) {
           throw new PrincipalReconnectError(
             "reconnect_source_in_use",
             "This OAuth registration already owns retained state and cannot be relinked.",
           );
         }
       }
-      // A relink changes the authorization boundary for this dynamic client.
-      // Revoke any tokens issued before the relink so only the authorization
-      // flow currently presenting the one-time code can obtain fresh access.
       this.database.sqlite
         .prepare("delete from oauth_access_tokens where client_id = ?")
         .run(clientId);
       this.database.sqlite
         .prepare("delete from oauth_refresh_tokens where client_id = ?")
         .run(clientId);
-      this.database.sqlite
-        .prepare("update oauth_clients set principal_id = ? where client_id = ?")
-        .run(target.principalId, clientId);
-      this.touchPrincipal(target.principalId);
-      if (source.principalId) {
+      const now = new Date().toISOString();
+      this.database.sqlite.prepare(`
+        update oauth_grants
+        set revoked_at = ?, last_used_at = ?
+        where client_id = ? and revoked_at is null
+      `).run(now, now, clientId);
+      this.database.sqlite.prepare(`
+        insert into oauth_grants (
+          grant_id, client_id, principal_id, subject_hash, organization_hash,
+          granted_scopes_json, authorization_epoch, created_at, last_used_at, revoked_at
+        ) values (?, ?, ?, null, null, ?, 1, ?, ?, null)
+      `).run(
+        `grant-${randomUUID()}`,
+        clientId,
+        targetPrincipalId,
+        JSON.stringify([...DEVSPACE_CAPABILITY_SCOPES]),
+        now,
+        now,
+      );
+      this.touchPrincipal(targetPrincipalId);
+      if (sourcePrincipalId && sourcePrincipalId !== targetPrincipalId) {
+        this.database.sqlite.prepare(`
+          delete from oauth_grants
+          where principal_id = ?
+            and revoked_at is not null
+            and not exists (
+              select 1 from oauth_access_tokens as token
+              where token.grant_id = oauth_grants.grant_id
+            )
+            and not exists (
+              select 1 from oauth_refresh_tokens as token
+              where token.grant_id = oauth_grants.grant_id
+            )
+        `).run(sourcePrincipalId);
         this.database.sqlite.prepare(`
           delete from connection_principals
           where principal_id = ?
             and not exists (
-              select 1 from oauth_clients where principal_id = connection_principals.principal_id
+              select 1 from oauth_grants
+              where principal_id = connection_principals.principal_id
+                and revoked_at is null
             )
             and not exists (
               select 1 from workspace_sessions where connection_principal_id = connection_principals.principal_id
             )
-        `).run(source.principalId);
+        `).run(sourcePrincipalId);
       }
       return {
         clientId,
-        ...(source.principalId ? { sourcePrincipalId: source.principalId } : {}),
-        targetPrincipalId: target.principalId,
-        changed: true,
+        ...(sourcePrincipalId ? { sourcePrincipalId } : {}),
+        targetPrincipalId,
+        changed: sourcePrincipalId !== targetPrincipalId,
       };
     });
     return consume.immediate();
+  }
+
+  private consumeReconnectCodeTarget(code: string): string {
+    if (!code.startsWith(RECONNECT_CODE_PREFIX) || code.length > 128) {
+      throw new PrincipalReconnectError("reconnect_code_invalid", "The reconnect code is invalid or expired.");
+    }
+    const now = Date.now();
+    this.cleanupExpiredReconnectCodes(now);
+    const codeHash = hashReconnectCode(code);
+    const target = this.database.sqlite.prepare(`
+      select reconnect.principal_id as principalId
+      from oauth_principal_reconnect_codes as reconnect
+      inner join connection_principals as principal
+        on principal.principal_id = reconnect.principal_id
+      where reconnect.code_hash = ?
+        and reconnect.expires_at > ?
+        and principal.revoked_at is null
+    `).get(codeHash, now) as { principalId: string } | undefined;
+    if (!target) {
+      throw new PrincipalReconnectError("reconnect_code_invalid", "The reconnect code is invalid or expired.");
+    }
+    this.database.sqlite
+      .prepare("delete from oauth_principal_reconnect_codes where code_hash = ?")
+      .run(codeHash);
+    return target.principalId;
   }
 
   checkAuthorizationLimits(
@@ -436,39 +658,56 @@ export class SqliteOAuthStore {
   }
 
   saveAccessToken(tokenHash: string, record: PersistedAccessTokenRecord): void {
-    this.assertClientHasActivePrincipal(record.clientId);
+    const normalized = this.resolveTokenGrant(record);
     this.database.sqlite
       .prepare(
-        `insert into oauth_access_tokens (token_hash, client_id, scopes_json, expires_at, resource)
-         values (?, ?, ?, ?, ?)
+        `insert into oauth_access_tokens (
+           token_hash, grant_id, client_id, principal_id, authorization_epoch,
+           scopes_json, expires_at, resource
+         ) values (?, ?, ?, ?, ?, ?, ?, ?)
          on conflict(token_hash) do update set
+           grant_id = excluded.grant_id,
            client_id = excluded.client_id,
+           principal_id = excluded.principal_id,
+           authorization_epoch = excluded.authorization_epoch,
            scopes_json = excluded.scopes_json,
            expires_at = excluded.expires_at,
            resource = excluded.resource`,
       )
       .run(
         tokenHash,
-        record.clientId,
-        JSON.stringify(record.scopes),
-        record.expiresAt,
-        record.resource ?? null,
+        normalized.grantId,
+        normalized.clientId,
+        normalized.principalId,
+        normalized.authorizationEpoch,
+        JSON.stringify(normalized.scopes),
+        normalized.expiresAt,
+        normalized.resource ?? null,
       );
   }
 
   getAccessToken(tokenHash: string): PersistedAccessTokenRecord | undefined {
-    const row = this.database.sqlite
-      .prepare(
-        "select client_id, scopes_json, expires_at, resource from oauth_access_tokens where token_hash = ?",
-      )
-      .get(tokenHash) as
-      | {
-          client_id: string;
-          scopes_json: string;
-          expires_at: number;
-          resource: string | null;
-        }
-      | undefined;
+    const row = this.database.sqlite.prepare(`
+      select
+        token.grant_id,
+        token.client_id,
+        token.principal_id,
+        token.authorization_epoch,
+        token.scopes_json,
+        token.expires_at,
+        token.resource
+      from oauth_access_tokens as token
+      inner join oauth_grants as grant
+        on grant.grant_id = token.grant_id
+       and grant.client_id = token.client_id
+       and grant.principal_id = token.principal_id
+      inner join connection_principals as principal
+        on principal.principal_id = token.principal_id
+      where token.token_hash = ?
+        and token.authorization_epoch = grant.authorization_epoch
+        and grant.revoked_at is null
+        and principal.revoked_at is null
+    `).get(tokenHash) as OAuthTokenRow | undefined;
 
     return row ? rowToAccessTokenRecord(row) : undefined;
   }
@@ -478,29 +717,59 @@ export class SqliteOAuthStore {
   }
 
   saveRefreshToken(tokenHash: string, record: PersistedRefreshTokenRecord): void {
-    this.assertClientHasActivePrincipal(record.clientId);
+    const normalized = this.resolveTokenGrant(record);
     this.database.sqlite
       .prepare(
-        `insert into oauth_refresh_tokens (token_hash, client_id, scopes_json, expires_at, resource)
-         values (?, ?, ?, ?, ?)
+        `insert into oauth_refresh_tokens (
+           token_hash, grant_id, client_id, principal_id, authorization_epoch,
+           scopes_json, expires_at, resource
+         ) values (?, ?, ?, ?, ?, ?, ?, ?)
          on conflict(token_hash) do update set
+           grant_id = excluded.grant_id,
            client_id = excluded.client_id,
+           principal_id = excluded.principal_id,
+           authorization_epoch = excluded.authorization_epoch,
            scopes_json = excluded.scopes_json,
            expires_at = excluded.expires_at,
            resource = excluded.resource`,
       )
       .run(
         tokenHash,
-        record.clientId,
-        JSON.stringify(record.scopes),
-        record.expiresAt,
-        record.resource ?? null,
+        normalized.grantId,
+        normalized.clientId,
+        normalized.principalId,
+        normalized.authorizationEpoch,
+        JSON.stringify(normalized.scopes),
+        normalized.expiresAt,
+        normalized.resource ?? null,
       );
   }
 
   saveTokenPair(pair: PersistedTokenPair, consumedRefreshTokenHash?: string): boolean {
     const save = this.database.sqlite.transaction(() => {
+      const access = this.resolveTokenGrant(pair.accessToken);
+      const refresh = this.resolveTokenGrant(pair.refreshToken);
+      if (
+        access.grantId !== refresh.grantId ||
+        access.clientId !== refresh.clientId ||
+        access.principalId !== refresh.principalId ||
+        access.authorizationEpoch !== refresh.authorizationEpoch ||
+        access.resource !== refresh.resource ||
+        access.scopes.length !== refresh.scopes.length ||
+        access.scopes.some((scope) => !refresh.scopes.includes(scope))
+      ) {
+        throw new InvalidRequestError(
+          "OAuth access and refresh tokens in one pair must belong to the same authorization grant",
+        );
+      }
       if (consumedRefreshTokenHash) {
+        const consumed = this.getRefreshToken(consumedRefreshTokenHash);
+        if (
+          !consumed ||
+          consumed.grantId !== refresh.grantId ||
+          consumed.principalId !== refresh.principalId ||
+          consumed.clientId !== refresh.clientId
+        ) return false;
         const result = this.database.sqlite
           .prepare("delete from oauth_refresh_tokens where token_hash = ?")
           .run(consumedRefreshTokenHash);
@@ -516,18 +785,27 @@ export class SqliteOAuthStore {
   }
 
   getRefreshToken(tokenHash: string): PersistedRefreshTokenRecord | undefined {
-    const row = this.database.sqlite
-      .prepare(
-        "select client_id, scopes_json, expires_at, resource from oauth_refresh_tokens where token_hash = ?",
-      )
-      .get(tokenHash) as
-      | {
-          client_id: string;
-          scopes_json: string;
-          expires_at: number;
-          resource: string | null;
-        }
-      | undefined;
+    const row = this.database.sqlite.prepare(`
+      select
+        token.grant_id,
+        token.client_id,
+        token.principal_id,
+        token.authorization_epoch,
+        token.scopes_json,
+        token.expires_at,
+        token.resource
+      from oauth_refresh_tokens as token
+      inner join oauth_grants as grant
+        on grant.grant_id = token.grant_id
+       and grant.client_id = token.client_id
+       and grant.principal_id = token.principal_id
+      inner join connection_principals as principal
+        on principal.principal_id = token.principal_id
+      where token.token_hash = ?
+        and token.authorization_epoch = grant.authorization_epoch
+        and grant.revoked_at is null
+        and principal.revoked_at is null
+    `).get(tokenHash) as OAuthTokenRow | undefined;
 
     return row ? rowToRefreshTokenRecord(row) : undefined;
   }
@@ -593,9 +871,10 @@ export class SqliteOAuthStore {
           @now,
           null
         from workspace_sessions as workspace
-        inner join oauth_clients as client
-          on client.principal_id = workspace.connection_principal_id
-        where workspace.status in ('active', 'closed')
+        where workspace.connection_principal_id in (
+          select principal_id from oauth_grants
+        )
+          and workspace.status in ('active', 'closed')
         on conflict(connection_principal_id, workspace_id) do nothing
       `).run({ now }).changes;
       this.database.sqlite.prepare(`
@@ -604,12 +883,18 @@ export class SqliteOAuthStore {
             state_generation = state_generation + 1,
             last_used_at = @now
         where status in ('active', 'closed')
-          and connection_principal_id in (select principal_id from oauth_clients)
+          and connection_principal_id in (select principal_id from oauth_grants)
       `).run({ now });
       this.database.sqlite.prepare(`
         update connection_principals
         set revoked_at = @now, last_used_at = @now
-        where principal_id in (select principal_id from oauth_clients)
+        where principal_id in (select principal_id from oauth_grants)
+      `).run({ now });
+      this.database.sqlite.prepare(`
+        update oauth_grants
+        set revoked_at = @now, last_used_at = @now,
+            authorization_epoch = authorization_epoch + 1
+        where revoked_at is null
       `).run({ now });
       this.database.sqlite.prepare("delete from oauth_principal_reconnect_codes").run();
       this.database.sqlite.prepare("delete from oauth_access_tokens").run();
@@ -617,6 +902,7 @@ export class SqliteOAuthStore {
       this.database.sqlite.prepare("delete from oauth_clients").run();
       return {
         clients: counts.clients,
+        grants: counts.grants,
         accessTokens: counts.accessTokens,
         refreshTokens: counts.refreshTokens,
         workspaceCleanupJobs,
@@ -677,6 +963,7 @@ export class SqliteOAuthStore {
     const row = this.database.sqlite.prepare(`
       select
         (select count(*) from oauth_clients) as clients,
+        (select count(*) from oauth_grants where revoked_at is null) as grants,
         (select count(*) from connection_principals where revoked_at is null) as principals,
         (select count(*) from oauth_access_tokens) as accessTokens,
         (select count(*) from oauth_refresh_tokens) as refreshTokens,
@@ -701,6 +988,24 @@ export class SqliteOAuthStore {
         .prepare("delete from oauth_authorization_limits where expires_at <= ?")
         .run(nowMs).changes,
       unapprovedClients: this.cleanupExpiredUnapprovedClients(nowSeconds),
+      orphanedGrants: this.database.sqlite.prepare(`
+        delete from oauth_grants
+        where grant_id in (
+          select grant.grant_id
+          from oauth_grants as grant
+          where grant.created_at < ?
+            and not exists (
+              select 1 from oauth_access_tokens as token
+              where token.grant_id = grant.grant_id
+            )
+            and not exists (
+              select 1 from oauth_refresh_tokens as token
+              where token.grant_id = grant.grant_id
+            )
+          order by grant.created_at, grant.grant_id
+          limit 1000
+        )
+      `).run(new Date(nowMs - PENDING_OAUTH_CLIENT_TTL_SECONDS * 1_000).toISOString()).changes,
       revokedPrincipals: this.database.sqlite.prepare(`
         delete from connection_principals
         where principal_id in (
@@ -708,8 +1013,8 @@ export class SqliteOAuthStore {
           from connection_principals as principal
           where principal.revoked_at is not null
             and not exists (
-              select 1 from oauth_clients as client
-              where client.principal_id = principal.principal_id
+              select 1 from oauth_grants as grant
+              where grant.principal_id = principal.principal_id
             )
             and not exists (
               select 1 from workspace_sessions as workspace
@@ -753,19 +1058,53 @@ export class SqliteOAuthStore {
     `).run(salt, verifier, new Date().toISOString());
   }
 
-  private assertClientHasActivePrincipal(clientId: string): void {
-    const row = this.database.sqlite.prepare(`
-      select 1
-      from oauth_clients as client
+  private resolveTokenGrant<T extends PersistedAccessTokenRecord | PersistedRefreshTokenRecord>(
+    record: T,
+  ): T & Required<Pick<T, "grantId" | "principalId" | "authorizationEpoch">> {
+    const scopes = normalizeGrantScopes(record.scopes);
+    const rows = this.database.sqlite.prepare(`
+      select
+        grant.grant_id as grantId,
+        grant.client_id as clientId,
+        grant.principal_id as principalId,
+        grant.subject_hash as subjectHash,
+        grant.organization_hash as organizationHash,
+        grant.granted_scopes_json as grantedScopesJson,
+        grant.authorization_epoch as authorizationEpoch,
+        grant.created_at as createdAt,
+        grant.last_used_at as lastUsedAt,
+        grant.revoked_at as revokedAt
+      from oauth_grants as grant
       inner join connection_principals as principal
-        on principal.principal_id = client.principal_id
-      where client.client_id = ? and principal.revoked_at is null
-    `).get(clientId);
-    if (!row) {
+        on principal.principal_id = grant.principal_id
+      where grant.client_id = @clientId
+        and grant.revoked_at is null
+        and principal.revoked_at is null
+        and (@grantId is null or grant.grant_id = @grantId)
+      order by grant.last_used_at desc
+      limit 2
+    `).all({ clientId: record.clientId, grantId: record.grantId ?? null }) as OAuthGrantRow[];
+    if (rows.length !== 1) {
       throw new InvalidRequestError(
-        "OAuth tokens cannot be issued before the registration has an active connection principal",
+        "OAuth token issuance requires one explicit or unambiguous active authorization grant",
       );
     }
+    const grant = rowToOAuthGrantRecord(rows[0]!);
+    if (
+      (record.principalId !== undefined && record.principalId !== grant.principalId) ||
+      (record.authorizationEpoch !== undefined &&
+        record.authorizationEpoch !== grant.authorizationEpoch) ||
+      scopes.some((scope) => !grant.grantedScopes.includes(scope))
+    ) {
+      throw new InvalidRequestError("OAuth token fields do not match the authorization grant");
+    }
+    return {
+      ...record,
+      grantId: grant.grantId,
+      principalId: grant.principalId,
+      authorizationEpoch: grant.authorizationEpoch,
+      scopes,
+    } as T & Required<Pick<T, "grantId" | "principalId" | "authorizationEpoch">>;
   }
 
   private cleanupExpiredReconnectCodes(nowMs = Date.now()): number {
@@ -777,7 +1116,11 @@ export class SqliteOAuthStore {
   private cleanupExpiredUnapprovedClients(nowSeconds: number): number {
     return this.database.sqlite.prepare(`
       delete from oauth_clients
-      where principal_id is null and issued_at < ?
+      where issued_at < ?
+        and not exists (
+          select 1 from oauth_grants as grant
+          where grant.client_id = oauth_clients.client_id
+        )
     `).run(nowSeconds - PENDING_OAUTH_CLIENT_TTL_SECONDS).changes;
   }
 
@@ -885,32 +1228,58 @@ export class SqliteOAuthClientsStore implements OAuthRegisteredClientsStore {
   }
 }
 
-function rowToAccessTokenRecord(row: {
-  client_id: string;
-  scopes_json: string;
-  expires_at: number;
-  resource: string | null;
-}): PersistedAccessTokenRecord {
+function rowToAccessTokenRecord(row: OAuthTokenRow): PersistedAccessTokenRecord {
   return {
+    grantId: row.grant_id,
     clientId: row.client_id,
+    principalId: row.principal_id,
+    authorizationEpoch: row.authorization_epoch,
     scopes: JSON.parse(row.scopes_json) as string[],
     expiresAt: row.expires_at,
     resource: row.resource ?? undefined,
   };
 }
 
-function rowToRefreshTokenRecord(row: {
-  client_id: string;
-  scopes_json: string;
-  expires_at: number;
-  resource: string | null;
-}): PersistedRefreshTokenRecord {
+function rowToRefreshTokenRecord(row: OAuthTokenRow): PersistedRefreshTokenRecord {
   return {
+    grantId: row.grant_id,
     clientId: row.client_id,
+    principalId: row.principal_id,
+    authorizationEpoch: row.authorization_epoch,
     scopes: JSON.parse(row.scopes_json) as string[],
     expiresAt: row.expires_at,
     resource: row.resource ?? undefined,
   };
+}
+
+function rowToOAuthGrantRecord(row: OAuthGrantRow): OAuthGrantRecord {
+  return {
+    grantId: row.grantId,
+    clientId: row.clientId,
+    principalId: row.principalId,
+    ...(row.subjectHash ? { subjectHash: row.subjectHash } : {}),
+    ...(row.organizationHash ? { organizationHash: row.organizationHash } : {}),
+    grantedScopes: normalizeGrantScopes(JSON.parse(row.grantedScopesJson) as unknown),
+    authorizationEpoch: row.authorizationEpoch,
+    createdAt: row.createdAt,
+    lastUsedAt: row.lastUsedAt,
+    ...(row.revokedAt ? { revokedAt: row.revokedAt } : {}),
+  };
+}
+
+function normalizeGrantScopes(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new InvalidRequestError("OAuth grant scopes must be a non-empty array");
+  }
+  const requested = new Set(value);
+  if (
+    [...requested].some(
+      (scope) => typeof scope !== "string" || !DEVSPACE_CAPABILITY_SCOPES.includes(scope as never),
+    )
+  ) {
+    throw new InvalidRequestError("OAuth grant contains an unsupported scope");
+  }
+  return DEVSPACE_CAPABILITY_SCOPES.filter((scope) => requested.has(scope));
 }
 
 function deriveOwnerCredentialVerifier(ownerToken: string, salt: string): string {

@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
   closeSync,
@@ -36,6 +36,19 @@ interface NormalizedOAuthClient {
   principalId: string | null;
   clientJson: string;
   issuedAt: number;
+}
+
+interface NormalizedOAuthGrant {
+  grantId: string;
+  clientId: string;
+  principalId: string;
+  subjectHash: string | null;
+  organizationHash: string | null;
+  grantedScopes: string[];
+  authorizationEpoch: number;
+  createdAt: string;
+  lastUsedAt: string;
+  revokedAt: string | null;
 }
 
 interface NormalizedWorkspace {
@@ -103,7 +116,7 @@ export function prepareDatabaseFile(path: string): DatabasePreparationResult {
     source.close();
   }
 
-  const temporaryPath = `${path}.v14-migrating-${process.pid}-${randomUUID()}`;
+  const temporaryPath = `${path}.v15-migrating-${process.pid}-${randomUUID()}`;
   const backupPath = uniqueBackupPath(path);
   let sourceDatabase: Database.Database | undefined;
   let targetDatabase: Database.Database | undefined;
@@ -178,6 +191,7 @@ function migrateLegacyData(
   const now = new Date().toISOString();
   const principalMap = normalizePrincipals(source, now);
   const clients = normalizeOAuthClients(source, sourceVersion, principalMap, now);
+  const grants = normalizeOAuthGrants(source, clients, principalMap, now);
   const clientPrincipalMap = new Map(
     clients
       .filter((client): client is NormalizedOAuthClient & { principalId: string } => Boolean(client.principalId))
@@ -195,7 +209,8 @@ function migrateLegacyData(
   normalizeDuplicateCheckouts(workspaces);
 
   insertPrincipals(target, principalMap.values());
-  insertOAuthClients(target, clients, principalMap);
+  insertOAuthClients(target, clients);
+  insertOAuthGrants(target, grants);
   insertWorkspaces(target, workspaces);
   insertLoadedAgentFiles(source, target, new Set(workspaces.map((workspace) => workspace.id)));
   insertMutationOperations(
@@ -203,8 +218,8 @@ function migrateLegacyData(
     normalizeMutationOperations(source, workspaces, sourceVersion, clientPrincipalMap, legacyOwner),
   );
   insertOAuthOwnerCredential(source, target);
-  insertOAuthTokens(source, target, "oauth_access_tokens", clients, principalMap);
-  insertOAuthTokens(source, target, "oauth_refresh_tokens", clients, principalMap);
+  insertOAuthTokens(source, target, "oauth_access_tokens", grants, principalMap);
+  insertOAuthTokens(source, target, "oauth_refresh_tokens", grants, principalMap);
   insertReconnectCodes(source, target, principalMap);
   insertAuthorizationLimits(source, target);
   insertCleanupJobs(source, target, sourceVersion, clientPrincipalMap, legacyOwner);
@@ -260,6 +275,60 @@ function normalizeOAuthClients(
       issuedAt: nonNegativeInteger(row.issued_at, 0),
     };
   });
+}
+
+function normalizeOAuthGrants(
+  source: Database.Database,
+  clients: readonly NormalizedOAuthClient[],
+  principals: ReadonlyMap<string, NormalizedPrincipal>,
+  now: string,
+): NormalizedOAuthGrant[] {
+  const grants: NormalizedOAuthGrant[] = [];
+  for (const client of clients) {
+    if (!client.principalId || principals.get(client.principalId)?.revokedAt) continue;
+    const grantedScopes = migratedClientScopes(source, client.clientId);
+    const createdAt = client.issuedAt > 0
+      ? new Date(client.issuedAt * 1_000).toISOString()
+      : now;
+    grants.push({
+      grantId: migratedGrantId(client.clientId, client.principalId),
+      clientId: client.clientId,
+      principalId: client.principalId,
+      subjectHash: null,
+      organizationHash: null,
+      grantedScopes,
+      authorizationEpoch: 1,
+      createdAt,
+      lastUsedAt: principals.get(client.principalId)?.lastUsedAt ?? createdAt,
+      revokedAt: null,
+    });
+  }
+  return grants;
+}
+
+function migratedClientScopes(source: Database.Database, clientId: string): string[] {
+  const requested = new Set<string>();
+  for (const table of ["oauth_access_tokens", "oauth_refresh_tokens"] as const) {
+    for (const row of tableRows(source, table)) {
+      if (optionalString(row, "client_id") !== clientId) continue;
+      for (const scope of normalizeOAuthScopes(nullableString(row, "scopes_json")) ?? []) {
+        requested.add(scope);
+      }
+    }
+  }
+  const scopes = DEVSPACE_CAPABILITY_SCOPES.filter((scope) => requested.has(scope));
+  return scopes.length > 0 ? scopes : [...DEVSPACE_CAPABILITY_SCOPES];
+}
+
+function migratedGrantId(clientId: string, principalId: string): string {
+  const digest = createHash("sha256")
+    .update("devspace-migrated-oauth-grant-v1\0", "utf8")
+    .update(clientId, "utf8")
+    .update("\0", "utf8")
+    .update(principalId, "utf8")
+    .digest("base64url")
+    .slice(0, 32);
+  return `grant-${digest}`;
 }
 
 function resolveLegacyOwner(
@@ -402,17 +471,39 @@ function insertPrincipals(
 function insertOAuthClients(
   target: Database.Database,
   clients: readonly NormalizedOAuthClient[],
-  principals: ReadonlyMap<string, NormalizedPrincipal>,
 ): void {
   const insert = target.prepare(`
-    insert into oauth_clients (client_id, principal_id, client_json, issued_at)
-    values (?, ?, ?, ?)
+    insert into oauth_clients (client_id, client_json, issued_at)
+    values (?, ?, ?)
   `);
   for (const client of clients) {
-    const principalId = client.principalId && !principals.get(client.principalId)?.revokedAt
-      ? client.principalId
-      : null;
-    insert.run(client.clientId, principalId, client.clientJson, client.issuedAt);
+    insert.run(client.clientId, client.clientJson, client.issuedAt);
+  }
+}
+
+function insertOAuthGrants(
+  target: Database.Database,
+  grants: readonly NormalizedOAuthGrant[],
+): void {
+  const insert = target.prepare(`
+    insert into oauth_grants (
+      grant_id, client_id, principal_id, subject_hash, organization_hash,
+      granted_scopes_json, authorization_epoch, created_at, last_used_at, revoked_at
+    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  for (const grant of grants) {
+    insert.run(
+      grant.grantId,
+      grant.clientId,
+      grant.principalId,
+      grant.subjectHash,
+      grant.organizationHash,
+      JSON.stringify(grant.grantedScopes),
+      grant.authorizationEpoch,
+      grant.createdAt,
+      grant.lastUsedAt,
+      grant.revokedAt,
+    );
   }
 }
 
@@ -588,23 +679,28 @@ function insertOAuthTokens(
   source: Database.Database,
   target: Database.Database,
   table: "oauth_access_tokens" | "oauth_refresh_tokens",
-  clients: readonly NormalizedOAuthClient[],
+  grants: readonly NormalizedOAuthGrant[],
   principals: ReadonlyMap<string, NormalizedPrincipal>,
 ): void {
-  const clientById = new Map(clients.map((client) => [client.clientId, client]));
+  const grantByClientId = new Map(grants.map((grant) => [grant.clientId, grant]));
   const insert = target.prepare(`
-    insert into ${table} (token_hash, client_id, scopes_json, expires_at, resource)
-    values (?, ?, ?, ?, ?)
+    insert into ${table} (
+      token_hash, grant_id, client_id, principal_id, authorization_epoch,
+      scopes_json, expires_at, resource
+    ) values (?, ?, ?, ?, ?, ?, ?, ?)
   `);
   for (const row of tableRows(source, table)) {
     const clientId = optionalString(row, "client_id");
-    const client = clientId ? clientById.get(clientId) : undefined;
-    if (!client?.principalId || principals.get(client.principalId)?.revokedAt) continue;
+    const grant = clientId ? grantByClientId.get(clientId) : undefined;
+    if (!grant || principals.get(grant.principalId)?.revokedAt) continue;
     const scopes = normalizeOAuthScopes(nullableString(row, "scopes_json"));
     if (!scopes) continue;
     insert.run(
       requiredString(row, "token_hash"),
+      grant.grantId,
       clientId,
+      grant.principalId,
+      grant.authorizationEpoch,
       JSON.stringify(scopes),
       nonNegativeInteger(row.expires_at, 0),
       nullableString(row, "resource"),
@@ -1016,7 +1112,7 @@ function quotedIdentifier(value: string): string {
 
 function uniqueBackupPath(path: string): string {
   const timestamp = new Date().toISOString().replace(/[:.]/gu, "-");
-  const candidate = `${path}.pre-v14.${timestamp}.bak`;
+  const candidate = `${path}.pre-v15.${timestamp}.bak`;
   return existsSync(candidate) ? `${candidate}.${randomUUID()}` : candidate;
 }
 

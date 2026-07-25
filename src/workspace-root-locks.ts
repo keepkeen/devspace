@@ -1,5 +1,15 @@
 export type WorkspaceRootLockMode = "read" | "write";
 
+import {
+  CrossProcessWorkspaceRootLock,
+  type CrossProcessWorkspaceRootLockOptions,
+} from "./cross-process-root-lock.js";
+
+export {
+  WorkspaceRootLockTimeoutError,
+  defaultWorkspaceRootLockDirectory,
+} from "./cross-process-root-lock.js";
+
 interface LockWaiter {
   mode: WorkspaceRootLockMode;
   resolve(release: () => void): void;
@@ -18,6 +28,26 @@ interface RootLockState {
  */
 export class WorkspaceRootLockManager {
   private readonly states = new Map<string, RootLockState>();
+  private readonly crossProcess?: CrossProcessWorkspaceRootLock;
+
+  constructor(options: {
+    crossProcessLockRoot?: string;
+    acquireTimeoutMs?: number;
+    pollIntervalMs?: number;
+  } = {}) {
+    if (options.crossProcessLockRoot) {
+      const crossProcessOptions: CrossProcessWorkspaceRootLockOptions = {
+        root: options.crossProcessLockRoot,
+        ...(options.acquireTimeoutMs === undefined
+          ? {}
+          : { acquireTimeoutMs: options.acquireTimeoutMs }),
+        ...(options.pollIntervalMs === undefined
+          ? {}
+          : { pollIntervalMs: options.pollIntervalMs }),
+      };
+      this.crossProcess = new CrossProcessWorkspaceRootLock(crossProcessOptions);
+    }
+  }
 
   async withLock<T>(
     key: string,
@@ -32,11 +62,29 @@ export class WorkspaceRootLockManager {
     }
   }
 
-  acquire(key: string, mode: WorkspaceRootLockMode): Promise<() => void> {
+  async acquire(key: string, mode: WorkspaceRootLockMode): Promise<() => void> {
     if (!key) return Promise.reject(new TypeError("Workspace root lock key is required."));
     if (mode !== "read" && mode !== "write") {
       return Promise.reject(new TypeError("Workspace root lock mode must be read or write."));
     }
+    const releaseLocal = await this.acquireLocal(key, mode);
+    let releaseCrossProcess: (() => void) | undefined;
+    try {
+      releaseCrossProcess = await this.crossProcess?.acquire(key, mode);
+    } catch (error) {
+      releaseLocal();
+      throw error;
+    }
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      releaseCrossProcess?.();
+      releaseLocal();
+    };
+  }
+
+  private acquireLocal(key: string, mode: WorkspaceRootLockMode): Promise<() => void> {
     const state = this.states.get(key) ?? { readers: 0, writer: false, queue: [] };
     this.states.set(key, state);
     return new Promise((resolve) => {

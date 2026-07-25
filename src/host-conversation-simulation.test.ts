@@ -9,12 +9,13 @@ import { promisify } from "node:util";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { loadConfig } from "./config.js";
-import { DEFAULT_DEVSPACE_OAUTH_SCOPES } from "./oauth-scopes.js";
+import { FULL_DEVSPACE_OAUTH_SCOPES } from "./oauth-scopes.js";
 import { createServer } from "./server.js";
 
-// "Account" in this simulation means an independent dynamic OAuth
-// registration and local connection principal. DevSpace does not receive a
-// verified ChatGPT account identity claim.
+// Labels in this simulation identify independent OAuth authorization grants.
+// The dynamic OAuth client registration is host metadata; each successful
+// Owner authorization creates a separate local principal unless explicitly
+// reconnected.
 const execFileAsync = promisify(execFile);
 const root = await mkdtemp(join(tmpdir(), "devspace-host-conversation-simulation-"));
 const projectsRoot = join(root, "projects");
@@ -53,14 +54,50 @@ try {
   });
   active = await startServer(config);
   const metadata = await discoverOAuth(active.origin);
-  const accountA = await registerAndAuthorize(active.origin, metadata, "account-a");
-  const accountB = await registerAndAuthorize(active.origin, metadata, "account-b");
-  authMetrics.push(accountA.auth, accountB.auth);
+  const defaultReader = await registerAndAuthorize(
+    active.origin,
+    metadata,
+    "default-reader",
+  );
+  const accountA = await registerAndAuthorize(
+    active.origin,
+    metadata,
+    "account-a",
+    FULL_DEVSPACE_OAUTH_SCOPES,
+  );
+  const accountB = await registerAndAuthorize(
+    active.origin,
+    metadata,
+    "account-b",
+    FULL_DEVSPACE_OAUTH_SCOPES,
+  );
+  authMetrics.push(defaultReader.auth, accountA.auth, accountB.auth);
+
+  const defaultReaderClient = await connect(
+    "default-reader-tools",
+    defaultReader.accessToken,
+    active.origin,
+  );
+  const defaultReaderTools = await defaultReaderClient.listTools();
+  const defaultReaderToolsBytes = byteLength(defaultReaderTools);
+  const defaultReaderToolNames = defaultReaderTools.tools.map((tool) => tool.name);
+  const defaultReaderToolSizes = Object.fromEntries(
+    defaultReaderTools.tools.map((tool) => [tool.name, byteLength(tool)]),
+  );
+  assert.ok(
+    defaultReaderToolsBytes < 12_000,
+    `default tools/list is ${defaultReaderToolsBytes} bytes: ${JSON.stringify(defaultReaderToolSizes)}`,
+  );
+  assert.ok(defaultReaderToolNames.includes("read"));
+  assert.equal(defaultReaderToolNames.includes("apply_patch"), false);
+  assert.equal(defaultReaderToolNames.includes("exec_command"), false);
+  assert.equal(defaultReaderToolNames.includes("revoke_workspace"), false);
+  await closeClient(defaultReaderClient);
 
   const firstTurn = await connect("account-a-main-turn-1", accountA.accessToken, active.origin);
   const mainProtocol = await protocolMetric(firstTurn);
   assert.ok(mainProtocol.instructionsBytes < 850);
-  assert.ok(mainProtocol.toolsListBytes < 19_000);
+  assert.ok(mainProtocol.toolsListBytes < 24_000);
 
   const openMetadata = await callAndRecord(
     firstTurn,
@@ -72,8 +109,8 @@ try {
   const alphaWorkspaceRef = workspaceRef(openMetadata);
   const metadataReceipt = currentReceipt(openMetadata);
   assert.equal(
-    (openMetadata.structuredContent as { context?: { phase?: unknown } } | undefined)?.context?.phase,
-    "metadata",
+    (openMetadata.structuredContent as { state?: { phase?: unknown } } | undefined)?.state?.phase,
+    "selected",
   );
 
   const fullContext = await callAndRecord(
@@ -83,12 +120,39 @@ try {
     "get_workspace_context",
     { receipt: metadataReceipt, contextMode: "full" },
   );
-  const alphaReceipt = currentReceipt(fullContext);
+  let alphaReceipt = currentReceipt(fullContext);
   const alphaGeneration = workspaceGeneration(fullContext);
   const alphaFingerprint = projectFingerprint(fullContext);
   const alphaInstructionRevision = instructionRevision(fullContext);
   const alphaSkillRevision = skillRevision(fullContext);
-  assert.ok(modelVisibleBytes(fullContext) < 20_000);
+  assert.ok(modelVisibleBytes(fullContext) < 8_000);
+  const alphaManifest = (fullContext.structuredContent as {
+    instructionManifest?: { files?: Array<Record<string, unknown>> };
+  } | undefined)?.instructionManifest;
+  assert.ok((alphaManifest?.files?.length ?? 0) > 0);
+  assert.equal(alphaManifest?.files?.[0]?.path, "AGENTS.md");
+  assert.equal(JSON.stringify(fullContext).includes("Keep edits scoped"), false);
+
+  const rootInstructions = await callAndRecord(
+    firstTurn,
+    "account-a-main",
+    "load-root-instructions",
+    "load_workspace_instructions",
+    { receipt: alphaReceipt, paths: ["."] },
+    ["Keep edits scoped"],
+  );
+  const alphaInstructionToken = String(
+    (rootInstructions.structuredContent as { instructionToken?: unknown } | undefined)
+      ?.instructionToken ?? "",
+  );
+  assert.match(alphaInstructionToken, /^instructions_/u);
+  assert.equal(
+    (rootInstructions.structuredContent as {
+      state?: { phase?: unknown };
+    } | undefined)?.state?.phase,
+    "target_scoped",
+  );
+  alphaReceipt = currentReceipt(rootInstructions);
 
   const skillList = await callAndRecord(
     firstTurn,
@@ -130,7 +194,7 @@ try {
     { receipt: alphaReceipt, path: "src/value.txt" },
     ["ALPHA_INITIAL_VALUE"],
   );
-  assertReceiptUnchanged(alphaReceipt, alphaRead);
+  assertOrdinaryResultHasNoContinuation(alphaRead);
   const alphaBatch = await callAndRecord(
     firstTurn,
     "account-a-main",
@@ -145,7 +209,7 @@ try {
     },
     ["ALPHA_INITIAL_VALUE"],
   );
-  assertReceiptUnchanged(alphaReceipt, alphaBatch);
+  assertOrdinaryResultHasNoContinuation(alphaBatch);
   const batchValue = (alphaBatch.structuredContent as {
     items?: Array<{ ref?: unknown; contentHash?: unknown; mtimeNs?: unknown }>;
   } | undefined)?.items?.find((item) => item.ref === "value");
@@ -160,11 +224,12 @@ try {
     {
       receipt: alphaReceipt,
       operationId: "host-simulation-a-main-patch",
+      instructionToken: alphaInstructionToken,
       ifMatch: { "notes/main.txt": null },
       patch: "*** Begin Patch\n*** Add File: notes/main.txt\n+main turn one\n*** End Patch",
     },
   );
-  assertReceiptUnchanged(alphaReceipt, firstPatch);
+  assertOrdinaryResultHasNoContinuation(firstPatch);
   const commandResult = await callAndRecord(
     firstTurn,
     "account-a-main",
@@ -178,7 +243,7 @@ try {
     },
     ["HOST_SIMULATION_COMMAND_RESULT"],
   );
-  assertReceiptUnchanged(alphaReceipt, commandResult);
+  assertOrdinaryResultHasNoContinuation(commandResult);
   const firstPreview = await callAndRecord(
     firstTurn,
     "account-a-main",
@@ -211,6 +276,28 @@ try {
   );
   await closeClient(firstTurn);
 
+  const refreshedA = await refreshExisting(active.origin, metadata, accountA);
+  const refreshedClient = await connect(
+    "account-a-refreshed",
+    refreshedA.accessToken,
+    active.origin,
+  );
+  const oldReceiptAfterRefresh = await callAndRecord(
+    refreshedClient,
+    "account-a-main",
+    "same-grant-refresh",
+    "read",
+    { receipt: alphaReceipt, path: "notes/main.txt" },
+    ["main turn one"],
+  );
+  assertOrdinaryResultHasNoContinuation(oldReceiptAfterRefresh);
+  assert.equal(
+    (oldReceiptAfterRefresh.structuredContent as { workspaceAlias?: unknown } | undefined)
+      ?.workspaceAlias,
+    "alpha-main",
+  );
+  await closeClient(refreshedClient);
+
   const reauthorizedA = await authorizeExisting(active.origin, metadata, accountA);
   authMetrics.push(reauthorizedA.auth);
   const reauthorizedClient = await connect(
@@ -218,21 +305,38 @@ try {
     reauthorizedA.accessToken,
     active.origin,
   );
+  const reauthorizedList = await callAndRecord(
+    reauthorizedClient,
+    "account-a-reauthorized",
+    "new-grant-list",
+    "list_workspaces",
+    {},
+  );
+  assert.deepEqual(
+    (reauthorizedList.structuredContent as {
+      workspaces?: unknown;
+    } | undefined)?.workspaces,
+    [],
+  );
   const oldReceiptAfterReapproval = await callAndRecord(
     reauthorizedClient,
-    "account-a-main",
-    "same-authority-reapproval",
+    "account-a-reauthorized",
+    "reject-new-grant-old-receipt",
     "read",
     { receipt: alphaReceipt, path: "notes/main.txt" },
-    ["main turn one"],
   );
-  assert.equal(workspaceGeneration(oldReceiptAfterReapproval), alphaGeneration);
-  assertReceiptUnchanged(alphaReceipt, oldReceiptAfterReapproval);
+  assert.equal(oldReceiptAfterReapproval.isError, true);
+  assert.equal(
+    (oldReceiptAfterReapproval.structuredContent as {
+      error?: { code?: unknown };
+    } | undefined)?.error?.code,
+    "workspace_context_required",
+  );
   await closeClient(reauthorizedClient);
 
   const secondTurn = await connect(
     "account-a-main-turn-2",
-    reauthorizedA.accessToken,
+    refreshedA.accessToken,
     active.origin,
     "stale-browser-session-header",
   );
@@ -263,7 +367,7 @@ try {
 
   const branchConversation = await connect(
     "account-a-branch",
-    reauthorizedA.accessToken,
+    refreshedA.accessToken,
     active.origin,
   );
   await callAndRecord(
@@ -290,7 +394,7 @@ try {
 
   const mainAfterBranch = await connect(
     "account-a-main-after-branch",
-    reauthorizedA.accessToken,
+    refreshedA.accessToken,
     active.origin,
   );
   await callAndRecord(
@@ -305,7 +409,7 @@ try {
 
   const freshConversation = await connect(
     "account-a-fresh-conversation",
-    reauthorizedA.accessToken,
+    refreshedA.accessToken,
     active.origin,
   );
   const freshProtocol = await protocolMetric(freshConversation);
@@ -360,21 +464,40 @@ try {
       contextMode: "full",
     },
   );
-  const betaInstructions = (betaContext.structuredContent as {
-    instructions?: { items?: Array<{ content?: unknown }> };
-  } | undefined)?.instructions?.items ?? [];
+  const betaManifest = (betaContext.structuredContent as {
+    instructionManifest?: { files?: Array<Record<string, unknown>> };
+  } | undefined)?.instructionManifest?.files ?? [];
+  assert.ok(betaManifest.some((item) => item.path === "AGENTS.md"));
+  assert.equal(betaManifest.some((item) => "content" in item), false);
+  const betaSkills = (betaContext.structuredContent as {
+    skills?: { count?: unknown; items?: unknown[] };
+  } | undefined)?.skills;
+  assert.equal(betaSkills?.count, 0);
+  assert.deepEqual(betaSkills?.items, []);
+  const betaContextReceipt = currentReceipt(betaContext);
+  const betaInstructionsResult = await callAndRecord(
+    accountBConversation,
+    "account-b",
+    "load-beta-scoped-instructions",
+    "load_workspace_instructions",
+    { receipt: betaContextReceipt, paths: ["src/value.txt"] },
+    ["Stress rule 240"],
+  );
+  const betaInstructions = (betaInstructionsResult.structuredContent as {
+    workspaceInstructions?: { items?: Array<{ content?: unknown }> };
+  } | undefined)?.workspaceInstructions?.items ?? [];
   assert.ok(
     betaInstructions.reduce(
       (total, item) => total + Buffer.byteLength(String(item.content ?? ""), "utf8"),
       0,
     ) > 20_000,
   );
-  const betaSkills = (betaContext.structuredContent as {
-    skills?: { count?: unknown; items?: unknown[] };
-  } | undefined)?.skills;
-  assert.equal(betaSkills?.count, 0);
-  assert.deepEqual(betaSkills?.items, []);
-  const betaReceipt = currentReceipt(betaContext);
+  const betaInstructionToken = String(
+    (betaInstructionsResult.structuredContent as { instructionToken?: unknown } | undefined)
+      ?.instructionToken ?? "",
+  );
+  assert.match(betaInstructionToken, /^instructions_/u);
+  const betaReceipt = currentReceipt(betaInstructionsResult);
   const betaWorkspaceRef = workspaceRef(betaContext);
   const betaSkillDiscovery = await callAndRecord(
     accountBConversation,
@@ -407,6 +530,7 @@ try {
     {
       receipt: betaReceipt,
       operationId: "host-simulation-b-beta-patch",
+      instructionToken: betaInstructionToken,
       ifMatch: { "notes/account-b-beta.txt": null },
       patch: "*** Begin Patch\n*** Add File: notes/account-b-beta.txt\n+account b beta\n*** End Patch",
     },
@@ -451,14 +575,28 @@ try {
     } | undefined)?.error?.code,
     "workspace_context_required",
   );
+  const accountBAlphaInstructions = await callAndRecord(
+    accountBConversation,
+    "account-b",
+    "load-shared-alpha-instructions",
+    "load_workspace_instructions",
+    { receipt: accountBAlphaReceipt, paths: ["notes/account-b-alpha.txt"] },
+  );
+  const accountBAlphaInstructionToken = String(
+    (accountBAlphaInstructions.structuredContent as { instructionToken?: unknown } | undefined)
+      ?.instructionToken ?? "",
+  );
+  assert.match(accountBAlphaInstructionToken, /^instructions_/u);
+  const accountBAlphaScopedReceipt = currentReceipt(accountBAlphaInstructions);
   await callAndRecord(
     accountBConversation,
     "account-b",
     "patch-shared-alpha-project",
     "apply_patch",
     {
-      receipt: accountBAlphaReceipt,
+      receipt: accountBAlphaScopedReceipt,
       operationId: "host-simulation-b-alpha-patch",
+      instructionToken: accountBAlphaInstructionToken,
       ifMatch: { "notes/account-b-alpha.txt": null },
       patch: "*** Begin Patch\n*** Add File: notes/account-b-alpha.txt\n+account b entered alpha\n*** End Patch",
     },
@@ -467,7 +605,7 @@ try {
 
   const finalAccountA = await connect(
     "account-a-final-shared-project-check",
-    reauthorizedA.accessToken,
+    refreshedA.accessToken,
     active.origin,
   );
   await callAndRecord(
@@ -582,6 +720,7 @@ interface OAuthCredentials {
   verifier: string;
   accessToken: string;
   refreshToken: string;
+  requestedScopes?: string[];
   auth: AuthMetric;
 }
 
@@ -685,6 +824,7 @@ async function registerAndAuthorize(
   origin: URL,
   metadata: OAuthMetadata,
   label: string,
+  requestedScopes?: readonly string[],
 ): Promise<OAuthCredentials> {
   const redirectUri = `https://chatgpt.com/connector/oauth/host-simulation-${label}`;
   const verifier = `host-simulation-${label}-verifier-0123456789-abcdefghijklmnopqrstuvwxyz`;
@@ -710,6 +850,7 @@ async function registerAndAuthorize(
     verifier,
     accessToken: "",
     refreshToken: "",
+    ...(requestedScopes ? { requestedScopes: [...requestedScopes] } : {}),
     auth: {
       label,
       registrationBytes: Buffer.byteLength(registrationText, "utf8"),
@@ -730,13 +871,15 @@ async function authorizeExisting(
     response_type: "code",
     client_id: credentials.clientId,
     redirect_uri: credentials.redirectUri,
-    scope: DEFAULT_DEVSPACE_OAUTH_SCOPES.join(" "),
     code_challenge: challenge,
     code_challenge_method: "S256",
     resource,
     state: `host-simulation-${credentials.label}`,
     ui_locales: "en-US",
   });
+  if (credentials.requestedScopes) {
+    authorization.set("scope", credentials.requestedScopes.join(" "));
+  }
   const authorizationUrl = localUrl(origin, metadata.authorization_endpoint);
   authorizationUrl.search = authorization.toString();
   const approvalPage = await fetch(authorizationUrl, { redirect: "manual" });
@@ -787,6 +930,35 @@ async function authorizeExisting(
       tokenResponseBytes: Buffer.byteLength(tokenText, "utf8"),
       reauthorization: Boolean(credentials.accessToken),
     },
+  };
+}
+
+async function refreshExisting(
+  origin: URL,
+  metadata: OAuthMetadata,
+  credentials: OAuthCredentials,
+): Promise<OAuthCredentials> {
+  const tokenResponse = await fetch(localUrl(origin, metadata.token_endpoint), {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "refresh_token",
+      client_id: credentials.clientId,
+      refresh_token: credentials.refreshToken,
+      resource,
+    }),
+  });
+  assert.equal(tokenResponse.status, 200);
+  const tokens = await tokenResponse.json() as {
+    access_token?: unknown;
+    refresh_token?: unknown;
+  };
+  assert.equal(typeof tokens.access_token, "string");
+  assert.equal(typeof tokens.refresh_token, "string");
+  return {
+    ...credentials,
+    accessToken: String(tokens.access_token),
+    refreshToken: String(tokens.refresh_token),
   };
 }
 
@@ -898,7 +1070,7 @@ function workspaceGeneration(result: Awaited<ReturnType<Client["callTool"]>>): n
   const value = (result.structuredContent as {
     workspace?: { generation?: unknown };
   } | undefined)?.workspace?.generation;
-  assert.equal(typeof value, "number");
+  assert.equal(typeof value, "number", JSON.stringify(result.structuredContent));
   return Number(value);
 }
 
@@ -913,8 +1085,8 @@ function projectFingerprint(result: Awaited<ReturnType<Client["callTool"]>>): st
 
 function instructionRevision(result: Awaited<ReturnType<Client["callTool"]>>): string {
   const value = (result.structuredContent as {
-    instructions?: { revision?: unknown };
-  } | undefined)?.instructions?.revision;
+    instructionManifest?: { revision?: unknown };
+  } | undefined)?.instructionManifest?.revision;
   assert.equal(typeof value, "string");
   return String(value);
 }
@@ -936,15 +1108,17 @@ function currentReceipt(result: Awaited<ReturnType<Client["callTool"]>>): string
     : undefined;
   const value = continuation?.receipt;
   assert.equal(typeof value, "string");
-  assert.match(String(value), /^wctx4\./u);
+  assert.match(String(value), /^wctx5\./u);
   return String(value);
 }
 
-function assertReceiptUnchanged(
-  expected: string,
+function assertOrdinaryResultHasNoContinuation(
   result: Awaited<ReturnType<Client["callTool"]>>,
 ): void {
-  assert.equal(currentReceipt(result), expected);
+  const structured = structuredRecord(result);
+  assert.equal(structured.continuation, undefined);
+  assert.equal(structured.contextChanged, false);
+  assert.equal(typeof structured.workspaceAlias, "string");
 }
 
 function toolText(result: Awaited<ReturnType<Client["callTool"]>>): string {

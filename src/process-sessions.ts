@@ -156,6 +156,7 @@ interface ProcessSession {
   quotaDroppedBytes: number;
   durableQuotaReached: boolean;
   outputStorageError?: string;
+  releaseWorkspaceRootLease?: () => void;
 }
 
 export interface ProcessSessionManagerOptions {
@@ -696,6 +697,30 @@ export class ProcessSessionManager {
     return snapshot;
   }
 
+  attachWorkspaceRootLease(
+    connectionPrincipalId: string,
+    workspaceId: string,
+    sessionId: number,
+    release: () => void,
+  ): boolean {
+    const session = this.sessions.get(sessionId);
+    if (
+      !session ||
+      !session.running ||
+      session.connectionPrincipalId !== connectionPrincipalId ||
+      session.workspaceId !== workspaceId
+    ) {
+      release();
+      return false;
+    }
+    if (session.releaseWorkspaceRootLease) {
+      release();
+      throw new Error(`Process session ${sessionId} already owns a workspace root lease.`);
+    }
+    session.releaseWorkspaceRootLease = releaseOnce(release);
+    return true;
+  }
+
   instructionContext(
     connectionPrincipalId: string,
     workspaceId: string,
@@ -965,6 +990,7 @@ export class ProcessSessionManager {
       return;
     }
     session.running = false;
+    this.releaseWorkspaceRootLease(session);
     this.finalizeDurableOutput(session);
     session.resolveExit();
     if (session.runtimeTimer) clearTimeout(session.runtimeTimer);
@@ -1100,11 +1126,18 @@ export class ProcessSessionManager {
 
   private removeSession(sessionId: number): void {
     const session = this.sessions.get(sessionId);
+    if (session) this.releaseWorkspaceRootLease(session);
     if (session?.cleanupTimer) clearTimeout(session.cleanupTimer);
     if (session?.runtimeTimer) clearTimeout(session.runtimeTimer);
     if (session?.escalationTimer) clearTimeout(session.escalationTimer);
     if (session?.treeExitTimer) clearTimeout(session.treeExitTimer);
     this.sessions.delete(sessionId);
+  }
+
+  private releaseWorkspaceRootLease(session: ProcessSession): void {
+    const release = session.releaseWorkspaceRootLease;
+    session.releaseWorkspaceRootLease = undefined;
+    release?.();
   }
 
   private resolveRuntimeLimitMs(requestedRuntimeMs: number | undefined): number {
@@ -1195,4 +1228,13 @@ export class ProcessSessionManager {
 
 function unknownProcessSessionError(_sessionId: number): Error {
   return new UnknownProcessSessionError();
+}
+
+function releaseOnce(release: () => void): () => void {
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    release();
+  };
 }

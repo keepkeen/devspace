@@ -94,6 +94,7 @@ export interface DevspaceUserConfig {
   projectDocFallbackFilenames?: string[];
   subagents?: boolean;
   widgets?: "off" | "changes" | "full";
+  mcpHttpTransport?: "stateless" | "stateful";
   resources?: {
     maxMcpSessions?: number;
     maxMcpSessionsPerClient?: number;

@@ -1127,3 +1127,46 @@ try {
   storageFailureStore.close();
   await rm(storageFailureRoot, { recursive: true, force: true });
 }
+
+const leaseManager = new ProcessSessionManager({
+  maxRuntimeMs: 10_000,
+  terminationGraceMs: 1_000,
+});
+try {
+  let released = 0;
+  const running = await leaseManager.start({
+    connectionPrincipalId,
+    workspaceId: "root-lease",
+    cwd: process.cwd(),
+    command: `${node} -e "setInterval(() => {}, 1000)"`,
+    yieldTimeMs: 0,
+  });
+  assert.equal(running.running, true);
+  assert.ok(running.sessionId);
+  assert.equal(leaseManager.attachWorkspaceRootLease(
+    connectionPrincipalId,
+    "root-lease",
+    running.sessionId!,
+    () => { released += 1; },
+  ), true);
+  assert.equal(released, 0, "a running process must retain the physical-root lease");
+  leaseManager.terminate(connectionPrincipalId, "root-lease", running.sessionId!);
+  await leaseManager.write({
+    connectionPrincipalId,
+    workspaceId: "root-lease",
+    sessionId: running.sessionId!,
+    yieldTimeMs: 2_000,
+  });
+  assert.equal(released, 1, "the lease must release after the complete process tree exits");
+
+  let rejectedRelease = 0;
+  assert.equal(leaseManager.attachWorkspaceRootLease(
+    connectionPrincipalId,
+    "root-lease",
+    999_999,
+    () => { rejectedRelease += 1; },
+  ), false);
+  assert.equal(rejectedRelease, 1, "an unowned or completed session must release immediately");
+} finally {
+  await leaseManager.shutdown();
+}

@@ -5,14 +5,8 @@ import {
   validInternalRevocationToken,
 } from "./internal-auth.js";
 import type { RuntimeDiagnostics } from "./runtime-diagnostics.js";
+import type { McpSessionUsageSnapshot } from "./mcp-sessions.js";
 import { DEVSPACE_VERSION } from "./version.js";
-
-interface McpUsage {
-  sessions: number;
-  reservations: number;
-  statelessRequests: number;
-  limit: number;
-}
 
 interface ProcessUsage {
   sessions: number;
@@ -74,7 +68,7 @@ export interface RuntimeControlPlaneOptions {
   isClosing(): boolean;
   workspaceDatabaseReady(): boolean;
   oauthDatabaseReady(): boolean;
-  mcpUsage(): McpUsage;
+  mcpUsage(): McpSessionUsageSnapshot;
   processUsage(): ProcessUsage;
   processOutputUsage(): ProcessOutputUsage;
   workspaceUsage(): WorkspaceUsage;
@@ -131,6 +125,7 @@ export function createRuntimeControlPlane(options: RuntimeControlPlaneOptions): 
           statelessRequests: mcpUsage.statelessRequests,
           reserved: mcpUsage.reservations,
           limit: finiteLimit(mcpUsage.limit),
+          statelessLeases: mcpUsage.statelessLeases,
         },
         processSessions: {
           active: processUsage.sessions,

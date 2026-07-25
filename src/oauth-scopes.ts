@@ -9,7 +9,14 @@ export const DEVSPACE_CAPABILITY_SCOPES = [
 
 export type DevSpaceCapabilityScope = typeof DEVSPACE_CAPABILITY_SCOPES[number];
 
-export const DEFAULT_DEVSPACE_OAUTH_SCOPES = [...DEVSPACE_CAPABILITY_SCOPES] as const;
+/** Every capability this server can support when explicitly requested. */
+export const FULL_DEVSPACE_OAUTH_SCOPES = [...DEVSPACE_CAPABILITY_SCOPES] as const;
+
+/** Historical public name for the default supported capability set. */
+export const DEFAULT_DEVSPACE_OAUTH_SCOPES = [...FULL_DEVSPACE_OAUTH_SCOPES] as const;
+
+/** Least-privilege scopes used only when an authorization request omits `scope`. */
+export const DEFAULT_AUTHORIZATION_SCOPES = ["workspace:read"] as const;
 
 const SCOPE_DESCRIPTIONS: Record<DevSpaceCapabilityScope, string> = {
   "workspace:read": "Read approved workspace files, instructions, Skills, and metadata",
@@ -38,7 +45,7 @@ export function defaultOAuthAuthorizationScopes(
   supportedScopes: readonly string[],
 ): string[] {
   const supported = new Set(supportedScopes);
-  return DEVSPACE_CAPABILITY_SCOPES.filter((scope) => supported.has(scope));
+  return DEFAULT_AUTHORIZATION_SCOPES.filter((scope) => supported.has(scope));
 }
 
 export function oauthScopeDescription(scope: string): string {

@@ -23,9 +23,8 @@ import {
   recoverableWorkspaceError,
   toolSurface,
   toolCallOperationId,
-  toolCallWorkspaceId,
+  legacyWorkspaceIdHint,
   readinessSnapshot,
-  workspaceOperationId,
   workspaceToolRootLockMode,
   toolCallWorkspaceReceipt,
   workspaceAppAssetPaths,
@@ -590,14 +589,10 @@ const generated = readinessSnapshot({
 });
 assert.equal(generated.body.generation, "generation-test");
 
-assert.equal(workspaceOperationId({
-  method: "tools/call",
-  params: { name: "read", arguments: { workspaceId: "ws_test" } },
-}), undefined);
 assert.equal(toolCallWorkspaceReceipt({
   method: "tools/call",
-  params: { name: "read", arguments: { receipt: `wctx4.${"A".repeat(43)}` } },
-}), `wctx4.${"A".repeat(43)}`);
+  params: { name: "read", arguments: { receipt: `wctx5.${"A".repeat(43)}` } },
+}), `wctx5.${"A".repeat(43)}`);
 assert.equal(toolCallOperationId({
   method: "tools/call",
   params: { name: "exec_command", arguments: { operationId: "operation-17" } },
@@ -608,23 +603,23 @@ assert.equal(toolCallOperationId({
 }), undefined);
 assert.equal(workspaceToolRootLockMode({
   method: "tools/call",
-  params: { name: "read", arguments: { receipt: `wctx4.${"A".repeat(43)}` } },
+  params: { name: "read", arguments: { receipt: `wctx5.${"A".repeat(43)}` } },
 }), "read");
 assert.equal(workspaceToolRootLockMode({
   method: "tools/call",
-  params: { name: "apply_patch", arguments: { receipt: `wctx4.${"A".repeat(43)}` } },
+  params: { name: "apply_patch", arguments: { receipt: `wctx5.${"A".repeat(43)}` } },
 }), "write");
 assert.equal(workspaceToolRootLockMode({
   method: "tools/call",
-  params: { name: "write_stdin", arguments: { receipt: `wctx4.${"A".repeat(43)}`, sessionId: 1 } },
-}), "read");
+  params: { name: "write_stdin", arguments: { receipt: `wctx5.${"A".repeat(43)}`, sessionId: 1 } },
+}), undefined);
 assert.equal(workspaceToolRootLockMode({
   method: "tools/call",
   params: {
     name: "write_stdin",
-    arguments: { receipt: `wctx4.${"A".repeat(43)}`, sessionId: 1, chars: "input" },
+    arguments: { receipt: `wctx5.${"A".repeat(43)}`, sessionId: 1, chars: "input" },
   },
-}), "write");
+}), undefined);
 assert.deepEqual(requiredOAuthScopesForTool("read"), ["workspace:read"]);
 assert.deepEqual(requiredOAuthScopesForTool("get_operation_status"), ["workspace:read"]);
 assert.deepEqual(requiredOAuthScopesForTool("exec_command"), [
@@ -684,26 +679,15 @@ assert.match(
   /byte limit/,
 );
 assert.match(processEnvironmentViolation({ CDPATH: "/tmp" }) ?? "", /managed by DevSpace/);
-assert.equal(workspaceOperationId({
-  method: "tools/call",
-  params: { name: "close_workspace", arguments: { workspaceId: "ws_test" } },
-}), undefined);
-for (const name of ["list_workspaces", "resume_workspace", "get_workspace_context"]) {
-  assert.equal(workspaceOperationId({
-    method: "tools/call",
-    params: { name, arguments: { alias: "project" } },
-  }), undefined);
-}
-assert.equal(toolCallWorkspaceId({
+assert.equal(legacyWorkspaceIdHint({
   method: "tools/call",
   params: { name: "close_workspace", arguments: { workspaceId: "ws_test" } },
 }), "ws_test");
-assert.equal(toolCallWorkspaceId({
+assert.equal(legacyWorkspaceIdHint({
   method: "tools/call",
   params: { name: "open_workspace", arguments: { path: "/tmp/project" } },
 }), undefined);
-assert.equal(toolCallWorkspaceId([{ method: "tools/call" }]), undefined);
-assert.equal(workspaceOperationId([{ method: "tools/call" }]), undefined);
+assert.equal(legacyWorkspaceIdHint([{ method: "tools/call" }]), undefined);
 assert.equal(jsonRpcRequestId({ jsonrpc: "2.0", id: 42 }), 42);
 assert.equal(jsonRpcRequestId({ jsonrpc: "2.0", id: "call-1" }), "call-1");
 assert.equal(jsonRpcRequestId([{ jsonrpc: "2.0", id: 42 }]), null);
@@ -720,11 +704,19 @@ assert.equal(recoverableWorkspaceError(new Error("database failure")), undefined
 const commonTools = [
   "apply_patch", "batch_inspect", "batch_read", "close_workspace", "exec_command",
   "get_operation_status", "get_workspace_context", "list_workspaces", "load_workspace_instructions",
-  "open_workspace", "read", "read_process_output", "resume_workspace", "revoke_workspace", "write_stdin",
+  "open_workspace", "read", "read_process_output", "resume_workspace", "revoke_workspace", "show_changes",
+  "write_stdin",
 ];
 assert.deepEqual(toolSurface({ widgets: "off", skillsEnabled: true }), [
   ...commonTools, "list_skills", "load_skill",
 ].sort());
+for (const widgets of ["off", "full", "changes"] as const) {
+  assert.equal(
+    toolSurface({ widgets, skillsEnabled: false }, ["workspace:read"]).includes("show_changes"),
+    true,
+    `show_changes must remain visible with workspace:read when widgets=${widgets}`,
+  );
+}
 const changesSurface = toolSurface({ widgets: "changes", skillsEnabled: false });
 assert.ok(changesSurface.includes("show_changes"));
 assert.equal(changesSurface.includes("load_skill"), false);

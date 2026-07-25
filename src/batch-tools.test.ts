@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import {
   BATCH_ERROR_MAX_CHARACTERS,
+  BATCH_ITEM_MIN_CHARACTERS,
   BATCH_ITEM_MAX_CHARACTERS,
   BATCH_MAX_ITEMS,
   BATCH_TOTAL_MAX_CHARACTERS,
@@ -55,6 +56,29 @@ assert.equal(oversized.truncated, true);
 assert.ok(oversized.items.every((item) => item.result.length <= BATCH_ITEM_MAX_CHARACTERS));
 assert.ok(oversized.items.reduce((sum, item) => sum + item.result.length, 0) <= BATCH_TOTAL_MAX_CHARACTERS);
 assert.ok(oversized.result.length <= BATCH_TOTAL_MAX_CHARACTERS);
+assert.ok(oversized.items.every((item) => item.result.length >= BATCH_ITEM_MIN_CHARACTERS));
+
+const fairlyAllocated = await runBoundedBatch(
+  Array.from({ length: 8 }, (_, index) => ({ operation: "grep", path: String(index) })),
+  async () => ({ ok: true, result: "x".repeat(1_000) }),
+  {
+    totalMaxCharacters: 800,
+    minItemCharacters: 50,
+    allocationChunkCharacters: 25,
+  },
+);
+assert.ok(fairlyAllocated.items.every((item) => item.result.length === 100));
+assert.ok(fairlyAllocated.items.every((item) => item.truncated));
+
+const explicitlyOmitted = await runBoundedBatch(
+  Array.from({ length: 4 }, (_, index) => ({ operation: "glob", path: String(index) })),
+  async () => ({ ok: true, result: "content" }),
+  { totalMaxCharacters: 2, minItemCharacters: 10 },
+);
+assert.equal(explicitlyOmitted.items.filter((item) => item.omitted).length, 2);
+assert.ok(explicitlyOmitted.items
+  .filter((item) => item.omitted)
+  .every((item) => item.omittedReason === "aggregate_budget_exhausted"));
 
 let capturedBatchError: unknown;
 const oversizedError = await runBoundedBatch(

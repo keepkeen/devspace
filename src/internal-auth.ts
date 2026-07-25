@@ -1,4 +1,4 @@
-import { createHash, timingSafeEqual } from "node:crypto";
+import { createHmac, timingSafeEqual } from "node:crypto";
 
 const DIAGNOSTICS_DOMAIN = "devspace-internal-diagnostics-v1\0";
 const CONFIG_RELOAD_DOMAIN = "devspace-internal-config-reload-v1\0";
@@ -38,5 +38,5 @@ export function validInternalConfigReloadToken(ownerToken: string, supplied: str
 }
 
 function internalToken(domain: string, ownerToken: string): string {
-  return createHash("sha256").update(domain).update(ownerToken).digest("base64url");
+  return createHmac("sha256", ownerToken).update(domain, "utf8").digest("base64url");
 }

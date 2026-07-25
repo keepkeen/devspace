@@ -111,11 +111,10 @@ export const oauthClients = sqliteTable(
   "oauth_clients",
   {
     clientId: text("client_id").primaryKey(),
-    principalId: text("principal_id"),
     clientJson: text("client_json").notNull(),
     issuedAt: integer("issued_at").notNull(),
   },
-  (table) => [index("oauth_clients_principal_id_idx").on(table.principalId)],
+  (table) => [index("oauth_clients_issued_at_idx").on(table.issuedAt)],
 );
 
 export const connectionPrincipals = sqliteTable(
@@ -127,6 +126,34 @@ export const connectionPrincipals = sqliteTable(
     revokedAt: text("revoked_at"),
   },
   (table) => [index("connection_principals_last_used_idx").on(table.lastUsedAt)],
+);
+
+export const oauthGrants = sqliteTable(
+  "oauth_grants",
+  {
+    grantId: text("grant_id").primaryKey(),
+    clientId: text("client_id")
+      .notNull()
+      .references(() => oauthClients.clientId, { onDelete: "cascade" }),
+    principalId: text("principal_id")
+      .notNull()
+      .references(() => connectionPrincipals.principalId),
+    subjectHash: text("subject_hash"),
+    organizationHash: text("organization_hash"),
+    grantedScopesJson: text("granted_scopes_json").notNull(),
+    authorizationEpoch: integer("authorization_epoch").notNull(),
+    createdAt: text("created_at").notNull(),
+    lastUsedAt: text("last_used_at").notNull(),
+    revokedAt: text("revoked_at"),
+  },
+  (table) => [
+    uniqueIndex("oauth_grants_identity_uq")
+      .on(table.grantId, table.principalId, table.clientId),
+    index("oauth_grants_client_id_idx").on(table.clientId, table.lastUsedAt),
+    index("oauth_grants_principal_id_idx").on(table.principalId, table.lastUsedAt),
+    index("oauth_grants_subject_hash_idx").on(table.subjectHash),
+    check("oauth_grants_authorization_epoch_check", sql`${table.authorizationEpoch} >= 1`),
+  ],
 );
 
 export const oauthPrincipalReconnectCodes = sqliteTable(
@@ -163,26 +190,56 @@ export const oauthAccessTokens = sqliteTable(
   "oauth_access_tokens",
   {
     tokenHash: text("token_hash").primaryKey(),
+    grantId: text("grant_id").notNull(),
     clientId: text("client_id")
       .notNull()
       .references(() => oauthClients.clientId, { onDelete: "cascade" }),
+    principalId: text("principal_id")
+      .notNull()
+      .references(() => connectionPrincipals.principalId),
+    authorizationEpoch: integer("authorization_epoch").notNull(),
     scopesJson: text("scopes_json").notNull(),
     expiresAt: integer("expires_at").notNull(),
     resource: text("resource"),
   },
+  (table) => [
+    foreignKey({
+      columns: [table.grantId, table.principalId, table.clientId],
+      foreignColumns: [oauthGrants.grantId, oauthGrants.principalId, oauthGrants.clientId],
+    }).onDelete("cascade"),
+    index("oauth_access_tokens_grant_id_idx").on(table.grantId),
+    index("oauth_access_tokens_client_id_idx").on(table.clientId),
+    index("oauth_access_tokens_expires_at_idx").on(table.expiresAt),
+    check("oauth_access_tokens_authorization_epoch_check", sql`${table.authorizationEpoch} >= 1`),
+  ],
 );
 
 export const oauthRefreshTokens = sqliteTable(
   "oauth_refresh_tokens",
   {
     tokenHash: text("token_hash").primaryKey(),
+    grantId: text("grant_id").notNull(),
     clientId: text("client_id")
       .notNull()
       .references(() => oauthClients.clientId, { onDelete: "cascade" }),
+    principalId: text("principal_id")
+      .notNull()
+      .references(() => connectionPrincipals.principalId),
+    authorizationEpoch: integer("authorization_epoch").notNull(),
     scopesJson: text("scopes_json").notNull(),
     expiresAt: integer("expires_at").notNull(),
     resource: text("resource"),
   },
+  (table) => [
+    foreignKey({
+      columns: [table.grantId, table.principalId, table.clientId],
+      foreignColumns: [oauthGrants.grantId, oauthGrants.principalId, oauthGrants.clientId],
+    }).onDelete("cascade"),
+    index("oauth_refresh_tokens_grant_id_idx").on(table.grantId),
+    index("oauth_refresh_tokens_client_id_idx").on(table.clientId),
+    index("oauth_refresh_tokens_expires_at_idx").on(table.expiresAt),
+    check("oauth_refresh_tokens_authorization_epoch_check", sql`${table.authorizationEpoch} >= 1`),
+  ],
 );
 
 export const oauthOwnerCredential = sqliteTable(

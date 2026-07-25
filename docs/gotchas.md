@@ -160,24 +160,28 @@ Enter that code once on the new approval page. Do not paste it into ChatGPT.
 Without this explicit link, reopening the project creates isolated connection
 state.
 
-## Missing Or Stale Workspace Receipt
+## Missing Or Stale Workspace Context
 
-Version 2.0 Workspace tools require the current v4 `continuation.receipt`. A
-raw `workspaceId`, a generation number, or an expired receipt is never used to
-guess authority. The call fails before the handler starts with
-`workspace_context_required` or `workspace_context_incomplete`.
+ChatGPT-style hosts normally use the server-side binding for the current
+`openai/session`. Generic MCP clients pass a v5 `continuation.receipt`. A raw
+`workspaceId`, generation, or expired receipt is never authority, and an
+explicitly supplied invalid receipt never falls back to host session state.
 
-For the first use of a host path, call `open_workspace`. Its default metadata
-receipt must be promoted with `get_workspace_context(contextMode="full")`. In
-a later conversation or after a backend restart, call `list_workspaces`, select
-the intended alias or `workspaceRef`, and call `resume_workspace` with
-`contextMode="full"`. Refresh the DevSpace app tools in ChatGPT after upgrading
-from 1.x so the host sends receipts instead of the removed handle fields.
+First use of an approved path starts with `open_workspace`, which returns
+`selected` by default. Promote it with
+`get_workspace_context(contextMode="full")`; full context returns an instruction
+manifest, and target paths are loaded through `load_workspace_instructions`.
 
-Normal stateless MCP transport reconnects do not invalidate the persisted
-Workspace. Principal relink/revoke, Owner or root-authority changes, lifecycle
-transitions, receipt expiry, and backend restart do invalidate receipts.
-Reauthorizing the same registered client with unchanged authority does not.
+In a later conversation or after backend restart, follow the structured recovery:
+call `list_workspaces`, select the intended alias or `workspaceRef`, then call
+`resume_workspace(contextMode="full")`. Only open a path again when
+`hasRetainedWorkspaces=false`. Refresh the ChatGPT app tools after upgrading so
+the host receives the v5 schemas.
+
+Stateless HTTP reconnects do not invalidate persisted Workspace records. Restart,
+receipt expiry, grant/principal/epoch changes, Owner credential rotation, root
+authority changes, and lifecycle transitions invalidate in-process context
+bindings.
 
 ## Managed Worktree Is Missing Or Platform Closed The Session
 

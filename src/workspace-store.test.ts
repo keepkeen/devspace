@@ -71,7 +71,7 @@ try {
       migratedDatabase.prepare(
         "select version, name from devspace_schema_migrations order by version",
       ).all(),
-      [{ version: 14, name: "canonical-state-v14" }],
+      [{ version: 15, name: "canonical-state-v15" }],
     );
     const workspaceColumns = migratedDatabase.prepare("pragma table_info(workspace_sessions)")
       .all() as Array<{ name: string }>;
