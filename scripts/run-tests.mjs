@@ -1,74 +1,54 @@
-import { spawnSync } from "node:child_process";
+import { readdirSync } from "node:fs";
 import { createRequire } from "node:module";
-import { dirname, resolve } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
+import { spawnSync } from "node:child_process";
 
-const tests = [
-  "src/version.test.ts",
-  "src/internal-auth.test.ts",
-  "src/runtime-diagnostics.test.ts",
-  "src/runtime-control-plane.test.ts",
-  "src/project-orientation.test.ts",
-  "src/allowed-roots-hot-reload.test.ts",
-  "src/request-barrier.test.ts",
-  "src/mutation-operation-store.test.ts",
-  "src/db/migrations.test.ts",
-  "src/config.test.ts",
-  "src/admin-config.test.ts",
-  "src/admin-runtime.test.ts",
-  "src/admin-server.test.ts",
-  "src/ui/card-types.test.ts",
-  "src/ui/patch-display.test.ts",
-  "src/ui/tool-display.test.ts",
-  "src/apply-patch.test.ts",
-  "src/tool-effects.test.ts",
-  "src/workspace-context-protocol.test.ts",
-  "src/workspace-root-locks.test.ts",
-  "src/pi-tools.test.ts",
-  "src/bash-prompt.test.ts",
-  "src/batch-tools.test.ts",
-  "src/command-policy.test.ts",
-  "src/shell-command-scopes.test.ts",
-  "src/shell-write-targets.test.ts",
-  "src/process-platform.test.ts",
-  "src/process-output-store.test.ts",
-  "src/process-sessions.test.ts",
-  "src/mcp-sessions.test.ts",
-  "src/mcp-transport-mode.test.ts",
-  "src/chatgpt-flow-e2e.test.ts",
-  "src/host-conversation-simulation.test.ts",
-  "src/server-observability.test.ts",
-  "src/server-startup.test.ts",
-  "src/mcp-context-budget.test.ts",
-  "src/server-shutdown.test.ts",
-  "src/local-agent-runtime.test.ts",
-  "src/local-agent-adapters.test.ts",
-  "src/local-agent-availability.test.ts",
-  "src/local-agent-profiles.test.ts",
-  "src/local-agent-targets.test.ts",
-  "src/local-agent-store.test.ts",
-  "src/detached-agent-cleanup.test.ts",
-  "src/roots.test.ts",
-  "src/skills.test.ts",
-  "src/workspace-store.test.ts",
-  "src/workspaces.test.ts",
-  "src/review-checkpoints.test.ts",
-  "src/oauth-store.test.ts",
-  "src/oauth-http.test.ts",
-  "src/oauth-scope-e2e.test.ts",
-  "src/cli.test.ts",
-];
+const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const sourceRoot = join(projectRoot, "src");
+const tests = discoverTestFiles(sourceRoot);
+
+if (tests.length === 0) {
+  throw new Error(`No test files were discovered under ${sourceRoot}.`);
+}
 
 const require = createRequire(import.meta.url);
 const tsxCli = resolve(dirname(require.resolve("tsx/package.json")), "dist/cli.mjs");
-for (const test of tests) {
-  const result = spawnSync(process.execPath, [tsxCli, test], {
+let completed = 0;
+
+console.log(`Discovered ${tests.length} test files under src/.`);
+
+for (const testPath of tests) {
+  const displayPath = relative(projectRoot, testPath).split(sep).join("/");
+  const result = spawnSync(process.execPath, [tsxCli, testPath], {
+    cwd: projectRoot,
     stdio: "inherit",
     timeout: 180_000,
   });
   if (result.error && "code" in result.error && result.error.code === "ETIMEDOUT") {
-    console.error(`Test timed out after 180 seconds: ${test}`);
+    console.error(`Test timed out after 180 seconds: ${displayPath}`);
     process.exit(1);
   }
   if (result.error) throw result.error;
   if (result.status !== 0) process.exit(result.status ?? 1);
+  completed += 1;
+}
+
+if (completed !== tests.length) {
+  throw new Error(`Test discovery found ${tests.length} files, but only ${completed} completed.`);
+}
+
+console.log(`Completed all ${completed} discovered test files.`);
+
+function discoverTestFiles(directory) {
+  const files = [];
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    const path = join(directory, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...discoverTestFiles(path));
+      continue;
+    }
+    if (entry.isFile() && entry.name.endsWith(".test.ts")) files.push(path);
+  }
+  return files.sort((left, right) => left.localeCompare(right, "en"));
 }

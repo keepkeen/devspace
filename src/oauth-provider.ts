@@ -21,25 +21,37 @@ import {
   type OAuthCleanupCounts,
   type OAuthGrantRecord,
   type OAuthRevocationCounts,
+  type ConnectionPrincipalSummary,
 } from "./oauth-store.js";
 import type { HashedHostIdentity } from "./host-identity.js";
 import { requestIp } from "./logger.js";
 import type { RuntimeCapabilities } from "./runtime-capabilities.js";
+import {
+  ALL_AUTHORIZED_ROOTS_ID,
+  type AuthorizationRoot,
+} from "./authorization-roots.js";
 import {
   DEFAULT_AUTHORIZATION_SCOPES,
   DEFAULT_DEVSPACE_OAUTH_SCOPES,
   defaultOAuthAuthorizationScopes,
   oauthScopeDescription,
 } from "./oauth-scopes.js";
+import {
+  verifyOwnerPassword,
+  type OwnerCredentialInput,
+  type SecurityKeyring,
+} from "./security-credentials.js";
 
 export interface OAuthConfig {
-  ownerToken: string;
+  ownerCredential: OwnerCredentialInput;
+  keys: SecurityKeyring;
   accessTokenTtlSeconds: number;
   refreshTokenTtlSeconds: number;
   scopes: string[];
   allowedRedirectHosts: string[];
   trustProxy?: boolean;
   runtimeCapabilities?: RuntimeCapabilities;
+  resourceRoots?: () => readonly AuthorizationRoot[];
 }
 
 export type OAuthAuditEventName =
@@ -74,12 +86,19 @@ interface AuthorizationCodeRecord {
   expiresAtMs: number;
 }
 
+interface AuthorizationSelectionRecord {
+  clientId: string;
+  authorizationSessionKey: string;
+  expiresAtMs: number;
+}
+
 export interface OAuthRequestAuthorization {
   clientId: string;
   grantId: string;
   connectionPrincipalId: string;
   authorizationEpoch: number;
   scopes: string[];
+  allowedRootIds: string[];
   subjectHash?: string;
   organizationHash?: string;
 }
@@ -89,6 +108,7 @@ const AUTH_EXTRA_PRINCIPAL_ID = "devspace/principal-id";
 const AUTH_EXTRA_AUTHORIZATION_EPOCH = "devspace/authorization-epoch";
 
 const CODE_TTL_MS = 5 * 60 * 1000;
+const SELECTION_TTL_MS = 5 * 60 * 1000;
 const AUTHORIZATION_LIMIT_TTL_MS = 24 * 60 * 60_000;
 
 const AUTHORIZATION_LIMIT_POLICIES = {
@@ -145,6 +165,9 @@ function formHtml(params: {
   resource?: URL;
   fields: Record<string, string | undefined>;
   runtimeCapabilities?: RuntimeCapabilities;
+  selectionToken?: string;
+  principals?: readonly ConnectionPrincipalSummary[];
+  roots?: readonly AuthorizationRoot[];
 }): string {
   const scopes = params.scopes.length > 0 ? params.scopes : [...DEFAULT_AUTHORIZATION_SCOPES];
   const scopeItems = scopes
@@ -168,6 +191,39 @@ function formHtml(params: {
         .map((warning) => `<li>${htmlEscape(warning)}</li>`)
         .join("")}</ul></section>`
     : "";
+  const selectionStage = Boolean(params.selectionToken);
+  const principalOptions = (params.principals ?? [])
+    .map((principal) => {
+      const aliases = principal.aliases.length > 0
+        ? ` — ${principal.aliases.slice(0, 4).join(", ")}`
+        : "";
+      const label = `${principal.principalId} (${principal.retainedWorkspaces} workspaces)${aliases}`;
+      return `<option value="${htmlEscape(principal.principalId)}">${htmlEscape(label)}</option>`;
+    })
+    .join("");
+  const rootChoices = (params.roots ?? []).map((root) =>
+    `<label class="choice"><input type="checkbox" name="root_id" value="${htmlEscape(root.id)}" checked /><strong>${htmlEscape(root.label)}</strong><span>${htmlEscape(root.path)}</span></label>`
+  ).join("");
+  const authorizationControls = selectionStage
+    ? `
+        <input type="hidden" name="selection_token" value="${htmlEscape(params.selectionToken!)}" />
+        <fieldset>
+          <legend>Local connection</legend>
+          <label class="choice"><input type="radio" name="connection_mode" value="new" checked /><strong>Create a new isolated local connection</strong></label>
+          ${principalOptions
+            ? `<label class="choice"><input type="radio" name="connection_mode" value="reuse" /><strong>Reuse an existing local connection</strong></label>
+          <select name="reuse_principal_id">${principalOptions}</select>
+          <p class="help">Reusing preserves that connection's Workspace aliases. This choice is made only after Owner-password approval.</p>`
+            : ""}
+        </fieldset>
+        <fieldset>
+          <legend>Authorized project roots</legend>
+          ${rootChoices || "<p>No approved roots are currently configured.</p>"}
+          <p class="help">Scopes control what this connection can do. These roots control where it can do it.</p>
+        </fieldset>`
+    : `
+        <label for="owner_token">Owner password</label>
+        <input id="owner_token" name="owner_token" type="password" autocomplete="current-password" autofocus required />`;
 
   return `<!doctype html>
 <html lang="en">
@@ -188,7 +244,12 @@ function formHtml(params: {
       li code { display: block; color: #bae6fd; }
       li span { color: #cbd5e1; font-size: 13px; }
       label { display: block; margin: 18px 0 8px; font-weight: 600; }
-      input { box-sizing: border-box; width: 100%; padding: 12px 14px; border-radius: 10px; border: 1px solid #475569; background: #020617; color: #e2e8f0; font-size: 16px; }
+      input, select { box-sizing: border-box; width: 100%; padding: 12px 14px; border-radius: 10px; border: 1px solid #475569; background: #020617; color: #e2e8f0; font-size: 16px; }
+      fieldset { margin: 18px 0; border: 1px solid #334155; border-radius: 12px; padding: 14px; }
+      legend { padding: 0 8px; font-weight: 700; }
+      .choice { display: grid; grid-template-columns: auto 1fr; gap: 4px 8px; align-items: start; padding: 8px 0; font-weight: 500; }
+      .choice input { width: auto; margin-top: 3px; }
+      .choice span { grid-column: 2; color: #94a3b8; font-size: 12px; word-break: break-all; }
       .optional { margin-top: 22px; padding-top: 18px; border-top: 1px solid #334155; }
       .help { margin: 6px 0 0; color: #94a3b8; font-size: 13px; }
       button { margin-top: 18px; width: 100%; border: 0; border-radius: 10px; padding: 12px 14px; font-weight: 700; color: #020617; background: #38bdf8; cursor: pointer; }
@@ -212,14 +273,8 @@ function formHtml(params: {
       </dl>
       <form method="post">
 ${hiddenFields}
-        <label for="owner_token">Owner password</label>
-        <input id="owner_token" name="owner_token" type="password" autocomplete="current-password" autofocus required />
-        <div class="optional">
-          <label for="reconnect_code">Reconnect code (optional)</label>
-          <input id="reconnect_code" name="reconnect_code" type="text" autocomplete="off" spellcheck="false" />
-          <p class="help">Use a short-lived code created locally with <code>devspace auth reconnect-code</code> to recover an earlier connection principal. New registrations remain isolated by default.</p>
-        </div>
-        <button type="submit">Authorize DevSpace</button>
+${authorizationControls}
+        <button type="submit">${selectionStage ? "Connect DevSpace" : "Continue"}</button>
       </form>
     </main>
   </body>
@@ -366,8 +421,10 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
   readonly clientsStore: OAuthRegisteredClientsStore;
   readonly ownerCredentialChanged: boolean;
   private readonly codes = new Map<string, AuthorizationCodeRecord>();
+  private readonly selections = new Map<string, AuthorizationSelectionRecord>();
   private readonly oauthStore: SqliteOAuthStore;
   private readonly resourceServerUrl: URL;
+  private readonly ownerPasswordHash: string;
 
   constructor(
     private readonly config: OAuthConfig,
@@ -380,7 +437,9 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
   ) {
     this.resourceServerUrl = resourceUrlFromServerUrl(resourceServerUrl);
     this.oauthStore = new SqliteOAuthStore(stateDir);
-    this.ownerCredentialChanged = this.oauthStore.reconcileOwnerCredential(config.ownerToken);
+    const credential = this.oauthStore.reconcileOwnerCredential(config.ownerCredential);
+    this.ownerCredentialChanged = credential.changed;
+    this.ownerPasswordHash = credential.passwordHash;
     this.clientsStore = new SqliteOAuthClientsStore(
       this.oauthStore,
       config.allowedRedirectHosts,
@@ -419,6 +478,73 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
       return;
     }
 
+    const selectionToken = String(res.req.body?.selection_token ?? "").trim();
+    if (selectionToken) {
+      const selection = this.selections.get(selectionToken);
+      if (
+        !selection ||
+        selection.clientId !== client.client_id ||
+        selection.authorizationSessionKey !== authorizationSessionKey(client, authorizedParams) ||
+        selection.expiresAtMs < Date.now()
+      ) {
+        this.selections.delete(selectionToken);
+        res.status(400).setHeader("Content-Type", "text/html; charset=utf-8");
+        res.send(formHtml({
+          error: "The local connection selection expired. Enter the Owner password again.",
+          clientName: client.client_name ?? client.client_id,
+          scopes,
+          resource: authorizedParams.resource,
+          fields: authorizationFormFields(client, authorizedParams),
+          runtimeCapabilities: this.config.runtimeCapabilities,
+        }));
+        return;
+      }
+      const roots = [...(this.config.resourceRoots?.() ?? [])];
+      const availableRootIds = new Set(roots.map((root) => root.id));
+      const rawRootIds: unknown = res.req.body?.root_id;
+      const submittedRoots: string[] = Array.isArray(rawRootIds)
+        ? rawRootIds.map((rootId: unknown) => String(rootId))
+        : rawRootIds
+          ? [String(rawRootIds)]
+          : [];
+      const allowedRootIds = [...new Set(
+        submittedRoots.filter((rootId) => availableRootIds.has(rootId)),
+      )];
+      const principalCandidates = this.oauthStore.listConnectionPrincipals();
+      const mode = String(res.req.body?.connection_mode ?? "new");
+      const reusePrincipalId = mode === "reuse"
+        ? String(res.req.body?.reuse_principal_id ?? "").trim()
+        : undefined;
+      if (
+        allowedRootIds.length === 0 ||
+        (mode === "reuse" &&
+          !principalCandidates.some((principal) => principal.principalId === reusePrincipalId))
+      ) {
+        res.status(400).setHeader("Content-Type", "text/html; charset=utf-8");
+        res.send(formHtml({
+          error: allowedRootIds.length === 0
+            ? "Select at least one currently approved project root."
+            : "Select a current local connection to reuse.",
+          clientName: client.client_name ?? client.client_id,
+          scopes,
+          resource: authorizedParams.resource,
+          fields: authorizationFormFields(client, authorizedParams),
+          runtimeCapabilities: this.config.runtimeCapabilities,
+          selectionToken,
+          principals: principalCandidates,
+          roots,
+        }));
+        return;
+      }
+      this.selections.delete(selectionToken);
+      await this.completeAuthorization(client, authorizedParams, res, {
+        scopes,
+        allowedRootIds,
+        ...(reusePrincipalId ? { reusePrincipalId } : {}),
+      });
+      return;
+    }
+
     const now = Date.now();
     const authorizationLimits = authorizationLimitInputs(
       client,
@@ -440,7 +566,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     }
 
     const providedToken = String(res.req.body?.owner_token ?? "");
-    const tokenMatches = safeEquals(providedToken, this.config.ownerToken);
+    const tokenMatches = verifyOwnerPassword(this.ownerPasswordHash, providedToken);
     if (!tokenMatches) {
       this.emitAudit("oauth_authorization_failed", client.client_id);
       const failure = this.oauthStore.recordAuthorizationFailure(authorizationLimits, now);
@@ -472,13 +598,63 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
       "session",
       authorizationLimits[0]!.key,
     );
-    const reconnectCode = String(res.req.body?.reconnect_code ?? "").trim();
+    if (this.config.resourceRoots) {
+      const roots = [...this.config.resourceRoots()];
+      if (roots.length === 0) {
+        res.status(400).setHeader("Content-Type", "text/html; charset=utf-8");
+        res.send(formHtml({
+          error: "No approved project roots are currently available.",
+          clientName: client.client_name ?? client.client_id,
+          scopes,
+          resource: authorizedParams.resource,
+          fields: authorizationFormFields(client, authorizedParams),
+          runtimeCapabilities: this.config.runtimeCapabilities,
+        }));
+        return;
+      }
+      const token = randomToken();
+      this.selections.set(token, {
+        clientId: client.client_id,
+        authorizationSessionKey: authorizationSessionKey(client, authorizedParams),
+        expiresAtMs: Date.now() + SELECTION_TTL_MS,
+      });
+      res.status(200).setHeader("Content-Type", "text/html; charset=utf-8");
+      res.send(formHtml({
+        clientName: client.client_name ?? client.client_id,
+        scopes,
+        resource: authorizedParams.resource,
+        fields: authorizationFormFields(client, authorizedParams),
+        runtimeCapabilities: this.config.runtimeCapabilities,
+        selectionToken: token,
+        principals: this.oauthStore.listConnectionPrincipals(),
+        roots,
+      }));
+      return;
+    }
+
+    await this.completeAuthorization(client, authorizedParams, res, {
+      scopes,
+      allowedRootIds: [ALL_AUTHORIZED_ROOTS_ID],
+    });
+  }
+
+  private async completeAuthorization(
+    client: OAuthClientInformationFull,
+    authorizedParams: AuthorizationParams,
+    res: Response,
+    input: {
+      scopes: string[];
+      allowedRootIds: string[];
+      reusePrincipalId?: string;
+    },
+  ): Promise<void> {
     let grant;
     try {
       grant = this.oauthStore.createAuthorizationGrant({
         clientId: client.client_id,
-        scopes,
-        ...(reconnectCode ? { reconnectCode } : {}),
+        scopes: input.scopes,
+        allowedRootIds: input.allowedRootIds,
+        ...(input.reusePrincipalId ? { reusePrincipalId: input.reusePrincipalId } : {}),
       });
     } catch (error) {
       if (!(error instanceof PrincipalReconnectError)) throw error;
@@ -487,7 +663,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
         formHtml({
           error: error.message,
           clientName: client.client_name ?? client.client_id,
-          scopes,
+          scopes: input.scopes,
           resource: authorizedParams.resource,
           fields: authorizationFormFields(client, authorizedParams),
           runtimeCapabilities: this.config.runtimeCapabilities,
@@ -495,13 +671,14 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
       );
       return;
     }
-    const boundaryChangeReason: OAuthAuthorizationBoundaryChange["reason"] = grant.reconnected
+    const boundaryChangeReason: OAuthAuthorizationBoundaryChange["reason"] =
+      grant.reconnected || grant.principalReused
       ? "principal_relinked"
       : "principal_created";
-    if (grant.reconnected) {
+    if (grant.reconnected || grant.principalReused) {
       this.emitAudit("oauth_principal_linked", client.client_id, grant);
     }
-    if (grant.principalCreated || grant.reconnected) {
+    if (grant.principalCreated || grant.reconnected || grant.principalReused) {
       this.onAuthorizationBoundaryChanged?.({
         connectionPrincipalId: grant.principalId,
         reason: boundaryChangeReason,
@@ -674,6 +851,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
       connectionPrincipalId: grant.principalId,
       authorizationEpoch: grant.authorizationEpoch,
       scopes: [...authInfo.scopes],
+      allowedRootIds: [...grant.allowedRootIds],
       ...(grant.subjectHash ? { subjectHash: grant.subjectHash } : {}),
       ...(grant.organizationHash ? { organizationHash: grant.organizationHash } : {}),
     };
@@ -691,6 +869,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
 
   revokeAll(): OAuthRevocationCounts {
     this.codes.clear();
+    this.selections.clear();
     return this.oauthStore.revokeAll();
   }
 
@@ -711,6 +890,10 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
       if (record.expiresAtMs >= nowMs) continue;
       this.codes.delete(code);
       authorizationCodes += 1;
+    }
+    for (const [token, record] of this.selections) {
+      if (record.expiresAtMs >= nowMs) continue;
+      this.selections.delete(token);
     }
     return { ...this.oauthStore.cleanupExpired(nowSeconds), authorizationCodes };
   }

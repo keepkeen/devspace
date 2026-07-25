@@ -4,6 +4,16 @@ import { InvalidRequestError } from "@modelcontextprotocol/sdk/server/auth/error
 import type { OAuthClientInformationFull } from "@modelcontextprotocol/sdk/shared/auth.js";
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
 import { DEVSPACE_CAPABILITY_SCOPES } from "./oauth-scopes.js";
+import {
+  ALL_AUTHORIZED_ROOTS_ID,
+  normalizeAuthorizedRootIds,
+} from "./authorization-roots.js";
+import {
+  hashOwnerPassword,
+  isArgon2idHash,
+  verifyOwnerPassword,
+  type OwnerCredentialInput,
+} from "./security-credentials.js";
 
 export interface PersistedAccessTokenRecord {
   grantId?: string;
@@ -63,6 +73,7 @@ export interface OAuthGrantRecord {
   subjectHash?: string;
   organizationHash?: string;
   grantedScopes: string[];
+  allowedRootIds: string[];
   authorizationEpoch: number;
   createdAt: string;
   lastUsedAt: string;
@@ -72,6 +83,7 @@ export interface OAuthGrantRecord {
 export interface OAuthGrantCreationResult extends OAuthGrantRecord {
   principalCreated: boolean;
   reconnected: boolean;
+  principalReused: boolean;
 }
 
 export class OAuthGrantIdentityError extends Error {
@@ -124,6 +136,48 @@ export interface PrincipalLinkResult {
   changed: boolean;
 }
 
+export interface PrincipalWorkspaceTransferPreview {
+  sourcePrincipalId: string;
+  targetPrincipalId: string;
+  sourceClientCount: number;
+  activeWorkspaces: number;
+  closedWorkspaces: number;
+  mutationOperations: number;
+  aliasConflicts: string[];
+  checkoutRootConflicts: string[];
+  operationIdConflicts: string[];
+  transferable: boolean;
+}
+
+export interface PrincipalWorkspaceTransferResult extends PrincipalWorkspaceTransferPreview {
+  transferredWorkspaces: number;
+  transferredOperations: number;
+}
+
+export interface OrphanPrincipalClosePreview {
+  principalId: string;
+  clientCount: number;
+  activeWorkspaces: number;
+  managedWorktrees: number;
+  retainedWorkspaces: number;
+  closable: boolean;
+}
+
+export interface OrphanPrincipalCloseResult extends OrphanPrincipalClosePreview {
+  closedWorkspaces: number;
+}
+
+export interface ClientRelinkPreview {
+  clientId: string;
+  sourcePrincipalId?: string;
+  targetPrincipalId: string;
+  sourceRetainedWorkspaces: number;
+  scopes: string[];
+  allowedRootIds: string[];
+  relinkable: boolean;
+  changed: boolean;
+}
+
 export interface PrincipalAssignmentResult {
   principalId: string;
   created: boolean;
@@ -134,7 +188,10 @@ export class PrincipalReconnectError extends Error {
     readonly code:
       | "reconnect_code_invalid"
       | "reconnect_source_in_use"
-      | "connection_principal_not_found",
+      | "connection_principal_not_found"
+      | "principal_not_orphaned"
+      | "principal_transfer_conflict"
+      | "oauth_client_not_found",
     message: string,
   ) {
     super(message);
@@ -164,6 +221,7 @@ interface OAuthGrantRow {
   subjectHash: string | null;
   organizationHash: string | null;
   grantedScopesJson: string;
+  allowedRootIdsJson: string;
   authorizationEpoch: number;
   createdAt: string;
   lastUsedAt: string;
@@ -302,8 +360,16 @@ export class SqliteOAuthStore {
     clientId: string;
     scopes: string[];
     reconnectCode?: string;
+    reusePrincipalId?: string;
+    allowedRootIds?: string[];
   }): OAuthGrantCreationResult {
     const scopes = normalizeGrantScopes(input.scopes);
+    const allowedRootIds = normalizeAuthorizedRootIds(
+      input.allowedRootIds ?? [ALL_AUTHORIZED_ROOTS_ID],
+    );
+    if (input.reconnectCode && input.reusePrincipalId) {
+      throw new InvalidRequestError("Choose either reconnect code or an existing principal, not both");
+    }
     const create = this.database.sqlite.transaction((): OAuthGrantCreationResult => {
       const client = this.database.sqlite.prepare(`
         select client_id
@@ -315,9 +381,55 @@ export class SqliteOAuthStore {
       let principalId: string;
       let principalCreated = false;
       let reconnected = false;
+      let principalReused = false;
       if (input.reconnectCode) {
         principalId = this.consumeReconnectCodeTarget(input.reconnectCode);
         reconnected = true;
+      } else if (input.reusePrincipalId) {
+        const existing = this.database.sqlite.prepare(`
+          select principal_id as principalId
+          from connection_principals
+          where principal_id = ? and revoked_at is null
+        `).get(input.reusePrincipalId) as { principalId: string } | undefined;
+        if (!existing) {
+          throw new PrincipalReconnectError(
+            "connection_principal_not_found",
+            "The selected local connection no longer exists.",
+          );
+        }
+        principalId = existing.principalId;
+        principalReused = true;
+        const sourcePrincipals = this.database.sqlite.prepare(`
+          select distinct principal_id as principalId
+          from oauth_grants
+          where client_id = ? and revoked_at is null
+        `).all(input.clientId) as Array<{ principalId: string }>;
+        for (const source of sourcePrincipals) {
+          if (source.principalId === principalId) continue;
+          const retained = (this.database.sqlite.prepare(`
+            select count(*) as count
+            from workspace_sessions
+            where connection_principal_id = ? and status in ('active', 'closed')
+          `).get(source.principalId) as { count: number }).count;
+          if (retained > 0) {
+            throw new PrincipalReconnectError(
+              "reconnect_source_in_use",
+              "This OAuth client already owns retained Workspaces under another local connection. Transfer or close them locally before reusing a different connection.",
+            );
+          }
+        }
+        if (sourcePrincipals.length > 0) {
+          this.database.sqlite.prepare("delete from oauth_access_tokens where client_id = ?")
+            .run(input.clientId);
+          this.database.sqlite.prepare("delete from oauth_refresh_tokens where client_id = ?")
+            .run(input.clientId);
+          const revokedAt = new Date().toISOString();
+          this.database.sqlite.prepare(`
+            update oauth_grants
+            set revoked_at = ?, last_used_at = ?, authorization_epoch = authorization_epoch + 1
+            where client_id = ? and revoked_at is null
+          `).run(revokedAt, revokedAt, input.clientId);
+        }
       } else {
         principalId = `principal-${randomUUID()}`;
         const principalNow = new Date().toISOString();
@@ -334,20 +446,31 @@ export class SqliteOAuthStore {
       this.database.sqlite.prepare(`
         insert into oauth_grants (
           grant_id, client_id, principal_id, subject_hash, organization_hash,
-          granted_scopes_json, authorization_epoch, created_at, last_used_at, revoked_at
-        ) values (?, ?, ?, null, null, ?, 1, ?, ?, null)
-      `).run(grantId, input.clientId, principalId, JSON.stringify(scopes), now, now);
+          granted_scopes_json, allowed_root_ids_json, authorization_epoch,
+          created_at, last_used_at, revoked_at
+        ) values (?, ?, ?, null, null, ?, ?, 1, ?, ?, null)
+      `).run(
+        grantId,
+        input.clientId,
+        principalId,
+        JSON.stringify(scopes),
+        JSON.stringify(allowedRootIds),
+        now,
+        now,
+      );
       this.touchPrincipal(principalId);
       return {
         grantId,
         clientId: input.clientId,
         principalId,
         grantedScopes: scopes,
+        allowedRootIds,
         authorizationEpoch: 1,
         createdAt: now,
         lastUsedAt: now,
         principalCreated,
         reconnected,
+        principalReused,
       };
     });
     return create.immediate();
@@ -362,6 +485,7 @@ export class SqliteOAuthStore {
         grant.subject_hash as subjectHash,
         grant.organization_hash as organizationHash,
         grant.granted_scopes_json as grantedScopesJson,
+        grant.allowed_root_ids_json as allowedRootIdsJson,
         grant.authorization_epoch as authorizationEpoch,
         grant.created_at as createdAt,
         grant.last_used_at as lastUsedAt,
@@ -476,6 +600,284 @@ export class SqliteOAuthStore {
     }));
   }
 
+  previewWorkspaceTransfer(
+    sourcePrincipalId: string,
+    targetPrincipalId: string,
+  ): PrincipalWorkspaceTransferPreview {
+    const source = this.requirePrincipalSummary(sourcePrincipalId);
+    this.requirePrincipalSummary(targetPrincipalId);
+    if (sourcePrincipalId === targetPrincipalId) {
+      throw new PrincipalReconnectError(
+        "principal_transfer_conflict",
+        "Source and target connection principals must be different.",
+      );
+    }
+    const counts = this.database.sqlite.prepare(`
+      select
+        count(*) filter (where status = 'active') as activeWorkspaces,
+        count(*) filter (where status = 'closed') as closedWorkspaces
+      from workspace_sessions
+      where connection_principal_id = ? and status in ('active', 'closed')
+    `).get(sourcePrincipalId) as { activeWorkspaces: number; closedWorkspaces: number };
+    const mutationOperations = (this.database.sqlite.prepare(`
+      select count(*) as count
+      from mutation_operations
+      where connection_principal_id = ?
+    `).get(sourcePrincipalId) as { count: number }).count;
+    const aliasConflicts = (this.database.sqlite.prepare(`
+      select source.alias
+      from workspace_sessions as source
+      inner join workspace_sessions as target
+        on target.connection_principal_id = @targetPrincipalId
+       and target.alias = source.alias
+      where source.connection_principal_id = @sourcePrincipalId
+        and source.status in ('active', 'closed')
+      order by source.alias
+    `).all({ sourcePrincipalId, targetPrincipalId }) as Array<{ alias: string }>).map(({ alias }) => alias);
+    const checkoutRootConflicts = (this.database.sqlite.prepare(`
+      select source.canonical_root as canonicalRoot
+      from workspace_sessions as source
+      inner join workspace_sessions as target
+        on target.connection_principal_id = @targetPrincipalId
+       and target.status = 'active'
+       and target.mode = 'checkout'
+       and target.canonical_root = source.canonical_root
+      where source.connection_principal_id = @sourcePrincipalId
+        and source.status = 'active'
+        and source.mode = 'checkout'
+        and source.canonical_root is not null
+      order by source.canonical_root
+    `).all({ sourcePrincipalId, targetPrincipalId }) as Array<{ canonicalRoot: string }>).map(
+      ({ canonicalRoot }) => canonicalRoot,
+    );
+    const operationIdConflicts = (this.database.sqlite.prepare(`
+      select source.operation_id as operationId
+      from mutation_operations as source
+      inner join mutation_operations as target
+        on target.connection_principal_id = @targetPrincipalId
+       and target.operation_id = source.operation_id
+      where source.connection_principal_id = @sourcePrincipalId
+      order by source.operation_id
+    `).all({ sourcePrincipalId, targetPrincipalId }) as Array<{ operationId: string }>).map(
+      ({ operationId }) => operationId,
+    );
+    return {
+      sourcePrincipalId,
+      targetPrincipalId,
+      sourceClientCount: source.clientCount,
+      activeWorkspaces: counts.activeWorkspaces,
+      closedWorkspaces: counts.closedWorkspaces,
+      mutationOperations,
+      aliasConflicts,
+      checkoutRootConflicts,
+      operationIdConflicts,
+      transferable: source.clientCount === 0 &&
+        aliasConflicts.length === 0 &&
+        checkoutRootConflicts.length === 0 &&
+        operationIdConflicts.length === 0,
+    };
+  }
+
+  transferPrincipalWorkspaces(
+    sourcePrincipalId: string,
+    targetPrincipalId: string,
+  ): PrincipalWorkspaceTransferResult {
+    const transfer = this.database.sqlite.transaction(() => {
+      const preview = this.previewWorkspaceTransfer(sourcePrincipalId, targetPrincipalId);
+      if (preview.sourceClientCount !== 0) {
+        throw new PrincipalReconnectError(
+          "principal_not_orphaned",
+          "Workspace transfer is allowed only from a principal with no active OAuth client.",
+        );
+      }
+      if (!preview.transferable) {
+        throw new PrincipalReconnectError(
+          "principal_transfer_conflict",
+          "Workspace transfer has alias, checkout-root, or operation-ID conflicts.",
+        );
+      }
+      this.database.sqlite.pragma("defer_foreign_keys = ON");
+      const transferredOperations = this.database.sqlite.prepare(`
+        update mutation_operations
+        set connection_principal_id = ?
+        where connection_principal_id = ?
+      `).run(targetPrincipalId, sourcePrincipalId).changes;
+      this.database.sqlite.prepare(`
+        update oauth_revocation_cleanup_jobs
+        set connection_principal_id = ?
+        where connection_principal_id = ?
+      `).run(targetPrincipalId, sourcePrincipalId);
+      this.database.sqlite.prepare(`
+        update oauth_revocation_dirty_worktree_artifacts
+        set connection_principal_id = ?
+        where connection_principal_id = ?
+      `).run(targetPrincipalId, sourcePrincipalId);
+      const transferredWorkspaces = this.database.sqlite.prepare(`
+        update workspace_sessions
+        set connection_principal_id = ?, last_used_at = ?
+        where connection_principal_id = ? and status in ('active', 'closed')
+      `).run(targetPrincipalId, new Date().toISOString(), sourcePrincipalId).changes;
+      this.touchPrincipal(targetPrincipalId);
+      return {
+        ...preview,
+        transferredWorkspaces,
+        transferredOperations,
+      };
+    });
+    return transfer.immediate();
+  }
+
+  previewOrphanClose(principalId: string): OrphanPrincipalClosePreview {
+    const principal = this.requirePrincipalSummary(principalId);
+    const row = this.database.sqlite.prepare(`
+      select
+        count(*) filter (where status = 'active') as activeWorkspaces,
+        count(*) filter (where status in ('active', 'closed')) as retainedWorkspaces,
+        count(*) filter (
+          where status = 'active' and mode = 'worktree' and managed = 'true'
+        ) as managedWorktrees
+      from workspace_sessions
+      where connection_principal_id = ?
+    `).get(principalId) as {
+      activeWorkspaces: number;
+      retainedWorkspaces: number;
+      managedWorktrees: number;
+    };
+    return {
+      principalId,
+      clientCount: principal.clientCount,
+      activeWorkspaces: row.activeWorkspaces,
+      managedWorktrees: row.managedWorktrees,
+      retainedWorkspaces: row.retainedWorkspaces,
+      closable: principal.clientCount === 0,
+    };
+  }
+
+  closeOrphanPrincipal(principalId: string): OrphanPrincipalCloseResult {
+    const close = this.database.sqlite.transaction(() => {
+      const preview = this.previewOrphanClose(principalId);
+      if (!preview.closable) {
+        throw new PrincipalReconnectError(
+          "principal_not_orphaned",
+          "Only a principal with no active OAuth client can be closed as an orphan.",
+        );
+      }
+      const closedWorkspaces = this.database.sqlite.prepare(`
+        update workspace_sessions
+        set status = 'closed', last_used_at = ?
+        where connection_principal_id = ? and status = 'active'
+      `).run(new Date().toISOString(), principalId).changes;
+      return { ...preview, closedWorkspaces };
+    });
+    return close.immediate();
+  }
+
+  previewClientRelink(clientId: string, targetPrincipalId: string): ClientRelinkPreview {
+    if (!this.getClient(clientId)) {
+      throw new PrincipalReconnectError("oauth_client_not_found", "The OAuth client does not exist.");
+    }
+    this.requirePrincipalSummary(targetPrincipalId);
+    const grants = this.database.sqlite.prepare(`
+      select
+        principal_id as principalId,
+        granted_scopes_json as scopesJson,
+        allowed_root_ids_json as rootIdsJson
+      from oauth_grants
+      where client_id = ? and revoked_at is null
+      order by last_used_at desc
+    `).all(clientId) as Array<{
+      principalId: string;
+      scopesJson: string;
+      rootIdsJson: string;
+    }>;
+    const sourcePrincipalId = grants.length === 1 ? grants[0]!.principalId : undefined;
+    const sourceRetainedWorkspaces = sourcePrincipalId && sourcePrincipalId !== targetPrincipalId
+      ? (this.database.sqlite.prepare(`
+          select count(*) as count from workspace_sessions
+          where connection_principal_id = ? and status in ('active', 'closed')
+        `).get(sourcePrincipalId) as { count: number }).count
+      : 0;
+    const current = grants[0];
+    return {
+      clientId,
+      ...(sourcePrincipalId ? { sourcePrincipalId } : {}),
+      targetPrincipalId,
+      sourceRetainedWorkspaces,
+      scopes: current
+        ? normalizeGrantScopes(JSON.parse(current.scopesJson) as unknown)
+        : [...DEVSPACE_CAPABILITY_SCOPES],
+      allowedRootIds: current
+        ? normalizeAuthorizedRootIds(JSON.parse(current.rootIdsJson) as unknown)
+        : [ALL_AUTHORIZED_ROOTS_ID],
+      relinkable: sourceRetainedWorkspaces === 0,
+      changed: sourcePrincipalId !== targetPrincipalId,
+    };
+  }
+
+  relinkClientToPrincipal(clientId: string, targetPrincipalId: string): PrincipalLinkResult {
+    const relink = this.database.sqlite.transaction(() => {
+      const preview = this.previewClientRelink(clientId, targetPrincipalId);
+      if (!preview.relinkable) {
+        throw new PrincipalReconnectError(
+          "reconnect_source_in_use",
+          "Transfer or close the source principal's retained Workspaces before relinking this client.",
+        );
+      }
+      if (!preview.changed) {
+        return {
+          clientId,
+          ...(preview.sourcePrincipalId ? { sourcePrincipalId: preview.sourcePrincipalId } : {}),
+          targetPrincipalId,
+          changed: false,
+        };
+      }
+      this.database.sqlite.prepare("delete from oauth_access_tokens where client_id = ?").run(clientId);
+      this.database.sqlite.prepare("delete from oauth_refresh_tokens where client_id = ?").run(clientId);
+      const now = new Date().toISOString();
+      this.database.sqlite.prepare(`
+        update oauth_grants
+        set revoked_at = ?, last_used_at = ?, authorization_epoch = authorization_epoch + 1
+        where client_id = ? and revoked_at is null
+      `).run(now, now, clientId);
+      this.database.sqlite.prepare(`
+        insert into oauth_grants (
+          grant_id, client_id, principal_id, subject_hash, organization_hash,
+          granted_scopes_json, allowed_root_ids_json, authorization_epoch,
+          created_at, last_used_at, revoked_at
+        ) values (?, ?, ?, null, null, ?, ?, 1, ?, ?, null)
+      `).run(
+        `grant-${randomUUID()}`,
+        clientId,
+        targetPrincipalId,
+        JSON.stringify(preview.scopes),
+        JSON.stringify(preview.allowedRootIds),
+        now,
+        now,
+      );
+      this.touchPrincipal(targetPrincipalId);
+      return {
+        clientId,
+        ...(preview.sourcePrincipalId ? { sourcePrincipalId: preview.sourcePrincipalId } : {}),
+        targetPrincipalId,
+        changed: true,
+      };
+    });
+    return relink.immediate();
+  }
+
+  private requirePrincipalSummary(principalId: string): ConnectionPrincipalSummary {
+    const principal = this.listConnectionPrincipals().find(
+      (candidate) => candidate.principalId === principalId,
+    );
+    if (!principal) {
+      throw new PrincipalReconnectError(
+        "connection_principal_not_found",
+        "The connection principal does not exist or has been revoked.",
+      );
+    }
+    return principal;
+  }
+
   issueReconnectCode(
     principalId: string,
     ttlMs = DEFAULT_RECONNECT_CODE_TTL_MS,
@@ -563,13 +965,15 @@ export class SqliteOAuthStore {
       this.database.sqlite.prepare(`
         insert into oauth_grants (
           grant_id, client_id, principal_id, subject_hash, organization_hash,
-          granted_scopes_json, authorization_epoch, created_at, last_used_at, revoked_at
-        ) values (?, ?, ?, null, null, ?, 1, ?, ?, null)
+          granted_scopes_json, allowed_root_ids_json, authorization_epoch,
+          created_at, last_used_at, revoked_at
+        ) values (?, ?, ?, null, null, ?, ?, 1, ?, ?, null)
       `).run(
         `grant-${randomUUID()}`,
         clientId,
         targetPrincipalId,
         JSON.stringify([...DEVSPACE_CAPABILITY_SCOPES]),
+        JSON.stringify([ALL_AUTHORIZED_ROOTS_ID]),
         now,
         now,
       );
@@ -820,24 +1224,43 @@ export class SqliteOAuthStore {
    * while preserving public dynamic client registrations so browser clients
    * can reauthorize without having to forget and recreate the connector.
    */
-  reconcileOwnerCredential(ownerToken: string): boolean {
+  reconcileOwnerCredential(input: OwnerCredentialInput): {
+    changed: boolean;
+    passwordHash: string;
+    upgraded: boolean;
+  } {
     const reconcile = this.database.sqlite.transaction(() => {
       const row = this.database.sqlite
         .prepare("select salt, verifier from oauth_owner_credential where id = 1")
         .get() as { salt: string; verifier: string } | undefined;
 
       if (!row) {
-        this.saveOwnerCredential(ownerToken);
-        return false;
+        const passwordHash = activeOwnerPasswordHash(input);
+        this.saveOwnerCredentialHash(passwordHash);
+        return { changed: false, passwordHash, upgraded: false };
       }
 
-      const candidate = deriveOwnerCredentialVerifier(ownerToken, row.salt);
-      if (verifiersEqual(candidate, row.verifier)) return false;
+      if (isArgon2idHash(row.verifier)) {
+        const matches = input.passwordHash === row.verifier || (
+          input.password !== undefined && verifyOwnerPassword(row.verifier, input.password)
+        );
+        if (matches) {
+          return { changed: false, passwordHash: row.verifier, upgraded: false };
+        }
+      } else if (
+        input.password !== undefined &&
+        verifiersEqual(deriveOwnerCredentialVerifier(input.password, row.salt), row.verifier)
+      ) {
+        const passwordHash = input.passwordHash ?? hashOwnerPassword(input.password);
+        this.saveOwnerCredentialHash(passwordHash);
+        return { changed: false, passwordHash, upgraded: true };
+      }
 
       this.database.sqlite.prepare("delete from oauth_access_tokens").run();
       this.database.sqlite.prepare("delete from oauth_refresh_tokens").run();
-      this.saveOwnerCredential(ownerToken);
-      return true;
+      const passwordHash = activeOwnerPasswordHash(input);
+      this.saveOwnerCredentialHash(passwordHash);
+      return { changed: true, passwordHash, upgraded: false };
     });
 
     return reconcile.immediate();
@@ -1045,9 +1468,10 @@ export class SqliteOAuthStore {
     }
   }
 
-  private saveOwnerCredential(ownerToken: string): void {
-    const salt = randomBytes(16).toString("base64url");
-    const verifier = deriveOwnerCredentialVerifier(ownerToken, salt);
+  private saveOwnerCredentialHash(passwordHash: string): void {
+    if (!isArgon2idHash(passwordHash)) {
+      throw new TypeError("Owner credential must use Argon2id.");
+    }
     this.database.sqlite.prepare(`
       insert into oauth_owner_credential (id, salt, verifier, updated_at)
       values (1, ?, ?, ?)
@@ -1055,7 +1479,7 @@ export class SqliteOAuthStore {
         salt = excluded.salt,
         verifier = excluded.verifier,
         updated_at = excluded.updated_at
-    `).run(salt, verifier, new Date().toISOString());
+    `).run("argon2id-v1", passwordHash, new Date().toISOString());
   }
 
   private resolveTokenGrant<T extends PersistedAccessTokenRecord | PersistedRefreshTokenRecord>(
@@ -1070,6 +1494,7 @@ export class SqliteOAuthStore {
         grant.subject_hash as subjectHash,
         grant.organization_hash as organizationHash,
         grant.granted_scopes_json as grantedScopesJson,
+        grant.allowed_root_ids_json as allowedRootIdsJson,
         grant.authorization_epoch as authorizationEpoch,
         grant.created_at as createdAt,
         grant.last_used_at as lastUsedAt,
@@ -1260,6 +1685,7 @@ function rowToOAuthGrantRecord(row: OAuthGrantRow): OAuthGrantRecord {
     ...(row.subjectHash ? { subjectHash: row.subjectHash } : {}),
     ...(row.organizationHash ? { organizationHash: row.organizationHash } : {}),
     grantedScopes: normalizeGrantScopes(JSON.parse(row.grantedScopesJson) as unknown),
+    allowedRootIds: normalizeAuthorizedRootIds(JSON.parse(row.allowedRootIdsJson) as unknown),
     authorizationEpoch: row.authorizationEpoch,
     createdAt: row.createdAt,
     lastUsedAt: row.lastUsedAt,
@@ -1284,6 +1710,12 @@ function normalizeGrantScopes(value: unknown): string[] {
 
 function deriveOwnerCredentialVerifier(ownerToken: string, salt: string): string {
   return scryptSync(ownerToken, Buffer.from(salt, "base64url"), 32).toString("base64url");
+}
+
+function activeOwnerPasswordHash(input: OwnerCredentialInput): string {
+  if (isArgon2idHash(input.passwordHash)) return input.passwordHash;
+  if (input.password !== undefined) return hashOwnerPassword(input.password);
+  throw new Error("Owner credential requires a password or Argon2id hash.");
 }
 
 function verifiersEqual(left: string, right: string): boolean {

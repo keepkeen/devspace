@@ -30,6 +30,14 @@ import {
   CURRENT_CONFIG_SCHEMA_VERSION,
   migrateConfigDocument,
 } from "./config-migrations.js";
+import {
+  DEVSPACE_AUTH_SCHEMA_VERSION,
+  generateMasterKey,
+  hashOwnerPassword,
+  isArgon2idHash,
+  legacyMasterKeyFromOwnerPassword,
+  type MasterKeyDerivation,
+} from "./security-credentials.js";
 
 const projectDocFallbackFilenameSchema = z
   .string()
@@ -57,6 +65,7 @@ const devspaceUserConfigSchema = z.object({
   adminSkillsDir: z.string().trim().min(1).optional(),
   projectDocFallbackFilenames: projectDocFallbackFilenamesSchema.optional(),
   subagents: z.boolean().optional(),
+  toolProfile: z.enum(["browse", "coding"]).optional(),
   widgets: z.enum(["off", "changes", "full"]).optional(),
   resources: z.object({
     maxMcpSessions: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxMcpSessions).optional(),
@@ -75,6 +84,10 @@ const devspaceUserConfigSchema = z.object({
 }).passthrough();
 
 const devspaceAuthConfigSchema = z.object({
+  schemaVersion: z.literal(DEVSPACE_AUTH_SCHEMA_VERSION).optional(),
+  ownerPasswordHash: z.string().optional(),
+  masterKey: z.string().optional(),
+  keyDerivation: z.enum(["hkdf-v1", "legacy-direct"]).optional(),
   ownerToken: z.string().optional(),
 }).passthrough();
 
@@ -93,6 +106,7 @@ export interface DevspaceUserConfig {
   adminSkillsDir?: string;
   projectDocFallbackFilenames?: string[];
   subagents?: boolean;
+  toolProfile?: "browse" | "coding";
   widgets?: "off" | "changes" | "full";
   mcpHttpTransport?: "stateless" | "stateful";
   resources?: {
@@ -114,6 +128,11 @@ export interface DevspaceUserConfig {
 }
 
 export interface DevspaceAuthConfig {
+  schemaVersion?: typeof DEVSPACE_AUTH_SCHEMA_VERSION;
+  ownerPasswordHash?: string;
+  masterKey?: string;
+  keyDerivation?: MasterKeyDerivation;
+  /** Legacy v1 field, accepted only for one-way migration. */
   ownerToken?: string;
 }
 
@@ -125,6 +144,8 @@ export interface DevspaceFiles {
   authExists: boolean;
   config: DevspaceUserConfig;
   auth: DevspaceAuthConfig;
+  /** Available only in the process that migrated a legacy auth document. */
+  migratedOwnerPassword?: string;
 }
 
 export function devspaceConfigDir(env: NodeJS.ProcessEnv = process.env): string {
@@ -154,6 +175,9 @@ export function loadDevspaceFiles(env: NodeJS.ProcessEnv = process.env): Devspac
   const configExists = existsSync(configPath);
   const authExists = existsSync(authPath);
 
+  const loadedAuth = authExists ? readJsonFile(authPath, devspaceAuthConfigSchema) : {};
+  const migrated = authExists ? migrateAuthDocument(loadedAuth) : { auth: loadedAuth };
+  if (authExists && migrated.changed) writeJsonFile(authPath, migrated.auth, 0o600);
   return {
     dir,
     configPath,
@@ -161,7 +185,8 @@ export function loadDevspaceFiles(env: NodeJS.ProcessEnv = process.env): Devspac
     configExists,
     authExists,
     config: configExists ? readAndMigrateConfigFile(configPath) : {},
-    auth: authExists ? readJsonFile(authPath, devspaceAuthConfigSchema) : {},
+    auth: migrated.auth,
+    ...(migrated.ownerPassword ? { migratedOwnerPassword: migrated.ownerPassword } : {}),
   };
 }
 
@@ -237,12 +262,24 @@ export function writeDevspaceAuth(
 ): string {
   const filePath = devspaceAuthPath(env);
   mkdirSync(devspaceConfigDir(env), { recursive: true });
-  writeJsonFile(filePath, auth, 0o600);
+  const safe = normalizedAuthDocument(auth);
+  writeJsonFile(filePath, safe, 0o600);
   return filePath;
 }
 
 export function generateOwnerToken(): string {
   return randomBytes(32).toString("base64url");
+}
+
+export const generateOwnerPassword = generateOwnerToken;
+
+export function createDevspaceAuth(ownerPassword: string): DevspaceAuthConfig {
+  return {
+    schemaVersion: DEVSPACE_AUTH_SCHEMA_VERSION,
+    ownerPasswordHash: hashOwnerPassword(ownerPassword),
+    masterKey: generateMasterKey(),
+    keyDerivation: "hkdf-v1",
+  };
 }
 
 export function ensureDevspaceDefaultSkills(env: NodeJS.ProcessEnv = process.env): string[] {
@@ -273,6 +310,48 @@ function readJsonFile<T>(filePath: string, schema: z.ZodType<T>): T {
     const reason = error instanceof Error ? error.message : String(error);
     throw new Error(`Unable to read ${filePath}: ${reason}`);
   }
+}
+
+function migrateAuthDocument(auth: DevspaceAuthConfig): {
+  auth: DevspaceAuthConfig;
+  changed?: true;
+  ownerPassword?: string;
+} {
+  if (auth.ownerToken) {
+    const ownerPassword = auth.ownerToken;
+    return {
+      changed: true,
+      ownerPassword,
+      auth: {
+        schemaVersion: DEVSPACE_AUTH_SCHEMA_VERSION,
+        ownerPasswordHash: hashOwnerPassword(ownerPassword),
+        // Direct derivation preserves root IDs, host identity hashes, and local
+        // admin tokens created by pre-v2 installations.
+        masterKey: legacyMasterKeyFromOwnerPassword(ownerPassword),
+        keyDerivation: "legacy-direct",
+      },
+    };
+  }
+  return { auth: normalizedAuthDocument(auth) };
+}
+
+function normalizedAuthDocument(auth: DevspaceAuthConfig): DevspaceAuthConfig {
+  if (
+    auth.schemaVersion !== DEVSPACE_AUTH_SCHEMA_VERSION ||
+    !isArgon2idHash(auth.ownerPasswordHash) ||
+    !auth.masterKey ||
+    (auth.keyDerivation !== "hkdf-v1" && auth.keyDerivation !== "legacy-direct")
+  ) {
+    throw new Error(
+      "Invalid DevSpace auth document. Run `devspace init --force` to repair it.",
+    );
+  }
+  return {
+    schemaVersion: DEVSPACE_AUTH_SCHEMA_VERSION,
+    ownerPasswordHash: auth.ownerPasswordHash,
+    masterKey: auth.masterKey,
+    keyDerivation: auth.keyDerivation,
+  };
 }
 
 function readAndMigrateConfigFile(filePath: string): DevspaceUserConfig {

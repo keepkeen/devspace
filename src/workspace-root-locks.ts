@@ -3,11 +3,19 @@ export type WorkspaceRootLockMode = "read" | "write";
 import {
   CrossProcessWorkspaceRootLock,
   type CrossProcessWorkspaceRootLockOptions,
+  type WorkspaceRootLease,
+  type WorkspaceRootLeaseMetadata,
+  type WorkspaceRootProcessOwner,
 } from "./cross-process-root-lock.js";
 
 export {
   WorkspaceRootLockTimeoutError,
   defaultWorkspaceRootLockDirectory,
+} from "./cross-process-root-lock.js";
+export type {
+  WorkspaceRootLease,
+  WorkspaceRootLeaseMetadata,
+  WorkspaceRootProcessOwner,
 } from "./cross-process-root-lock.js";
 
 interface LockWaiter {
@@ -53,8 +61,9 @@ export class WorkspaceRootLockManager {
     key: string,
     mode: WorkspaceRootLockMode,
     callback: () => T | Promise<T>,
+    metadata: WorkspaceRootLeaseMetadata = {},
   ): Promise<T> {
-    const release = await this.acquire(key, mode);
+    const release = await this.acquire(key, mode, metadata);
     try {
       return await callback();
     } finally {
@@ -62,26 +71,39 @@ export class WorkspaceRootLockManager {
     }
   }
 
-  async acquire(key: string, mode: WorkspaceRootLockMode): Promise<() => void> {
+  async acquire(
+    key: string,
+    mode: WorkspaceRootLockMode,
+    metadata: WorkspaceRootLeaseMetadata = {},
+  ): Promise<WorkspaceRootLease> {
     if (!key) return Promise.reject(new TypeError("Workspace root lock key is required."));
     if (mode !== "read" && mode !== "write") {
       return Promise.reject(new TypeError("Workspace root lock mode must be read or write."));
     }
     const releaseLocal = await this.acquireLocal(key, mode);
-    let releaseCrossProcess: (() => void) | undefined;
+    let crossProcessLease: WorkspaceRootLease | undefined;
     try {
-      releaseCrossProcess = await this.crossProcess?.acquire(key, mode);
+      crossProcessLease = await this.crossProcess?.acquire(key, mode, metadata);
     } catch (error) {
       releaseLocal();
       throw error;
     }
     let released = false;
-    return () => {
+    const release = () => {
       if (released) return;
       released = true;
-      releaseCrossProcess?.();
+      crossProcessLease?.release();
       releaseLocal();
     };
+    const lease = (() => release()) as WorkspaceRootLease;
+    lease.release = release;
+    lease.heartbeat = async () => {
+      await crossProcessLease?.heartbeat();
+    };
+    lease.attachProcess = async (owner: WorkspaceRootProcessOwner) => {
+      await crossProcessLease?.attachProcess(owner);
+    };
+    return lease;
   }
 
   private acquireLocal(key: string, mode: WorkspaceRootLockMode): Promise<() => void> {

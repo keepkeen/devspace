@@ -18,6 +18,7 @@ import {
   validateCanonicalDatabase,
 } from "./canonical-schema.js";
 import { DEVSPACE_CAPABILITY_SCOPES } from "../oauth-scopes.js";
+import { ALL_AUTHORIZED_ROOTS_ID } from "../authorization-roots.js";
 
 const LEGACY_UNOWNED_PRINCIPAL = "__legacy_unowned__";
 const LEGACY_FULL_SCOPE = "devspace";
@@ -45,6 +46,7 @@ interface NormalizedOAuthGrant {
   subjectHash: string | null;
   organizationHash: string | null;
   grantedScopes: string[];
+  allowedRootIds: string[];
   authorizationEpoch: number;
   createdAt: string;
   lastUsedAt: string;
@@ -77,8 +79,19 @@ interface NormalizedOperation {
   operationId: string;
   workspaceGeneration: number;
   requestHash: string;
-  state: "pending" | "settled" | "outcome_unknown";
+  state:
+    | "pending"
+    | "settled"
+    | "outcome_unknown"
+    | "verified_committed"
+    | "verified_not_started"
+    | "acknowledged_unknown";
   resultJson: string | null;
+  resolutionMethod: string | null;
+  evidenceType: string | null;
+  evidenceJson: string | null;
+  resolvedAt: string | null;
+  operatorRef: string | null;
   createdAt: string;
   updatedAt: string;
   expiresAt: string;
@@ -116,7 +129,7 @@ export function prepareDatabaseFile(path: string): DatabasePreparationResult {
     source.close();
   }
 
-  const temporaryPath = `${path}.v15-migrating-${process.pid}-${randomUUID()}`;
+  const temporaryPath = `${path}.v${CURRENT_DATABASE_SCHEMA_VERSION}-migrating-${process.pid}-${randomUUID()}`;
   const backupPath = uniqueBackupPath(path);
   let sourceDatabase: Database.Database | undefined;
   let targetDatabase: Database.Database | undefined;
@@ -283,6 +296,40 @@ function normalizeOAuthGrants(
   principals: ReadonlyMap<string, NormalizedPrincipal>,
   now: string,
 ): NormalizedOAuthGrant[] {
+  const clientIds = new Set(clients.map((client) => client.clientId));
+  const persisted = tableRows(source, "oauth_grants");
+  if (persisted.length > 0) {
+    return persisted.flatMap((row): NormalizedOAuthGrant[] => {
+      const clientId = optionalString(row, "client_id");
+      const principalId = optionalString(row, "principal_id");
+      if (
+        !clientId ||
+        !principalId ||
+        !clientIds.has(clientId) ||
+        !principals.has(principalId) ||
+        principals.get(principalId)?.revokedAt
+      ) return [];
+      const grantedScopes = normalizeOAuthScopes(
+        nullableString(row, "granted_scopes_json"),
+      ) ?? migratedClientScopes(source, clientId);
+      return [{
+        grantId: requiredString(row, "grant_id"),
+        clientId,
+        principalId,
+        subjectHash: nullableString(row, "subject_hash"),
+        organizationHash: nullableString(row, "organization_hash"),
+        grantedScopes,
+        allowedRootIds: normalizeAllowedRootIds(
+          nullableString(row, "allowed_root_ids_json"),
+        ),
+        authorizationEpoch: positiveInteger(row.authorization_epoch, 1),
+        createdAt: optionalString(row, "created_at") ?? now,
+        lastUsedAt: optionalString(row, "last_used_at") ?? now,
+        revokedAt: nullableString(row, "revoked_at"),
+      }];
+    });
+  }
+
   const grants: NormalizedOAuthGrant[] = [];
   for (const client of clients) {
     if (!client.principalId || principals.get(client.principalId)?.revokedAt) continue;
@@ -297,6 +344,7 @@ function normalizeOAuthGrants(
       subjectHash: null,
       organizationHash: null,
       grantedScopes,
+      allowedRootIds: [ALL_AUTHORIZED_ROOTS_ID],
       authorizationEpoch: 1,
       createdAt,
       lastUsedAt: principals.get(client.principalId)?.lastUsedAt ?? createdAt,
@@ -488,8 +536,9 @@ function insertOAuthGrants(
   const insert = target.prepare(`
     insert into oauth_grants (
       grant_id, client_id, principal_id, subject_hash, organization_hash,
-      granted_scopes_json, authorization_epoch, created_at, last_used_at, revoked_at
-    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      granted_scopes_json, allowed_root_ids_json, authorization_epoch,
+      created_at, last_used_at, revoked_at
+    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   for (const grant of grants) {
     insert.run(
@@ -499,6 +548,7 @@ function insertOAuthGrants(
       grant.subjectHash,
       grant.organizationHash,
       JSON.stringify(grant.grantedScopes),
+      JSON.stringify(grant.allowedRootIds),
       grant.authorizationEpoch,
       grant.createdAt,
       grant.lastUsedAt,
@@ -602,7 +652,14 @@ function normalizeMutationOperations(
     if (principalId !== workspace.connectionPrincipalId) continue;
     const state = enumValue(
       row.state,
-      ["pending", "settled", "outcome_unknown"] as const,
+      [
+        "pending",
+        "settled",
+        "outcome_unknown",
+        "verified_committed",
+        "verified_not_started",
+        "acknowledged_unknown",
+      ] as const,
       "outcome_unknown",
     );
     const operation: NormalizedOperation & { rowId: number } = {
@@ -614,6 +671,11 @@ function normalizeMutationOperations(
       requestHash: optionalString(row, "request_hash") ?? "unavailable",
       state,
       resultJson: normalizeMutationResult(nullableString(row, "result_json")),
+      resolutionMethod: nullableString(row, "resolution_method"),
+      evidenceType: nullableString(row, "evidence_type"),
+      evidenceJson: nullableString(row, "evidence_json"),
+      resolvedAt: nullableString(row, "resolved_at"),
+      operatorRef: nullableString(row, "operator_ref"),
       createdAt: optionalString(row, "created_at") ?? workspace.createdAt,
       updatedAt: optionalString(row, "updated_at") ?? workspace.lastUsedAt,
       expiresAt: optionalString(row, "expires_at") ?? workspace.lastUsedAt,
@@ -644,8 +706,9 @@ function insertMutationOperations(
     insert into mutation_operations (
       connection_principal_id, workspace_id, tool, operation_id,
       workspace_generation, request_hash, state, result_json,
+      resolution_method, evidence_type, evidence_json, resolved_at, operator_ref,
       created_at, updated_at, expires_at
-    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   for (const operation of operations) {
     insert.run(
@@ -657,6 +720,11 @@ function insertMutationOperations(
       operation.requestHash,
       operation.state,
       operation.resultJson,
+      operation.resolutionMethod,
+      operation.evidenceType,
+      operation.evidenceJson,
+      operation.resolvedAt,
+      operation.operatorRef,
       operation.createdAt,
       operation.updatedAt,
       operation.expiresAt,
@@ -975,6 +1043,9 @@ function workspaceStatusRank(status: NormalizedWorkspace["status"]): number {
 }
 
 function operationPreference(operation: NormalizedOperation): number {
+  if (operation.state === "verified_committed") return 6;
+  if (operation.state === "verified_not_started") return 5;
+  if (operation.state === "acknowledged_unknown") return 4;
   if (operation.state === "settled" && operation.resultJson !== null) return 3;
   if (operation.state === "settled") return 2;
   if (operation.state === "outcome_unknown") return 1;
@@ -1023,6 +1094,23 @@ function normalizeOAuthScopes(value: string | null): string[] | undefined {
   }
   const scopes = DEVSPACE_CAPABILITY_SCOPES.filter((scope) => requested.has(scope));
   return scopes.length > 0 ? scopes : undefined;
+}
+
+function normalizeAllowedRootIds(value: string | null): string[] {
+  if (!value) return [ALL_AUTHORIZED_ROOTS_ID];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    return [ALL_AUTHORIZED_ROOTS_ID];
+  }
+  if (!Array.isArray(parsed)) return [ALL_AUTHORIZED_ROOTS_ID];
+  const ids = [...new Set(parsed.filter(
+    (entry): entry is string =>
+      typeof entry === "string" && entry.length > 0 && entry.length <= 128,
+  ))];
+  if (ids.includes(ALL_AUTHORIZED_ROOTS_ID)) return [ALL_AUTHORIZED_ROOTS_ID];
+  return ids.length > 0 ? ids.sort() : [ALL_AUTHORIZED_ROOTS_ID];
 }
 
 function tableRows(source: Database.Database, table: string, includeRowId = false): Row[] {
@@ -1112,7 +1200,7 @@ function quotedIdentifier(value: string): string {
 
 function uniqueBackupPath(path: string): string {
   const timestamp = new Date().toISOString().replace(/[:.]/gu, "-");
-  const candidate = `${path}.pre-v15.${timestamp}.bak`;
+  const candidate = `${path}.pre-v${CURRENT_DATABASE_SCHEMA_VERSION}.${timestamp}.bak`;
   return existsSync(candidate) ? `${candidate}.${randomUUID()}` : candidate;
 }
 

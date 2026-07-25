@@ -1,7 +1,10 @@
 /** Compact model-facing instructions for the fixed DevSpace tool surface. */
 
 export function buildWorkspaceLifecycleInstruction(): string {
-  return "Use DevSpace only in an opened, user-approved workspace; keep its alias for this conversation and, after a reconnect or later turn, list and resume it instead of opening another worktree; use other tools for unrelated computation.";
+  return [
+    "Use DevSpace only in a user-approved Workspace: use metadata when the user is only selecting a project, use full context for immediate analysis or editing, and in a new conversation resume a uniquely named alias or list candidates instead of choosing the most recent Workspace automatically.",
+    "Load instruction and Skill bodies only when the target paths or task require them; use other tools for unrelated computation.",
+  ].join(" ");
 }
 
 /**

@@ -55,7 +55,10 @@ const running = createServer();
 try {
   const canonicalRootA = await realpath(rootA);
   const canonicalRootB = await realpath(rootB);
-  assert.deepEqual(running.config.allowedRoots, [rootA]);
+  assert.deepEqual(
+    await Promise.all(running.config.allowedRoots.map((root) => realpath(root))),
+    [canonicalRootA],
+  );
   await waitFor(() => {
     const store = new SqliteWorkspaceStore(stateDir);
     try {

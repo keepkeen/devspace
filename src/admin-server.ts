@@ -111,7 +111,7 @@ export async function startAdminServer(
   const backendClient = options.backendClient ?? new HttpAdminBackendClient({
     host: initialConfig.host,
     port: initialConfig.port,
-    ownerToken: initialConfig.oauth.ownerToken,
+    keys: initialConfig.oauth.keys,
     processShutdownGraceMs: initialConfig.resources.processShutdownGraceMs,
   });
   const capability = randomBytes(32).toString("base64url");

@@ -29,6 +29,10 @@ import { readFileVersion, type FileVersion } from "./file-version.js";
 import { loadConfig, type ServerConfig, type WidgetMode } from "./config.js";
 import {
   logEvent,
+  boundedLogHeader,
+  contentLengthForLog,
+  originForLog,
+  refererForLog,
   requestIp,
   requestPath,
   commandPreview,
@@ -43,7 +47,10 @@ import {
   buildCodexServerInstructions,
   buildWorkspaceLifecycleInstruction,
 } from "./bash-prompt.js";
-import { classifyCommand } from "./command-policy.js";
+import {
+  classifyCommand,
+  devSpaceSelfManagementViolation,
+} from "./command-policy.js";
 import {
   directMutationTargets,
   validateDirectCommandPaths,
@@ -62,6 +69,7 @@ import {
 import {
   findFilesTool,
   grepFilesTool,
+  isExpectedPiToolInputError,
   listDirectoryTool,
   readFileTool,
 } from "./pi-tools.js";
@@ -98,6 +106,7 @@ import { createWorkspaceStore } from "./workspace-store.js";
 import {
   MutationOperationStore,
   type MutationOperationKey,
+  type MutationOperationStatus,
 } from "./mutation-operation-store.js";
 import {
   formatAgentsPath,
@@ -129,10 +138,18 @@ import {
   type RuntimeCapabilities,
 } from "./runtime-capabilities.js";
 import { ActiveRequestBarrier } from "./request-barrier.js";
-import { WorkspaceRootLockTimeoutError } from "./workspace-root-locks.js";
+import {
+  WorkspaceRootLockTimeoutError,
+  type WorkspaceRootLease,
+} from "./workspace-root-locks.js";
 import { createRuntimeControlPlane } from "./runtime-control-plane.js";
 import { AccessDeniedError, allowedRootsRevision, isPathInsideRoot } from "./roots.js";
 import { DEVSPACE_SERVER_INFO } from "./version.js";
+import { AuditEventStore } from "./audit-events.js";
+import {
+  buildAuthorizationRoots,
+  resolveAuthorizedRootPaths,
+} from "./authorization-roots.js";
 import { summarizeLocalAgentProfile } from "./local-agent-profiles.js";
 import { createLocalAgentStore } from "./local-agent-store.js";
 import { cleanupDetachedAgentPromptArtifacts } from "./detached-agent-cleanup.js";
@@ -165,6 +182,15 @@ import {
   missingOAuthScopes,
   type DevSpaceCapabilityScope,
 } from "./oauth-scopes.js";
+import {
+  CursorProtocolError,
+  cursorPrincipalRef,
+  cursorQueryHash,
+  cursorRevision,
+  decodeCursor,
+  encodeCursor,
+  type CursorEnvelope,
+} from "./cursor-protocol.js";
 
 const SHELL_COMMAND_MAX_CHARACTERS = 100_000;
 const MAX_PROCESS_ENVIRONMENT_ENTRIES = 128;
@@ -183,6 +209,7 @@ const requestContext = new AsyncLocalStorage<{
   oauthGrantId: string;
   authorizationEpoch: number;
   scopes: string[];
+  authorizedRoots: string[];
   hostAuthorization: HostAuthorizationContext;
   hostSubjectHash?: string;
   hostOrganizationHash?: string;
@@ -190,7 +217,8 @@ const requestContext = new AsyncLocalStorage<{
   correlation: RequestCorrelationState;
   workspaceBinding?: WorkspaceContextReceiptBinding;
   workspaceReceipt?: { receipt: string; expiresAt: number };
-  retainWorkspaceRootLease?: () => () => void;
+  retainWorkspaceRootLease?: () => WorkspaceRootLease;
+  auditReferenceKey: Uint8Array;
 }>();
 const toolHandlerBarriers = new WeakMap<McpServer, ActiveRequestBarrier>();
 const toolErrorReporters = new WeakMap<McpServer, (tool: string, error: unknown) => void>();
@@ -551,6 +579,20 @@ function operationEnvelope(
   return { id, phase, safeToRetry, effectsKnown };
 }
 
+function operationStatusEnvelope(status: MutationOperationStatus): OperationEnvelope {
+  switch (status.state) {
+    case "verified_not_started":
+      return operationEnvelope(status.operationId, "not_started", true, true);
+    case "settled":
+    case "verified_committed":
+      return operationEnvelope(status.operationId, "committed", false, true);
+    case "pending":
+    case "outcome_unknown":
+    case "acknowledged_unknown":
+      return operationEnvelope(status.operationId, "outcome_unknown", false, false);
+  }
+}
+
 function attachOperationEnvelope<T>(
   value: T,
   operation: OperationEnvelope,
@@ -749,6 +791,20 @@ async function runMutationOperation<T>(options: {
       },
     );
   }
+  if (reservation.status === "verified_not_started") {
+    throw new PublicActionError(
+      "operation_verified_not_started",
+      "The earlier operation was verified not to have started. Use a new operationId to retry.",
+      {
+        retryable: true,
+        safeToRetry: true,
+        recovery: "new_operation_id",
+        phase: "not_started",
+        effectsKnown: true,
+        operationId: options.key.operationId,
+      },
+    );
+  }
   if (reservation.status === "result_unavailable") {
     throw new PublicActionError(
       "operation_result_unavailable",
@@ -826,6 +882,7 @@ async function runMutationOperation<T>(options: {
 }
 
 export function isExpectedPiToolError(error: unknown): boolean {
+  if (isExpectedPiToolInputError(error)) return true;
   if (!error || typeof error !== "object" || !("code" in error)) return false;
   const code = (error as { code?: unknown }).code;
   return code === "ENOENT" || code === "ENOTDIR" || code === "EISDIR";
@@ -838,6 +895,7 @@ const LIFECYCLE_TOOL_NAMES = new Set<string>([
   "get_workspace_context",
   "load_workspace_instructions",
   "get_operation_status",
+  "resolve_operation",
   "close_workspace",
   "revoke_workspace",
 ]);
@@ -1145,6 +1203,7 @@ const toolNames = {
   listSkills: "list_skills",
   loadSkill: "load_skill",
   getOperationStatus: "get_operation_status",
+  resolveOperation: "resolve_operation",
   readProcessOutput: "read_process_output",
   closeWorkspace: "close_workspace",
   revokeWorkspace: "revoke_workspace",
@@ -1201,6 +1260,8 @@ export function requiredOAuthScopesForTool(
       return ["workspace:read"];
     case toolNames.getOperationStatus:
       return ["workspace:read"];
+    case toolNames.resolveOperation:
+      return ["workspace:read", "workspace:write"];
     case toolNames.execCommand:
       return ["workspace:read", "workspace:write", "process:execute", "network:access"];
     case toolNames.writeStdin:
@@ -1282,7 +1343,8 @@ function toolDescription(parts: {
 }
 
 export function toolSurface(
-  config: Pick<ServerConfig, "widgets" | "skillsEnabled">,
+  config: Pick<ServerConfig, "widgets" | "skillsEnabled"> &
+    Partial<Pick<ServerConfig, "toolProfile">>,
   grantedScopes: readonly string[] = DEVSPACE_CAPABILITY_SCOPES,
 ): string[] {
   const granted = new Set(grantedScopes);
@@ -1302,12 +1364,17 @@ export function toolSurface(
       toolNames.batchInspect,
       "show_changes",
     );
+    if (config.toolProfile === "browse") return tools.sort();
     if (config.skillsEnabled && elevated) {
       tools.push(toolNames.listSkills, toolNames.loadSkill);
     }
   }
+  if (config.toolProfile === "browse") return tools.sort();
   if (permits("workspace:read") && elevated) {
     tools.push(toolNames.getOperationStatus);
+  }
+  if (permits("workspace:read", "workspace:write") && elevated) {
+    tools.push(toolNames.resolveOperation);
   }
   if (permits("workspace:read", "workspace:write")) {
     tools.push(toolNames.applyPatch);
@@ -1358,6 +1425,8 @@ const workspaceSkillOutputSchema = z.object({
 });
 
 export const MAX_SKILL_CATALOG_BYTES = 4_000;
+export const MAX_SKILL_LIST_PAGE_BYTES = 8_000;
+export const MAX_WORKSPACE_LIST_PAGE_BYTES = 8_000;
 
 export interface WorkspaceSkillCatalogEntry {
   skillId: string;
@@ -1385,7 +1454,12 @@ interface WorkspaceSkillCatalogOptions {
 function workspaceInstructionRecord(
   file: Pick<ApplicableAgentsFile, "path" | "content">,
   workspaceRoot: string,
+  options: {
+    fullContent?: string;
+    fragment?: WorkspaceContextInstructionItem["fragment"];
+  } = {},
 ): WorkspaceContextInstructionItem {
+  const fullContent = options.fullContent ?? file.content;
   const repositoryInstruction = isPathInsideRoot(file.path, workspaceRoot);
   const path = repositoryInstruction
     ? formatAgentsPath(file.path, workspaceRoot)
@@ -1397,8 +1471,9 @@ function workspaceInstructionRecord(
       : { source: "user" as const, trust: "user_trusted" as const }),
     scope: relativeScope === "." ? "." : relativeScope.split(sep).join("/"),
     path,
-    hash: `sha256-v1:${createHash("sha256").update(file.content).digest("hex")}`,
-    bytes: Buffer.byteLength(file.content, "utf8"),
+    hash: `sha256-v1:${createHash("sha256").update(fullContent).digest("hex")}`,
+    bytes: Buffer.byteLength(fullContent, "utf8"),
+    ...(options.fragment ? { fragment: options.fragment } : {}),
     content: file.content,
   };
 }
@@ -1409,6 +1484,135 @@ function workspaceInstructionManifestRecord(
 ): WorkspaceContextInstructionManifestItem {
   const { content: _content, ...manifest } = workspaceInstructionRecord(file, workspaceRoot);
   return manifest;
+}
+
+interface InstructionContentFragment {
+  file: ApplicableAgentsFile;
+  content: string;
+  fragment: NonNullable<WorkspaceContextInstructionItem["fragment"]>;
+}
+
+interface InstructionContentPage {
+  fragments: InstructionContentFragment[];
+  completedFiles: ApplicableAgentsFile[];
+  totalBytes: number;
+  returnedBytes: number;
+  returnedFiles: number;
+  omittedBytes: number;
+  omittedFiles: number;
+  nextOffset?: number;
+}
+
+function workspaceInstructionFragmentRecord(
+  item: InstructionContentFragment,
+  workspaceRoot: string,
+): WorkspaceContextInstructionItem {
+  return workspaceInstructionRecord(
+    { path: item.file.path, content: item.content },
+    workspaceRoot,
+    { fullContent: item.file.content, fragment: item.fragment },
+  );
+}
+
+function workspaceInstructionFragmentManifestRecord(
+  item: InstructionContentFragment,
+  workspaceRoot: string,
+): WorkspaceContextInstructionManifestItem {
+  const { content: _content, ...manifest } = workspaceInstructionFragmentRecord(
+    item,
+    workspaceRoot,
+  );
+  return manifest;
+}
+
+function buildInstructionContentPage(
+  files: readonly ApplicableAgentsFile[],
+  offset: number,
+  maximumBytes: number,
+): InstructionContentPage {
+  if (!Number.isSafeInteger(offset) || offset < 0) {
+    throw new RangeError("Instruction page offset must be a non-negative safe integer.");
+  }
+  if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 1) {
+    throw new RangeError("Instruction page byte budget must be positive.");
+  }
+  const encoded = files.map((file) => ({ file, bytes: Buffer.from(file.content, "utf8") }));
+  const totalBytes = encoded.reduce((sum, item) => sum + item.bytes.byteLength, 0);
+  if (offset > totalBytes) throw new RangeError("Instruction page offset exceeds available content.");
+
+  const fragments: InstructionContentFragment[] = [];
+  const completedFiles: ApplicableAgentsFile[] = [];
+  let returnedBytes = 0;
+  let fileBaseOffset = 0;
+
+  for (const item of encoded) {
+    const fileEndOffset = fileBaseOffset + item.bytes.byteLength;
+    if (offset + returnedBytes >= fileEndOffset) {
+      fileBaseOffset = fileEndOffset;
+      continue;
+    }
+    const localOffset = Math.max(0, offset + returnedBytes - fileBaseOffset);
+    const remainingBudget = maximumBytes - returnedBytes;
+    if (remainingBudget <= 0) break;
+    const end = instructionFragmentEnd(item.bytes, localOffset, remainingBudget);
+    if (end <= localOffset) break;
+    const lengthBytes = end - localOffset;
+    const complete = end === item.bytes.byteLength;
+    const lineBoundary = complete || item.bytes[end - 1] === 0x0a;
+    fragments.push({
+      file: item.file,
+      content: item.bytes.subarray(localOffset, end).toString("utf8"),
+      fragment: {
+        offsetBytes: localOffset,
+        lengthBytes,
+        totalBytes: item.bytes.byteLength,
+        complete,
+        lineBoundary,
+      },
+    });
+    returnedBytes += lengthBytes;
+    if (complete) completedFiles.push(item.file);
+    if (!complete || returnedBytes >= maximumBytes) break;
+    fileBaseOffset = fileEndOffset;
+  }
+
+  const nextOffsetValue = offset + returnedBytes;
+  const nextOffset = nextOffsetValue < totalBytes ? nextOffsetValue : undefined;
+  let cumulative = 0;
+  let omittedFiles = 0;
+  for (const item of encoded) {
+    cumulative += item.bytes.byteLength;
+    if (cumulative > nextOffsetValue) omittedFiles += 1;
+  }
+  return {
+    fragments,
+    completedFiles,
+    totalBytes,
+    returnedBytes,
+    returnedFiles: new Set(fragments.map((fragment) => fragment.file.path)).size,
+    omittedBytes: totalBytes - nextOffsetValue,
+    omittedFiles,
+    ...(nextOffset === undefined ? {} : { nextOffset }),
+  };
+}
+
+function instructionFragmentEnd(
+  bytes: Buffer,
+  offset: number,
+  maximumBytes: number,
+): number {
+  let end = Math.min(bytes.byteLength, offset + maximumBytes);
+  if (end < bytes.byteLength) {
+    while (end > offset && (bytes[end]! & 0xc0) === 0x80) end -= 1;
+  }
+  if (end <= offset) return end;
+  const newline = bytes.lastIndexOf(0x0a, end - 1);
+  if (newline >= offset) {
+    const lineEnd = newline + 1;
+    const minimumUsefulPage = Math.min(1_024, Math.max(1, Math.floor((end - offset) / 2)));
+    if (lineEnd - offset >= minimumUsefulPage) end = lineEnd;
+  }
+  return end;
 }
 
 function truncateCatalogDescription(description: string, maximum: number): string {
@@ -1517,30 +1721,21 @@ export function buildWorkspaceSkillCatalog(
   };
 }
 
-interface SkillCursorPayload {
-  revision: string;
-  query: string;
-  offset: number;
-}
+const INSTRUCTION_PAGE_TARGET_BYTES = 8 * 1024;
 
-function encodeSkillCursor(payload: SkillCursorPayload): string {
-  return Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
-}
-
-function decodeSkillCursor(cursor: string): SkillCursorPayload {
+function decodedCursorOrError(
+  cursor: string,
+  key: string | Uint8Array,
+  code: string,
+  message: string,
+): CursorEnvelope {
   try {
-    const value = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")) as Partial<SkillCursorPayload>;
-    if (
-      typeof value.revision !== "string" ||
-      typeof value.query !== "string" ||
-      !Number.isSafeInteger(value.offset) ||
-      (value.offset ?? -1) < 0
-    ) {
-      throw new Error("invalid cursor fields");
+    return decodeCursor(cursor, key);
+  } catch (error) {
+    if (error instanceof CursorProtocolError) {
+      throw new PublicActionError(code, message);
     }
-    return value as SkillCursorPayload;
-  } catch {
-    throw new PublicActionError("invalid_skill_cursor", "The Skill cursor is invalid; restart the listing without a cursor.");
+    throw error;
   }
 }
 
@@ -1561,17 +1756,13 @@ function renderWorkspaceContext(
     instructionScan,
     reused,
   } = context;
-  const skillCatalog = buildWorkspaceSkillCatalog(workspace.skills);
+  const totalSkills = workspace.skills.length;
   const instructionsIncluded = contextMode === "full" || (
     contextMode === "retained" && knownInstructionRevision !== instructionRevision
-  );
-  const skillsIncluded = contextMode === "full" || (
-    contextMode === "retained" && knownSkillRevision !== skillRevision
   );
   const instructionManifest = agentsFiles.map((file) =>
     workspaceInstructionManifestRecord(file, workspace.root));
   const returnedManifest = instructionsIncluded ? instructionManifest : [];
-  const visibleSkills = skillsIncluded ? skillCatalog.skills : [];
   const serialized = serializeWorkspaceContext({
     connectionPrincipalId: workspace.connectionPrincipalId,
     workspaceId: workspace.id,
@@ -1595,9 +1786,9 @@ function renderWorkspaceContext(
     },
     skills: {
       revision: skillRevision,
-      count: skillCatalog.totalSkills,
-      included: skillsIncluded,
-      items: visibleSkills,
+      count: totalSkills,
+      included: false,
+      items: [],
       warningCount: workspace.skillDiagnostics.length,
     },
   }, receipts);
@@ -1607,8 +1798,8 @@ function renderWorkspaceContext(
     summary: {
       workspaceInstructions: returnedManifest.length,
       instructionManifestIncluded: instructionsIncluded,
-      skills: visibleSkills.length,
-      skillsIncluded,
+      skills: totalSkills,
+      skillsIncluded: false,
       skillDiagnostics: workspace.skillDiagnostics.length,
       instructionScanComplete: instructionScan.complete,
       contextMode,
@@ -1643,34 +1834,6 @@ const workspaceHandleInputSchema = {
 
 const DEFAULT_PROCESS_OUTPUT_READ_BYTES = 40_000;
 const MAX_PROCESS_OUTPUT_READ_BYTES = 40_000;
-
-const batchItemOutputSchema = z.object({
-  ok: z.boolean(),
-  ref: z.string().optional(),
-  result: z.string(),
-  truncated: z.literal(true).optional(),
-  omitted: z.literal(true).optional(),
-  omittedReason: z.literal("aggregate_budget_exhausted").optional(),
-  continuation: z.object({
-    action: z.enum(["increase_limit", "refine_query"]),
-    message: z.string(),
-  }).optional(),
-});
-
-const batchReadItemOutputSchema = z.object({
-  ok: z.boolean(),
-  ref: z.string().optional(),
-  path: z.string(),
-  content: z.string().optional(),
-  error: z.string().optional(),
-  contentHash: z.string().optional(),
-  mtimeNs: z.string().optional(),
-  offset: z.number().int().positive().optional(),
-  nextOffset: z.number().int().positive().optional(),
-  truncated: z.literal(true).optional(),
-  omitted: z.literal(true).optional(),
-  omittedReason: z.literal("aggregate_budget_exhausted").optional(),
-});
 
 interface StableWorkspaceFileRead {
   response: Awaited<ReturnType<typeof readFileTool>>;
@@ -1770,6 +1933,7 @@ function compactBatchItems(items: BatchItemResult[]) {
       ok: item.ok,
       ...(item.ref ? { ref: item.ref } : {}),
       result: item.result,
+      ...(item.error ? { error: item.error } : {}),
       ...(item.truncated ? { truncated: true as const } : {}),
       ...(item.omitted ? { omitted: true as const } : {}),
       ...(item.omittedReason ? { omittedReason: item.omittedReason } : {}),
@@ -1993,11 +2157,13 @@ function correlationLogFields(
   connectionPrincipalId: string | undefined,
   workspaceId?: string,
   oauthClientId?: string,
+  explicitKey?: string | Uint8Array,
 ): Record<string, string | undefined> {
+  const key = explicitKey ?? requestContext.getStore()?.auditReferenceKey;
   return {
-    oauthClientRef: oauthClientRef(oauthClientId),
-    connectionRef: connectionRef(connectionPrincipalId),
-    workspaceActivityRef: workspaceActivityRef(connectionPrincipalId, workspaceId),
+    oauthClientRef: oauthClientRef(oauthClientId, key),
+    connectionRef: connectionRef(connectionPrincipalId, key),
+    workspaceActivityRef: workspaceActivityRef(connectionPrincipalId, workspaceId, key),
   };
 }
 
@@ -2009,13 +2175,18 @@ export function containsBatchedToolCall(body: unknown): boolean {
 }
 
 function requestLogFields(req: Request, config: ServerConfig): Record<string, unknown> {
+  const debug = config.logging.level === "debug";
   return {
-    ip: requestIp(req, config.logging.trustProxy),
-    host: req.header("host"),
-    userAgent: req.header("user-agent"),
-    origin: req.header("origin"),
-    referer: req.header("referer"),
-    contentLength: req.header("content-length"),
+    host: boundedLogHeader(req.header("host"), 255),
+    origin: originForLog(req.header("origin")),
+    referer: refererForLog(req.header("referer")),
+    contentLength: contentLengthForLog(req.header("content-length")),
+    ...(debug
+      ? {
+          ip: boundedLogHeader(requestIp(req, config.logging.trustProxy), 64),
+          userAgent: boundedLogHeader(req.header("user-agent"), 256),
+        }
+      : {}),
   };
 }
 
@@ -2028,6 +2199,7 @@ function logToolCall(config: ServerConfig, fields: ToolLogFields): void {
     context.correlation.workspaceActivityRef = workspaceActivityRef(
       context.connectionPrincipalId,
       workspaceId,
+      context.auditReferenceKey,
     );
   }
   if (!config.logging.toolCalls) return;
@@ -2139,6 +2311,12 @@ function currentWorkspaceContextSessionId(): string {
   const contextSessionId = requestContext.getStore()?.workspaceBinding?.contextSessionId;
   if (!contextSessionId) throw new WorkspaceContextSessionError();
   return contextSessionId;
+}
+
+function currentAuthorizedRoots(): readonly string[] {
+  const roots = requestContext.getStore()?.authorizedRoots;
+  if (!roots) throw new PublicActionError("authorization_roots_missing", "Reconnect and authorize project roots.");
+  return roots;
 }
 
 async function applicableMutationGate(
@@ -2738,23 +2916,6 @@ export function processModelState(snapshot: ProcessSnapshot) {
   };
 }
 
-function processOutputSchema(extra: z.ZodRawShape = {}) {
-  return z.object({
-    ok: z.boolean(),
-    ...structuredToolErrorFields,
-    status: z.enum(["running", "exited"]).optional(),
-    commandExecuted: z.literal(true).optional(),
-    sessionId: z.number().optional(),
-    outputId: z.string().optional(),
-    output: z.unknown().optional(),
-    exitCode: z.number().int().optional(),
-    signal: z.string().optional(),
-    timedOut: z.literal(true).optional(),
-    effects: z.unknown().optional(),
-    ...extra,
-  }).passthrough();
-}
-
 function extensibleOutputSchema<T extends z.ZodRawShape>(shape: T) {
   return z.object(shape).passthrough();
 }
@@ -2851,7 +3012,6 @@ function registerWriteStdinTool(
           .max(100_000)
           .optional(),
       },
-      outputSchema: processOutputSchema(),
       ...toolWidgetDescriptorMeta(config, "shell"),
     },
     async ({ workspaceId, workspaceGeneration, operationId, instructionToken, sessionId, chars, closeStdin, columns, rows, yieldTimeMs, maxOutputTokens }) => {
@@ -2989,11 +3149,12 @@ function registerReadProcessOutputTool(
         use: "paging retained output to EOF.",
         avoid: "polling a live session.",
         requires: "receipt and outputId.",
-        returns: "one page plus nextOffset/eof.",
+        returns: "one page plus signed cursor/eof.",
       }),
       inputSchema: {
         ...workspaceHandleInputSchema,
         outputId: z.string(),
+        cursor: z.string().max(4_096).optional(),
         offset: z
           .number()
           .int()
@@ -3006,23 +3167,47 @@ function registerReadProcessOutputTool(
           .max(MAX_PROCESS_OUTPUT_READ_BYTES)
           .optional(),
       },
-      outputSchema: extensibleOutputSchema({
-        ok: z.boolean(),
-        ...structuredToolErrorFields,
-        nextOffset: z.number().int().nonnegative().optional(),
-        eof: z.literal(true).optional(),
-        status: z.enum(["active", "unknown"]).optional(),
-        page: z.unknown().optional(),
-      }),
       ...toolWidgetDescriptorMeta(config, "shell"),
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
-    async ({ workspaceId, outputId, offset, limit }) => {
+    async ({ workspaceId, workspaceGeneration, outputId, cursor, offset, limit }) => {
       const startedAt = performance.now();
       workspaces.getWorkspace(connectionPrincipalId, workspaceId);
+      const principalRef = cursorPrincipalRef(connectionPrincipalId, config.oauth.keys.cursor);
+      const queryHash = cursorQueryHash({ outputId });
+      const revision = cursorRevision({ outputId });
+      const decoded = cursor
+        ? decodedCursorOrError(
+            cursor,
+            config.oauth.keys.cursor,
+            "invalid_process_cursor",
+            "The process output cursor is invalid or expired; restart with offset=0.",
+          )
+        : undefined;
+      if (
+        decoded &&
+        (
+          decoded.resourceType !== "process" ||
+          decoded.principalRef !== principalRef ||
+          decoded.workspaceGeneration !== workspaceGeneration ||
+          decoded.queryHash !== queryHash ||
+          decoded.revision !== revision
+        )
+      ) {
+        throw new PublicActionError(
+          "process_cursor_stale",
+          "The process output, Workspace generation, or caller changed; restart without a cursor.",
+        );
+      }
+      if (decoded && offset !== undefined && offset !== decoded.offset) {
+        throw new PublicActionError(
+          "process_cursor_offset_conflict",
+          "Omit offset when using cursor, or provide the exact cursor offset.",
+        );
+      }
       processSessions.flushOutput(connectionPrincipalId, workspaceId, outputId);
       const page = processOutputStore.read(connectionPrincipalId, workspaceId, outputId, {
-        offset: offset ?? 0,
+        offset: decoded?.offset ?? offset ?? 0,
         limit: limit ?? DEFAULT_PROCESS_OUTPUT_READ_BYTES,
       });
       const status = page.status;
@@ -3043,6 +3228,16 @@ function registerReadProcessOutputTool(
         .filter((value): value is string => Boolean(value))
         .join("\n");
       const terminalEof = page.eof && status !== "active";
+      const nextCursor = terminalEof
+        ? undefined
+        : encodeCursor({
+            resourceType: "process",
+            principalRef,
+            workspaceGeneration,
+            queryHash,
+            revision,
+            offset: page.nextOffset,
+          }, config.oauth.keys.cursor);
       logToolCall(config, {
         tool: toolNames.readProcessOutput,
         workspaceId,
@@ -3068,6 +3263,7 @@ function registerReadProcessOutputTool(
         structuredContent: {
           ok: true,
           ...(!page.eof || status === "active" ? { nextOffset: page.nextOffset } : {}),
+          ...(nextCursor ? { nextCursor } : {}),
           ...(terminalEof ? { eof: true as const } : {}),
           ...(status === "active" || status === "unknown" ? { status } : {}),
           page: {
@@ -3153,7 +3349,6 @@ function registerProcessTools(
           .max(100_000)
           .optional(),
       },
-      outputSchema: processOutputSchema(),
       ...toolWidgetDescriptorMeta(config, "shell"),
     },
     async ({ workspaceId, workspaceGeneration, operationId, instructionToken, program, args, shell, command, stdin, closeStdin, tty, columns, rows, workingDirectory, environment, network, yieldTimeMs, timeoutMs, maxOutputTokens }) => {
@@ -3196,6 +3391,23 @@ function registerProcessTools(
         throw new PublicActionError("command_shape_invalid", "args requires program.");
       }
       const commandText = direct ? [program, ...directArgs].join(" ") : shellCommand!;
+      const selfManagementViolation = devSpaceSelfManagementViolation(commandText, {
+        pid: process.pid,
+        launchdServiceLabel: process.env.DEVSPACE_LAUNCHD_SERVICE_LABEL,
+      });
+      if (selfManagementViolation) {
+        throw new PublicActionError(
+          "devspace_self_management_blocked",
+          selfManagementViolation,
+          {
+            retryable: false,
+            safeToRetry: false,
+            recovery: "use_local_admin_runtime_control",
+            phase: "not_started",
+            effectsKnown: true,
+          },
+        );
+      }
       const cwd = workspaces.resolveWorkingDirectory(workspace, effectiveWorkingDirectory);
       const commandScopes = direct
         ? directCommandScopePaths(
@@ -3364,12 +3576,16 @@ function registerProcessTools(
             processSessions.terminate(connectionPrincipalId, workspaceId, snapshot.sessionId);
             throw new Error("The running process could not retain its workspace root lease.");
           }
-          processSessions.attachWorkspaceRootLease(
+          const attached = await processSessions.attachWorkspaceRootLease(
             connectionPrincipalId,
             workspaceId,
             snapshot.sessionId,
             retainRootLease(),
           );
+          if (!attached) {
+            processSessions.terminate(connectionPrincipalId, workspaceId, snapshot.sessionId);
+            throw new Error("The running process exited before its workspace root lease was retained.");
+          }
         }
         logToolCall(config, {
           tool: "exec_command",
@@ -3437,11 +3653,26 @@ function createMcpServer(
       instructions: serverInstructions(),
     },
   );
+  const capabilitiesRevision = createHash("sha256")
+    .update(JSON.stringify(capabilities))
+    .digest("base64url");
   const enabledTools = new Set(toolSurface(config, grantedScopes));
+  const principalCursorRef = cursorPrincipalRef(connectionPrincipalId, config.oauth.keys.cursor);
   enabledToolsByServer.set(server, enabledTools);
   toolHandlerBarriers.set(server, activeToolHandlers);
   toolErrorReporters.set(server, (tool, error) => {
-    runtimeDiagnostics.recordFailure("mcp_tool_error", error);
+    const context = requestContext.getStore();
+    const fields = errorFields(error);
+    runtimeDiagnostics.recordFailure("mcp_tool_error", error, {
+      requestId: context?.requestId,
+      tool,
+      connectionRef: connectionRef(connectionPrincipalId, config.oauth.keys.auditReference),
+      workspaceActivityRef: context?.correlation.workspaceActivityRef,
+      errorCode: typeof fields.errorCode === "string" ? fields.errorCode : undefined,
+      errorFingerprint: typeof fields.errorFingerprint === "string"
+        ? fields.errorFingerprint
+        : undefined,
+    });
     logEvent(config.logging, "error", "mcp_tool_error", {
       requestId: requestContext.getStore()?.requestId,
       ...correlationLogFields(
@@ -3454,7 +3685,19 @@ function createMcpServer(
   });
   const reportPiToolError = (error: unknown): void => {
     const expected = isExpectedPiToolError(error);
-    if (!expected) runtimeDiagnostics.recordFailure("pi_tool_error", error);
+    if (!expected) {
+      const context = requestContext.getStore();
+      const fields = errorFields(error);
+      runtimeDiagnostics.recordFailure("pi_tool_error", error, {
+        requestId: context?.requestId,
+        connectionRef: connectionRef(connectionPrincipalId, config.oauth.keys.auditReference),
+        workspaceActivityRef: context?.correlation.workspaceActivityRef,
+        errorCode: typeof fields.errorCode === "string" ? fields.errorCode : undefined,
+        errorFingerprint: typeof fields.errorFingerprint === "string"
+          ? fields.errorFingerprint
+          : undefined,
+      });
+    }
     logEvent(config.logging, expected ? "info" : "error", expected ? "pi_tool_expected_error" : "pi_tool_error", {
       requestId: requestContext.getStore()?.requestId,
       ...correlationLogFields(
@@ -3577,7 +3820,12 @@ function createMcpServer(
           alias: summary.alias,
           displayPath: summary.displayPath,
           ...(contextMode === "metadata" ? {} : { workspaceId: workspace.id }),
-          summary: { mode: workspace.mode, writeAccess: workspace.writeAccess, ...rendered.summary },
+          summary: {
+            mode: workspace.mode,
+            writeAccess: workspace.writeAccess,
+            capabilitiesRevision,
+            ...rendered.summary,
+          },
         },
       },
       structuredContent: {
@@ -3585,7 +3833,8 @@ function createMcpServer(
         schemaVersion: 1,
         contextSchemaVersion: rendered.structuredContent.schemaVersion,
         ok: true,
-        runtimeCapabilities: capabilities,
+        capabilitiesRevision,
+        ...(tool === toolNames.openWorkspace ? { runtimeCapabilities: capabilities } : {}),
         contextChanged: true,
         ...(context.recovery ? { recovery: context.recovery } : {}),
         ...(tool === toolNames.openWorkspace
@@ -3603,23 +3852,123 @@ function createMcpServer(
 
   registerAppTool(server, toolNames.listWorkspaces, {
     title: "List workspaces",
-    description: toolDescription({
-      use: "finding retained aliases or refs.",
-      avoid: "filesystem discovery.",
-      requires: "authorization.",
-      returns: "retained Workspace summaries.",
-    }),
-    inputSchema: {},
-    outputSchema: lifecycleOutputSchema(),
+    description: "Use when listing saved Workspaces. Needs authorization. Returns a filtered page.",
+    inputSchema: {
+      status: z.enum(["active", "closed", "all"]).optional(),
+      aliasPrefix: z.string().max(64).optional(),
+      projectFingerprint: z.string().max(128).optional(),
+      mode: z.enum(["checkout", "worktree"]).optional(),
+      recentFirst: z.boolean().optional(),
+      includeClosed: z.boolean().optional(),
+      limit: z.number().int().min(1).max(100).optional(),
+      cursor: z.string().max(4_096).optional(),
+    },
     ...toolWidgetDescriptorMeta(config, "workspace"),
     annotations: { readOnlyHint: true, openWorldHint: false },
-  }, async () => {
-    const summaries = workspaces.listWorkspaces(connectionPrincipalId);
+  }, async ({
+    status,
+    aliasPrefix,
+    projectFingerprint,
+    mode,
+    recentFirst,
+    includeClosed,
+    limit,
+    cursor,
+  }) => {
+    const effectiveStatus = status ?? (includeClosed ? "all" : "active");
+    const query = {
+      status: effectiveStatus,
+      aliasPrefix: aliasPrefix ?? "",
+      projectFingerprint: projectFingerprint ?? "",
+      mode: mode ?? "",
+      recentFirst: recentFirst !== false,
+    };
+    const queryHash = cursorQueryHash(query);
+    const decoded = cursor
+      ? decodedCursorOrError(
+          cursor,
+          config.oauth.keys.cursor,
+          "invalid_workspace_cursor",
+          "The Workspace cursor is invalid or expired; restart without it.",
+        )
+      : undefined;
+    const summaries = workspaces.listWorkspaces(
+      connectionPrincipalId,
+      currentAuthorizedRoots(),
+      {
+        statuses: effectiveStatus === "all"
+          ? ["active", "closed"]
+          : [effectiveStatus],
+        ...(aliasPrefix ? { aliasPrefix } : {}),
+        ...(projectFingerprint ? { projectFingerprint } : {}),
+        ...(mode ? { mode } : {}),
+        recentFirst: recentFirst !== false,
+      },
+    );
+    const revision = cursorRevision(summaries.map((summary) => ({
+      ref: summary.workspaceRef,
+      alias: summary.alias,
+      status: summary.status,
+      generation: summary.workspaceGeneration,
+      hydrationStatus: summary.hydrationStatus,
+      writeAccess: summary.writeAccess,
+      lastUsedAt: summary.lastUsedAt,
+    })));
+    if (
+      decoded &&
+      (
+        decoded.resourceType !== "workspace" ||
+        decoded.principalRef !== principalCursorRef ||
+        decoded.queryHash !== queryHash ||
+        decoded.revision !== revision ||
+        decoded.workspaceGeneration !== undefined
+      )
+    ) {
+      throw new PublicActionError(
+        "workspace_cursor_stale",
+        "Workspace filters or retained Workspace state changed; restart without a cursor.",
+      );
+    }
+    const offset = decoded?.offset ?? 0;
+    if (offset > summaries.length) {
+      throw new PublicActionError(
+        "invalid_workspace_cursor",
+        "The Workspace cursor offset is invalid; restart without a cursor.",
+      );
+    }
+    const pageSize = limit ?? 20;
+    const requestedPage = summaries
+      .slice(offset, offset + pageSize)
+      .map(({ createdAt: _createdAt, lastUsedAt: _lastUsedAt, ...summary }) => ({
+        ...summary,
+        ...(summary.hydrationStatus === "recovery_required"
+          ? { recovery: "resolve_saved_worktree_before_resume" as const }
+          : summary.status === "closed"
+            ? { recovery: "resume_reactivates_closed_workspace" as const }
+            : {}),
+      }));
+    const page = requestedPage.slice(0, 1);
+    for (const summary of requestedPage.slice(1)) {
+      if (serializedBytes([...page, summary]) > MAX_WORKSPACE_LIST_PAGE_BYTES) break;
+      page.push(summary);
+    }
+    const nextOffset = offset + page.length;
+    const nextCursor = nextOffset < summaries.length
+      ? encodeCursor({
+          resourceType: "workspace",
+          principalRef: principalCursorRef,
+          queryHash,
+          revision,
+          offset: nextOffset,
+        }, config.oauth.keys.cursor)
+      : undefined;
     return {
-      content: [textBlock(`Found ${summaries.length} resumable workspace(s).`)],
+      content: [textBlock(`Found ${summaries.length} matching Workspace(s); returned ${page.length}.`)],
       structuredContent: {
         ok: true,
-        workspaces: summaries.map(({ createdAt: _createdAt, lastUsedAt: _lastUsedAt, ...summary }) => summary),
+        workspaces: page,
+        total: summaries.length,
+        ...(nextCursor ? { nextCursor } : {}),
       },
     };
   });
@@ -3635,7 +3984,6 @@ function createMcpServer(
     inputSchema: {
       operationId: z.string().min(1).max(128),
     },
-    outputSchema: lifecycleOutputSchema(),
     ...toolWidgetDescriptorMeta(config, "workspace"),
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async ({ operationId }) => {
@@ -3656,12 +4004,99 @@ function createMcpServer(
           ref: status.workspaceId,
           generation: status.workspaceGeneration,
         },
-        operation: operationEnvelope(
-          status.operationId,
-          status.state === "settled" ? "committed" : "outcome_unknown",
-          false,
-          status.state === "settled" && status.resultAvailable,
-        ),
+        operation: operationStatusEnvelope(status),
+        ...(status.resolution ? { resolution: status.resolution } : {}),
+      },
+    };
+  });
+
+  registerAppTool(server, toolNames.resolveOperation, {
+    title: "Resolve operation",
+    description: toolDescription({
+      use: "resolving one retained unknown mutation outcome using explicit evidence.",
+      avoid: "guessing or deleting operation history.",
+      requires: "write scope and a prior operation ID.",
+      returns: "the durable resolution and evidence metadata.",
+    }),
+    inputSchema: {
+      targetOperationId: z.string().min(1).max(128),
+      resolution: z.enum([
+        "verified_committed",
+        "verified_not_started",
+        "acknowledged_unknown",
+      ]),
+      method: z.enum([
+        "manual_verification",
+        "file_state",
+        "process_output",
+        "external_confirmation",
+        "admin_review",
+      ]),
+      evidenceType: z.enum([
+        "none",
+        "content_hash",
+        "output_id",
+        "changed_files",
+        "status_snapshot",
+        "operator_statement",
+      ]),
+      evidence: z.unknown().optional(),
+    },
+    ...toolWidgetDescriptorMeta(config, "workspace"),
+    annotations: { idempotentHint: true, openWorldHint: false },
+  }, async ({ targetOperationId, resolution, method, evidenceType, evidence }) => {
+    assertOAuthScopes(["workspace:write"]);
+    const existing = mutationOperations.getOperationStatus(
+      connectionPrincipalId,
+      targetOperationId,
+    );
+    if (!existing) {
+      throw new PublicActionError(
+        "unknown_operation",
+        "No retained operation with that ID belongs to this connection.",
+        { retryable: false, safeToRetry: false, recovery: "verify_operation_id" },
+      );
+    }
+    const resolved = mutationOperations.resolveOutcome({
+      connectionPrincipalId,
+      operationId: targetOperationId,
+      resolution,
+      method,
+      evidenceType,
+      ...(evidence === undefined ? {} : { evidence }),
+      operatorRef: connectionRef(connectionPrincipalId, config.oauth.keys.auditReference)!,
+    });
+    const status = resolved ?? mutationOperations.getOperationStatus(
+      connectionPrincipalId,
+      targetOperationId,
+    );
+    if (!status?.resolution || status.resolution.state !== resolution) {
+      throw new PublicActionError(
+        "operation_resolution_conflict",
+        "The operation is not outcome_unknown or already has a different resolution.",
+        { retryable: false, safeToRetry: false, recovery: "get_operation_status" },
+      );
+    }
+    logEvent(config.logging, "info", "mutation_operation_resolved", {
+      requestId: requestContext.getStore()?.requestId,
+      ...correlationLogFields(connectionPrincipalId, status.workspaceId),
+      tool: status.tool,
+      operationRef: identifierHash(
+        targetOperationId,
+        config.oauth.keys.auditReference,
+        "operation",
+      ),
+      method,
+      status: resolution,
+      effectsKnown: resolution !== "acknowledged_unknown",
+    });
+    return {
+      content: [textBlock(`Operation resolution recorded: ${resolution}.`)],
+      structuredContent: {
+        ok: true,
+        workspace: { ref: status.workspaceId, generation: status.workspaceGeneration },
+        operation: operationStatusEnvelope(status),
+        resolution: status.resolution,
       },
     };
   });
@@ -3712,14 +4147,8 @@ function createMcpServer(
 
   registerAppTool(server, toolNames.resumeWorkspace, {
     title: "Resume workspace",
-    description: toolDescription({
-      use: "resuming retained Workspace state.",
-      avoid: "host paths.",
-      requires: "one alias or ref.",
-      returns: "manifest and continuation.",
-    }),
+    description: "Use when restoring a saved Workspace. Avoid host paths. Needs one alias or ref. Returns context.",
     inputSchema: resumeInputSchema,
-    outputSchema: lifecycleOutputSchema(),
     ...toolWidgetDescriptorMeta(config, "workspace"),
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async ({ alias, workspaceRef, contextMode, knownInstructionRevision, knownSkillRevision }) => {
@@ -3732,8 +4161,12 @@ function createMcpServer(
     }
     const startedAt = performance.now();
     const context = alias
-      ? await workspaces.resumeWorkspace(connectionPrincipalId, alias)
-      : await workspaces.resumeWorkspaceByReference(connectionPrincipalId, workspaceRef!);
+      ? await workspaces.resumeWorkspace(connectionPrincipalId, alias, currentAuthorizedRoots())
+      : await workspaces.resumeWorkspaceByReference(
+          connectionPrincipalId,
+          workspaceRef!,
+          currentAuthorizedRoots(),
+        );
     return returnWorkspaceContext(
       toolNames.resumeWorkspace,
       context,
@@ -3753,7 +4186,6 @@ function createMcpServer(
       returns: "manifest and continuation.",
     }),
     inputSchema: { ...workspaceHandleInputSchema, ...contextOptionsInputSchema },
-    outputSchema: lifecycleOutputSchema(),
     ...toolWidgetDescriptorMeta(config, "workspace"),
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async ({ workspaceId, workspaceGeneration, contextMode, knownInstructionRevision, knownSkillRevision }) => {
@@ -3824,14 +4256,18 @@ function createMcpServer(
     } else if (writeAccess === "read_write") {
       assertOAuthScopes(["workspace:write"]);
     }
-    const context = await workspaces.openWorkspace(connectionPrincipalId, {
-      path,
-      alias,
-      mode: effectiveMode,
-      baseRef,
-      writeAccess,
-      forceNew,
-    });
+    const context = await workspaces.openWorkspace(
+      connectionPrincipalId,
+      {
+        path,
+        alias,
+        mode: effectiveMode,
+        baseRef,
+        writeAccess,
+        forceNew,
+      },
+      currentAuthorizedRoots(),
+    );
     return returnWorkspaceContext(
       toolNames.openWorkspace,
       context,
@@ -3853,11 +4289,11 @@ function createMcpServer(
     inputSchema: {
       ...workspaceHandleInputSchema,
       paths: z.array(z.string().min(1).max(1_024)).min(1).max(16),
+      cursor: z.string().max(4_096).optional(),
     },
-    outputSchema: lifecycleOutputSchema(),
     ...toolWidgetDescriptorMeta(config, "read"),
     annotations: { readOnlyHint: true, openWorldHint: false },
-  }, async ({ workspaceId, paths }) => {
+  }, async ({ workspaceId, paths, cursor }) => {
     const workspace = workspaces.getWorkspace(connectionPrincipalId, workspaceId);
     const requestState = requestContext.getStore();
     const currentBinding = requestState?.workspaceBinding;
@@ -3869,18 +4305,94 @@ function createMcpServer(
       throw new WorkspaceContextSessionError();
     }
     const contextSessionId = currentWorkspaceContextSessionId();
-    const files = await workspaces.loadApplicableAgentsFiles(
+    const queryHash = cursorQueryHash({
+      contextSessionId,
+      paths: [...paths].sort(),
+    });
+    const decodedCursor = cursor
+      ? decodedCursorOrError(
+          cursor,
+          config.oauth.keys.cursor,
+          "invalid_instruction_cursor",
+          "The instruction cursor is invalid or expired; repeat without it.",
+        )
+      : undefined;
+    if (
+      decodedCursor &&
+      (
+        decodedCursor.resourceType !== "instruction" ||
+        decodedCursor.principalRef !== principalCursorRef ||
+        decodedCursor.workspaceGeneration !== workspace.stateGeneration ||
+        decodedCursor.queryHash !== queryHash
+      )
+    ) {
+      throw new PublicActionError(
+        "instruction_cursor_stale",
+        "Workspace generation, instruction revision, or target paths changed; repeat without cursor.",
+      );
+    }
+    const availableFiles = await workspaces.loadApplicableAgentsFiles(
       workspace,
       paths,
       { contextSessionId, requireAcknowledged: true },
     );
-    const instructionToken = files.length > 0
-      ? await workspaces.createInstructionAcknowledgement(workspace, contextSessionId, files)
+    const revision = cursorRevision({
+      instructionRevision: currentBinding.instructionRevision,
+      files: availableFiles.map((file) => ({
+        path: file.path,
+        fingerprint: file.fingerprint,
+        bytes: Buffer.byteLength(file.content, "utf8"),
+      })),
+    });
+    if (decodedCursor && decodedCursor.revision !== revision) {
+      throw new PublicActionError(
+        "instruction_cursor_stale",
+        "Applicable instructions changed while paging; repeat without a cursor.",
+      );
+    }
+    const pageOffset = decodedCursor?.offset ?? 0;
+    let page: InstructionContentPage;
+    try {
+      page = buildInstructionContentPage(
+        availableFiles,
+        pageOffset,
+        INSTRUCTION_PAGE_TARGET_BYTES,
+      );
+    } catch (error) {
+      if (!(error instanceof RangeError)) throw error;
+      throw new PublicActionError(
+        "invalid_instruction_cursor",
+        "The instruction cursor offset is invalid; repeat without a cursor.",
+      );
+    }
+    const nextCursor = page.nextOffset !== undefined
+      ? encodeCursor({
+          resourceType: "instruction",
+          principalRef: principalCursorRef,
+          workspaceGeneration: workspace.stateGeneration,
+          queryHash,
+          revision,
+          offset: page.nextOffset,
+        }, config.oauth.keys.cursor)
       : undefined;
-    await workspaces.markAgentsFilesDelivered(workspace, contextSessionId, files);
+    const instructionToken = !nextCursor && availableFiles.length > 0
+      ? await workspaces.createInstructionAcknowledgement(
+          workspace,
+          contextSessionId,
+          availableFiles,
+        )
+      : undefined;
+    if (page.completedFiles.length > 0) {
+      await workspaces.markAgentsFilesDelivered(
+        workspace,
+        contextSessionId,
+        page.completedFiles,
+      );
+    }
+    const pageComplete = nextCursor === undefined;
     const targetBinding: WorkspaceContextReceiptBinding = {
       ...currentBinding,
-      phase: "target_scoped",
+      phase: pageComplete ? "target_scoped" : "context_loaded",
     };
     const continuation = contextReceipts.issue(targetBinding);
     if (requestState?.hostAuthorization) {
@@ -3888,15 +4400,17 @@ function createMcpServer(
     }
     return {
       content: [textBlock(
-        files.length > 0
-          ? "Target-scoped workspace instructions loaded."
+        page.fragments.length > 0
+          ? nextCursor
+            ? "Instruction page loaded; continue with nextCursor before mutation."
+            : "Target-scoped workspace instructions loaded."
           : "The target scope has no new workspace instructions.",
       )],
       structuredContent: {
         schemaVersion: 1,
         contextSchemaVersion: 5,
         ok: true,
-        state: { phase: "target_scoped" as const },
+        state: { phase: targetBinding.phase },
         workspace: {
           ref: workspace.id,
           alias: workspace.alias,
@@ -3905,18 +4419,31 @@ function createMcpServer(
         },
         instructionManifest: {
           revision: currentBinding.instructionRevision,
-          loadedForScope: true,
-          reviewedRevision: currentBinding.instructionRevision,
-          files: files.map((file) =>
-            workspaceInstructionManifestRecord(file, workspace.root)),
+          loadedForScope: pageComplete,
+          ...(pageComplete
+            ? { reviewedRevision: currentBinding.instructionRevision }
+            : {}),
+          files: page.fragments.map((item) =>
+            workspaceInstructionFragmentManifestRecord(item, workspace.root)),
         },
         workspaceInstructions: {
-          items: files.map((file) => workspaceInstructionRecord(file, workspace.root)),
+          items: page.fragments.map((item) =>
+            workspaceInstructionFragmentRecord(item, workspace.root)),
+        },
+        pagination: {
+          returnedFiles: page.returnedFiles,
+          returnedFragments: page.fragments.length,
+          completedFiles: page.completedFiles.length,
+          returnedBytes: page.returnedBytes,
+          totalBytes: page.totalBytes,
+          omittedFiles: page.omittedFiles,
+          omittedBytes: page.omittedBytes,
+          ...(nextCursor ? { nextCursor } : {}),
         },
         ...(instructionToken ? { instructionToken } : {}),
         continuation: {
           receipt: continuation.receipt,
-          phase: "target_scoped" as const,
+          phase: targetBinding.phase,
           expiresAt: new Date(continuation.expiresAt).toISOString(),
           instructionRevision: currentBinding.instructionRevision,
           skillRevision: currentBinding.skillRevision,
@@ -3947,8 +4474,32 @@ function createMcpServer(
       const workspace = workspaces.getWorkspace(connectionPrincipalId, workspaceId);
       const revision = workspaces.skillRevision(workspace);
       const normalizedQuery = (query ?? "").trim().toLocaleLowerCase("en-US");
-      const decoded = cursor ? decodeSkillCursor(cursor) : undefined;
-      if (decoded && (decoded.revision !== revision || decoded.query !== normalizedQuery)) {
+      const queryHash = cursorQueryHash({ query: normalizedQuery });
+      if (!normalizedQuery && workspace.skills.length > 25) {
+        throw new PublicActionError(
+          "skill_query_required",
+          "This Workspace has a large Skill catalog; provide a query before listing it.",
+          { retryable: true, safeToRetry: true, recovery: "add_skill_query", phase: "not_started" },
+        );
+      }
+      const decoded = cursor
+        ? decodedCursorOrError(
+            cursor,
+            config.oauth.keys.cursor,
+            "invalid_skill_cursor",
+            "The Skill cursor is invalid or expired; restart without it.",
+          )
+        : undefined;
+      if (
+        decoded &&
+        (
+          decoded.resourceType !== "skill" ||
+          decoded.principalRef !== principalCursorRef ||
+          decoded.workspaceGeneration !== workspace.stateGeneration ||
+          decoded.queryHash !== queryHash ||
+          decoded.revision !== revision
+        )
+      ) {
         throw new PublicActionError(
           "skill_cursor_stale",
           "The Skill catalog or query changed; restart the listing without a cursor.",
@@ -3970,11 +4521,29 @@ function createMcpServer(
       if (offset > allEntries.length) {
         throw new PublicActionError("invalid_skill_cursor", "The Skill cursor offset is invalid; restart without a cursor.");
       }
-      const pageSize = limit ?? 20;
-      const skills = allEntries.slice(offset, offset + pageSize);
+      const pageSize = limit ?? 10;
+      const requestedSkills = allEntries.slice(offset, offset + pageSize).map((entry) => ({
+        skillId: entry.skillId,
+        name: entry.name,
+        description: entry.description,
+        trust: entry.trust,
+        ...(entry.explicitOnly ? { explicitOnly: true as const } : {}),
+      }));
+      const skills = requestedSkills.slice(0, 1);
+      for (const entry of requestedSkills.slice(1)) {
+        if (serializedBytes([...skills, entry]) > MAX_SKILL_LIST_PAGE_BYTES) break;
+        skills.push(entry);
+      }
       const nextOffset = offset + skills.length;
       const nextCursor = nextOffset < allEntries.length
-        ? encodeSkillCursor({ revision, query: normalizedQuery, offset: nextOffset })
+        ? encodeCursor({
+            resourceType: "skill",
+            principalRef: principalCursorRef,
+            workspaceGeneration: workspace.stateGeneration,
+            queryHash,
+            revision,
+            offset: nextOffset,
+          }, config.oauth.keys.cursor)
         : undefined;
       return {
         content: [textBlock(`Found ${allEntries.length} matching Skill(s); returned ${skills.length}.`)],
@@ -4090,7 +4659,6 @@ function createMcpServer(
         ...workspaceHandleInputSchema,
         operationId: z.string().min(1).max(128),
       },
-      outputSchema: lifecycleOutputSchema(),
       ...toolWidgetDescriptorMeta(config, "workspace", {
         invoking: "Closing workspace…",
         invoked: "Workspace close processed",
@@ -4243,7 +4811,6 @@ function createMcpServer(
       ...workspaceHandleInputSchema,
       operationId: z.string().min(1).max(128),
     },
-    outputSchema: lifecycleOutputSchema(),
     ...toolWidgetDescriptorMeta(config, "workspace"),
     annotations: { destructiveHint: true, idempotentHint: true, openWorldHint: false },
   }, async ({ workspaceId, workspaceGeneration, operationId }) => {
@@ -4491,16 +5058,6 @@ function createMcpServer(
           .min(1)
           .max(BATCH_MAX_ITEMS),
       },
-      outputSchema: extensibleOutputSchema({
-        ok: z.boolean(),
-        ...structuredToolErrorFields,
-        items: z.array(batchReadItemOutputSchema).optional(),
-        status: z.enum(["completed", "partial", "failed"]).optional(),
-        succeeded: z.number().int().nonnegative().optional(),
-        failed: z.number().int().nonnegative().optional(),
-        scopedInstructionsAvailable: z.literal(true).optional(),
-        truncated: z.literal(true).optional(),
-      }),
       ...toolWidgetDescriptorMeta(config, "read"),
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
@@ -4647,16 +5204,6 @@ function createMcpServer(
           .min(1)
           .max(BATCH_MAX_ITEMS),
       },
-      outputSchema: extensibleOutputSchema({
-        ok: z.boolean(),
-        ...structuredToolErrorFields,
-        items: z.array(batchItemOutputSchema).optional(),
-        status: z.enum(["completed", "partial", "failed"]).optional(),
-        succeeded: z.number().int().nonnegative().optional(),
-        failed: z.number().int().nonnegative().optional(),
-        scopedInstructionsAvailable: z.literal(true).optional(),
-        truncated: z.literal(true).optional(),
-      }),
       ...toolWidgetDescriptorMeta(config, "search"),
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
@@ -4700,7 +5247,11 @@ function createMcpServer(
                 { path: operation.path, limit: operation.limit },
                 { cwd: workspace.root, root: workspace.root, onError: reportPiToolError },
               );
-        return { ok: !response.isError, result: contentText(response.content) };
+        return {
+          ok: !response.isError,
+          result: contentText(response.content),
+          ...(response.error ? { error: response.error } : {}),
+        };
       }, { onError: reportPiToolError });
       const failed = batch.items.filter((item) => !item.ok).length;
       const succeeded = batch.items.length - failed;
@@ -4998,7 +5549,15 @@ export function createServer(configInput?: ServerConfig): RunningServer {
     mcpHttpTransport: config.mcpHttpTransport,
   });
   const processGeneration = randomUUID();
-  const contextReceipts = createWorkspaceContextReceiptManager({ processGeneration });
+  const auditReferenceKey = config.oauth.keys.auditReference;
+  const auditEvents = new AuditEventStore(config.stateDir);
+  config.logging.auditSink = config.logging.auditEvents === false
+    ? undefined
+    : (entry) => auditEvents.record({ ...entry });
+  const contextReceipts = createWorkspaceContextReceiptManager({
+    key: config.oauth.keys.receipt,
+    processGeneration,
+  });
   const hostWorkspaceBindings = new HostWorkspaceBindingStore();
   const runtimeDiagnostics = new RuntimeDiagnostics();
   const activeMcpRequests = new ActiveRequestBarrier();
@@ -5030,19 +5589,31 @@ export function createServer(configInput?: ServerConfig): RunningServer {
   const workspaceStore = createWorkspaceStore(config.stateDir);
   const workspaces = new WorkspaceRegistry(config, workspaceStore);
   const oauthProvider = new SingleUserOAuthProvider(
-    { ...config.oauth, runtimeCapabilities: capabilities },
+    {
+      ...config.oauth,
+      runtimeCapabilities: capabilities,
+      resourceRoots: () => buildAuthorizationRoots(
+        config.allowedRoots,
+        config.oauth.keys.authorizationRoot,
+      ),
+    },
     mcpUrl,
     config.stateDir,
     ({ event, clientId }) => {
       logEvent(config.logging, event === "oauth_authorization_failed" || event === "oauth_authorization_rate_limited" ? "warn" : "info", event, {
-        ...correlationLogFields(undefined, undefined, clientId),
+        ...correlationLogFields(undefined, undefined, clientId, auditReferenceKey),
       });
     },
     ({ connectionPrincipalId, reason }) => {
       hostWorkspaceBindings.invalidatePrincipal(connectionPrincipalId);
       const bumpedWorkspaces = workspaces.bumpAuthorityGenerations(connectionPrincipalId);
       logEvent(config.logging, "info", "oauth_authorization_epoch_changed", {
-        ...correlationLogFields(connectionPrincipalId),
+        ...correlationLogFields(
+          connectionPrincipalId,
+          undefined,
+          undefined,
+          auditReferenceKey,
+        ),
         reason,
         bumpedWorkspaces,
       });
@@ -5078,7 +5649,12 @@ export function createServer(configInput?: ServerConfig): RunningServer {
     onOutputStorageError: (error, context) => {
       runtimeDiagnostics.recordFailure("process_output_storage_failed", error);
       logEvent(config.logging, "error", "process_output_storage_failed", {
-        ...correlationLogFields(context.connectionPrincipalId, context.workspaceId),
+        ...correlationLogFields(
+          context.connectionPrincipalId,
+          context.workspaceId,
+          undefined,
+          auditReferenceKey,
+        ),
         workspaceId: context.workspaceId,
         outputId: context.outputId,
         ...errorFields(error),
@@ -5285,7 +5861,12 @@ export function createServer(configInput?: ServerConfig): RunningServer {
           runtimeDiagnostics.recordFailure("oauth_revocation_cleanup_failed", error);
           logEvent(config.logging, "error", "oauth_revocation_cleanup_failed", {
             workspaceId: job.workspaceId,
-            ...correlationLogFields(job.connectionPrincipalId, job.workspaceId),
+            ...correlationLogFields(
+              job.connectionPrincipalId,
+              job.workspaceId,
+              undefined,
+              auditReferenceKey,
+            ),
             ...errorFields(error),
           });
         }
@@ -5323,6 +5904,7 @@ export function createServer(configInput?: ServerConfig): RunningServer {
       localAgentStore.cleanup();
       processOutputStore.cleanupExpired();
       mutationOperations.cleanupExpired();
+      auditEvents.cleanup();
       await drainRevocationCleanupJobs();
       workspaceStore.cleanupRevocationHistory?.(
         new Date(Date.now() - 30 * 24 * 60 * 60 * 1_000).toISOString(),
@@ -5389,7 +5971,7 @@ export function createServer(configInput?: ServerConfig): RunningServer {
       }
       logEvent(config.logging, "warn", "oauth_stale_client", {
         requestId: res.locals.requestId as string | undefined,
-        ...correlationLogFields(undefined, undefined, clientId),
+        ...correlationLogFields(undefined, undefined, clientId, auditReferenceKey),
         ...requestLogFields(req, config),
       });
       const uiLocales = typeof req.query.ui_locales === "string" ? req.query.ui_locales : undefined;
@@ -5436,7 +6018,11 @@ export function createServer(configInput?: ServerConfig): RunningServer {
   );
 
   app.use(createRuntimeControlPlane({
-    ownerToken: config.oauth.ownerToken,
+    internalAuth: {
+      diagnostics: config.oauth.keys.internalDiagnostics,
+      configReload: config.oauth.keys.internalConfigReload,
+      revocation: config.oauth.keys.internalRevocation,
+    },
     generation: processGeneration,
     runtimeConfig: { widgets: config.widgets },
     allowedRootsRevision: () => allowedRootsRevision(config.allowedRoots),
@@ -5496,7 +6082,7 @@ export function createServer(configInput?: ServerConfig): RunningServer {
     const oauthClientId = req.auth?.clientId;
     const hostIdentity = hashOpenAiHostIdentity(
       toolCallMeta(req.body),
-      config.oauth.ownerToken,
+      config.oauth.keys.hostIdentity,
     );
     let oauthAuthorization: OAuthRequestAuthorization | undefined;
     try {
@@ -5511,7 +6097,7 @@ export function createServer(configInput?: ServerConfig): RunningServer {
         method: req.method,
         path: requestPath(req),
         reason: "oauth_grant_or_host_identity_mismatch",
-        ...correlationLogFields(undefined, undefined, oauthClientId),
+        ...correlationLogFields(undefined, undefined, oauthClientId, auditReferenceKey),
         ...errorFields(error),
       });
       sendJsonRpcError(res, 401, -32001, "Unauthorized");
@@ -5519,10 +6105,10 @@ export function createServer(configInput?: ServerConfig): RunningServer {
     }
     const connectionPrincipalId = oauthAuthorization?.connectionPrincipalId;
     if (oauthClientId) {
-      res.locals.oauthClientRef = oauthClientRef(oauthClientId);
+      res.locals.oauthClientRef = oauthClientRef(oauthClientId, auditReferenceKey);
     }
     if (connectionPrincipalId) {
-      res.locals.connectionRef = connectionRef(connectionPrincipalId);
+      res.locals.connectionRef = connectionRef(connectionPrincipalId, auditReferenceKey);
     }
     if (
       !oauthClientId ||
@@ -5544,17 +6130,42 @@ export function createServer(configInput?: ServerConfig): RunningServer {
           connectionPrincipalId,
           legacyWorkspaceIdHint(req.body),
           oauthClientId,
+          auditReferenceKey,
         ),
         ...requestLogFields(req, config),
       });
       sendJsonRpcError(res, 401, -32001, "Unauthorized");
       return;
     }
+    const authorizedRoots = resolveAuthorizedRootPaths(
+      oauthAuthorization.allowedRootIds,
+      buildAuthorizationRoots(config.allowedRoots, config.oauth.keys.authorizationRoot),
+    );
+    if (authorizedRoots.length === 0) {
+      logEvent(config.logging, "warn", "auth_denied", {
+        requestId,
+        method: req.method,
+        path: requestPath(req),
+        reason: "no_current_authorized_roots",
+        ...correlationLogFields(
+          connectionPrincipalId,
+          undefined,
+          oauthClientId,
+          auditReferenceKey,
+        ),
+      });
+      sendJsonRpcError(res, 403, -32001, "No currently approved project roots belong to this authorization");
+      return;
+    }
 
     const requestWorkspaceId = legacyWorkspaceIdHint(req.body);
     const correlation: RequestCorrelationState = {
       workspaceId: requestWorkspaceId,
-      workspaceActivityRef: workspaceActivityRef(connectionPrincipalId, requestWorkspaceId),
+      workspaceActivityRef: workspaceActivityRef(
+        connectionPrincipalId,
+        requestWorkspaceId,
+        auditReferenceKey,
+      ),
     };
     res.locals.correlation = correlation;
     const hostAuthorization: HostAuthorizationContext = {
@@ -5577,6 +6188,7 @@ export function createServer(configInput?: ServerConfig): RunningServer {
         connectionPrincipalId,
         legacyWorkspaceIdHint(req.body),
         oauthClientId,
+        auditReferenceKey,
       ),
     });
 
@@ -5607,8 +6219,8 @@ export function createServer(configInput?: ServerConfig): RunningServer {
         const statelessRequestLease = transports.tryAcquireStatelessRequest(
           connectionPrincipalId,
           {
-            principalRef: connectionRef(connectionPrincipalId)!,
-            clientRef: oauthClientRef(oauthClientId)!,
+            principalRef: connectionRef(connectionPrincipalId, auditReferenceKey)!,
+            clientRef: oauthClientRef(oauthClientId, auditReferenceKey)!,
           },
         );
         if (!statelessRequestLease) {
@@ -5619,6 +6231,7 @@ export function createServer(configInput?: ServerConfig): RunningServer {
               connectionPrincipalId,
               legacyWorkspaceIdHint(req.body),
               oauthClientId,
+              auditReferenceKey,
             ),
             maxSessions: config.resources.maxMcpSessions,
             maxSessionsPerClient: config.resources.maxMcpSessionsPerClient,
@@ -5668,6 +6281,7 @@ export function createServer(configInput?: ServerConfig): RunningServer {
               connectionPrincipalId,
               legacyWorkspaceIdHint(req.body),
               oauthClientId,
+              auditReferenceKey,
             ),
             reason: "not_found_or_not_owned",
           });
@@ -5692,6 +6306,7 @@ export function createServer(configInput?: ServerConfig): RunningServer {
               connectionPrincipalId,
               legacyWorkspaceIdHint(req.body),
               oauthClientId,
+              auditReferenceKey,
             ),
             maxSessions: config.resources.maxMcpSessions,
           });
@@ -5720,6 +6335,7 @@ export function createServer(configInput?: ServerConfig): RunningServer {
                 connectionPrincipalId,
                 legacyWorkspaceIdHint(req.body),
                 oauthClientId,
+                auditReferenceKey,
               ),
               ...requestLogFields(req, config),
             });
@@ -5740,6 +6356,7 @@ export function createServer(configInput?: ServerConfig): RunningServer {
                 connectionPrincipalId,
                 legacyWorkspaceIdHint(req.body),
                 oauthClientId,
+                auditReferenceKey,
               ),
             });
           }
@@ -5792,19 +6409,52 @@ export function createServer(configInput?: ServerConfig): RunningServer {
       const effectiveReceipt = receipt;
       const workspaceBinding = resolvedWorkspaceReceipt?.binding
         ?? resolvedHostWorkspace?.binding;
+      const callToolName = toolCallName(req.body);
+      const callOperationId = toolCallOperationId(req.body);
+      const retainedLifecycleOperation =
+        receipt !== undefined &&
+        resolvedWorkspaceReceipt !== undefined &&
+        workspaceBinding !== undefined &&
+        callOperationId !== undefined &&
+        (callToolName === toolNames.closeWorkspace || callToolName === toolNames.revokeWorkspace)
+          ? mutationOperations.getOperationStatus(connectionPrincipalId, callOperationId)
+          : undefined;
+      const safeLifecycleReplay = Boolean(
+        retainedLifecycleOperation?.state === "settled" &&
+        retainedLifecycleOperation.resultAvailable &&
+        retainedLifecycleOperation.tool === callToolName &&
+        retainedLifecycleOperation.workspaceId === workspaceBinding?.workspaceId &&
+        retainedLifecycleOperation.workspaceGeneration === workspaceBinding?.generation,
+      );
       if (
         lease &&
         (
           !workspaceBinding ||
           workspaceBinding.connectionPrincipalId !== connectionPrincipalId ||
-          (receipt !== undefined && !resolvedWorkspaceReceipt)
+          (receipt !== undefined && !resolvedWorkspaceReceipt) ||
+          (
+            !safeLifecycleReplay &&
+            !workspaces.workspaceAuthorized(
+              connectionPrincipalId,
+              workspaceBinding?.workspaceId ?? "",
+              authorizedRoots,
+            )
+          )
         )
       ) {
-        const hasRetainedWorkspaces = workspaces.listWorkspaces(connectionPrincipalId).length > 0;
+        const hasRetainedWorkspaces = workspaces.listWorkspaces(
+          connectionPrincipalId,
+          authorizedRoots,
+        ).length > 0;
         const recovery = hasRetainedWorkspaces ? "list_then_resume" : "open_workspace_full";
         logEvent(config.logging, "warn", "workspace_context_rejected", {
           requestId,
-          ...correlationLogFields(connectionPrincipalId, undefined, oauthClientId),
+          ...correlationLogFields(
+            connectionPrincipalId,
+            undefined,
+            oauthClientId,
+            auditReferenceKey,
+          ),
           tool: toolCallName(req.body),
           reason: receipt
             ? "invalid_or_expired_receipt"
@@ -5855,9 +6505,10 @@ export function createServer(configInput?: ServerConfig): RunningServer {
         correlation.workspaceActivityRef = workspaceActivityRef(
           connectionPrincipalId,
           workspaceBinding.workspaceId,
+          auditReferenceKey,
         );
       }
-      let retainWorkspaceRootLease: (() => () => void) | undefined;
+      let retainWorkspaceRootLease: (() => WorkspaceRootLease) | undefined;
       const handleRequest = () => requestContext.run(
         {
           connectionPrincipalId,
@@ -5865,6 +6516,7 @@ export function createServer(configInput?: ServerConfig): RunningServer {
           oauthGrantId: oauthAuthorization.grantId,
           authorizationEpoch: oauthAuthorization.authorizationEpoch,
           scopes: [...oauthAuthorization.scopes],
+          authorizedRoots: [...authorizedRoots],
           hostAuthorization,
           ...(oauthAuthorization.subjectHash
             ? { hostSubjectHash: oauthAuthorization.subjectHash }
@@ -5874,6 +6526,7 @@ export function createServer(configInput?: ServerConfig): RunningServer {
             : {}),
           requestId,
           correlation,
+          auditReferenceKey,
           workspaceBinding,
           workspaceReceipt: resolvedWorkspaceReceipt && effectiveReceipt
             ? { receipt: effectiveReceipt, expiresAt: resolvedWorkspaceReceipt.expiresAt }
@@ -5917,13 +6570,17 @@ export function createServer(configInput?: ServerConfig): RunningServer {
       }
       const workspaceError = recoverableWorkspaceError(error);
       if (workspaceError && !res.headersSent) {
-        const hasRetainedWorkspaces = workspaces.listWorkspaces(connectionPrincipalId).length > 0;
+        const hasRetainedWorkspaces = workspaces.listWorkspaces(
+          connectionPrincipalId,
+          authorizedRoots,
+        ).length > 0;
         logEvent(config.logging, "warn", "workspace_reopen_required", {
           requestId,
           ...correlationLogFields(
             connectionPrincipalId,
             legacyWorkspaceIdHint(req.body),
             oauthClientId,
+            auditReferenceKey,
           ),
           workspaceId: legacyWorkspaceIdHint(req.body),
         });
@@ -5951,6 +6608,7 @@ export function createServer(configInput?: ServerConfig): RunningServer {
           connectionPrincipalId,
           legacyWorkspaceIdHint(req.body),
           oauthClientId,
+          auditReferenceKey,
         ),
         ...errorFields(error),
       });
@@ -5983,6 +6641,7 @@ export function createServer(configInput?: ServerConfig): RunningServer {
               connectionPrincipalId,
               legacyWorkspaceIdHint(req.body),
               oauthClientId,
+              auditReferenceKey,
             ),
             ...errorFields(error),
           });
@@ -6058,6 +6717,11 @@ export function createServer(configInput?: ServerConfig): RunningServer {
         }
         try {
           workspaceStore.close?.();
+        } catch (error) {
+          closeErrors.push(error);
+        }
+        try {
+          auditEvents.close();
         } catch (error) {
           closeErrors.push(error);
         }

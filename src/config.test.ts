@@ -14,6 +14,13 @@ const baseEnv = {
 };
 
 assert.equal(loadConfig(baseEnv).widgets, "full");
+assert.equal(loadConfig(baseEnv).toolProfile, "coding");
+assert.equal(loadConfig({ ...baseEnv, DEVSPACE_TOOL_PROFILE: "browse" }).toolProfile, "browse");
+assert.equal(loadConfig({ ...baseEnv, DEVSPACE_TOOL_PROFILE: "coding" }).toolProfile, "coding");
+assert.throws(
+  () => loadConfig({ ...baseEnv, DEVSPACE_TOOL_PROFILE: "dynamic" }),
+  /Invalid DEVSPACE_TOOL_PROFILE: dynamic/,
+);
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_WIDGETS: "changes" }).widgets, "changes");
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_WIDGETS: "full" }).widgets, "full");
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_WIDGETS: "off" }).widgets, "off");
@@ -107,6 +114,7 @@ assert.deepEqual(loadConfig(baseEnv).logging, {
   toolCalls: true,
   shellCommands: false,
   trustProxy: false,
+  auditEvents: true,
 });
 
 assert.deepEqual(loadConfig(baseEnv).resources, {
@@ -171,6 +179,8 @@ assert.equal(loadConfig({ ...baseEnv, DEVSPACE_LOG_ASSETS: "1" }).logging.assets
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_LOG_TOOL_CALLS: "0" }).logging.toolCalls, false);
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_LOG_SHELL_COMMANDS: "1" }).logging.shellCommands, true);
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_TRUST_PROXY: "1" }).logging.trustProxy, true);
+assert.equal(loadConfig(baseEnv).logging.auditEvents, true);
+assert.equal(loadConfig({ ...baseEnv, DEVSPACE_AUDIT_EVENTS: "0" }).logging.auditEvents, false);
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_LOG_ASSETS: "OFF" }).logging.assets, false);
 assert.throws(
   () => loadConfig({ ...baseEnv, DEVSPACE_LOG_ASSETS: "treu" }),
@@ -244,7 +254,12 @@ assert.throws(
   /Invalid DEVSPACE_LOG_FORMAT: color/,
 );
 
-assert.equal(loadConfig(baseEnv).oauth.ownerToken, "test-owner-token-that-is-long-enough");
+const environmentOAuth = loadConfig(baseEnv).oauth;
+assert.equal(environmentOAuth.ownerCredential.password, "test-owner-token-that-is-long-enough");
+assert.equal(environmentOAuth.ownerCredential.passwordHash, undefined);
+assert.equal(environmentOAuth.keys.derivation, "legacy-direct");
+assert.equal(environmentOAuth.keys.source, "legacy_environment");
+assert.equal(environmentOAuth.keys.legacyCompatibility, true);
 assert.deepEqual(loadConfig(baseEnv).oauth.scopes, [...DEFAULT_DEVSPACE_OAUTH_SCOPES]);
 assert.deepEqual(loadConfig(baseEnv).oauth.allowedRedirectHosts, [
   "chatgpt.com",
@@ -276,7 +291,7 @@ assert.equal(
 
 assert.throws(
   () => loadConfig({ DEVSPACE_CONFIG_DIR: emptyConfigDir, DEVSPACE_ALLOWED_ROOTS: process.cwd() }),
-  /DEVSPACE_OAUTH_OWNER_TOKEN is required/,
+  /Owner password is not configured/,
 );
 assert.throws(
   () => loadConfig({ ...baseEnv, DEVSPACE_OAUTH_OWNER_TOKEN: "too-short" }),
@@ -343,7 +358,21 @@ writeFileSync(
 
 const fileConfig = loadConfig({ DEVSPACE_CONFIG_DIR: configDir });
 assert.equal(fileConfig.port, 8787);
-assert.equal(fileConfig.oauth.ownerToken, "persisted-owner-token-long-enough");
+assert.equal(fileConfig.oauth.ownerCredential.password, "persisted-owner-token-long-enough");
+assert.match(fileConfig.oauth.ownerCredential.passwordHash ?? "", /^\$argon2id\$/u);
+assert.equal(fileConfig.oauth.keys.derivation, "legacy-direct");
+const migratedAuth = JSON.parse(readFileSync(join(configDir, "auth.json"), "utf8")) as {
+  schemaVersion?: unknown;
+  ownerPasswordHash?: unknown;
+  masterKey?: unknown;
+  keyDerivation?: unknown;
+  ownerToken?: unknown;
+};
+assert.equal(migratedAuth.schemaVersion, 2);
+assert.match(String(migratedAuth.ownerPasswordHash), /^\$argon2id\$/u);
+assert.equal(typeof migratedAuth.masterKey, "string");
+assert.equal(migratedAuth.keyDerivation, "legacy-direct");
+assert.equal(migratedAuth.ownerToken, undefined);
 assert.equal(fileConfig.publicBaseUrl, "https://devspace.example.com");
 assert.deepEqual(fileConfig.projectDocFallbackFilenames, ["TEAM_GUIDE.md", ".agents.md"]);
 assert.deepEqual(fileConfig.skillPaths, ["workspace-skills"]);

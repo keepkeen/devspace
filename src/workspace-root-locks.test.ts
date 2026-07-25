@@ -217,6 +217,79 @@ try {
       await waitForChildExit(child).catch(() => undefined);
     }
   }
+
+  if (process.platform !== "win32") {
+    const crashSource = `
+      import { spawn } from "node:child_process";
+      import { CrossProcessWorkspaceRootLock } from ${JSON.stringify(lockModuleUrl)};
+      const lock = new CrossProcessWorkspaceRootLock({
+        root: process.argv[1],
+        acquireTimeoutMs: 2_000,
+        pollIntervalMs: 10,
+        heartbeatIntervalMs: 50,
+      });
+      const lease = await lock.acquire("orphan-process-root", "write", {
+        workspaceGeneration: 17,
+      });
+      const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+        detached: true,
+        stdio: "ignore",
+      });
+      if (!sleeper.pid) throw new Error("orphan sleeper PID missing");
+      sleeper.unref();
+      await lease.attachProcess({ pid: sleeper.pid, processGroupId: sleeper.pid });
+      process.stdout.write("ORPHAN " + sleeper.pid + "\\n");
+      setInterval(() => {}, 1000);
+    `;
+    const crashedServer = spawn(
+      process.execPath,
+      ["--import", "tsx", "--input-type=module", "-e", crashSource, crossProcessRoot],
+      { stdio: "pipe" },
+    );
+    let crashedStderr = "";
+    crashedServer.stderr.on("data", (chunk) => { crashedStderr += String(chunk); });
+    let orphanPid: number | undefined;
+    try {
+      const line = await waitForChildLine(crashedServer, /^ORPHAN (\d+)$/u);
+      orphanPid = Number(/^ORPHAN (\d+)$/u.exec(line)?.[1]);
+      assert.ok(Number.isSafeInteger(orphanPid) && orphanPid > 0, crashedStderr);
+      crashedServer.kill("SIGKILL");
+      const crashedExit = await waitForChildExit(crashedServer);
+      assert.equal(crashedExit.signal, "SIGKILL", crashedStderr);
+
+      const contender = new CrossProcessWorkspaceRootLock({
+        root: crossProcessRoot,
+        acquireTimeoutMs: 150,
+        pollIntervalMs: 10,
+      });
+      await assert.rejects(
+        contender.acquire("orphan-process-root", "write"),
+        WorkspaceRootLockTimeoutError,
+        "a child process must retain the root lease after its DevSpace server crashes",
+      );
+
+      process.kill(-orphanPid, "SIGTERM");
+      await waitForProcessExit(orphanPid);
+      const releaseAfterOrphanExit = await new CrossProcessWorkspaceRootLock({
+        root: crossProcessRoot,
+        acquireTimeoutMs: 2_000,
+        pollIntervalMs: 10,
+      }).acquire("orphan-process-root", "write");
+      releaseAfterOrphanExit();
+    } finally {
+      if (crashedServer.exitCode === null && crashedServer.signalCode === null) {
+        crashedServer.kill("SIGKILL");
+        await waitForChildExit(crashedServer).catch(() => undefined);
+      }
+      if (orphanPid) {
+        try {
+          process.kill(-orphanPid, "SIGKILL");
+        } catch {
+          // The detached process group already exited.
+        }
+      }
+    }
+  }
 } finally {
   await rm(crossProcessRoot, { recursive: true, force: true });
 }
@@ -262,6 +335,54 @@ function waitForChildExit(
     child.once("error", reject);
     child.once("exit", (code, signal) => resolve({ code, signal }));
   });
+}
+
+function waitForChildLine(
+  child: ChildProcessWithoutNullStreams,
+  pattern: RegExp,
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let output = "";
+    const cleanup = () => {
+      child.stdout.off("data", onData);
+      child.off("error", onError);
+      child.off("exit", onExit);
+    };
+    const onData = (chunk: Buffer | string) => {
+      output += String(chunk);
+      for (const line of output.split(/\r?\n/u)) {
+        if (!pattern.test(line)) continue;
+        cleanup();
+        resolve(line);
+        return;
+      }
+    };
+    const onError = (error: Error) => {
+      cleanup();
+      reject(error);
+    };
+    const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+      cleanup();
+      reject(new Error(`Child exited before matching line: code=${code}, signal=${signal}, output=${output}`));
+    };
+    child.stdout.on("data", onData);
+    child.once("error", onError);
+    child.once("exit", onExit);
+  });
+}
+
+async function waitForProcessExit(pid: number): Promise<void> {
+  const deadline = Date.now() + 3_000;
+  for (;;) {
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") return;
+      if ((error as NodeJS.ErrnoException).code !== "EPERM") throw error;
+    }
+    if (Date.now() >= deadline) throw new Error(`Process ${pid} did not exit.`);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
 }
 
 const root = await mkdtemp(join(tmpdir(), "devspace-root-lock-integration-"));

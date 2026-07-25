@@ -6,9 +6,11 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import Database from "better-sqlite3";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { loadConfig } from "./config.js";
+import { databasePath } from "./db/client.js";
 import { FULL_DEVSPACE_OAUTH_SCOPES } from "./oauth-scopes.js";
 import { createServer } from "./server.js";
 
@@ -165,7 +167,6 @@ try {
     skills?: Array<Record<string, unknown>>;
   } | undefined)?.skills?.find((skill) => skill.name === "host-simulation-audit");
   assert.ok(repositorySkill);
-  assert.equal(repositorySkill.source, "repository");
   assert.equal(repositorySkill.trust, "repository_untrusted");
   assert.equal(repositorySkill.explicitOnly, true);
   const skillId = String(repositorySkill.skillId);
@@ -298,7 +299,7 @@ try {
   );
   await closeClient(refreshedClient);
 
-  const reauthorizedA = await authorizeExisting(active.origin, metadata, accountA);
+  const reauthorizedA = await authorizeExisting(active.origin, metadata, accountA, true);
   authMetrics.push(reauthorizedA.auth);
   const reauthorizedClient = await connect(
     "account-a-reauthorized",
@@ -312,11 +313,11 @@ try {
     "list_workspaces",
     {},
   );
-  assert.deepEqual(
+  assert.equal(
     (reauthorizedList.structuredContent as {
-      workspaces?: unknown;
-    } | undefined)?.workspaces,
-    [],
+      workspaces?: Array<{ alias?: unknown }>;
+    } | undefined)?.workspaces?.some((workspace) => workspace.alias === "alpha-main"),
+    true,
   );
   const oldReceiptAfterReapproval = await callAndRecord(
     reauthorizedClient,
@@ -330,13 +331,37 @@ try {
     (oldReceiptAfterReapproval.structuredContent as {
       error?: { code?: unknown };
     } | undefined)?.error?.code,
-    "workspace_context_required",
+    "stale_workspace_generation",
   );
+  const reauthorizedResume = await callAndRecord(
+    reauthorizedClient,
+    "account-a-reauthorized",
+    "resume-after-principal-reuse",
+    "resume_workspace",
+    { alias: "alpha-main", contextMode: "full" },
+  );
+  const reauthorizedGeneration = workspaceGeneration(reauthorizedResume);
+  assert.ok(reauthorizedGeneration > alphaGeneration);
+  alphaReceipt = currentReceipt(reauthorizedResume);
+  const reauthorizedInstructions = await callAndRecord(
+    reauthorizedClient,
+    "account-a-reauthorized",
+    "reload-instructions-after-principal-reuse",
+    "load_workspace_instructions",
+    { receipt: alphaReceipt, paths: ["notes/main.txt"] },
+  );
+  const reauthorizedInstructionToken = String(
+    (reauthorizedInstructions.structuredContent as {
+      instructionToken?: unknown;
+    } | undefined)?.instructionToken ?? "",
+  );
+  assert.match(reauthorizedInstructionToken, /^instructions_/u);
+  alphaReceipt = currentReceipt(reauthorizedInstructions);
   await closeClient(reauthorizedClient);
 
   const secondTurn = await connect(
     "account-a-main-turn-2",
-    refreshedA.accessToken,
+    reauthorizedA.accessToken,
     active.origin,
     "stale-browser-session-header",
   );
@@ -358,6 +383,7 @@ try {
     {
       receipt: alphaReceipt,
       operationId: "host-simulation-a-turn-two-patch",
+      instructionToken: reauthorizedInstructionToken,
       ifMatch: { "notes/main.txt": noteVersion },
       patch: "*** Begin Patch\n*** Update File: notes/main.txt\n@@\n-main turn one\n+main turn one\n+main turn two\n*** End Patch",
     },
@@ -367,7 +393,7 @@ try {
 
   const branchConversation = await connect(
     "account-a-branch",
-    refreshedA.accessToken,
+    reauthorizedA.accessToken,
     active.origin,
   );
   await callAndRecord(
@@ -394,7 +420,7 @@ try {
 
   const mainAfterBranch = await connect(
     "account-a-main-after-branch",
-    refreshedA.accessToken,
+    reauthorizedA.accessToken,
     active.origin,
   );
   await callAndRecord(
@@ -409,7 +435,7 @@ try {
 
   const freshConversation = await connect(
     "account-a-fresh-conversation",
-    refreshedA.accessToken,
+    reauthorizedA.accessToken,
     active.origin,
   );
   const freshProtocol = await protocolMetric(freshConversation);
@@ -472,32 +498,54 @@ try {
   const betaSkills = (betaContext.structuredContent as {
     skills?: { count?: unknown; items?: unknown[] };
   } | undefined)?.skills;
-  assert.equal(betaSkills?.count, 0);
+  assert.equal(betaSkills?.count, 48);
   assert.deepEqual(betaSkills?.items, []);
-  const betaContextReceipt = currentReceipt(betaContext);
-  const betaInstructionsResult = await callAndRecord(
-    accountBConversation,
-    "account-b",
-    "load-beta-scoped-instructions",
-    "load_workspace_instructions",
-    { receipt: betaContextReceipt, paths: ["src/value.txt"] },
-    ["Stress rule 240"],
-  );
-  const betaInstructions = (betaInstructionsResult.structuredContent as {
-    workspaceInstructions?: { items?: Array<{ content?: unknown }> };
-  } | undefined)?.workspaceInstructions?.items ?? [];
-  assert.ok(
-    betaInstructions.reduce(
-      (total, item) => total + Buffer.byteLength(String(item.content ?? ""), "utf8"),
-      0,
-    ) > 20_000,
-  );
+  let betaReceipt = currentReceipt(betaContext);
+  let betaInstructionCursor: string | undefined;
+  let betaInstructionsResult: Awaited<ReturnType<Client["callTool"]>> | undefined;
+  let betaInstructionContent = "";
+  let betaInstructionBytes = 0;
+  let betaInstructionPages = 0;
+  do {
+    betaInstructionsResult = await callAndRecord(
+      accountBConversation,
+      "account-b",
+      `load-beta-scoped-instructions-page-${betaInstructionPages + 1}`,
+      "load_workspace_instructions",
+      {
+        receipt: betaReceipt,
+        paths: ["src/value.txt"],
+        ...(betaInstructionCursor ? { cursor: betaInstructionCursor } : {}),
+      },
+    );
+    assert.ok(
+      modelVisibleBytes(betaInstructionsResult) < 12_500,
+      "large instruction files must be delivered in bounded model-visible pages",
+    );
+    const pageItems = (betaInstructionsResult.structuredContent as {
+      workspaceInstructions?: { items?: Array<{ content?: unknown }> };
+      pagination?: { returnedBytes?: unknown; nextCursor?: unknown };
+    } | undefined)?.workspaceInstructions?.items ?? [];
+    const pagination = (betaInstructionsResult.structuredContent as {
+      pagination?: { returnedBytes?: unknown; nextCursor?: unknown };
+    } | undefined)?.pagination;
+    assert.ok(Number(pagination?.returnedBytes) > 0 && Number(pagination?.returnedBytes) <= 8 * 1024);
+    betaInstructionBytes += Number(pagination?.returnedBytes);
+    betaInstructionContent += pageItems.map((item) => String(item.content ?? "")).join("");
+    betaReceipt = currentReceipt(betaInstructionsResult);
+    betaInstructionCursor = typeof pagination?.nextCursor === "string"
+      ? pagination.nextCursor
+      : undefined;
+    betaInstructionPages += 1;
+  } while (betaInstructionCursor);
+  assert.ok(betaInstructionBytes > 20_000);
+  assert.ok(betaInstructionPages >= 3);
+  assert.equal(occurrences(betaInstructionContent, "Stress rule 240"), 1);
   const betaInstructionToken = String(
-    (betaInstructionsResult.structuredContent as { instructionToken?: unknown } | undefined)
+    (betaInstructionsResult!.structuredContent as { instructionToken?: unknown } | undefined)
       ?.instructionToken ?? "",
   );
   assert.match(betaInstructionToken, /^instructions_/u);
-  const betaReceipt = currentReceipt(betaInstructionsResult);
   const betaWorkspaceRef = workspaceRef(betaContext);
   const betaSkillDiscovery = await callAndRecord(
     accountBConversation,
@@ -510,10 +558,16 @@ try {
     (betaSkillDiscovery.structuredContent as { total?: unknown } | undefined)?.total,
     48,
   );
-  assert.equal(
-    (betaSkillDiscovery.structuredContent as { skills?: unknown[] } | undefined)?.skills?.length,
-    48,
+  const betaSkillPage = betaSkillDiscovery.structuredContent as {
+    skills?: unknown[];
+    nextCursor?: unknown;
+  } | undefined;
+  assert.ok(
+    (betaSkillPage?.skills?.length ?? 0) > 0 && (betaSkillPage?.skills?.length ?? 0) < 48,
+    "large Skill searches must be byte-bounded and paginated",
   );
+  assert.equal(typeof betaSkillPage?.nextCursor, "string");
+  assert.ok(modelVisibleBytes(betaSkillDiscovery) < 10_000);
   await callAndRecord(
     accountBConversation,
     "account-b",
@@ -605,7 +659,7 @@ try {
 
   const finalAccountA = await connect(
     "account-a-final-shared-project-check",
-    refreshedA.accessToken,
+    reauthorizedA.accessToken,
     active.origin,
   );
   await callAndRecord(
@@ -625,6 +679,74 @@ try {
   );
   assert.equal(accountACrossPrincipal.isError, true);
   await closeClient(finalAccountA);
+
+  const preRestartReceipt = alphaReceipt;
+  await active.close();
+  active = await startServer(config);
+  await assertAccessTokenRejected(active.origin, accountA.accessToken);
+  await assertAccessTokenRejected(active.origin, refreshedA.accessToken);
+
+  const afterReauthorizationRestart = await connect(
+    "account-a-after-reauthorization-restart",
+    reauthorizedA.accessToken,
+    active.origin,
+  );
+  const oldReceiptAfterRestart = await callAndRecord(
+    afterReauthorizationRestart,
+    "account-a-restart",
+    "reject-pre-restart-receipt",
+    "read",
+    { receipt: preRestartReceipt, path: "notes/main.txt" },
+  );
+  assert.equal(oldReceiptAfterRestart.isError, true);
+  const oldReceiptAfterRestartCode = (oldReceiptAfterRestart.structuredContent as {
+    error?: { code?: unknown };
+  } | undefined)?.error?.code;
+  assert.ok(
+    oldReceiptAfterRestartCode === "workspace_context_required" ||
+      oldReceiptAfterRestartCode === "workspace_resume_required" ||
+      oldReceiptAfterRestartCode === "stale_workspace_generation",
+  );
+
+  const restartList = await callAndRecord(
+    afterReauthorizationRestart,
+    "account-a-restart",
+    "list-after-reauthorization-restart",
+    "list_workspaces",
+    {},
+  );
+  const listedRestartWorkspace = (restartList.structuredContent as {
+    workspaces?: Array<{ alias?: unknown; hydrationStatus?: unknown }>;
+  } | undefined)?.workspaces?.find((workspace) => workspace.alias === "alpha-main");
+  assert.equal(listedRestartWorkspace?.hydrationStatus, "requires_resume");
+
+  const restartResume = await callAndRecord(
+    afterReauthorizationRestart,
+    "account-a-restart",
+    "resume-after-reauthorization-restart",
+    "resume_workspace",
+    { alias: "alpha-main", contextMode: "full" },
+  );
+  assert.equal(workspaceRef(restartResume), alphaWorkspaceRef);
+  assert.equal(projectFingerprint(restartResume), alphaFingerprint);
+  const postRestartGeneration = workspaceGeneration(restartResume);
+  assert.ok(postRestartGeneration > reauthorizedGeneration);
+  alphaReceipt = currentReceipt(restartResume);
+  await callAndRecord(
+    afterReauthorizationRestart,
+    "account-a-restart",
+    "read-after-reauthorization-restart",
+    "read",
+    { receipt: alphaReceipt, path: "notes/main.txt" },
+    ["main turn two"],
+  );
+  await closeClient(afterReauthorizationRestart);
+
+  const restartUnknownOperationCount = mutationOperationCount(
+    config.stateDir,
+    "outcome_unknown",
+  );
+  assert.equal(restartUnknownOperationCount, 0);
 
   assert.equal(await readFile(join(alphaRoot, "notes", "main.txt"), "utf8"), "main turn one\nmain turn two\n");
   assert.equal(await readFile(join(alphaRoot, "notes", "branch.txt"), "utf8"), "created in branched conversation\n");
@@ -662,6 +784,13 @@ try {
       },
     },
     envelopes: envelopeReport(),
+    restartContinuity: {
+      oldAccessTokensRejected: true,
+      oldReceiptErrorCode: oldReceiptAfterRestartCode,
+      preRestartGeneration: reauthorizedGeneration,
+      postRestartGeneration,
+      unknownOperationCount: restartUnknownOperationCount,
+    },
     largestResults: [...stageMetrics]
       .sort((left, right) => right.modelBytes - left.modelBytes)
       .slice(0, 8)
@@ -865,6 +994,7 @@ async function authorizeExisting(
   origin: URL,
   metadata: OAuthMetadata,
   credentials: OAuthCredentials,
+  reuseExisting = false,
 ): Promise<OAuthCredentials> {
   const challenge = createHash("sha256").update(credentials.verifier).digest("base64url");
   const authorization = new URLSearchParams({
@@ -886,7 +1016,7 @@ async function authorizeExisting(
   assert.equal(approvalPage.status, 200);
   const approvalPageText = await approvalPage.text();
   assert.match(approvalPageText, /Owner password/);
-  const approval = await fetch(localUrl(origin, metadata.authorization_endpoint), {
+  let approval = await fetch(localUrl(origin, metadata.authorization_endpoint), {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
@@ -895,6 +1025,38 @@ async function authorizeExisting(
     }),
     redirect: "manual",
   });
+  let selectionPageBytes = 0;
+  if (approval.status === 200) {
+    const selectionPage = await approval.text();
+    selectionPageBytes = Buffer.byteLength(selectionPage, "utf8");
+    const selectionToken = selectionPage.match(
+      /name="selection_token" value="([^"]+)"/u,
+    )?.[1];
+    const rootIds = [...selectionPage.matchAll(
+      /name="root_id" value="([^"]+)"/gu,
+    )].map((match) => match[1]!);
+    const reusablePrincipalId = selectionPage.match(
+      /<option value="([^"]+)">/u,
+    )?.[1];
+    assert.ok(selectionToken);
+    assert.ok(rootIds.length > 0);
+    if (reuseExisting) assert.ok(reusablePrincipalId);
+    const selection = new URLSearchParams({
+      ...Object.fromEntries(authorization),
+      selection_token: selectionToken,
+      connection_mode: reuseExisting ? "reuse" : "new",
+      ...(reuseExisting && reusablePrincipalId
+        ? { reuse_principal_id: reusablePrincipalId }
+        : {}),
+    });
+    for (const rootId of rootIds) selection.append("root_id", rootId);
+    approval = await fetch(localUrl(origin, metadata.authorization_endpoint), {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: selection,
+      redirect: "manual",
+    });
+  }
   assert.equal(approval.status, 302);
   const callback = new URL(approval.headers.get("location") ?? "");
   const code = callback.searchParams.get("code");
@@ -926,7 +1088,7 @@ async function authorizeExisting(
     auth: {
       label: credentials.label,
       registrationBytes: credentials.auth.registrationBytes,
-      approvalPageBytes: Buffer.byteLength(approvalPageText, "utf8"),
+      approvalPageBytes: Buffer.byteLength(approvalPageText, "utf8") + selectionPageBytes,
       tokenResponseBytes: Buffer.byteLength(tokenText, "utf8"),
       reauthorization: Boolean(credentials.accessToken),
     },
@@ -976,6 +1138,25 @@ async function connect(
   }));
   clients.add(client);
   return client;
+}
+
+async function assertAccessTokenRejected(origin: URL, accessToken: string): Promise<void> {
+  const response = await fetch(new URL("/mcp", origin), {
+    headers: { authorization: `Bearer ${accessToken}` },
+  });
+  assert.equal(response.status, 401);
+}
+
+function mutationOperationCount(stateDir: string, state: string): number {
+  const database = new Database(databasePath(stateDir), { readonly: true });
+  try {
+    const row = database.prepare(
+      "select count(*) as count from mutation_operations where state = ?",
+    ).get(state) as { count: number };
+    return Number(row.count);
+  } finally {
+    database.close();
+  }
 }
 
 async function closeClient(client: Client): Promise<void> {

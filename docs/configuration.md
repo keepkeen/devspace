@@ -30,7 +30,16 @@ node dist/cli.js admin --no-open
 node dist/cli.js doctor
 node dist/cli.js config get
 node dist/cli.js config set publicBaseUrl https://devspace.example.com
+node dist/cli.js auth principals
+node dist/cli.js auth transfer-workspaces <source> <target>
+node dist/cli.js auth close-orphan <principal-id>
+node dist/cli.js auth relink-client <oauth-client-id> <target>
+node dist/cli.js audit --limit 100
 ```
+
+Principal mutation commands are dry-run by default. Add `--apply` only after
+reviewing the preview; DevSpace requires the backend to be stopped before the
+persisted ownership change is committed.
 
 ## Local Admin Panel
 
@@ -95,6 +104,7 @@ DevSpace uses a single-user OAuth approval flow.
 
 | Variable | Default |
 | --- | --- |
+| `DEVSPACE_MASTER_KEY` | auth-file master key; legacy-compatible password key only for old/env-only installs | Persistent base64url master key for HKDF-derived identities and internal tokens. |
 | `DEVSPACE_OAUTH_ACCESS_TOKEN_TTL_SECONDS` | `3600` |
 | `DEVSPACE_OAUTH_REFRESH_TOKEN_TTL_SECONDS` | `2592000` |
 | `DEVSPACE_OAUTH_SCOPES` | `workspace:read,workspace:write,process:execute,network:access,worktree:create,workspace:revoke` |
@@ -114,13 +124,22 @@ grant directly; refresh rotation preserves it and does not derive a principal
 from `clientId`.
 
 The first successful Owner approval normally creates a new grant and principal.
-Use `devspace auth principals` and
-`devspace auth reconnect-code <principal-id>` to deliberately attach a fresh
-grant to an earlier principal. The one-time code is consumed once, and tokens
-issued before a relink are revoked. A new grant remains isolated by default.
+After the Owner password succeeds, a second local-only page selects either a new
+isolated principal or an existing principal to reuse, plus the configured roots
+this grant may access. Principal IDs and local paths are never shown before
+Owner verification. Reuse revokes the same client's old tokens and grants,
+preserves the selected principal's Workspace aliases, and invalidates stale
+Workspace generations. A client that still owns retained Workspaces under a
+different principal must transfer or close them locally before it can jump to a
+new principal.
+
+`devspace auth reconnect-code <principal-id>` remains available for legacy MCP
+clients. The one-time code is consumed once and must not be sent through ChatGPT
+or repository content.
 
 Tool-call metadata may contain `openai/subject`, `openai/organization`, and
-`openai/session`. DevSpace persists only purpose-separated HMAC values. Subject
+`openai/session`. DevSpace persists only purpose-separated HMAC values derived
+from the persistent master key. Subject
 and organization are consistency, anonymous audit, and rate-limit dimensions;
 they are not credentials. Session HMAC participates in the server-side Workspace
 binding used by ChatGPT-style hosts.
@@ -130,6 +149,11 @@ after restart, call `list_workspaces`, then `resume_workspace` by one alias or
 `workspaceRef`. Do not reopen a remembered path merely because a receipt or
 transport session disappeared. `projectFingerprint` distinguishes projects
 without exposing absolute paths.
+
+`list_workspaces` supports status, alias prefix, project fingerprint, mode,
+ordering, limit, and signed cursor pagination. Closed Workspaces are omitted by
+default and can be included explicitly; resuming a closed Workspace reactivates
+the same retained identity rather than opening a replacement.
 
 Managed Workspace records remain active when their worktree directory is
 missing. `list_workspaces` reports `recovery_required`, and
@@ -143,6 +167,12 @@ physical directory and its uncommitted files were lost, recovery reports
 If an authorization request omits `scope`, DevSpace grants only `workspace:read`.
 Elevated capabilities must be explicitly requested. tools/list is filtered by the
 current grant and handlers repeat scope checks.
+
+Scopes and root IDs are independent. Scopes determine the permitted operation;
+root IDs determine the local project trees visible to `open_workspace`,
+`list_workspaces`, `resume_workspace`, and all receipt/session-bound tools.
+Existing pre-v16 grants migrate with the compatibility wildcard `*`; reauthorize
+them to select a narrower set.
 
 The granular scopes mean:
 
@@ -164,9 +194,13 @@ and a global fallback. Backoff grows after repeated exhaustion. A successful
 authorization clears only its exact session key. When `DEVSPACE_TRUST_PROXY=1`,
 forwarded client IPs are used only when the direct peer is loopback; otherwise
 forwarding headers are ignored.
-Changing the Owner password and restarting DevSpace revokes all access and refresh
-tokens, but preserves public OAuth client registrations so ChatGPT and other MCP
-clients can reauthorize without recreating their connector. The local Admin panel's
+`~/.devspace/auth.json` schema version 2 stores an Argon2id Owner-password
+verifier, a random persistent master key, and its derivation mode. Changing the
+Owner password revokes all access and refresh tokens but preserves the master
+key, root IDs, project fingerprints, and Workspace aliases. Rotating the master
+key is a separate offline global reset and requires every connector to
+reauthorize. Public OAuth client registrations remain preserved so ChatGPT and
+other MCP clients can reauthorize without recreating their connector. The local Admin panel's
 "revoke all" action deliberately removes both clients and tokens when a complete
 reset is required. Before revocation, new tool calls are blocked and in-flight
 calls are drained. Active Workspace cleanup is persisted as durable jobs, so
@@ -246,10 +280,22 @@ valid only while refreshing the exact context whose revisions remain available.
 Before handling concrete target paths, call
 `load_workspace_instructions(paths)`. It returns only the applicable chain, a
 `reviewedRevision`, and a one-use token when mutation gating requires one. The
-context advances to `target_scoped`. `loadedForScope` means that the server
-returned that revision; it is not a claim that a model agreed to obey it.
+context advances to `target_scoped`. Large individual files and chains are
+returned as signed, UTF-8-safe pages with an 8 KiB body budget. Pages prefer
+complete line boundaries; a single line longer than the budget is split only at
+a UTF-8 code-point boundary. Each item includes `fragment.offsetBytes`,
+`lengthBytes`, `totalBytes`, `complete`, and `lineBoundary`. The one-use
+instruction token is returned only after every byte in the applicable chain was
+delivered. `loadedForScope` means that the server returned that revision; it is
+not a claim that a model agreed to obey it.
 Read/search output never includes instruction Markdown and only advertises
 `scopedInstructionsAvailable=true` when another scope must be loaded.
+
+`devspace doctor` performs a bounded local scan of approved roots and reports
+instruction files or lines over 8 KiB, effective chains approaching the 32 KiB
+hard limit, repeated templates, and root rules that appear suitable for a
+nested instruction file. The scan skips dependency/build/VCS directories and
+does not send instruction content to an MCP client.
 
 Configure fallbacks in `~/.devspace/config.json`:
 
@@ -277,15 +323,26 @@ returning a process session.
 
 ## Fixed Tool Surface
 
-DevSpace exposes a stable surface filtered by the current OAuth grant. A default
-read-only authorization receives the compact lifecycle and file/batch
-inspection profile plus read-only change preview. Skills and operation status are
-loaded only in the elevated coding profile to keep default tools/list bounded;
-mutation, process, network, worktree, and revocation tools additionally require
-matching capabilities. A cached old tools/list cannot bypass handler scope checks.
+`DEVSPACE_TOOL_PROFILE` selects one static server profile:
+
+- `browse` exposes only nine lifecycle/read/inspection tools, including the
+  read-only `show_changes` preview. It never exposes Skills, mutation, process,
+  operation-resolution, worktree, close, or revoke tools even when the OAuth
+  grant has elevated scopes.
+- `coding` is the compatibility default and exposes the full fixed surface,
+  still filtered by the current OAuth grant.
+
+The profile is fixed when the MCP server is created. Change it in configuration,
+then reconnect or refresh the Connector tools; DevSpace never changes tools/list
+mid-conversation. Scope checks still run in every handler, so a cached old
+tools/list cannot bypass either the static profile or OAuth policy. Automated
+wire tests keep browse below 12 KiB and full coding below 19 KiB. To avoid
+repeating contracts, only `open_workspace` publishes the canonical lifecycle
+output schema and `read` publishes its file-version schema; other tools keep
+their actual structured result envelopes without advertising duplicate schemas.
 
 ChatGPT-style hosts normally use the server-side binding for
-`(principal, HMAC(openai/session))`. Generic MCP clients pass a `wctx5`
+`(principal, grant, HMAC(openai/session))`. Generic MCP clients pass a `wctx5`
 receipt. Workspace IDs and generations are identifiers, not authority handles.
 Explicitly supplying an invalid receipt never falls back to host state.
 
@@ -296,6 +353,14 @@ only a compact `workspaceAlias`/`contextChanged: false` envelope plus their
 result; they do not echo receipt, expiry, revisions, ID, or generation. A new
 continuation is returned only when context phase, revision, or generation changes.
 Receipts are bounded, fixed-expiry, in-process compatibility handles.
+
+Workspace, Skill, instruction, and process-output pagination share the signed
+`dcur1` cursor envelope. It contains a schema version, resource type, anonymous
+principal reference, optional Workspace generation, query hash, revision,
+offset, expiry, and HMAC. Cursors are continuation state rather than authority;
+the bearer grant and Workspace binding are rechecked on every page. Numeric
+`offset` remains available for process-output compatibility, but new clients
+should follow `nextCursor`.
 
 Commands run without a PTY by default. Prefer `program` plus `args`; use
 `shell: true` plus `command` only for shell syntax. `cmd` and `cwd` are not
@@ -471,9 +536,19 @@ node dist/cli.js serve
 | `DEVSPACE_LOG_ASSETS` | `0` |
 | `DEVSPACE_LOG_TOOL_CALLS` | `1` |
 | `DEVSPACE_LOG_SHELL_COMMANDS` | `0` |
+| `DEVSPACE_AUDIT_EVENTS` | `1` |
 | `DEVSPACE_TRUST_PROXY` | `0` |
 
 Set `DEVSPACE_LOG_FORMAT=pretty` for local debugging.
+`DEVSPACE_LOG_LEVEL` controls console verbosity; the bounded safe SQLite audit
+index remains active even at `silent` unless `DEVSPACE_AUDIT_EVENTS=0` is set.
+Request/tool category switches still determine whether those event categories
+are emitted at all.
+
+At normal `info` verbosity, request logs include only bounded Host and Origin,
+a Referer stripped of credentials/query/fragment, and numeric Content-Length.
+Full IP and User-Agent fields are debug-only. Every logged header is bounded
+before formatting.
 
 Boolean environment variables accept `1,true,yes,on` and
 `0,false,no,off` (case-insensitive). Other values fail startup instead of

@@ -1,8 +1,8 @@
 import type Database from "better-sqlite3";
 import { DEVSPACE_CAPABILITY_SCOPES } from "../oauth-scopes.js";
 
-export const CURRENT_DATABASE_SCHEMA_VERSION = 15 as const;
-export const CURRENT_DATABASE_SCHEMA_NAME = "canonical-state-v15";
+export const CURRENT_DATABASE_SCHEMA_VERSION = 16 as const;
+export const CURRENT_DATABASE_SCHEMA_NAME = "canonical-state-v16";
 
 export function createCanonicalSchema(sqlite: Database.Database): void {
   sqlite.exec(`
@@ -38,6 +38,7 @@ export function createCanonicalSchema(sqlite: Database.Database): void {
       subject_hash text,
       organization_hash text,
       granted_scopes_json text not null,
+      allowed_root_ids_json text not null,
       authorization_epoch integer not null check (authorization_epoch >= 1),
       created_at text not null,
       last_used_at text not null,
@@ -124,8 +125,16 @@ export function createCanonicalSchema(sqlite: Database.Database): void {
       operation_id text not null,
       workspace_generation integer not null check (workspace_generation >= 1),
       request_hash text not null,
-      state text not null check (state in ('pending', 'settled', 'outcome_unknown')),
+      state text not null check (state in (
+        'pending', 'settled', 'outcome_unknown',
+        'verified_committed', 'verified_not_started', 'acknowledged_unknown'
+      )),
       result_json text,
+      resolution_method text,
+      evidence_type text,
+      evidence_json text,
+      resolved_at text,
+      operator_ref text,
       created_at text not null,
       updated_at text not null,
       expires_at text not null,
@@ -137,6 +146,38 @@ export function createCanonicalSchema(sqlite: Database.Database): void {
 
     create index if not exists mutation_operations_expires_at_idx
       on mutation_operations(expires_at);
+
+    create index if not exists mutation_operations_state_updated_idx
+      on mutation_operations(state, updated_at desc);
+
+    create table if not exists audit_events (
+      id integer primary key autoincrement,
+      ts text not null,
+      level text not null check (level in ('error', 'warn', 'info', 'debug')),
+      event text not null,
+      request_id text,
+      tool text,
+      oauth_client_ref text,
+      connection_ref text,
+      workspace_activity_ref text,
+      operation_ref text,
+      error_code text,
+      error_category text,
+      error_fingerprint text,
+      details_json text not null
+    );
+
+    create index if not exists audit_events_ts_idx
+      on audit_events(ts desc, id desc);
+
+    create index if not exists audit_events_event_ts_idx
+      on audit_events(event, ts desc, id desc);
+
+    create index if not exists audit_events_tool_ts_idx
+      on audit_events(tool, ts desc, id desc);
+
+    create index if not exists audit_events_connection_ts_idx
+      on audit_events(connection_ref, ts desc, id desc);
 
     create table if not exists oauth_access_tokens (
       token_hash text primary key,

@@ -63,8 +63,20 @@ export const mutationOperations = sqliteTable(
     operationId: text("operation_id").notNull(),
     workspaceGeneration: integer("workspace_generation").notNull(),
     requestHash: text("request_hash").notNull(),
-    state: text("state", { enum: ["pending", "settled", "outcome_unknown"] }).notNull(),
+    state: text("state", { enum: [
+      "pending",
+      "settled",
+      "outcome_unknown",
+      "verified_committed",
+      "verified_not_started",
+      "acknowledged_unknown",
+    ] }).notNull(),
     resultJson: text("result_json"),
+    resolutionMethod: text("resolution_method"),
+    evidenceType: text("evidence_type"),
+    evidenceJson: text("evidence_json"),
+    resolvedAt: text("resolved_at"),
+    operatorRef: text("operator_ref"),
     createdAt: text("created_at").notNull(),
     updatedAt: text("updated_at").notNull(),
     expiresAt: text("expires_at").notNull(),
@@ -78,9 +90,10 @@ export const mutationOperations = sqliteTable(
       foreignColumns: [workspaceSessions.id, workspaceSessions.connectionPrincipalId],
     }).onDelete("cascade"),
     index("mutation_operations_expires_at_idx").on(table.expiresAt),
+    index("mutation_operations_state_updated_idx").on(table.state, table.updatedAt),
     check(
       "mutation_operations_state_check",
-      sql`${table.state} in ('pending', 'settled', 'outcome_unknown')`,
+      sql`${table.state} in ('pending', 'settled', 'outcome_unknown', 'verified_committed', 'verified_not_started', 'acknowledged_unknown')`,
     ),
     check(
       "mutation_operations_workspace_generation_check",
@@ -141,6 +154,7 @@ export const oauthGrants = sqliteTable(
     subjectHash: text("subject_hash"),
     organizationHash: text("organization_hash"),
     grantedScopesJson: text("granted_scopes_json").notNull(),
+    allowedRootIdsJson: text("allowed_root_ids_json").notNull(),
     authorizationEpoch: integer("authorization_epoch").notNull(),
     createdAt: text("created_at").notNull(),
     lastUsedAt: text("last_used_at").notNull(),
@@ -153,6 +167,32 @@ export const oauthGrants = sqliteTable(
     index("oauth_grants_principal_id_idx").on(table.principalId, table.lastUsedAt),
     index("oauth_grants_subject_hash_idx").on(table.subjectHash),
     check("oauth_grants_authorization_epoch_check", sql`${table.authorizationEpoch} >= 1`),
+  ],
+);
+
+export const auditEvents = sqliteTable(
+  "audit_events",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    ts: text("ts").notNull(),
+    level: text("level", { enum: ["error", "warn", "info", "debug"] }).notNull(),
+    event: text("event").notNull(),
+    requestId: text("request_id"),
+    tool: text("tool"),
+    oauthClientRef: text("oauth_client_ref"),
+    connectionRef: text("connection_ref"),
+    workspaceActivityRef: text("workspace_activity_ref"),
+    operationRef: text("operation_ref"),
+    errorCode: text("error_code"),
+    errorCategory: text("error_category"),
+    errorFingerprint: text("error_fingerprint"),
+    detailsJson: text("details_json").notNull(),
+  },
+  (table) => [
+    index("audit_events_ts_idx").on(table.ts, table.id),
+    index("audit_events_event_ts_idx").on(table.event, table.ts, table.id),
+    index("audit_events_tool_ts_idx").on(table.tool, table.ts, table.id),
+    index("audit_events_connection_ts_idx").on(table.connectionRef, table.ts, table.id),
   ],
 );
 
@@ -337,3 +377,4 @@ export type NewLocalAgentSessionRow = typeof localAgentSessions.$inferInsert;
 export type OAuthRevocationCleanupJobRow = typeof oauthRevocationCleanupJobs.$inferSelect;
 export type OAuthRevocationDirtyWorktreeArtifactRow =
   typeof oauthRevocationDirtyWorktreeArtifacts.$inferSelect;
+export type AuditEventRow = typeof auditEvents.$inferSelect;

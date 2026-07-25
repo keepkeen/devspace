@@ -16,9 +16,15 @@ import {
   loadDevspaceFiles,
   type DevspaceUserConfig,
 } from "./user-config.js";
+import {
+  createSecurityKeyring,
+  legacyMasterKeyFromOwnerPassword,
+  type MasterKeyDerivation,
+} from "./security-credentials.js";
 
 export type WidgetMode = "off" | "changes" | "full";
 export type McpHttpTransportMode = "stateless" | "stateful";
+export type ToolProfile = "browse" | "coding";
 const DEFAULT_OAUTH_ACCESS_TOKEN_TTL_SECONDS = 60 * 60;
 const DEFAULT_OAUTH_REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
 
@@ -51,6 +57,7 @@ export interface ServerConfig {
   allowedHosts: string[];
   publicBaseUrl: string;
   mcpHttpTransport: McpHttpTransportMode;
+  toolProfile: ToolProfile;
   widgets: WidgetMode;
   stateDir: string;
   worktreeRoot: string;
@@ -199,6 +206,9 @@ function parseLoggingConfig(env: NodeJS.ProcessEnv): LoggingConfig {
     toolCalls: env.DEVSPACE_LOG_TOOL_CALLS === undefined ? true : parseBoolean(env.DEVSPACE_LOG_TOOL_CALLS, "DEVSPACE_LOG_TOOL_CALLS"),
     shellCommands: parseBoolean(env.DEVSPACE_LOG_SHELL_COMMANDS, "DEVSPACE_LOG_SHELL_COMMANDS"),
     trustProxy: parseBoolean(env.DEVSPACE_TRUST_PROXY, "DEVSPACE_TRUST_PROXY"),
+    auditEvents: env.DEVSPACE_AUDIT_EVENTS === undefined
+      ? true
+      : parseBoolean(env.DEVSPACE_AUDIT_EVENTS, "DEVSPACE_AUDIT_EVENTS"),
   };
 }
 
@@ -325,6 +335,18 @@ function parseWidgetMode(value: string | undefined, configuredMode?: WidgetMode)
   throw new Error(`Invalid DEVSPACE_WIDGETS: ${value}`);
 }
 
+function parseToolProfile(
+  value: string | undefined,
+  configuredProfile?: ToolProfile,
+): ToolProfile {
+  const profile = value?.trim().toLowerCase();
+  if (!profile) return configuredProfile ?? "coding";
+  if (profile === "browse" || profile === "coding") return profile;
+  throw new Error(
+    `Invalid DEVSPACE_TOOL_PROFILE: ${value} (expected browse or coding)`,
+  );
+}
+
 function parseMcpHttpTransport(
   value: string | undefined,
   configuredMode?: McpHttpTransportMode,
@@ -348,9 +370,47 @@ function parseRequiredSecret(value: string | undefined, name: string): string {
   return secret;
 }
 
-function parseOAuthConfig(env: NodeJS.ProcessEnv, ownerToken: string | undefined): OAuthConfig {
+function parseOAuthConfig(
+  env: NodeJS.ProcessEnv,
+  files: ReturnType<typeof loadDevspaceFiles>,
+): OAuthConfig {
+  const environmentPassword = env.DEVSPACE_OAUTH_OWNER_TOKEN === undefined
+    ? undefined
+    : parseRequiredSecret(
+        env.DEVSPACE_OAUTH_OWNER_TOKEN,
+        "DEVSPACE_OAUTH_OWNER_TOKEN",
+      );
+  const ownerPassword = environmentPassword ?? files.migratedOwnerPassword;
+  const ownerPasswordHash = environmentPassword ? undefined : files.auth.ownerPasswordHash;
+  if (!ownerPassword && !ownerPasswordHash) {
+    throw new Error("DevSpace Owner password is not configured. Run: devspace init");
+  }
+
+  const environmentMasterKey = env.DEVSPACE_MASTER_KEY?.trim();
+  const masterKey = environmentMasterKey ?? files.auth.masterKey ?? (
+    ownerPassword ? legacyMasterKeyFromOwnerPassword(ownerPassword) : undefined
+  );
+  if (!masterKey) {
+    throw new Error("DevSpace master key is not configured. Run: devspace init");
+  }
+  const derivation: MasterKeyDerivation = environmentMasterKey
+    ? "hkdf-v1"
+    : files.auth.keyDerivation ?? "legacy-direct";
+
   return {
-    ownerToken: parseRequiredSecret(env.DEVSPACE_OAUTH_OWNER_TOKEN ?? ownerToken, "DEVSPACE_OAUTH_OWNER_TOKEN"),
+    ownerCredential: {
+      ...(ownerPassword ? { password: ownerPassword } : {}),
+      ...(ownerPasswordHash ? { passwordHash: ownerPasswordHash } : {}),
+    },
+    keys: createSecurityKeyring({
+      masterKey,
+      derivation,
+      source: environmentMasterKey
+        ? "environment"
+        : files.auth.masterKey
+          ? "auth_file"
+          : "legacy_environment",
+    }),
     accessTokenTtlSeconds: parsePositiveInteger(
       env.DEVSPACE_OAUTH_ACCESS_TOKEN_TTL_SECONDS,
       DEFAULT_OAUTH_ACCESS_TOKEN_TTL_SECONDS,
@@ -405,13 +465,17 @@ export function loadConfigForAdmin(env: NodeJS.ProcessEnv = process.env): Server
   return {
     host,
     port,
-    oauth: parseOAuthConfig(env, files.auth.ownerToken),
+    oauth: parseOAuthConfig(env, files),
     allowedRoots: parseAllowedRoots(env.DEVSPACE_ALLOWED_ROOTS ?? files.config.allowedRoots),
     allowedHosts: parseAllowedHosts(env.DEVSPACE_ALLOWED_HOSTS, derivedAllowedHosts),
     publicBaseUrl,
     mcpHttpTransport: parseMcpHttpTransport(
       env.DEVSPACE_MCP_HTTP_TRANSPORT,
       files.config.mcpHttpTransport,
+    ),
+    toolProfile: parseToolProfile(
+      env.DEVSPACE_TOOL_PROFILE,
+      files.config.toolProfile,
     ),
     widgets: parseWidgetMode(env.DEVSPACE_WIDGETS, files.config.widgets),
     stateDir: resolve(expandHomePath(env.DEVSPACE_STATE_DIR ?? files.config.stateDir ?? defaultStateDir())),

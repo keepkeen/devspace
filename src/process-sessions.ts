@@ -15,6 +15,7 @@ import {
   isShellAnalysisLimitError,
   splitShellSegments,
 } from "./shell-command-analysis.js";
+import type { WorkspaceRootLease } from "./workspace-root-locks.js";
 
 const DEFAULT_EXEC_YIELD_MS = 10_000;
 const DEFAULT_INTERACTIVE_YIELD_MS = 250;
@@ -116,6 +117,8 @@ export interface ProcessInstructionContext {
 }
 
 interface ManagedProcess {
+  pid?: number;
+  processGroupId?: number;
   write(data: string): void;
   end?(): void;
   kill(signal?: NodeJS.Signals): void;
@@ -697,12 +700,13 @@ export class ProcessSessionManager {
     return snapshot;
   }
 
-  attachWorkspaceRootLease(
+  async attachWorkspaceRootLease(
     connectionPrincipalId: string,
     workspaceId: string,
     sessionId: number,
-    release: () => void,
-  ): boolean {
+    lease: WorkspaceRootLease | (() => void),
+  ): Promise<boolean> {
+    const release = () => lease();
     const session = this.sessions.get(sessionId);
     if (
       !session ||
@@ -716,6 +720,24 @@ export class ProcessSessionManager {
     if (session.releaseWorkspaceRootLease) {
       release();
       throw new Error(`Process session ${sessionId} already owns a workspace root lease.`);
+    }
+    const richLease = workspaceRootLease(lease);
+    if (richLease && session.process?.pid !== undefined) {
+      try {
+        await richLease.attachProcess({
+          pid: session.process.pid,
+          ...(session.process.processGroupId === undefined
+            ? {}
+            : { processGroupId: session.process.processGroupId }),
+        });
+      } catch (error) {
+        release();
+        throw error;
+      }
+      if (!session.running) {
+        release();
+        return false;
+      }
     }
     session.releaseWorkspaceRootLease = releaseOnce(release);
     return true;
@@ -894,6 +916,8 @@ export class ProcessSessionManager {
     });
 
     session.process = {
+      ...(child.pid === undefined ? {} : { pid: child.pid }),
+      ...(detached && child.pid !== undefined ? { processGroupId: child.pid } : {}),
       write: (data) => {
         child.stdin?.write(data);
       },
@@ -950,6 +974,8 @@ export class ProcessSessionManager {
     }
 
     session.process = {
+      pid: pty.pid,
+      ...(process.platform === "win32" ? {} : { processGroupId: pty.pid }),
       write: (data) => pty.write(data),
       kill: (signal = "SIGTERM") => terminateProcessTree(pty, signal, true),
       // Let the terminal driver deliver Ctrl-C to its foreground process group.
@@ -1237,4 +1263,15 @@ function releaseOnce(release: () => void): () => void {
     released = true;
     release();
   };
+}
+
+function workspaceRootLease(
+  lease: WorkspaceRootLease | (() => void),
+): WorkspaceRootLease | undefined {
+  const candidate = lease as Partial<WorkspaceRootLease>;
+  return typeof candidate.attachProcess === "function" &&
+      typeof candidate.heartbeat === "function" &&
+      typeof candidate.release === "function"
+    ? lease as WorkspaceRootLease
+    : undefined;
 }

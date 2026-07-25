@@ -182,7 +182,7 @@ try {
     await abortStatelessToolCallAfterLease({
       origin,
       accessToken: chatGptToken,
-      ownerToken: config.oauth.ownerToken,
+      ownerToken: config.oauth.keys.internalDiagnostics,
       requestId: 200 + index,
       body: {
         jsonrpc: "2.0",
@@ -490,7 +490,7 @@ function rawMcpPost(origin: URL, accessToken: string, sessionId: string): Promis
 async function abortStatelessToolCallAfterLease(options: {
   origin: URL;
   accessToken: string;
-  ownerToken: string;
+  ownerToken: string | Uint8Array;
   requestId: number;
   body: Record<string, unknown>;
 }): Promise<void> {
@@ -531,7 +531,7 @@ async function abortStatelessToolCallAfterLease(options: {
 
 async function waitForStatelessRequestCount(
   origin: URL,
-  ownerToken: string,
+  ownerToken: string | Uint8Array,
   expected: number,
 ): Promise<void> {
   const deadline = Date.now() + 2_000;

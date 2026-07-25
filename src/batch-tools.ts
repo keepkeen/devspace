@@ -22,6 +22,14 @@ export interface BatchItemResult {
   ref?: string;
   ok: boolean;
   result: string;
+  error?: {
+    code: string;
+    retryable?: boolean;
+    safeToRetry?: boolean;
+    recovery?: string;
+    phase?: "not_started" | "committed" | "outcome_unknown";
+    effectsKnown?: boolean;
+  };
   truncated: boolean;
   omitted?: true;
   omittedReason?: BatchOmittedReason;
@@ -53,7 +61,11 @@ export function limitBatchText(
  */
 export async function runBoundedBatch<T extends BatchWorkItem>(
   items: T[],
-  execute: (item: T, index: number) => Promise<{ ok: boolean; result: string }>,
+  execute: (item: T, index: number) => Promise<{
+    ok: boolean;
+    result: string;
+    error?: BatchItemResult["error"];
+  }>,
   options: BatchOptions<T> = {},
 ): Promise<BatchResult> {
   if (items.length === 0 || items.length > BATCH_MAX_ITEMS) {
@@ -90,6 +102,7 @@ export async function runBoundedBatch<T extends BatchWorkItem>(
         ...(item.ref ? { ref: item.ref } : {}),
         ok: response.ok,
         result: limited.text,
+        ...(response.error ? { error: response.error } : {}),
         truncated: limited.truncated,
       };
     } catch (error) {

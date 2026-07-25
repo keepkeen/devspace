@@ -5,6 +5,7 @@ import type {
   WorkspaceMode,
   WorkspaceSession,
   WorkspaceSessionCursor,
+  WorkspaceStatus,
   WorkspaceStore,
   WorkspaceWriteAccess,
 } from "./workspace-store.js";
@@ -33,6 +34,7 @@ import {
   isPathInsideRoot,
   resolveAllowedPath,
 } from "./roots.js";
+import { pathAllowedByAuthorizationRoots } from "./authorization-roots.js";
 import {
   computeSkillOpenAiMetadataHash,
   loadWorkspaceSkills,
@@ -50,6 +52,7 @@ import {
 import {
   defaultWorkspaceRootLockDirectory,
   WorkspaceRootLockManager,
+  type WorkspaceRootLease,
   type WorkspaceRootLockMode,
 } from "./workspace-root-locks.js";
 
@@ -161,6 +164,7 @@ export interface WorkspaceSummary {
   alias: string;
   projectFingerprint: string;
   displayPath: string;
+  status: WorkspaceStatus;
   mode: WorkspaceMode;
   managed: boolean;
   dirtySource?: boolean;
@@ -169,6 +173,14 @@ export interface WorkspaceSummary {
   hydrationStatus: "ready" | "requires_resume" | "recovery_required";
   createdAt: string;
   lastUsedAt: string;
+}
+
+export interface WorkspaceListOptions {
+  statuses?: WorkspaceStatus[];
+  aliasPrefix?: string;
+  projectFingerprint?: string;
+  mode?: WorkspaceMode;
+  recentFirst?: boolean;
 }
 
 export interface WorkspaceCloseLease {
@@ -182,7 +194,7 @@ export interface WorkspaceOperationLease {
    * Transfers the already-held physical-root lease to a longer-lived owner.
    * The returned release function is idempotent. Call at most once.
    */
-  retain(): () => void;
+  retain(): WorkspaceRootLease;
 }
 
 export interface WorkspaceUsageSnapshot {
@@ -389,8 +401,15 @@ export class WorkspaceRegistry {
   async openWorkspace(
     connectionPrincipalId: string,
     input: string | OpenWorkspaceInput,
+    authorizedRoots: readonly string[] = this.config.allowedRoots,
   ): Promise<WorkspaceContext> {
     const options = typeof input === "string" ? { path: input } : input;
+    if (
+      authorizationRootsRestrictGlobal(authorizedRoots, this.config.allowedRoots) &&
+      !pathAllowedByAuthorizationRoots(options.path, authorizedRoots)
+    ) {
+      throw new AccessDeniedError("Path is outside this OAuth grant's authorized roots");
+    }
     const mode = options.mode ?? "checkout";
     const alias = options.alias === undefined ? undefined : validateWorkspaceAlias(options.alias);
     const writeAccess = options.writeAccess ?? (mode === "worktree" ? "read_write" : "read_only");
@@ -458,68 +477,80 @@ export class WorkspaceRegistry {
     throw new WorkspaceResumeRequiredError();
   }
 
-  listWorkspaces(connectionPrincipalId: string): WorkspaceSummary[] {
+  listWorkspaces(
+    connectionPrincipalId: string,
+    authorizedRoots: readonly string[] = this.config.allowedRoots,
+    options: WorkspaceListOptions = {},
+  ): WorkspaceSummary[] {
     this.reconcileMissingManagedSessions();
-    const summaries = this.store?.listActiveSessionSummaries?.(connectionPrincipalId)
+    const statuses = options.statuses?.length ? [...new Set(options.statuses)] : ["active" as const];
+    const sessions = this.store?.listSessions?.(connectionPrincipalId, statuses)
       ?? Array.from(this.workspaces.values())
-        .filter((workspace) => workspace.connectionPrincipalId === connectionPrincipalId)
-        .map((workspace): ActiveWorkspaceSummary => ({
-          alias: workspace.alias,
-          mode: workspace.mode,
-          managed: workspace.worktree?.managed ?? false,
-          ...(workspace.worktree?.managed
-            ? { dirtySource: workspace.worktree.dirtySource }
-            : {}),
-          writeAccess: workspace.writeAccess,
-          stateGeneration: workspace.stateGeneration,
-          createdAt: new Date(workspace.lastUsedAt).toISOString(),
-          lastUsedAt: new Date(workspace.lastUsedAt).toISOString(),
-        }));
-    const residentByAlias = new Map(
-      Array.from(this.workspaces.values())
-        .filter((workspace) => workspace.connectionPrincipalId === connectionPrincipalId)
-        .map((workspace) => [workspace.alias, workspace] as const),
-    );
-    const persistedByAlias = new Map(
-      (this.store?.listActiveSessions?.(connectionPrincipalId) ?? [])
-        .flatMap((session) => session.alias ? [[session.alias, session] as const] : []),
-    );
-
-    return summaries.map((summary) => {
-      const session = persistedByAlias.get(summary.alias);
-      const resident = residentByAlias.get(summary.alias);
+        .filter((workspace) =>
+          workspace.connectionPrincipalId === connectionPrincipalId && statuses.includes("active")
+        )
+        .map(workspaceToSessionSnapshot);
+    const summaries = sessions.flatMap((session): WorkspaceSummary[] => {
+      const resident = this.workspaces.get(session.id);
       const available = resident
         ? this.workspaceRootAllowed(resident.root, resident.mode, resident.sourceRoot)
-        : session
-          ? this.workspaceRootAllowed(session.root, session.mode, session.sourceRoot)
-          : true;
-      const identityRoot = resident?.sourceRoot ?? resident?.root ?? session?.sourceRoot ?? session?.root;
-      if (!identityRoot) throw new Error(`Workspace summary is missing its persisted root: ${summary.alias}`);
-      const workspaceRef = resident?.id ?? session?.id;
-      if (!workspaceRef) throw new Error(`Workspace summary is missing its reference: ${summary.alias}`);
-      return {
-        workspaceRef,
-        alias: summary.alias,
-        projectFingerprint: this.projectFingerprintForRoot(identityRoot),
+        : this.workspaceRootAllowed(session.root, session.mode, session.sourceRoot);
+      const identityRoot = resident?.sourceRoot ?? resident?.root ?? session.sourceRoot ?? session.root;
+      if (!pathAllowedByAuthorizationRoots(identityRoot, authorizedRoots)) return [];
+      const projectFingerprint = this.projectFingerprintForRoot(identityRoot);
+      if (options.aliasPrefix && !session.alias.startsWith(options.aliasPrefix)) return [];
+      if (options.projectFingerprint && projectFingerprint !== options.projectFingerprint) return [];
+      if (options.mode && session.mode !== options.mode) return [];
+      return [{
+        workspaceRef: session.id,
+        alias: session.alias,
+        projectFingerprint,
         displayPath: formatWorkspaceDisplayPath(
           identityRoot,
         ),
-        mode: summary.mode,
-        managed: summary.managed,
-        ...(summary.managed
-          ? { dirtySource: resident?.worktree?.dirtySource ?? session?.dirtySource ?? summary.dirtySource }
+        status: session.status,
+        mode: session.mode,
+        managed: session.managed,
+        ...(session.managed
+          ? { dirtySource: resident?.worktree?.dirtySource ?? session.dirtySource }
           : {}),
-        writeAccess: summary.writeAccess,
-        workspaceGeneration: summary.stateGeneration,
-        hydrationStatus: summary.managed && !available
+        writeAccess: session.writeAccess,
+        workspaceGeneration: session.stateGeneration,
+        hydrationStatus: session.managed && !available
           ? "recovery_required"
-          : resident
+          : resident && session.status === "active"
             ? "ready"
             : "requires_resume",
-        createdAt: summary.createdAt,
-        lastUsedAt: summary.lastUsedAt,
-      };
+        createdAt: session.createdAt,
+        lastUsedAt: session.lastUsedAt,
+      }];
     });
+    return summaries.sort((left, right) => {
+      const ordering = left.lastUsedAt.localeCompare(right.lastUsedAt) ||
+        left.workspaceRef.localeCompare(right.workspaceRef);
+      return options.recentFirst === false ? ordering : -ordering;
+    });
+  }
+
+  workspaceAuthorized(
+    connectionPrincipalId: string,
+    workspaceId: string,
+    authorizedRoots: readonly string[],
+  ): boolean {
+    const resident = this.workspaces.get(workspaceId);
+    if (resident?.connectionPrincipalId === connectionPrincipalId) {
+      return pathAllowedByAuthorizationRoots(
+        resident.sourceRoot ?? resident.root,
+        authorizedRoots,
+      );
+    }
+    const session = this.store?.getSession(workspaceId, connectionPrincipalId);
+    return Boolean(
+      session && pathAllowedByAuthorizationRoots(
+        session.sourceRoot ?? session.root,
+        authorizedRoots,
+      ),
+    );
   }
 
   workspaceSummary(connectionPrincipalId: string, alias: string): WorkspaceSummary {
@@ -537,13 +568,14 @@ export class WorkspaceRegistry {
   async resumeWorkspaceByReference(
     connectionPrincipalId: string,
     workspaceRef: string,
+    authorizedRoots: readonly string[] = this.config.allowedRoots,
   ): Promise<WorkspaceContext> {
     const resident = this.workspaces.get(workspaceRef);
     const alias = resident?.connectionPrincipalId === connectionPrincipalId
       ? resident.alias
       : this.store?.getSession(workspaceRef, connectionPrincipalId)?.alias;
     if (!alias) throw new UnknownWorkspaceAliasError();
-    return this.resumeWorkspace(connectionPrincipalId, alias);
+    return this.resumeWorkspace(connectionPrincipalId, alias, authorizedRoots);
   }
 
   activeSessionsSnapshot(): WorkspaceSession[] {
@@ -576,7 +608,11 @@ export class WorkspaceRegistry {
     return bumped;
   }
 
-  async resumeWorkspace(connectionPrincipalId: string, alias: string): Promise<WorkspaceContext> {
+  async resumeWorkspace(
+    connectionPrincipalId: string,
+    alias: string,
+    authorizedRoots: readonly string[] = this.config.allowedRoots,
+  ): Promise<WorkspaceContext> {
     const normalizedAlias = validateWorkspaceAlias(alias);
     const resident = Array.from(this.workspaces.values()).find(
       (workspace) =>
@@ -584,6 +620,12 @@ export class WorkspaceRegistry {
         workspace.alias === normalizedAlias,
     );
     if (resident) {
+      if (
+        authorizationRootsRestrictGlobal(authorizedRoots, this.config.allowedRoots) &&
+        !pathAllowedByAuthorizationRoots(resident.sourceRoot ?? resident.root, authorizedRoots)
+      ) {
+        throw new AccessDeniedError("Workspace is outside this OAuth grant's authorized roots");
+      }
       if (this.workspaceRootAllowed(resident.root, resident.mode, resident.sourceRoot)) {
         if (resident.mode !== "worktree" || !resident.worktree?.managed || !resident.sourceRoot) {
           return this.contextForWorkspace(resident, true);
@@ -614,8 +656,27 @@ export class WorkspaceRegistry {
       this.evictWorkspace(resident.id, resident.root);
     }
 
-    const session = this.store?.getActiveSessionByAlias?.(connectionPrincipalId, normalizedAlias);
+    let session = this.store?.getActiveSessionByAlias?.(connectionPrincipalId, normalizedAlias);
+    if (!session) {
+      const retained = this.store?.getSessionByAlias?.(connectionPrincipalId, normalizedAlias);
+      if (retained?.status === "closed") {
+        const generation = this.store?.reactivateClosedSession?.(
+          retained.id,
+          connectionPrincipalId,
+          this.config.resources.maxActiveWorkspacesPerClient,
+        );
+        if (generation !== undefined) {
+          session = this.store?.getSession(retained.id, connectionPrincipalId);
+        }
+      }
+    }
     if (!session) throw new UnknownWorkspaceAliasError();
+    if (
+      authorizationRootsRestrictGlobal(authorizedRoots, this.config.allowedRoots) &&
+      !pathAllowedByAuthorizationRoots(session.sourceRoot ?? session.root, authorizedRoots)
+    ) {
+      throw new AccessDeniedError("Workspace is outside this OAuth grant's authorized roots");
+    }
     const identity = workspaceIdentity(session.id, connectionPrincipalId);
     const pending = this.pendingHydrations.get(identity);
     if (pending) return pending;
@@ -1160,7 +1221,9 @@ export class WorkspaceRegistry {
       workspaceGeneration,
     );
     const lockKey = this.workspaceRootLockKey(initialWorkspace);
-    const releaseRoot = await this.rootLocks.acquire(lockKey, lockMode);
+    const releaseRoot = await this.rootLocks.acquire(lockKey, lockMode, {
+      workspaceGeneration,
+    });
     let retained = false;
     let lifecycle: WorkspaceLifecycleState | undefined;
     try {
@@ -1217,7 +1280,7 @@ export class WorkspaceRegistry {
     return this.rootLocks.withLock(lockKey, "write", async () => {
       const workspace = this.getWorkspace(connectionPrincipalId, workspaceId, workspaceGeneration);
       return callback(workspace);
-    });
+    }, { workspaceGeneration });
   }
 
   async acquireExclusiveClose(
@@ -2093,7 +2156,7 @@ export class WorkspaceRegistry {
   }
 
   private projectFingerprintForRoot(root: string): string {
-    const digest = createHmac("sha256", this.config.oauth.ownerToken)
+    const digest = createHmac("sha256", this.config.oauth.keys.projectFingerprint)
       .update("devspace:project-fingerprint:v1\0", "utf8")
       .update(root, "utf8")
       .digest("base64url")
@@ -2434,6 +2497,19 @@ function validateWorkspaceAlias(alias: string): string {
     throw new Error("Workspace alias must be 1-64 letters, digits, dots, underscores, or hyphens.");
   }
   return normalized;
+}
+
+function authorizationRootsRestrictGlobal(
+  authorizedRoots: readonly string[],
+  globalRoots: readonly string[],
+): boolean {
+  if (authorizedRoots.length !== globalRoots.length) return true;
+  return !globalRoots.every((globalRoot) =>
+    authorizedRoots.some((authorizedRoot) =>
+      pathAllowedByAuthorizationRoots(globalRoot, [authorizedRoot]) &&
+      pathAllowedByAuthorizationRoots(authorizedRoot, [globalRoot])
+    )
+  );
 }
 
 function validateInstructionContextSessionId(contextSessionId: string): string {

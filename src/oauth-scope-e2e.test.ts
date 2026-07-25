@@ -106,6 +106,7 @@ try {
   );
   for (const name of [
     "get_operation_status",
+    "resolve_operation",
     "list_skills",
     "load_skill",
     "apply_patch",

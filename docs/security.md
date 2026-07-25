@@ -36,7 +36,8 @@ reach.
 
 ## Owner Password
 
-`devspace init` generates an Owner password and stores it in:
+`devspace init` generates an Owner password. It displays that password once and
+stores only an Argon2id verifier in:
 
 ```text
 ~/.devspace/auth.json
@@ -44,12 +45,50 @@ reach.
 
 When an MCP client connects, DevSpace shows an approval page. Enter the Owner
 password only when you intentionally want that client to access this server.
+Only after the password succeeds does DevSpace show the local principal list
+and approved filesystem roots. That second step uses a short-lived one-time
+selection token and never resubmits the Owner password.
 
 For env-driven deployments, set a long random value:
 
 ```bash
 DEVSPACE_OAUTH_OWNER_TOKEN="$(openssl rand -base64 32)"
 ```
+
+DevSpace keeps authentication and identity-key material separate:
+
+```text
+Owner password
+  -> Argon2id verifier (local approval only)
+
+random persistent master key
+  -> HKDF host-identity key
+  -> HKDF authorization-root key
+  -> HKDF project-fingerprint key
+  -> HKDF cursor and receipt keys
+  -> HKDF audit-reference and internal-control keys
+```
+
+Changing the Owner password revokes access and refresh tokens but preserves the
+master key, authorized-root IDs, project fingerprints, anonymous audit
+references, and retained Workspace continuity. Rotating the master key is a
+separate deliberate global security reset: stop DevSpace, replace the key, and
+reauthorize every connector because HMAC identities, cursors, receipts, and
+internal control tokens change.
+
+For a fully environment-driven deployment, provide both values. The master key
+must be persistent base64url text generated from cryptographically random bytes:
+
+```bash
+DEVSPACE_OAUTH_OWNER_TOKEN="$(openssl rand -base64 32)"
+DEVSPACE_MASTER_KEY="$(node -e 'console.log(require("node:crypto").randomBytes(32).toString("base64url"))')"
+```
+
+When upgrading an older `auth.json`, DevSpace rewrites it to schema version 2,
+hashes the former Owner token with Argon2id, and temporarily uses that token as
+legacy-compatible master-key material so existing local HMAC identifiers do not
+change. `devspace doctor` reports this `legacy-direct` state; move to a new HKDF
+master key only during a planned global reauthorization.
 
 Failed approval attempts are not tracked in one global in-memory counter.
 DevSpace persists bounded token-bucket state for the exact authorization
@@ -67,12 +106,19 @@ arbitrary forwarding headers.
 OAuth `client_id` identifies a dynamic connector registration. It is not a
 verified account identity and does not own Workspace state. Every successful
 Owner approval creates an authorization grant with a fixed local principal,
-granted scope set, and authorization epoch. Authorization codes, access tokens,
-and refresh tokens reference that grant directly. Refresh rotation preserves
-the original grant and never derives a principal from `clientId`.
+granted scope set, authorized root-ID set, and authorization epoch.
+Authorization codes, access tokens, and refresh tokens reference that grant
+directly. Refresh rotation preserves the original grant and never derives a
+principal from `clientId`.
 
-A fresh grant and principal are isolated by default. To deliberately reconnect
-a new grant to an earlier principal, generate a one-time code locally:
+A fresh grant and principal are isolated by default. After Owner verification,
+the local approval page may explicitly reuse an existing principal. Reuse
+revokes the same client's old tokens and grants and bumps Workspace generations,
+so stale receipts cannot survive an authorization-boundary change. A client
+cannot silently jump away from another principal that still owns retained
+Workspaces; transfer or close those records locally first.
+
+Legacy clients may still use a one-time reconnect code:
 
 ```bash
 devspace auth principals
@@ -83,9 +129,20 @@ Treat this code as a short-lived credential. It is stored hashed, expires, is
 consumed once, and must not be sent through ChatGPT or repository content.
 Tokens issued before a successful relink are revoked.
 
+Historical orphan state can be managed locally with dry-run-first commands:
+
+```bash
+devspace auth transfer-workspaces <source> <target> [--apply]
+devspace auth close-orphan <principal-id> [--apply]
+devspace auth relink-client <oauth-client-id> <target> [--apply]
+```
+
+Applying these operations requires the backend to be stopped so persisted
+ownership cannot diverge from live in-memory bindings.
+
 Tool calls may carry `openai/subject`, `openai/organization`, and
 `openai/session`. DevSpace stores only purpose-separated HMAC values under a
-server identity key. Subject and organization provide grant consistency,
+derived host-identity key. Subject and organization provide grant consistency,
 anonymous audit/rate-limit dimensions, and protection against using one token
 under another host subject. They are not credentials and never replace the OAuth
 bearer token. Raw values are not persisted.
@@ -95,6 +152,11 @@ binding from the authorized principal/grant to one Workspace context. Generic
 MCP clients use an explicit `wctx5` receipt. An explicitly invalid receipt is
 never allowed to fall back to session state. Server restart clears these
 in-process bindings while retained aliases remain resumable.
+
+Conversation bindings have no fixed wall-clock expiry. They remain bounded by
+LRU limits and are invalidated by grant/epoch changes, Workspace lifecycle
+changes, global revocation, or process restart. This avoids breaking a long,
+actively used ChatGPT conversation after an arbitrary fixed deadline.
 
 DevSpace still receives no trusted human account or conversation identity.
 Aliases are the durable local continuity key. New conversations and restarted
@@ -119,6 +181,13 @@ tool handlers enforce the actual combination immediately before execution,
 including conditional checks for writable checkouts, worktree creation, network
 inheritance, and mutating process input. A cached schema cannot turn a read token
 into process, write, or revoke authority.
+
+Scopes answer **what** a connection may do. Authorized root IDs answer **where**
+it may do it. `open_workspace`, `list_workspaces`, `resume_workspace`, and every
+receipt/session-bound Workspace call recheck the current grant's root set. Two
+accounts with identical scopes can therefore receive non-overlapping project
+roots. Legacy grants migrate with the compatibility wildcard `*` and retain the
+configured global roots until they are reauthorized more narrowly.
 
 ## Public URL And Host Allowlist
 
@@ -168,6 +237,12 @@ generation before the UI reports success.
 Tunnel management remains status-only, and public diagnostics issue only a
 credential-free `/readyz` request without following redirects.
 
+The model-facing `exec_command` path separately rejects attempts to terminate
+the current DevSpace PID or control the enrolled DevSpace service through
+`launchctl`, `systemctl`, `service`, `pkill`, or `killall`. Runtime lifecycle
+changes belong to the local Admin control plane so the initiating MCP request
+cannot kill itself before returning a durable result.
+
 ## Shell Access
 
 The shell tool is powerful by design. It is meant for tests, builds, git, and
@@ -206,14 +281,21 @@ secrets, bypass file preconditions, or authorize operations outside the Workspac
 Structured tool results are the source of truth for execution and retry state.
 Do not retry a mutation unless `safeToRetry` is explicitly true.
 
+An unknown mutation outcome can later be resolved as `verified_committed`,
+`verified_not_started`, or `acknowledged_unknown`. Resolution records the method,
+evidence type, bounded evidence, time, and anonymous operator reference. The old
+operation ID remains a tombstone and is never reused for a new effect.
+
 ## Concurrent Workspace Access
 
 Workspace operations first use a fair process-local read/write queue keyed by
 the canonical physical root. Write operations additionally acquire a
 cross-process lock under a per-user lock directory, using hashed root keys so
 absolute paths are not disclosed. Reader markers, writer intent, and writer
-markers prevent writer starvation. Stale markers are reclaimed only after PID
-liveness checks, and lock timeouts return `workspace_root_busy` before effects.
+markers prevent writer starvation. Versioned lock markers record the server PID,
+process start identity, boot identity, random lease token, heartbeat, and
+Workspace generation. This prevents a recycled PID from making a stale lock
+look live. Lock timeouts return `workspace_root_busy` before effects.
 
 Reads and default change previews may overlap. Patches, commands, mutating
 process input, checkpoint advancement, close, and revoke serialize even when
@@ -222,8 +304,12 @@ different principals or DevSpace state directories point at the same checkout.
 If `exec_command` returns a running background or interactive process, the
 write lease transfers to that process session and remains held until the entire
 process tree exits, is terminated, the Workspace closes or revokes, or the
-server shuts down. Polling and stdin tools operate on the existing lease rather
-than deadlocking by reacquiring it.
+server shuts down. The marker owner changes to the child PID and process group.
+If the DevSpace server crashes while descendants remain alive, a replacement
+server still sees the child-owned lease and cannot write the same physical root;
+the lock is reclaimed only after both the owner process and process group exit.
+Polling and stdin tools operate on the existing lease rather than deadlocking by
+reacquiring it.
 
 This coordination covers DevSpace instances, not arbitrary external editors.
 Every patch therefore still requires strict `ifMatch` versions. Use separate
@@ -242,5 +328,20 @@ By default, DevSpace logs requests and tool calls. Principal, client, grant,
 subject, organization, and session dimensions use opaque or HMAC-derived
 identifiers; raw host identity claims and bearer tokens are not logged. Shell
 command previews are disabled unless `DEVSPACE_LOG_SHELL_COMMANDS=1`.
+
+At `info`, request logs retain only bounded Host and Origin values, a Referer
+with credentials/query/fragment removed, and numeric Content-Length. Full IP
+and User-Agent values are emitted only at `debug`, and every header is length
+bounded before formatting. Anonymous OAuth, connection, Workspace-activity, and
+operation references use the dedicated audit-reference HMAC key.
+
+DevSpace also persists a bounded safe audit index in SQLite. It records event,
+request/tool, anonymous connection and Workspace activity references, operation
+reference, error code/category/fingerprint, and a small allowlisted details map.
+It does not persist command text, absolute paths, bearer tokens, raw host claims,
+or error stacks. Query it locally with `devspace audit`; human-readable output is
+rendered in `Asia/Shanghai`, while stored timestamps remain canonical UTC ISO.
+Console log level does not suppress this index; set `DEVSPACE_AUDIT_EVENTS=0`
+only when intentionally disabling persistent audit records.
 
 Do not enable shell command logging if commands may contain secrets.

@@ -50,6 +50,11 @@ export interface CommandPolicyResult {
   matchedSegment?: string;
 }
 
+export interface DevSpaceSelfManagementContext {
+  pid: number;
+  launchdServiceLabel?: string;
+}
+
 /**
  * Commands that are always denied. Matched against the first non-wrapper token
  * of a segment. See DANGEROUS_PATTERNS for the fine-grained rules.
@@ -114,6 +119,55 @@ export function splitCommandSegments(command: string): string[] {
  */
 export function tokenizeSegment(segment: string): string[] {
   return tokenizeShellSegment(segment);
+}
+
+/**
+ * Reject commands that can terminate or restart the currently serving
+ * DevSpace backend. Lifecycle changes must go through the local Admin control
+ * plane, which verifies the old/new PID and readiness generation.
+ */
+export function devSpaceSelfManagementViolation(
+  command: string,
+  context: DevSpaceSelfManagementContext,
+): string | undefined {
+  const currentPid = String(context.pid);
+  const serviceLabel = context.launchdServiceLabel?.trim().toLowerCase();
+  for (const segment of splitCommandSegments(command)) {
+    const tokens = unwrapCommandWrappers(tokenizeSegment(segment));
+    if (tokens.length === 0) continue;
+    const program = commandBasename(tokens[0]);
+    const args = tokens.slice(1);
+    const normalizedArgs = args.map((value) => value.toLowerCase());
+    const joined = normalizedArgs.join(" ");
+
+    if (program === "kill" && args.some((value) => value === currentPid)) {
+      return "Terminating the current DevSpace backend is not permitted through exec_command.";
+    }
+    if (
+      (program === "pkill" || program === "killall") &&
+      /(?:^|[\s/._-])(?:devspace|node|cli\.js)(?:$|[\s/._-])/u.test(joined)
+    ) {
+      return "Process-wide DevSpace termination is not permitted through exec_command.";
+    }
+    if (
+      program === "launchctl" &&
+      normalizedArgs.some((value) =>
+        ["kickstart", "kill", "bootout", "unload", "remove", "stop"].includes(value)
+      ) &&
+      serviceLabel &&
+      normalizedArgs.some((value) => value === serviceLabel || value.endsWith(`/${serviceLabel}`))
+    ) {
+      return "The enrolled DevSpace launchd service can be restarted only from the local Admin control plane.";
+    }
+    if (
+      (program === "systemctl" || program === "service") &&
+      /(?:^|[\s/._-])devspace(?:$|[\s/._-])/u.test(joined) &&
+      /(?:^|\s)(?:restart|stop|kill|reload-or-restart)(?:\s|$)/u.test(joined)
+    ) {
+      return "The DevSpace service lifecycle can be changed only from the local Admin control plane.";
+    }
+  }
+  return undefined;
 }
 
 function matchesPrefix(tokens: string[], prefix: string[]): boolean {

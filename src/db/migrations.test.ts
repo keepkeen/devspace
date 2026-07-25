@@ -19,12 +19,13 @@ import {
 } from "./canonical-schema.js";
 import { prepareDatabaseFile } from "./migrations.js";
 
-const root = mkdtempSync(join(tmpdir(), "devspace-v15-migrations-"));
+const root = mkdtempSync(join(tmpdir(), "devspace-v16-migrations-"));
 
 try {
   for (const version of [1, 4, 5, 7, 8, 10, 11, 13, 14]) {
     testHistoricalVersion(version);
   }
+  testVersionFifteenPreservesGrantIdentity();
   testAmbiguousOwnershipIsAtomic();
 } finally {
   rmSync(root, { recursive: true, force: true });
@@ -162,6 +163,163 @@ function testHistoricalVersion(version: number): void {
   });
 }
 
+function testVersionFifteenPreservesGrantIdentity(): void {
+  const directory = join(root, "v15");
+  const project = join(directory, "project");
+  const databasePath = join(directory, "devspace.sqlite");
+  mkdirSync(project, { recursive: true });
+  const source = new Database(databasePath);
+  try {
+    source.exec(`
+      create table devspace_schema_migrations (
+        version integer primary key,
+        name text not null,
+        applied_at text not null
+      );
+      insert into devspace_schema_migrations values (
+        15, 'canonical-state-v15', '2026-01-01T00:00:00.000Z'
+      );
+      create table connection_principals (
+        principal_id text primary key,
+        created_at text not null,
+        last_used_at text not null,
+        revoked_at text
+      );
+      create table oauth_clients (
+        client_id text primary key,
+        client_json text not null,
+        issued_at integer not null
+      );
+      create table oauth_grants (
+        grant_id text primary key,
+        client_id text not null,
+        principal_id text not null,
+        subject_hash text,
+        organization_hash text,
+        granted_scopes_json text not null,
+        authorization_epoch integer not null,
+        created_at text not null,
+        last_used_at text not null,
+        revoked_at text
+      );
+      create table workspace_sessions (
+        id text primary key,
+        connection_principal_id text not null,
+        alias text not null,
+        root text not null,
+        canonical_root text,
+        status text not null,
+        mode text not null,
+        source_root text,
+        base_ref text,
+        base_sha text,
+        dirty_source text not null,
+        managed text not null,
+        write_access text not null,
+        state_generation integer not null,
+        created_at text not null,
+        last_used_at text not null
+      );
+      create table mutation_operations (
+        connection_principal_id text not null,
+        workspace_id text not null,
+        tool text not null,
+        operation_id text not null,
+        workspace_generation integer not null,
+        request_hash text not null,
+        state text not null,
+        result_json text,
+        created_at text not null,
+        updated_at text not null,
+        expires_at text not null
+      );
+    `);
+    source.prepare("insert into connection_principals values (?, ?, ?, null)").run(
+      "principal-v15",
+      "2026-01-01T00:00:00.000Z",
+      "2026-01-02T00:00:00.000Z",
+    );
+    source.prepare("insert into oauth_clients values (?, ?, ?)").run(
+      "client-v15",
+      JSON.stringify({ redirect_uris: ["https://chatgpt.com/callback"] }),
+      1,
+    );
+    source.prepare("insert into oauth_grants values (?, ?, ?, ?, ?, ?, ?, ?, ?, null)").run(
+      "grant-v15",
+      "client-v15",
+      "principal-v15",
+      "sub_preserved",
+      "org_preserved",
+      JSON.stringify(["workspace:read", "workspace:write"]),
+      7,
+      "2026-01-01T00:00:00.000Z",
+      "2026-01-02T00:00:00.000Z",
+    );
+    source.prepare("insert into workspace_sessions values (?, ?, ?, ?, ?, ?, ?, null, null, null, ?, ?, ?, ?, ?, ?)").run(
+      "workspace-v15",
+      "principal-v15",
+      "v15-project",
+      project,
+      realpathSync(project),
+      "active",
+      "checkout",
+      "false",
+      "false",
+      "read_write",
+      3,
+      "2026-01-01T00:00:00.000Z",
+      "2026-01-02T00:00:00.000Z",
+    );
+    source.prepare("insert into mutation_operations values (?, ?, ?, ?, ?, ?, ?, null, ?, ?, ?)").run(
+      "principal-v15",
+      "workspace-v15",
+      "exec_command",
+      "unknown-v15",
+      3,
+      "hash-v15",
+      "outcome_unknown",
+      "2026-01-02T00:00:00.000Z",
+      "2026-01-02T00:00:01.000Z",
+      "2099-01-01T00:00:00.000Z",
+    );
+  } finally {
+    source.close();
+  }
+
+  const preparation = prepareDatabaseFile(databasePath);
+  assert.equal(preparation.sourceVersion, 15);
+  const migrated = new Database(databasePath, { readonly: true });
+  try {
+    assert.deepEqual(migrated.prepare(`
+      select
+        grant_id as grantId,
+        subject_hash as subjectHash,
+        organization_hash as organizationHash,
+        granted_scopes_json as scopesJson,
+        allowed_root_ids_json as rootIdsJson,
+        authorization_epoch as authorizationEpoch
+      from oauth_grants
+    `).get(), {
+      grantId: "grant-v15",
+      subjectHash: "sub_preserved",
+      organizationHash: "org_preserved",
+      scopesJson: JSON.stringify(["workspace:read", "workspace:write"]),
+      rootIdsJson: JSON.stringify(["*"]),
+      authorizationEpoch: 7,
+    });
+    assert.deepEqual(migrated.prepare(`
+      select state, resolution_method as resolutionMethod, resolved_at as resolvedAt
+      from mutation_operations where operation_id = 'unknown-v15'
+    `).get(), {
+      state: "outcome_unknown",
+      resolutionMethod: null,
+      resolvedAt: null,
+    });
+  } finally {
+    migrated.close();
+  }
+}
+
 function testAmbiguousOwnershipIsAtomic(): void {
   const directory = join(root, "ambiguous");
   const project = join(directory, "project");
@@ -176,7 +334,7 @@ function testAmbiguousOwnershipIsAtomic(): void {
   );
   assert.equal(fileHash(databasePath), before);
   assert.equal(
-    readdirSync(directory).some((name) => name.includes("v15-migrating") || name.includes("pre-v15")),
+    readdirSync(directory).some((name) => name.includes("v16-migrating") || name.includes("pre-v16")),
     false,
   );
 }
@@ -379,4 +537,4 @@ function fileHash(path: string): string {
   return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
 
-console.log("canonical v15 migration matrix passed");
+console.log("canonical v16 migration matrix passed");

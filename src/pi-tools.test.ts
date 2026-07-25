@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   PI_TOOL_ERROR_MAX_CHARACTERS,
+  InvalidSearchPatternError,
   editFileTool,
   findFilesTool,
   grepFilesTool,
@@ -90,6 +91,28 @@ try {
   assert.match(grepText, /a\.ts-1- zero/);
   assert.match(grepText, /nested\/b\.ts:1: nested MATCH/);
   assert.doesNotMatch(grepText, /node_modules|hidden\.ts/);
+
+  let invalidPatternReported = false;
+  const invalidPattern = await grepFilesTool(
+    { pattern: "[", path: "src" },
+    {
+      cwd: adapterRoot,
+      root: adapterRoot,
+      onError: () => {
+        invalidPatternReported = true;
+      },
+    },
+  );
+  assert.equal(invalidPattern.isError, true);
+  assert.equal(invalidPatternReported, false);
+  assert.equal(invalidPattern.error?.code, "invalid_pattern");
+  assert.equal(invalidPattern.error?.phase, "not_started");
+  assert.equal(invalidPattern.error?.safeToRetry, true);
+  assert.match(
+    invalidPattern.content[0]?.type === "text" ? invalidPattern.content[0].text : "",
+    /^invalid_pattern:/u,
+  );
+  assert.ok(new InvalidSearchPatternError() instanceof Error);
 
   const found = await findFilesTool(
     { pattern: "*.ts", path: "." },

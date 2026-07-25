@@ -7,7 +7,18 @@ export interface MutationOperationKey {
   operationId: string;
 }
 
-export type MutationOperationState = "pending" | "settled" | "outcome_unknown";
+export type MutationOperationState =
+  | "pending"
+  | "settled"
+  | "outcome_unknown"
+  | "verified_committed"
+  | "verified_not_started"
+  | "acknowledged_unknown";
+
+export type MutationOperationResolution =
+  | "verified_committed"
+  | "verified_not_started"
+  | "acknowledged_unknown";
 
 export interface MutationOperationStatus {
   operationId: string;
@@ -19,6 +30,24 @@ export interface MutationOperationStatus {
   updatedAt: string;
   expiresAt: string;
   resultAvailable: boolean;
+  resolution?: {
+    state: MutationOperationResolution;
+    method: string;
+    evidenceType: string;
+    evidence?: unknown;
+    resolvedAt: string;
+    operatorRef: string;
+  };
+}
+
+export interface MutationOperationResolutionInput {
+  connectionPrincipalId: string;
+  operationId: string;
+  resolution: MutationOperationResolution;
+  method: string;
+  evidenceType: string;
+  evidence?: unknown;
+  operatorRef: string;
 }
 
 export type MutationOperationReservation =
@@ -27,6 +56,7 @@ export type MutationOperationReservation =
   | { status: "conflict" }
   | { status: "stale_generation"; currentGeneration: number }
   | { status: "outcome_unknown" }
+  | { status: "verified_not_started" }
   | { status: "result_unavailable" };
 
 export type MutationOperationSettlement =
@@ -63,6 +93,8 @@ const MAX_CLEANUP_LIMIT = 10_000;
 const MAX_KEY_PART_LENGTH = 1_024;
 const MAX_TOOL_LENGTH = 256;
 const MAX_REQUEST_HASH_LENGTH = 512;
+const MAX_RESOLUTION_LABEL_LENGTH = 128;
+const MAX_EVIDENCE_BYTES = 64 * 1024;
 
 /**
  * Durable idempotency records for mutating tool calls. The store persists only
@@ -138,8 +170,15 @@ export class MutationOperationStore {
         ) {
           return { status: "conflict" };
         }
-        if (row.state === "outcome_unknown" || row.state === "pending") {
+        if (
+          row.state === "outcome_unknown" ||
+          row.state === "acknowledged_unknown" ||
+          row.state === "pending"
+        ) {
           return { status: "outcome_unknown" };
+        }
+        if (row.state === "verified_not_started") {
+          return { status: "verified_not_started" };
         }
         if (row.result_json === null) return { status: "result_unavailable" };
 
@@ -301,13 +340,100 @@ export class MutationOperationStore {
         created_at as createdAt,
         updated_at as updatedAt,
         expires_at as expiresAt,
+        resolution_method as resolutionMethod,
+        evidence_type as evidenceType,
+        evidence_json as evidenceJson,
+        resolved_at as resolvedAt,
+        operator_ref as operatorRef,
         case when state = 'settled' and result_json is not null then 1 else 0 end as resultAvailable
       from mutation_operations
       where connection_principal_id = ? and operation_id = ?
     `).get(normalizedConnectionPrincipalId, normalizedOperationId) as
-      | Omit<MutationOperationStatus, "resultAvailable"> & { resultAvailable: 0 | 1 }
+      | Omit<MutationOperationStatus, "resultAvailable" | "resolution"> & {
+          resultAvailable: 0 | 1;
+          resolutionMethod: string | null;
+          evidenceType: string | null;
+          evidenceJson: string | null;
+          resolvedAt: string | null;
+          operatorRef: string | null;
+        }
       | undefined;
-    return row ? { ...row, resultAvailable: row.resultAvailable === 1 } : undefined;
+    if (!row) return undefined;
+    const {
+      resolutionMethod,
+      evidenceType,
+      evidenceJson,
+      resolvedAt,
+      operatorRef,
+      ...status
+    } = row;
+    const resolvedState = isResolutionState(row.state) ? row.state : undefined;
+    return {
+      ...status,
+      resultAvailable: row.resultAvailable === 1,
+      ...(resolvedState && resolutionMethod && evidenceType && resolvedAt && operatorRef
+        ? {
+            resolution: {
+              state: resolvedState,
+              method: resolutionMethod,
+              evidenceType,
+              ...(evidenceJson ? { evidence: parseJson(evidenceJson) } : {}),
+              resolvedAt,
+              operatorRef,
+            },
+          }
+        : {}),
+    };
+  }
+
+  resolveOutcome(input: MutationOperationResolutionInput): MutationOperationStatus | undefined {
+    this.assertOpen();
+    const connectionPrincipalId = boundedNonEmptyString(
+      input.connectionPrincipalId,
+      "connectionPrincipalId",
+      MAX_KEY_PART_LENGTH,
+    );
+    const operationId = boundedNonEmptyString(
+      input.operationId,
+      "operationId",
+      MAX_KEY_PART_LENGTH,
+    );
+    if (!isResolutionState(input.resolution)) throw new TypeError("Unknown operation resolution.");
+    const method = boundedNonEmptyString(input.method, "method", MAX_RESOLUTION_LABEL_LENGTH);
+    const evidenceType = boundedNonEmptyString(
+      input.evidenceType,
+      "evidenceType",
+      MAX_RESOLUTION_LABEL_LENGTH,
+    );
+    const operatorRef = boundedNonEmptyString(
+      input.operatorRef,
+      "operatorRef",
+      MAX_RESOLUTION_LABEL_LENGTH,
+    );
+    const evidenceJson = input.evidence === undefined ? null : serializeJson(input.evidence);
+    if (evidenceJson && Buffer.byteLength(evidenceJson, "utf8") > MAX_EVIDENCE_BYTES) {
+      throw new RangeError(`evidence exceeds ${MAX_EVIDENCE_BYTES} bytes`);
+    }
+    const now = timestampFromMs(this.currentTime());
+    const result = this.database.sqlite.prepare(`
+      update mutation_operations
+      set state = ?, resolution_method = ?, evidence_type = ?, evidence_json = ?,
+          resolved_at = ?, operator_ref = ?, updated_at = ?
+      where connection_principal_id = ? and operation_id = ?
+        and state = 'outcome_unknown'
+    `).run(
+      input.resolution,
+      method,
+      evidenceType,
+      evidenceJson,
+      now,
+      operatorRef,
+      now,
+      connectionPrincipalId,
+      operationId,
+    );
+    if (result.changes === 0) return undefined;
+    return this.getOperationStatus(connectionPrincipalId, operationId);
   }
 
   cleanupExpired(limit = this.cleanupLimit): number {
@@ -464,4 +590,18 @@ function serializeJson(result: unknown): string {
   }
   if (serialized === undefined) throw new TypeError("result must be JSON-serializable");
   return serialized;
+}
+
+function parseJson(value: string): unknown {
+  try {
+    return JSON.parse(value) as unknown;
+  } catch {
+    return undefined;
+  }
+}
+
+function isResolutionState(value: string): value is MutationOperationResolution {
+  return value === "verified_committed" ||
+    value === "verified_not_started" ||
+    value === "acknowledged_unknown";
 }

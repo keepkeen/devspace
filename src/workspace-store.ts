@@ -185,7 +185,12 @@ export interface WorkspaceStore {
     maxActiveSessionsPerClient?: number;
   }): WorkspaceSession;
   getActiveSessionByAlias?(connectionPrincipalId: string, alias: string): WorkspaceSession | undefined;
+  getSessionByAlias?(connectionPrincipalId: string, alias: string): WorkspaceSession | undefined;
   listActiveSessionSummaries?(connectionPrincipalId: string): ActiveWorkspaceSummary[];
+  listSessions?(
+    connectionPrincipalId?: string,
+    statuses?: WorkspaceStatus[],
+  ): WorkspaceSession[];
   updateStateGeneration?(
     id: string,
     connectionPrincipalId: string,
@@ -618,6 +623,45 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
       ))
       .get();
     return row ? rowToWorkspaceSession(row) : undefined;
+  }
+
+  getSessionByAlias(connectionPrincipalId: string, alias: string): WorkspaceSession | undefined {
+    const row = this.database.db
+      .select()
+      .from(workspaceSessions)
+      .where(and(
+        eq(workspaceSessions.connectionPrincipalId, connectionPrincipalId),
+        eq(workspaceSessions.alias, alias),
+      ))
+      .get();
+    return row ? rowToWorkspaceSession(row) : undefined;
+  }
+
+  listSessions(
+    connectionPrincipalId?: string,
+    statuses: WorkspaceStatus[] = ["active"],
+  ): WorkspaceSession[] {
+    const normalizedStatuses = [...new Set(statuses)].filter(
+      (status): status is WorkspaceStatus =>
+        status === "active" || status === "closed" || status === "revoked",
+    );
+    if (normalizedStatuses.length === 0) return [];
+    const statusCondition = or(
+      ...normalizedStatuses.map((status) => eq(workspaceSessions.status, status)),
+    );
+    return this.database.db
+      .select()
+      .from(workspaceSessions)
+      .where(connectionPrincipalId === undefined
+        ? statusCondition
+        : and(
+            statusCondition,
+            eq(workspaceSessions.connectionPrincipalId, connectionPrincipalId),
+          ))
+      .orderBy(workspaceSessions.lastUsedAt, workspaceSessions.id)
+      .all()
+      .map(rowToWorkspaceSession)
+      .reverse();
   }
 
   listActiveSessionSummaries(connectionPrincipalId: string): ActiveWorkspaceSummary[] {

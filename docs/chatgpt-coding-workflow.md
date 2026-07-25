@@ -101,8 +101,8 @@ are not credentials. The OAuth bearer token remains the authorization proof.
 For ordinary ChatGPT calls, DevSpace binds:
 
 ```text
-(principal, HMAC(openai/session))
-  → grant + authorization epoch
+(principal, grant, HMAC(openai/session))
+  → authorization epoch
   → Workspace + generation
   → context session + phase + revisions
 ```
@@ -197,6 +197,13 @@ user/root/nested chain for those paths only:
         "path": "AGENTS.md",
         "hash": "sha256-v1:…",
         "bytes": 3120,
+        "fragment": {
+          "offsetBytes": 0,
+          "lengthBytes": 3120,
+          "totalBytes": 3120,
+          "complete": true,
+          "lineBoundary": true
+        },
         "content": "…"
       }
     ],
@@ -212,7 +219,12 @@ specific revision. They do not claim that a model agreed to obey repository
 content.
 
 Instruction discovery order is documented in configuration. The effective
-chain has a 32 KiB UTF-8 budget and is never silently truncated. Reads may set
+chain has a 32 KiB UTF-8 budget and is never silently truncated. Each response
+contains at most 8 KiB of instruction body. Signed `dcur1` pages use a global
+byte offset over the applicable ordered chain, prefer complete lines, preserve
+UTF-8, and bind the cursor to the current principal, Workspace generation,
+context session, target paths, and file revisions. Continue until `nextCursor`
+is absent; only that final page returns the instruction token. Reads may set
 `scopedInstructionsAvailable=true`, but instruction Markdown is never appended
 to file or search output. Mutations, commands, and interactive input that may
 change directory all use the same instruction gate.
@@ -234,19 +246,30 @@ implicit invocation.
 
 ## OAuth-Filtered Tool Surface
 
-DevSpace exposes tools only when the current grant has the required capability.
-Omitting OAuth `scope` grants only `workspace:read`. Higher capabilities must be
-requested explicitly.
+DevSpace exposes the intersection of a static server profile and the current
+grant capabilities. Omitting OAuth `scope` grants only `workspace:read`; higher
+capabilities must be requested explicitly.
 
-The default read profile includes the compact lifecycle and file/batch
-inspection surface plus read-only change preview. Skill discovery and operation
-status are loaded only in the elevated coding profile to keep default tools/list
-bounded; writing, process execution, network access, worktree creation, and
-revocation additionally require their matching grant capabilities. Handlers
-repeat scope checks, so an old cached tools/list cannot bypass policy.
+`DEVSPACE_TOOL_PROFILE=browse` exposes exactly the compact lifecycle,
+file/batch inspection, and read-only change-preview surface. Elevated OAuth
+scopes do not add mutation or process tools to this profile.
+`DEVSPACE_TOOL_PROFILE=coding` is the compatibility default and adds Skills,
+operation status/resolution, mutation, process, worktree, close, and revoke tools
+only when the grant has every required capability. The profile does not change
+inside a conversation; reconnect or refresh the Connector tools after changing
+it. Handlers repeat scope checks, so an old cached tools/list cannot bypass
+policy.
 
-The default profile is kept below a 12 KB tools/list budget. Full-capability
-profiles are larger because they include execution and mutation schemas.
+Real MCP wire tests currently measure browse at about 8 KB for nine tools and
+full coding at about 17.5 KB for nineteen tools. Repeated output schemas are
+omitted except for the canonical `open_workspace` lifecycle schema and `read`
+file-version schema; structured tool results themselves are unchanged.
+
+Workspace, Skill, instruction, and process-output pagination all use the signed
+`dcur1` envelope. It binds resource type, anonymous principal reference,
+Workspace generation where applicable, query hash, revision, byte/item offset,
+and expiry. A cursor is not authority: every page still requires the OAuth grant
+and current Workspace receipt/session binding.
 
 ## Result Payload Contract
 

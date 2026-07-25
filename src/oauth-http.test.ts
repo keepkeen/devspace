@@ -244,12 +244,34 @@ async function issueTokens(
   clientId: string,
   ownerToken: string,
 ): Promise<{ access_token: string; refresh_token: string }> {
-  const approval = await fetch(new URL("/authorize", origin), {
+  let approval = await fetch(new URL("/authorize", origin), {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
     body: authorizationParams(clientId, "en-US", { owner_token: ownerToken }),
     redirect: "manual",
   });
+  if (approval.status === 200) {
+    const selectionPage = await approval.text();
+    const selectionToken = selectionPage.match(
+      /name="selection_token" value="([^"]+)"/u,
+    )?.[1];
+    const rootIds = [...selectionPage.matchAll(
+      /name="root_id" value="([^"]+)"/gu,
+    )].map((match) => match[1]!);
+    assert.ok(selectionToken);
+    assert.ok(rootIds.length > 0);
+    const selection = authorizationParams(clientId, "en-US", {
+      selection_token: selectionToken,
+      connection_mode: "new",
+    });
+    for (const rootId of rootIds) selection.append("root_id", rootId);
+    approval = await fetch(new URL("/authorize", origin), {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: selection,
+      redirect: "manual",
+    });
+  }
   assert.equal(approval.status, 302);
   const callback = new URL(approval.headers.get("location") ?? "");
   const authorizationCode = callback.searchParams.get("code");

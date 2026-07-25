@@ -58,7 +58,11 @@ interface AllowedRootsReloadResult {
 }
 
 export interface RuntimeControlPlaneOptions {
-  ownerToken: string;
+  internalAuth: {
+    diagnostics: string | Uint8Array;
+    configReload: string | Uint8Array;
+    revocation: string | Uint8Array;
+  };
   generation: string;
   runtimeConfig: {
     widgets: "full" | "changes" | "off";
@@ -98,7 +102,10 @@ export function createRuntimeControlPlane(options: RuntimeControlPlaneOptions): 
   });
 
   router.get("/internal/diagnostics", (req, res) => {
-    if (!validInternalDiagnosticsToken(options.ownerToken, req.header("x-devspace-internal-token"))) {
+    if (!validInternalDiagnosticsToken(
+      options.internalAuth.diagnostics,
+      req.header("x-devspace-internal-token"),
+    )) {
       res.status(404).json({ error: "not_found" });
       return;
     }
@@ -161,7 +168,10 @@ export function createRuntimeControlPlane(options: RuntimeControlPlaneOptions): 
   });
 
   router.post("/internal/security/revoke", express.json({ limit: "1kb" }), async (req, res) => {
-    if (!validInternalRevocationToken(options.ownerToken, req.header("x-devspace-internal-token"))) {
+    if (!validInternalRevocationToken(
+      options.internalAuth.revocation,
+      req.header("x-devspace-internal-token"),
+    )) {
       res.status(404).json({ error: "not_found" });
       return;
     }
@@ -177,7 +187,10 @@ export function createRuntimeControlPlane(options: RuntimeControlPlaneOptions): 
   });
 
   router.post("/internal/config/reload-roots", async (req, res) => {
-    if (!validInternalConfigReloadToken(options.ownerToken, req.header("x-devspace-internal-token"))) {
+    if (!validInternalConfigReloadToken(
+      options.internalAuth.configReload,
+      req.header("x-devspace-internal-token"),
+    )) {
       res.status(404).json({ error: "not_found" });
       return;
     }

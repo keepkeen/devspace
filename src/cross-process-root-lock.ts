@@ -1,25 +1,72 @@
 import { createHash, randomBytes } from "node:crypto";
-import { rmSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
 import { link, mkdir, open, readFile, readdir, rm, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+  defaultProcessIdentityRuntime,
+  processIdentityAlive,
+  readProcessIdentity,
+  type ProcessIdentity,
+  type ProcessIdentityRuntime,
+} from "./process-identity.js";
 import type { WorkspaceRootLockMode } from "./workspace-root-locks.js";
 
 const DEFAULT_ACQUIRE_TIMEOUT_MS = 30_000;
 const DEFAULT_POLL_INTERVAL_MS = 25;
+const DEFAULT_HEARTBEAT_INTERVAL_MS = 5_000;
+const DEFAULT_HEARTBEAT_STALE_MS = 30_000;
+const LOCK_MARKER_SCHEMA_VERSION = 2 as const;
 
 interface LockMarker {
+  schemaVersion: typeof LOCK_MARKER_SCHEMA_VERSION;
+  serverPid: number;
+  serverStartIdentity?: string;
+  bootIdentity?: string;
+  ownerPid?: number;
+  ownerStartIdentity?: string;
+  processGroupId?: number;
+  workspaceGeneration?: number;
+  token: string;
+  createdAt: number;
+  heartbeatAt: number;
+}
+
+interface LegacyLockMarker {
   pid: number;
   token: string;
   createdAt: number;
+}
+
+type AnyLockMarker = LockMarker | LegacyLockMarker;
+
+export interface WorkspaceRootLeaseMetadata {
+  workspaceGeneration?: number;
+}
+
+export interface WorkspaceRootProcessOwner {
+  pid: number;
+  processGroupId?: number;
+}
+
+/** Callable for compatibility with existing release callbacks. */
+export interface WorkspaceRootLease {
+  (): void;
+  release(): void;
+  heartbeat(): Promise<void>;
+  attachProcess(owner: WorkspaceRootProcessOwner): Promise<void>;
 }
 
 export interface CrossProcessWorkspaceRootLockOptions {
   root: string;
   acquireTimeoutMs?: number;
   pollIntervalMs?: number;
+  heartbeatIntervalMs?: number;
+  heartbeatStaleMs?: number;
   now?: () => number;
   pid?: number;
+  processIdentityRuntime?: ProcessIdentityRuntime;
+  serverIdentity?: ProcessIdentity;
 }
 
 export class WorkspaceRootLockTimeoutError extends Error {
@@ -34,17 +81,21 @@ export class WorkspaceRootLockTimeoutError extends Error {
 }
 
 /**
- * Filesystem-backed reader/writer lease shared by every DevSpace process owned
- * by the same OS user. Paths are SHA-256 keyed so the lock directory does not
- * disclose workspace names. Writer intent blocks new readers before waiting
- * for existing readers, preventing cross-process writer starvation.
+ * Filesystem-backed reader/writer leases shared by every DevSpace process owned
+ * by the same OS user. Marker ownership includes boot and process-start identity
+ * so PID reuse cannot keep stale locks alive. A retained command replaces the
+ * marker owner with its PID/process group; after a server crash, descendants
+ * therefore continue blocking writers until their complete process tree exits.
  */
 export class CrossProcessWorkspaceRootLock {
   private readonly root: string;
   private readonly acquireTimeoutMs: number;
   private readonly pollIntervalMs: number;
+  private readonly heartbeatIntervalMs: number;
+  private readonly heartbeatStaleMs: number;
   private readonly now: () => number;
-  private readonly pid: number;
+  private readonly runtime: ProcessIdentityRuntime;
+  private readonly serverIdentity: ProcessIdentity;
 
   constructor(options: CrossProcessWorkspaceRootLockOptions) {
     if (!options.root) throw new TypeError("Cross-process lock root is required.");
@@ -57,54 +108,81 @@ export class CrossProcessWorkspaceRootLock {
       options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS,
       "pollIntervalMs",
     );
+    this.heartbeatIntervalMs = positiveInteger(
+      options.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS,
+      "heartbeatIntervalMs",
+    );
+    this.heartbeatStaleMs = positiveInteger(
+      options.heartbeatStaleMs ?? DEFAULT_HEARTBEAT_STALE_MS,
+      "heartbeatStaleMs",
+    );
     this.now = options.now ?? Date.now;
-    this.pid = options.pid ?? process.pid;
+    this.runtime = options.processIdentityRuntime ?? defaultProcessIdentityRuntime;
+    const pid = options.pid ?? this.runtime.currentPid;
+    this.serverIdentity = options.serverIdentity ?? readProcessIdentity(pid, this.runtime);
   }
 
-  async acquire(key: string, mode: WorkspaceRootLockMode): Promise<() => void> {
+  async acquire(
+    key: string,
+    mode: WorkspaceRootLockMode,
+    metadata: WorkspaceRootLeaseMetadata = {},
+  ): Promise<WorkspaceRootLease> {
     if (!key) throw new TypeError("Workspace root lock key is required.");
     if (mode !== "read" && mode !== "write") {
       throw new TypeError("Workspace root lock mode must be read or write.");
+    }
+    if (
+      metadata.workspaceGeneration !== undefined &&
+      (!Number.isSafeInteger(metadata.workspaceGeneration) || metadata.workspaceGeneration < 1)
+    ) {
+      throw new TypeError("Workspace generation must be a positive safe integer.");
     }
     const paths = this.paths(key);
     await this.ensureDirectories(paths);
     const deadline = this.now() + this.acquireTimeoutMs;
     return mode === "read"
-      ? this.acquireReader(paths, deadline)
-      : this.acquireWriter(paths, deadline);
+      ? this.acquireReader(paths, deadline, metadata)
+      : this.acquireWriter(paths, deadline, metadata);
   }
 
   private async acquireReader(
     paths: ReturnType<CrossProcessWorkspaceRootLock["paths"]>,
     deadline: number,
-  ): Promise<() => void> {
-    const marker = join(paths.readers, `${this.pid}-${randomToken()}.json`);
+    metadata: WorkspaceRootLeaseMetadata,
+  ): Promise<WorkspaceRootLease> {
+    const markerPath = join(
+      paths.readers,
+      `${this.serverIdentity.pid}-${randomToken()}.json`,
+    );
     for (;;) {
       await this.cleanupStale(paths);
       if (await exists(paths.intent) || await exists(paths.writer)) {
         await this.wait(deadline);
         continue;
       }
-      if (!await this.createMarker(marker)) {
+      const marker = await this.createMarker(markerPath, metadata);
+      if (!marker) {
         await this.wait(deadline);
         continue;
       }
       if (await exists(paths.intent) || await exists(paths.writer)) {
-        await rm(marker, { force: true });
+        await removeOwnedMarker(markerPath, marker.token);
         await this.wait(deadline);
         continue;
       }
-      return releaseFileMarker(marker);
+      return this.createLease(markerPath, marker);
     }
   }
 
   private async acquireWriter(
     paths: ReturnType<CrossProcessWorkspaceRootLock["paths"]>,
     deadline: number,
-  ): Promise<() => void> {
+    metadata: WorkspaceRootLeaseMetadata,
+  ): Promise<WorkspaceRootLease> {
     for (;;) {
       await this.cleanupStale(paths);
-      if (!await this.createMarker(paths.intent)) {
+      const intent = await this.createMarker(paths.intent, metadata);
+      if (!intent) {
         await this.wait(deadline);
         continue;
       }
@@ -113,15 +191,16 @@ export class CrossProcessWorkspaceRootLock {
           await this.cleanupStale(paths);
           const readers = await readerMarkers(paths.readers);
           if (readers.length === 0 && !await exists(paths.writer)) {
-            if (await this.createMarker(paths.writer)) {
-              await rm(paths.intent, { force: true });
-              return releaseFileMarker(paths.writer);
+            const writer = await this.createMarker(paths.writer, metadata);
+            if (writer) {
+              await removeOwnedMarker(paths.intent, intent.token);
+              return this.createLease(paths.writer, writer);
             }
           }
           await this.wait(deadline);
         }
       } catch (error) {
-        await rm(paths.intent, { force: true });
+        await removeOwnedMarker(paths.intent, intent.token);
         throw error;
       }
     }
@@ -149,16 +228,42 @@ export class CrossProcessWorkspaceRootLock {
     await mkdir(paths.readers, { recursive: true, mode: 0o700 });
   }
 
-  private async createMarker(path: string): Promise<boolean> {
-    const temporaryPath = `${path}.${this.pid}-${randomToken()}.tmp`;
+  private newMarker(metadata: WorkspaceRootLeaseMetadata): LockMarker {
+    const now = this.now();
+    return {
+      schemaVersion: LOCK_MARKER_SCHEMA_VERSION,
+      serverPid: this.serverIdentity.pid,
+      ...(this.serverIdentity.startIdentity
+        ? { serverStartIdentity: this.serverIdentity.startIdentity }
+        : {}),
+      ...(this.serverIdentity.bootIdentity
+        ? { bootIdentity: this.serverIdentity.bootIdentity }
+        : {}),
+      ownerPid: this.serverIdentity.pid,
+      ...(this.serverIdentity.startIdentity
+        ? { ownerStartIdentity: this.serverIdentity.startIdentity }
+        : {}),
+      ...(this.serverIdentity.processGroupId
+        ? { processGroupId: this.serverIdentity.processGroupId }
+        : {}),
+      ...(metadata.workspaceGeneration === undefined
+        ? {}
+        : { workspaceGeneration: metadata.workspaceGeneration }),
+      token: randomToken(),
+      createdAt: now,
+      heartbeatAt: now,
+    };
+  }
+
+  private async createMarker(
+    path: string,
+    metadata: WorkspaceRootLeaseMetadata,
+  ): Promise<LockMarker | undefined> {
+    const marker = this.newMarker(metadata);
+    const temporaryPath = `${path}.${this.serverIdentity.pid}-${randomToken()}.tmp`;
     let handle;
     try {
       handle = await open(temporaryPath, "wx", 0o600);
-      const marker: LockMarker = {
-        pid: this.pid,
-        token: randomToken(),
-        createdAt: this.now(),
-      };
       await handle.writeFile(JSON.stringify(marker), "utf8");
       await handle.sync();
     } finally {
@@ -166,13 +271,54 @@ export class CrossProcessWorkspaceRootLock {
     }
     try {
       await link(temporaryPath, path);
-      return true;
+      return marker;
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") return undefined;
       throw error;
     } finally {
       await rm(temporaryPath, { force: true });
     }
+  }
+
+  private createLease(path: string, initialMarker: LockMarker): WorkspaceRootLease {
+    let marker = initialMarker;
+    let released = false;
+    const heartbeat = async (): Promise<void> => {
+      if (released) return;
+      const next = { ...marker, heartbeatAt: this.now() };
+      if (await updateOwnedMarker(path, next)) marker = next;
+    };
+    const timer = setInterval(() => {
+      void heartbeat().catch(() => undefined);
+    }, this.heartbeatIntervalMs);
+    timer.unref();
+    const release = (): void => {
+      if (released) return;
+      released = true;
+      clearInterval(timer);
+      releaseOwnedMarkerSync(path, marker.token);
+    };
+    const lease = (() => release()) as WorkspaceRootLease;
+    lease.release = release;
+    lease.heartbeat = heartbeat;
+    lease.attachProcess = async (owner): Promise<void> => {
+      if (released) throw new Error("Workspace root lease was already released.");
+      const identity = readProcessIdentity(owner.pid, this.runtime);
+      const next: LockMarker = {
+        ...marker,
+        ownerPid: identity.pid,
+        ...(identity.startIdentity
+          ? { ownerStartIdentity: identity.startIdentity }
+          : { ownerStartIdentity: undefined }),
+        processGroupId: owner.processGroupId ?? identity.processGroupId,
+        heartbeatAt: this.now(),
+      };
+      if (!await updateOwnedMarker(path, next)) {
+        throw new Error("Workspace root lease marker is no longer owned by this process.");
+      }
+      marker = next;
+    };
+    return lease;
   }
 
   private async cleanupStale(
@@ -190,29 +336,47 @@ export class CrossProcessWorkspaceRootLock {
   }
 
   private async cleanupMarker(path: string): Promise<void> {
-    let marker: LockMarker | undefined;
+    let marker: AnyLockMarker | undefined;
     try {
-      const parsed = JSON.parse(await readFile(path, "utf8")) as Partial<LockMarker>;
-      if (
-        Number.isSafeInteger(parsed.pid) &&
-        (parsed.pid ?? 0) > 0 &&
-        typeof parsed.token === "string" &&
-        Number.isFinite(parsed.createdAt)
-      ) {
-        marker = parsed as LockMarker;
-      }
+      marker = parseLockMarker(JSON.parse(await readFile(path, "utf8")) as unknown);
     } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code === "ENOENT") return;
-      // Malformed markers are not valid leases and are removed below.
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      // Marker heartbeats update in place. Another process may briefly observe
+      // a partial JSON write; retain only recently modified malformed files.
+      if (await recentlyModified(path, this.now(), this.heartbeatStaleMs)) return;
     }
-    if (
-      marker &&
-      processAlive(marker.pid)
-    ) {
-      return;
-    }
+    if (marker && this.markerAlive(marker)) return;
     await rm(path, { force: true });
+  }
+
+  private markerAlive(marker: AnyLockMarker): boolean {
+    if ("pid" in marker) return this.runtime.processAlive(marker.pid);
+    const serverIdentity: ProcessIdentity = {
+      pid: marker.serverPid,
+      ...(marker.serverStartIdentity
+        ? { startIdentity: marker.serverStartIdentity }
+        : {}),
+      ...(marker.bootIdentity ? { bootIdentity: marker.bootIdentity } : {}),
+    };
+    if (processIdentityAlive(serverIdentity, this.runtime)) return true;
+    if (marker.ownerPid) {
+      const ownerIdentity: ProcessIdentity = {
+        pid: marker.ownerPid,
+        ...(marker.ownerStartIdentity
+          ? { startIdentity: marker.ownerStartIdentity }
+          : {}),
+        ...(marker.bootIdentity ? { bootIdentity: marker.bootIdentity } : {}),
+      };
+      if (processIdentityAlive(ownerIdentity, this.runtime)) return true;
+    }
+    if (marker.processGroupId && this.runtime.processGroupAlive(marker.processGroupId)) return true;
+    const strongIdentityAvailable = Boolean(
+      marker.serverStartIdentity ||
+      marker.ownerStartIdentity ||
+      marker.processGroupId ||
+      marker.bootIdentity
+    );
+    return !strongIdentityAvailable && this.now() - marker.heartbeatAt <= this.heartbeatStaleMs;
   }
 
   private async cleanupTemporaryMarkers(directory: string): Promise<void> {
@@ -227,8 +391,16 @@ export class CrossProcessWorkspaceRootLock {
     }
     await Promise.all(names.map(async (name) => {
       const path = join(directory, name);
-      const pid = await temporaryMarkerPid(path, name);
-      if (pid !== undefined && processAlive(pid)) return;
+      let marker: AnyLockMarker | undefined;
+      try {
+        marker = parseLockMarker(JSON.parse(await readFile(path, "utf8")) as unknown);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+        if (await recentlyModified(path, this.now(), this.heartbeatStaleMs)) return;
+      }
+      if (marker && this.markerAlive(marker)) return;
+      const pid = temporaryMarkerPid(name);
+      if (pid !== undefined && this.runtime.processAlive(pid)) return;
       await rm(path, { force: true });
     }));
   }
@@ -268,35 +440,79 @@ async function exists(path: string): Promise<boolean> {
   }
 }
 
-function processAlive(pid: number): boolean {
+async function recentlyModified(path: string, now: number, maximumAgeMs: number): Promise<boolean> {
   try {
-    process.kill(pid, 0);
-    return true;
+    const metadata = await stat(path);
+    return now - metadata.mtimeMs <= maximumAgeMs;
   } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
   }
 }
 
-async function temporaryMarkerPid(path: string, name: string): Promise<number | undefined> {
-  try {
-    const parsed = JSON.parse(await readFile(path, "utf8")) as Partial<LockMarker>;
-    if (Number.isSafeInteger(parsed.pid) && (parsed.pid ?? 0) > 0) return parsed.pid;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+function parseLockMarker(value: unknown): AnyLockMarker | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Partial<LockMarker & LegacyLockMarker>;
+  if (
+    record.schemaVersion === LOCK_MARKER_SCHEMA_VERSION &&
+    positive(record.serverPid) &&
+    typeof record.token === "string" && record.token.length > 0 &&
+    finite(record.createdAt) && finite(record.heartbeatAt)
+  ) {
+    return record as LockMarker;
   }
+  if (
+    positive(record.pid) &&
+    typeof record.token === "string" && record.token.length > 0 &&
+    finite(record.createdAt)
+  ) {
+    return { pid: record.pid, token: record.token, createdAt: record.createdAt };
+  }
+  return undefined;
+}
+
+async function updateOwnedMarker(path: string, marker: LockMarker): Promise<boolean> {
+  let handle;
+  try {
+    handle = await open(path, "r+");
+    const current = parseLockMarker(JSON.parse(await handle.readFile("utf8")) as unknown);
+    if (!current || current.token !== marker.token) return false;
+    const bytes = Buffer.from(JSON.stringify(marker), "utf8");
+    await handle.truncate(0);
+    await handle.write(bytes, 0, bytes.byteLength, 0);
+    await handle.sync();
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  } finally {
+    await handle?.close();
+  }
+}
+
+async function removeOwnedMarker(path: string, token: string): Promise<void> {
+  try {
+    const marker = parseLockMarker(JSON.parse(await readFile(path, "utf8")) as unknown);
+    if (marker?.token === token) await rm(path, { force: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+}
+
+function releaseOwnedMarkerSync(path: string, token: string): void {
+  try {
+    const marker = parseLockMarker(JSON.parse(readFileSync(path, "utf8")) as unknown);
+    if (marker?.token === token) rmSync(path, { force: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+}
+
+function temporaryMarkerPid(name: string): number | undefined {
   const value = name.match(/\.(\d+)-[A-Za-z0-9_-]+\.tmp$/u)?.[1];
   if (!value) return undefined;
   const pid = Number(value);
-  return Number.isSafeInteger(pid) && pid > 0 ? pid : undefined;
-}
-
-function releaseFileMarker(path: string): () => void {
-  let released = false;
-  return () => {
-    if (released) return;
-    released = true;
-    rmSync(path, { force: true });
-  };
+  return positive(pid) ? pid : undefined;
 }
 
 function randomToken(): string {
@@ -308,4 +524,12 @@ function positiveInteger(value: number, name: string): number {
     throw new RangeError(`${name} must be a positive safe integer.`);
   }
   return value;
+}
+
+function positive(value: unknown): value is number {
+  return Number.isSafeInteger(value) && Number(value) > 0;
+}
+
+function finite(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
 }

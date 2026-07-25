@@ -64,6 +64,13 @@ interface WorkspaceContextInstructionItemBase {
   path: string;
   hash: string;
   bytes: number;
+  fragment?: {
+    offsetBytes: number;
+    lengthBytes: number;
+    totalBytes: number;
+    complete: boolean;
+    lineBoundary: boolean;
+  };
 }
 
 export type WorkspaceContextInstructionManifestItem = WorkspaceContextInstructionItemBase & (

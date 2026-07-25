@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import {
   classifyCommand,
+  devSpaceSelfManagementViolation,
   splitCommandSegments,
   tokenizeSegment,
   type CommandDecision,
@@ -35,6 +36,28 @@ assert.equal(classifyCommand("ls missing 2>/dev/null || true").decision, "allow"
 assert.equal(classifyCommand("build 2>&1").decision, "allow");
 assert.equal(classifyCommand("echo ok # && rm -rf nested").decision, "allow");
 assert.equal(classifyCommand("echo ok # ignored\nrm -rf nested").decision, "allow");
+
+const selfContext = { pid: 4242, launchdServiceLabel: "com.waishnav.devspace" };
+assert.match(
+  devSpaceSelfManagementViolation("kill -TERM 4242", selfContext) ?? "",
+  /current DevSpace/u,
+);
+assert.match(
+  devSpaceSelfManagementViolation(
+    "/bin/launchctl kickstart -k gui/501/com.waishnav.devspace",
+    selfContext,
+  ) ?? "",
+  /Admin control plane/u,
+);
+assert.match(
+  devSpaceSelfManagementViolation("pkill -f 'dist/cli.js serve'", selfContext) ?? "",
+  /termination/u,
+);
+assert.equal(devSpaceSelfManagementViolation("kill -TERM 9999", selfContext), undefined);
+assert.equal(
+  devSpaceSelfManagementViolation("launchctl print gui/501/com.waishnav.devspace", selfContext),
+  undefined,
+);
 
 for (const command of [
   "touch nested/file.ts",

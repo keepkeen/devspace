@@ -10,6 +10,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { loadConfig } from "./config.js";
 import { connectionRef, oauthClientRef, workspaceActivityRef } from "./logger.js";
+import { MutationOperationStore } from "./mutation-operation-store.js";
 import { DEFAULT_DEVSPACE_OAUTH_SCOPES } from "./oauth-scopes.js";
 import { SqliteOAuthStore } from "./oauth-store.js";
 import { createServer } from "./server.js";
@@ -644,9 +645,128 @@ try {
     (opened.structuredContent as { workspace?: { generation?: unknown } } | undefined)?.workspace?.generation,
   );
   assert.ok(initialGeneration >= 1);
+  const interruptedOperationId = "restart-boundary-interrupted-operation";
   await active.close();
+  const restartWorkspaceStore = new SqliteWorkspaceStore(mainConfig.stateDir);
+  const restartWorkspace = restartWorkspaceStore.getSessionByAlias(
+    connectionPrincipalId!,
+    "primary",
+  );
+  restartWorkspaceStore.close();
+  assert.ok(restartWorkspace);
+  assert.equal(restartWorkspace.id, workspaceA);
+  const interruptedOperations = new MutationOperationStore(mainConfig.stateDir);
+  try {
+    assert.deepEqual(
+      interruptedOperations.reserve(
+        {
+          connectionPrincipalId: connectionPrincipalId!,
+          workspaceId: workspaceA,
+          tool: "apply_patch",
+          operationId: interruptedOperationId,
+        },
+        "restart-boundary-request-hash",
+        restartWorkspace.stateGeneration,
+      ),
+      { status: "new" },
+    );
+  } finally {
+    interruptedOperations.close();
+  }
   active = await startServer(mainConfig);
   const afterRestart = await connectClient("same-account-after-restart", oauthA.accessToken, active.origin);
+  const interruptedStatus = await afterRestart.callTool({
+    name: "get_operation_status",
+    arguments: { operationId: interruptedOperationId },
+  });
+  assertToolSucceeded(interruptedStatus);
+  assert.deepEqual(
+    (interruptedStatus.structuredContent as {
+      operation?: {
+        phase?: unknown;
+        safeToRetry?: unknown;
+        effectsKnown?: unknown;
+      };
+    } | undefined)?.operation,
+    {
+      id: interruptedOperationId,
+      phase: "outcome_unknown",
+      safeToRetry: false,
+      effectsKnown: false,
+    },
+  );
+  const resolutionArguments = {
+    targetOperationId: interruptedOperationId,
+    resolution: "verified_not_started" as const,
+    method: "admin_review" as const,
+    evidenceType: "operator_statement" as const,
+    evidence: {
+      statement: "The operation was inserted as pending after the old server closed and before the new server started.",
+    },
+  };
+  const resolvedInterrupted = await afterRestart.callTool({
+    name: "resolve_operation",
+    arguments: resolutionArguments,
+  });
+  assertToolSucceeded(resolvedInterrupted);
+  assert.deepEqual(
+    (resolvedInterrupted.structuredContent as {
+      operation?: {
+        phase?: unknown;
+        safeToRetry?: unknown;
+        effectsKnown?: unknown;
+      };
+    } | undefined)?.operation,
+    {
+      id: interruptedOperationId,
+      phase: "not_started",
+      safeToRetry: true,
+      effectsKnown: true,
+    },
+  );
+  assert.equal(
+    (resolvedInterrupted.structuredContent as {
+      resolution?: { state?: unknown; method?: unknown; evidenceType?: unknown };
+    } | undefined)?.resolution?.state,
+    "verified_not_started",
+  );
+  const replayedResolution = await afterRestart.callTool({
+    name: "resolve_operation",
+    arguments: resolutionArguments,
+  });
+  assertToolSucceeded(replayedResolution);
+  assert.equal(
+    (replayedResolution.structuredContent as {
+      resolution?: { state?: unknown };
+    } | undefined)?.resolution?.state,
+    "verified_not_started",
+  );
+  const conflictingResolution = await afterRestart.callTool({
+    name: "resolve_operation",
+    arguments: {
+      ...resolutionArguments,
+      resolution: "verified_committed",
+    },
+  });
+  assertToolRejected(conflictingResolution, /operation_resolution_conflict/);
+  const resolvedInterruptedStatus = await afterRestart.callTool({
+    name: "get_operation_status",
+    arguments: { operationId: interruptedOperationId },
+  });
+  assertToolSucceeded(resolvedInterruptedStatus);
+  assert.equal(
+    (resolvedInterruptedStatus.structuredContent as {
+      operation?: { phase?: unknown };
+      resolution?: { state?: unknown };
+    } | undefined)?.operation?.phase,
+    "not_started",
+  );
+  assert.equal(
+    (resolvedInterruptedStatus.structuredContent as {
+      resolution?: { state?: unknown };
+    } | undefined)?.resolution?.state,
+    "verified_not_started",
+  );
   const coldRead = await afterRestart.callTool({
     name: "read",
     arguments: { workspaceId: workspaceA, path: "payload.txt" },
@@ -744,15 +864,20 @@ try {
   quietPrincipalStore.close();
 
   const logText = capturedLogs.join("\n");
-  const oauthRefA = oauthClientRef(oauthA.clientId);
-  const oauthRefB = oauthClientRef(oauthB.clientId);
-  const connectionA = connectionRef(principalA);
-  const connectionB = connectionRef(principalB);
-  const activityA = workspaceActivityRef(principalA, workspaceA);
-  const activityB = workspaceActivityRef(principalB, workspaceB);
-  const quietOauthRef = oauthClientRef(quietCredentials?.clientId);
-  const quietConnection = connectionRef(quietPrincipalId);
-  const quietActivity = workspaceActivityRef(quietPrincipalId, quietWorkspaceId);
+  const auditReferenceKey = mainConfig.oauth.keys.auditReference;
+  const oauthRefA = oauthClientRef(oauthA.clientId, auditReferenceKey);
+  const oauthRefB = oauthClientRef(oauthB.clientId, auditReferenceKey);
+  const connectionA = connectionRef(principalA, auditReferenceKey);
+  const connectionB = connectionRef(principalB, auditReferenceKey);
+  const activityA = workspaceActivityRef(principalA, workspaceA, auditReferenceKey);
+  const activityB = workspaceActivityRef(principalB, workspaceB, auditReferenceKey);
+  const quietOauthRef = oauthClientRef(quietCredentials?.clientId, auditReferenceKey);
+  const quietConnection = connectionRef(quietPrincipalId, auditReferenceKey);
+  const quietActivity = workspaceActivityRef(
+    quietPrincipalId,
+    quietWorkspaceId,
+    auditReferenceKey,
+  );
   assert.ok(
     oauthRefA && oauthRefB && connectionA && connectionB && activityA && activityB &&
     quietCredentials && quietOauthRef && quietConnection && quietActivity,
@@ -930,12 +1055,35 @@ async function registerAndAuthorize(
   assert.match(authorizePage.headers.get("content-type") ?? "", /^text\/html/);
   assert.match(await authorizePage.text(), /Owner password/);
 
-  const approval = await fetch(localUrl(origin, metadata.authorization_endpoint), {
+  let approval = await fetch(localUrl(origin, metadata.authorization_endpoint), {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({ ...Object.fromEntries(authorization), owner_token: ownerPassword }),
     redirect: "manual",
   });
+  if (approval.status === 200) {
+    const selectionPage = await approval.text();
+    const selectionToken = selectionPage.match(
+      /name="selection_token" value="([^"]+)"/u,
+    )?.[1];
+    const rootIds = [...selectionPage.matchAll(
+      /name="root_id" value="([^"]+)"/gu,
+    )].map((match) => match[1]!);
+    assert.ok(selectionToken);
+    assert.ok(rootIds.length > 0);
+    const selection = new URLSearchParams({
+      ...Object.fromEntries(authorization),
+      selection_token: selectionToken,
+      connection_mode: "new",
+    });
+    for (const rootId of rootIds) selection.append("root_id", rootId);
+    approval = await fetch(localUrl(origin, metadata.authorization_endpoint), {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: selection,
+      redirect: "manual",
+    });
+  }
   assert.equal(approval.status, 302);
   const callback = new URL(approval.headers.get("location") ?? "");
   assert.equal(callback.origin, "https://chatgpt.com");

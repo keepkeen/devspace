@@ -4,6 +4,7 @@ import {
   internalDiagnosticsToken,
   internalRevocationToken,
 } from "./internal-auth.js";
+import type { SecurityKeyring } from "./security-credentials.js";
 
 const MAX_INTERNAL_RESPONSE_BYTES = 256 * 1_024;
 
@@ -27,7 +28,10 @@ export interface AdminBackendClient {
 export interface HttpAdminBackendClientOptions {
   host: string;
   port: number;
-  ownerToken: string;
+  keys: Pick<
+    SecurityKeyring,
+    "internalDiagnostics" | "internalConfigReload" | "internalRevocation"
+  >;
   processShutdownGraceMs: number;
 }
 
@@ -42,9 +46,9 @@ export class HttpAdminBackendClient implements AdminBackendClient {
   constructor(options: HttpAdminBackendClientOptions) {
     this.host = internalLoopbackHost(options.host);
     this.port = options.port;
-    this.internalToken = deriveInternalAdminToken(options.ownerToken);
-    this.configReloadToken = internalConfigReloadToken(options.ownerToken);
-    this.revocationToken = internalRevocationToken(options.ownerToken);
+    this.internalToken = deriveInternalAdminToken(options.keys.internalDiagnostics);
+    this.configReloadToken = internalConfigReloadToken(options.keys.internalConfigReload);
+    this.revocationToken = internalRevocationToken(options.keys.internalRevocation);
     this.configReloadTimeoutMs = Math.min(
       2_147_000_000,
       Math.max(15_000, options.processShutdownGraceMs * 2 + 5_000),
@@ -154,8 +158,8 @@ function internalLoopbackHost(host: string): string | undefined {
   return undefined;
 }
 
-export function deriveInternalAdminToken(ownerToken: string): string {
-  return internalDiagnosticsToken(ownerToken);
+export function deriveInternalAdminToken(key: string | Uint8Array): string {
+  return internalDiagnosticsToken(key);
 }
 
 export function redactDiagnosticValue(value: unknown, key = ""): unknown {

@@ -18,11 +18,53 @@ try {
   testKeyIsolation(join(root, "isolation"));
   testPendingCancellation(join(root, "cancellation"));
   testStatusLookupAndGenerationSnapshot(join(root, "status"));
+  testOutcomeResolution(join(root, "resolution"));
   testOversizedResultTombstone(join(root, "oversized"));
   testOwnerMatchedWorkspaceForeignKey(join(root, "owner-fk"));
   testDuplicateMigration(join(root, "duplicate-migration"));
 } finally {
   rmSync(root, { recursive: true, force: true });
+}
+
+function testOutcomeResolution(stateDir: string): void {
+  prepareStateDir(stateDir);
+  let now = 1_000;
+  const store = new MutationOperationStore(stateDir, { now: () => now });
+  const key = operationKey({ operationId: "resolved-operation" });
+  try {
+    assert.deepEqual(store.reserve(key, "hash"), { status: "new" });
+    assert.deepEqual(store.markOutcomeUnknown(key, "hash"), { status: "outcome_unknown" });
+    now = 2_000;
+    const resolved = store.resolveOutcome({
+      connectionPrincipalId: key.connectionPrincipalId,
+      operationId: key.operationId,
+      resolution: "verified_not_started",
+      method: "manual_verification",
+      evidenceType: "status_snapshot",
+      evidence: { process: "absent" },
+      operatorRef: "conn_operator",
+    });
+    assert.equal(resolved?.state, "verified_not_started");
+    assert.deepEqual(resolved?.resolution, {
+      state: "verified_not_started",
+      method: "manual_verification",
+      evidenceType: "status_snapshot",
+      evidence: { process: "absent" },
+      resolvedAt: "1970-01-01T00:00:02.000Z",
+      operatorRef: "conn_operator",
+    });
+    assert.deepEqual(store.reserve(key, "hash"), { status: "verified_not_started" });
+    assert.equal(store.resolveOutcome({
+      connectionPrincipalId: key.connectionPrincipalId,
+      operationId: key.operationId,
+      resolution: "verified_committed",
+      method: "manual_verification",
+      evidenceType: "none",
+      operatorRef: "conn_operator",
+    }), undefined);
+  } finally {
+    store.close();
+  }
 }
 
 function testPendingCancellation(stateDir: string): void {

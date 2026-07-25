@@ -3,9 +3,9 @@ import type {
   WorkspaceContextReceiptBinding,
 } from "./workspace-context-protocol.js";
 
-const DEFAULT_BINDING_TTL_MS = 6 * 60 * 60_000;
 const DEFAULT_MAX_BINDINGS = 4_096;
 const DEFAULT_MAX_BINDINGS_PER_PRINCIPAL = 128;
+const NON_EXPIRING_BINDING = Number.MAX_SAFE_INTEGER;
 
 export interface HostAuthorizationContext {
   principalId: string;
@@ -28,7 +28,6 @@ interface StoredHostWorkspaceBinding extends HostWorkspaceBindingSnapshot {
 
 export interface HostWorkspaceBindingStoreOptions {
   now?: () => number;
-  ttlMs?: number;
   maxBindings?: number;
   maxBindingsPerPrincipal?: number;
 }
@@ -42,13 +41,11 @@ export class HostWorkspaceBindingStore {
   private readonly entries = new Map<string, StoredHostWorkspaceBinding>();
   private readonly entriesByPrincipal = new Map<string, Map<string, true>>();
   private readonly now: () => number;
-  private readonly ttlMs: number;
   private readonly maxBindings: number;
   private readonly maxBindingsPerPrincipal: number;
 
   constructor(options: HostWorkspaceBindingStoreOptions = {}) {
     this.now = options.now ?? Date.now;
-    this.ttlMs = positiveInteger(options.ttlMs ?? DEFAULT_BINDING_TTL_MS, "ttlMs");
     this.maxBindings = positiveInteger(
       options.maxBindings ?? DEFAULT_MAX_BINDINGS,
       "maxBindings",
@@ -69,7 +66,6 @@ export class HostWorkspaceBindingStore {
     if (!entry) return undefined;
     const now = this.now();
     if (
-      entry.expiresAt <= now ||
       entry.grantId !== context.grantId ||
       entry.authorizationEpoch !== context.authorizationEpoch
     ) {
@@ -95,14 +91,16 @@ export class HostWorkspaceBindingStore {
       throw new Error("Host Workspace binding belongs to a different principal.");
     }
     const now = this.now();
-    this.cleanupExpired(now);
     this.remove(key);
     const entry: StoredHostWorkspaceBinding = {
       binding: { ...binding },
       phase: binding.phase,
       grantId: context.grantId,
       authorizationEpoch: context.authorizationEpoch,
-      expiresAt: now + this.ttlMs,
+      // Invalidated by grant/epoch changes, Workspace lifecycle, process
+      // restart, or LRU limits. A long active conversation has no wall-clock
+      // expiry.
+      expiresAt: NON_EXPIRING_BINDING,
       lastUsedAt: now,
     };
     this.touch(key, entry);
@@ -152,12 +150,6 @@ export class HostWorkspaceBindingStore {
     return this.entries.size;
   }
 
-  private cleanupExpired(now: number): void {
-    for (const [key, entry] of this.entries) {
-      if (entry.expiresAt <= now) this.remove(key);
-    }
-  }
-
   private touch(key: string, entry: StoredHostWorkspaceBinding): void {
     this.entries.delete(key);
     this.entries.set(key, entry);
@@ -202,7 +194,7 @@ function bindingKey(context: HostAuthorizationContext): string | undefined {
   if (!Number.isSafeInteger(context.authorizationEpoch) || context.authorizationEpoch < 1) {
     throw new RangeError("authorizationEpoch must be a positive safe integer.");
   }
-  return `${context.principalId}\0${context.sessionHash}`;
+  return `${context.principalId}\0${context.grantId}\0${context.sessionHash}`;
 }
 
 function positiveInteger(value: number, name: string): number {

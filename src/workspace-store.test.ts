@@ -71,7 +71,7 @@ try {
       migratedDatabase.prepare(
         "select version, name from devspace_schema_migrations order by version",
       ).all(),
-      [{ version: 15, name: "canonical-state-v15" }],
+      [{ version: 16, name: "canonical-state-v16" }],
     );
     const workspaceColumns = migratedDatabase.prepare("pragma table_info(workspace_sessions)")
       .all() as Array<{ name: string }>;
@@ -110,6 +110,11 @@ try {
       "request_hash",
       "state",
       "result_json",
+      "resolution_method",
+      "evidence_type",
+      "evidence_json",
+      "resolved_at",
+      "operator_ref",
       "created_at",
       "updated_at",
       "expires_at",

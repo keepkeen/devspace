@@ -71,6 +71,13 @@ try {
 
 function assertInstalledDependencyTree(installRoot) {
   const packageRoot = join(installRoot, "node_modules", "@waishnav", "devspace");
+  for (const readme of ["README.md", "README_EN.md"]) {
+    try {
+      readFileSync(join(packageRoot, readme), "utf8");
+    } catch {
+      throw new Error(`Packed DevSpace is missing ${readme}.`);
+    }
+  }
   const bundledPackages = installedPackageVersions(join(packageRoot, "node_modules"));
   const mcpVersions = bundledPackages.get("@modelcontextprotocol/sdk") ?? [];
   const honoVersions = bundledPackages.get("@hono/node-server") ?? [];

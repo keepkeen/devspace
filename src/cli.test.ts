@@ -4,6 +4,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "./config.js";
+import { AuditEventStore } from "./audit-events.js";
 import { LocalAgentStore } from "./local-agent-store.js";
 import { SqliteOAuthClientsStore, SqliteOAuthStore } from "./oauth-store.js";
 import { SqliteWorkspaceStore } from "./workspace-store.js";
@@ -92,6 +93,49 @@ try {
   );
   assert.match(principalOutput, new RegExp(principalId.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")));
   assert.match(principalOutput, /aliases=cli-primary/);
+
+  const dryRunClose = execFileSync(
+    "node",
+    ["--import", "tsx", "src/cli.ts", "auth", "close-orphan", principalId],
+    { encoding: "utf8", env: authEnv },
+  );
+  assert.match(dryRunClose, /"action": "close-orphan"/u);
+  assert.match(dryRunClose, /"apply": false/u);
+  assert.match(dryRunClose, /Dry run only/u);
+
+  const auditStore = new AuditEventStore(stateDir);
+  try {
+    auditStore.record({
+      ts: "2026-07-25T00:00:00.000Z",
+      level: "error",
+      event: "mcp_tool_error",
+      requestId: "request-cli-audit",
+      tool: "grep",
+      connectionRef: "conn_cli_audit",
+      errorCode: "invalid_pattern",
+      errorName: "InvalidSearchPatternError",
+      errorFingerprint: "fingerprint_cli",
+      phase: "not_started",
+    });
+  } finally {
+    auditStore.close();
+  }
+  const auditOutput = JSON.parse(execFileSync(
+    "node",
+    [
+      "--import",
+      "tsx",
+      "src/cli.ts",
+      "audit",
+      "--event",
+      "mcp_tool_error",
+      "--json",
+    ],
+    { encoding: "utf8", env: authEnv },
+  )) as Array<{ timeChina?: unknown; requestId?: unknown; errorCode?: unknown }>;
+  assert.equal(auditOutput[0]?.timeChina, "2026-07-25 08:00:00.000 UTC+08:00");
+  assert.equal(auditOutput[0]?.requestId, "request-cli-audit");
+  assert.equal(auditOutput[0]?.errorCode, "invalid_pattern");
 
   const reconnectOutput = execFileSync(
     "node",

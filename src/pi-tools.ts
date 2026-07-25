@@ -68,6 +68,68 @@ interface ReadToolDetails {
   truncation?: TruncationResult;
 }
 
+export interface PiToolStructuredError {
+  code: "invalid_pattern" | "invalid_glob" | "invalid_tool_input";
+  retryable: true;
+  safeToRetry: true;
+  recovery: "correct_pattern" | "correct_glob" | "correct_input";
+  phase: "not_started";
+  effectsKnown: true;
+}
+
+export class PiToolInputError extends Error {
+  constructor(
+    readonly structuredError: PiToolStructuredError,
+    readonly publicText: string,
+    options?: ErrorOptions,
+  ) {
+    super(publicText, options);
+    this.name = "PiToolInputError";
+  }
+}
+
+export class InvalidSearchPatternError extends PiToolInputError {
+  constructor(cause?: unknown) {
+    super({
+      code: "invalid_pattern",
+      retryable: true,
+      safeToRetry: true,
+      recovery: "correct_pattern",
+      phase: "not_started",
+      effectsKnown: true,
+    }, "The search regular expression is invalid; correct the pattern and retry.", { cause });
+    this.name = "InvalidSearchPatternError";
+  }
+}
+
+export class InvalidGlobPatternError extends PiToolInputError {
+  constructor(cause?: unknown) {
+    super({
+      code: "invalid_glob",
+      retryable: true,
+      safeToRetry: true,
+      recovery: "correct_glob",
+      phase: "not_started",
+      effectsKnown: true,
+    }, "The glob pattern is invalid; correct the glob and retry.", { cause });
+    this.name = "InvalidGlobPatternError";
+  }
+}
+
+export class InvalidToolInputError extends PiToolInputError {
+  constructor(publicText: string, cause?: unknown) {
+    super({
+      code: "invalid_tool_input",
+      retryable: true,
+      safeToRetry: true,
+      recovery: "correct_input",
+      phase: "not_started",
+      effectsKnown: true,
+    }, publicText, { cause });
+    this.name = "InvalidToolInputError";
+  }
+}
+
 interface EditToolDetails {
   patch: string;
   diff: string;
@@ -89,6 +151,7 @@ export type ToolResponse<TDetails = unknown> = {
   content: McpContent[];
   details?: TDetails;
   isError?: boolean;
+  error?: PiToolStructuredError;
 };
 
 interface ToolContext {
@@ -159,6 +222,16 @@ async function runLocalTool<TDetails>(
   try {
     return await operation();
   } catch (error) {
+    if (error instanceof PiToolInputError) {
+      return {
+        content: [{
+          type: "text",
+          text: `${error.structuredError.code}: ${error.publicText}`,
+        }],
+        isError: true,
+        error: error.structuredError,
+      };
+    }
     context.onError?.(error);
     return {
       content: [{ type: "text", text: sanitizePiToolError(error, context) }],
@@ -269,9 +342,14 @@ export async function grepFilesTool(
     const searchPath = resolveAllowedPath(input.path ?? ".", context.cwd, [context.root]);
     const effectiveLimit = Math.max(1, input.limit ?? DEFAULT_GREP_LIMIT);
     const contextLines = Math.max(0, input.context ?? 0);
-    const expression = input.literal
-      ? new RegExp(escapeRegExp(input.pattern), input.ignoreCase ? "iu" : "u")
-      : new RegExp(input.pattern, input.ignoreCase ? "iu" : "u");
+    let expression: RegExp;
+    try {
+      expression = input.literal
+        ? new RegExp(escapeRegExp(input.pattern), input.ignoreCase ? "iu" : "u")
+        : new RegExp(input.pattern, input.ignoreCase ? "iu" : "u");
+    } catch (error) {
+      throw new InvalidSearchPatternError(error);
+    }
     const files = await collectFiles(searchPath);
     const output: string[] = [];
     let matches = 0;
@@ -420,11 +498,19 @@ function displayRelative(root: string, path: string, singleFile: boolean): strin
 }
 
 function globMatches(path: string, pattern: string): boolean {
-  return minimatch(toPosix(path), toPosix(pattern), {
-    dot: true,
-    matchBase: !pattern.includes("/") && !pattern.includes("\\"),
-    nocase: process.platform === "win32",
-  });
+  try {
+    return minimatch(toPosix(path), toPosix(pattern), {
+      dot: true,
+      matchBase: !pattern.includes("/") && !pattern.includes("\\"),
+      nocase: process.platform === "win32",
+    });
+  } catch (error) {
+    throw new InvalidGlobPatternError(error);
+  }
+}
+
+export function isExpectedPiToolInputError(error: unknown): boolean {
+  return error instanceof PiToolInputError;
 }
 
 function toPosix(path: string): string {

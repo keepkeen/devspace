@@ -15,7 +15,7 @@ const binding: WorkspaceContextReceiptBinding = {
   phase: "context_loaded",
 };
 
-test("host Workspace bindings require matching grant, epoch, principal, and session", () => {
+test("host Workspace bindings isolate grants and require matching epoch, principal, and session", () => {
   const store = new HostWorkspaceBindingStore();
   const authorization = {
     principalId: "principal-a",
@@ -25,15 +25,29 @@ test("host Workspace bindings require matching grant, epoch, principal, and sess
   };
   store.bind(authorization, binding);
   assert.equal(store.resolve(authorization)?.binding.workspaceId, "workspace-a");
-  assert.equal(store.resolve({ ...authorization, grantId: "grant-b" }), undefined);
-  assert.equal(store.resolve(authorization), undefined, "grant mismatch invalidates the entry");
+  const otherGrant = { ...authorization, grantId: "grant-b" };
+  assert.equal(store.resolve(otherGrant), undefined);
+  assert.equal(
+    store.resolve(authorization)?.binding.workspaceId,
+    "workspace-a",
+    "looking up another grant must not evict the original binding",
+  );
+  store.bind(otherGrant, {
+    ...binding,
+    workspaceId: "workspace-b",
+    contextSessionId: "context-b",
+  });
+  assert.equal(store.resolve(authorization)?.binding.workspaceId, "workspace-a");
+  assert.equal(store.resolve(otherGrant)?.binding.workspaceId, "workspace-b");
+  assert.equal(store.resolve({ ...authorization, authorizationEpoch: 3 }), undefined);
+  assert.equal(store.resolve(authorization), undefined, "epoch mismatch invalidates its grant binding");
+  assert.equal(store.resolve(otherGrant)?.binding.workspaceId, "workspace-b");
 });
 
-test("host Workspace bindings expire and enforce per-principal limits", () => {
+test("host Workspace bindings do not expire and enforce per-principal limits", () => {
   let now = 100;
   const store = new HostWorkspaceBindingStore({
     now: () => now,
-    ttlMs: 10,
     maxBindings: 3,
     maxBindingsPerPrincipal: 2,
   });
@@ -47,8 +61,11 @@ test("host Workspace bindings expire and enforce per-principal limits", () => {
   store.bind({ ...authorization, sessionHash: "three" }, { ...binding, workspaceId: "workspace-c" });
   assert.equal(store.resolve({ ...authorization, sessionHash: "one" }), undefined);
   assert.equal(store.size, 2);
-  now = 111;
-  assert.equal(store.resolve({ ...authorization, sessionHash: "two" }), undefined);
+  now = Number.MAX_SAFE_INTEGER - 1;
+  assert.equal(
+    store.resolve({ ...authorization, sessionHash: "two" })?.binding.workspaceId,
+    "workspace-b",
+  );
 });
 
 test("hosts without session metadata cannot create an implicit binding", () => {

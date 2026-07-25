@@ -18,7 +18,11 @@ let rootsReloadCount = 0;
 let rootsCleanupPending = 0;
 const app = express();
 app.use(createRuntimeControlPlane({
-  ownerToken,
+  internalAuth: {
+    diagnostics: ownerToken,
+    configReload: ownerToken,
+    revocation: ownerToken,
+  },
   generation: "runtime-generation",
   runtimeConfig: { widgets: "changes" },
   allowedRootsRevision: () => "roots-revision-test",

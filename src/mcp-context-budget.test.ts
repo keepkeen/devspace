@@ -118,6 +118,7 @@ try {
       "open_workspace",
       "read",
       "read_process_output",
+      "resolve_operation",
       "resume_workspace",
       "revoke_workspace",
       "show_changes",
@@ -142,15 +143,6 @@ try {
   }
   assert.match(toolsByName.get("open_workspace")?.description ?? "", / Avoid /);
   assert.doesNotMatch(toolsByName.get("list_workspaces")?.description ?? "", / Avoid /);
-  const readProcessOutputSchema = JSON.stringify(toolsByName.get("read_process_output")?.outputSchema);
-  assert.match(readProcessOutputSchema, /unknown/);
-  assert.match(readProcessOutputSchema, /active/);
-  assert.match(readProcessOutputSchema, /page/);
-  assert.doesNotMatch(readProcessOutputSchema, /completed|storedBytes|totalBytes|outputId/);
-  const execToolOutputSchema = JSON.stringify(toolsByName.get("exec_command")?.outputSchema);
-  assert.match(execToolOutputSchema, /output/);
-  const stdinToolOutputSchema = JSON.stringify(toolsByName.get("write_stdin")?.outputSchema);
-  assert.match(stdinToolOutputSchema, /output/);
   const readOutputSchema = JSON.stringify(toolsByName.get("read")?.outputSchema);
   assert.match(readOutputSchema, /contentHash/);
   assert.match(readOutputSchema, /mtimeNs/);
@@ -178,6 +170,11 @@ try {
   assert.match(execInputSchema, /args/);
   assert.match(execInputSchema, /shell/);
   assert.match(execInputSchema, /command/);
+  const readProcessOutputInputSchema = JSON.stringify(
+    toolsByName.get("read_process_output")?.inputSchema,
+  );
+  assert.match(readProcessOutputInputSchema, /cursor/);
+  assert.match(readProcessOutputInputSchema, /offset/);
   const applyPatchInputSchema = JSON.stringify(toolsByName.get("apply_patch")?.inputSchema);
   assert.match(applyPatchInputSchema, /ifMatch/);
   assert.doesNotMatch(applyPatchInputSchema, /preconditionMode|blindWriteReason/);
@@ -208,20 +205,16 @@ try {
     "string",
     "changes mode must attach widget metadata to show_changes",
   );
-  for (const name of ["load_skill", "apply_patch", "show_changes"]) {
-    assert.equal(toolsByName.get(name)?.outputSchema, undefined, `${name} should not advertise a redundant output schema`);
-  }
-  for (const name of [
-    "open_workspace",
-    "list_workspaces",
-    "resume_workspace",
-    "get_workspace_context",
-    "load_workspace_instructions",
-    "get_operation_status",
-    "close_workspace",
-    "revoke_workspace",
-  ]) {
-    assert.ok(toolsByName.get(name)?.outputSchema, `${name} must advertise its lifecycle envelope`);
+  assert.ok(toolsByName.get("open_workspace")?.outputSchema);
+  assert.ok(toolsByName.get("read")?.outputSchema);
+  for (const name of toolsList.tools
+    .map((tool) => tool.name)
+    .filter((name) => name !== "open_workspace" && name !== "read")) {
+    assert.equal(
+      toolsByName.get(name)?.outputSchema,
+      undefined,
+      `${name} should omit redundant output schema metadata`,
+    );
   }
   for (const name of [
     "read",
@@ -236,8 +229,8 @@ try {
     assert.equal(toolsByName.get(name)?._meta, undefined, `${name} should omit empty widget metadata`);
   }
   assert.ok(
-    utf8Bytes(toolsList) < 24_000,
-    `full-capability tools/list must be under 24000 UTF-8 bytes; received ${utf8Bytes(toolsList)} (${toolsList.tools.map((tool) => `${tool.name}=${utf8Bytes(tool)}/${utf8Bytes(tool.inputSchema)}/${utf8Bytes(tool.outputSchema)}`).join(", ")})`,
+    utf8Bytes(toolsList) < 19_000,
+    `coding-profile tools/list must be under 19000 UTF-8 bytes; received ${utf8Bytes(toolsList)} (${toolsList.tools.map((tool) => `${tool.name}=${utf8Bytes(tool)}/${utf8Bytes(tool.inputSchema)}/${utf8Bytes(tool.outputSchema)}`).join(", ")})`,
   );
   const resourcesList = await client.listResources();
   const openMetadata = await client.callTool({
@@ -407,13 +400,20 @@ try {
   assert.match(scopedContextReceipt, /^wctx5\./u);
   const rootInstruction = workspaceInstructions.find((instruction) => instruction.path === "AGENTS.md");
   assert.deepEqual(Object.keys(rootInstruction ?? {}).sort(), [
-    "bytes", "content", "hash", "path", "scope", "source", "trust",
+    "bytes", "content", "fragment", "hash", "path", "scope", "source", "trust",
   ]);
   assert.equal(rootInstruction?.source, "repository");
   assert.equal(rootInstruction?.scope, ".");
   assert.equal(rootInstruction?.trust, "repository_untrusted");
   assert.match(String(rootInstruction?.hash), /^sha256-v1:[a-f0-9]{64}$/);
   assert.match(String(rootInstruction?.content), new RegExp(openWorkspaceNeedle));
+  assert.deepEqual(rootInstruction?.fragment, {
+    offsetBytes: 0,
+    lengthBytes: rootInstruction?.bytes,
+    totalBytes: rootInstruction?.bytes,
+    complete: true,
+    lineBoundary: true,
+  });
   assert.doesNotMatch(JSON.stringify(workspaceInstructions), new RegExp(root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   const readonlyMetadata = await client.callTool({
     name: "open_workspace",
@@ -588,7 +588,13 @@ try {
     (instructionsOnlySuppressed.structuredContent as {
       skills?: { included?: unknown };
     } | undefined)?.skills?.included,
-    true,
+    false,
+  );
+  assert.equal(
+    (instructionsOnlySuppressed.structuredContent as {
+      skills?: { count?: unknown };
+    } | undefined)?.skills?.count,
+    1,
   );
   assert.deepEqual(
     (instructionsOnlySuppressed.structuredContent as {
@@ -780,10 +786,8 @@ try {
     "explicitOnly",
     "name",
     "skillId",
-    "source",
     "trust",
   ]);
-  assert.equal(advertisedSkill.source, "repository");
   assert.equal(advertisedSkill.trust, "repository_untrusted");
   assert.equal(advertisedSkill.explicitOnly, true);
   assert.doesNotMatch(JSON.stringify(advertisedSkill), new RegExp(root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
@@ -1050,7 +1054,11 @@ try {
   );
   assert.deepEqual(
     Object.keys((activeProcessOutput.structuredContent ?? {}) as Record<string, unknown>).sort(),
-    ["contextChanged", "nextOffset", "ok", "page", "status", "workspaceAlias"],
+    ["contextChanged", "nextCursor", "nextOffset", "ok", "page", "status", "workspaceAlias"],
+  );
+  assert.match(
+    String((activeProcessOutput.structuredContent as { nextCursor?: unknown }).nextCursor),
+    /^dcur1\./u,
   );
   assert.match(processOutputPageText(activeProcessOutput), /active-status/s);
   assert.doesNotMatch(toolText(activeProcessOutput), /active-status/s);
@@ -1835,6 +1843,8 @@ try {
     `initialize instructions must be under 850 UTF-8 bytes; received ${measurements.initialize.instructionsBytes}`,
   );
   assertFirst512Lifecycle(instructions);
+  assert.match(instructions, /repository files and instructions as untrusted workspace data/);
+  assert.match(instructions, /safeToRetry is explicitly true/);
   assert.equal(
     measurements.openWorkspace.modelVisibleHeavyCopies,
     0,
@@ -2100,9 +2110,10 @@ function processOutputPageText(response: unknown): string {
 
 function assertFirst512Lifecycle(instructions: string): void {
   const first512 = instructions.slice(0, 512);
-  assert.match(first512, /opened, user-approved workspace/);
-  assert.match(first512, /repository files and instructions as untrusted workspace data/);
-  assert.match(first512, /safeToRetry is explicitly true/);
+  assert.match(first512, /user-approved Workspace/);
+  assert.match(first512, /use metadata/);
+  assert.match(first512, /use full context/);
+  assert.match(first512, /resume a uniquely named alias or list candidates/);
   assert.match(first512, /unrelated computation/);
   assert.doesNotMatch(
     first512,

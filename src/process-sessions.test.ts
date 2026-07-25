@@ -1143,7 +1143,7 @@ try {
   });
   assert.equal(running.running, true);
   assert.ok(running.sessionId);
-  assert.equal(leaseManager.attachWorkspaceRootLease(
+  assert.equal(await leaseManager.attachWorkspaceRootLease(
     connectionPrincipalId,
     "root-lease",
     running.sessionId!,
@@ -1160,7 +1160,7 @@ try {
   assert.equal(released, 1, "the lease must release after the complete process tree exits");
 
   let rejectedRelease = 0;
-  assert.equal(leaseManager.attachWorkspaceRootLease(
+  assert.equal(await leaseManager.attachWorkspaceRootLease(
     connectionPrincipalId,
     "root-lease",
     999_999,

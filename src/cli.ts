@@ -2,6 +2,7 @@
 import { createRequire } from "node:module";
 import { stdin as input, stdout as output } from "node:process";
 import { spawn } from "node:child_process";
+import { get as httpGet } from "node:http";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -9,7 +10,7 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as prompts from "@clack/prompts";
 import { satisfies } from "semver";
-import { DEVSPACE_VERSION } from "./version.js";
+import { DEVSPACE_VERSION, SUPPORTED_NODE_RANGE } from "./version.js";
 import { loadConfig } from "./config.js";
 import { runLocalAgentProvider } from "./local-agent-adapters.js";
 import {
@@ -33,6 +34,7 @@ import {
   removeDetachedAgentPrompt,
 } from "./detached-agent-cleanup.js";
 import {
+  createDevspaceAuth,
   ensureDevspaceDefaultSkills,
   generateOwnerToken,
   loadDevspaceFiles,
@@ -44,10 +46,12 @@ import {
 } from "./user-config.js";
 import { expandHomePath } from "./roots.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
+import { AuditEventStore, type AuditEventQuery } from "./audit-events.js";
+import { formatChinaTimestamp } from "./logger.js";
+import { inspectInstructionHealth } from "./instruction-health.js";
 
-type Command = "serve" | "admin" | "init" | "doctor" | "config" | "auth" | "agents" | "help" | "version";
+type Command = "serve" | "admin" | "init" | "doctor" | "config" | "auth" | "audit" | "agents" | "help" | "version";
 const require = createRequire(import.meta.url);
-const SUPPORTED_NODE_RANGE = ">=20.12 <27";
 
 async function main(argv: string[]): Promise<void> {
   assertSupportedNode();
@@ -77,6 +81,10 @@ async function main(argv: string[]): Promise<void> {
       await ensureConfigured();
       await runAuthCommand(args);
       return;
+    case "audit":
+      await ensureConfigured();
+      runAuditCommand(args);
+      return;
     case "agents":
       await runAgentsCommand(args);
       return;
@@ -97,6 +105,7 @@ function normalizeCommand(command: string | undefined): Command {
     command === "doctor" ||
     command === "config" ||
     command === "auth" ||
+    command === "audit" ||
     command === "agents"
   ) return command;
   if (command === "help" || command === "--help" || command === "-h") return "help";
@@ -184,9 +193,12 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
       publicBaseUrl,
       subagents: resolveSubagentsFlag(files.config),
     };
-    const auth = {
-      ownerToken: files.auth.ownerToken ?? generateOwnerToken(),
-    };
+    const displayedOwnerPassword = files.auth.ownerPasswordHash
+      ? files.migratedOwnerPassword
+      : generateOwnerToken();
+    const auth = files.auth.ownerPasswordHash
+      ? files.auth
+      : createDevspaceAuth(displayedOwnerPassword!);
 
     const configPath = writeDevspaceConfig(config);
     const authPath = writeDevspaceAuth(auth);
@@ -200,14 +212,26 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
       ...(publicBaseUrl ? [`Public MCP URL: ${publicBaseUrl}/mcp`] : []),
     ];
     prompts.note(lines.join("\n"), "DevSpace configured");
-    prompts.note(
-      [
-        `Owner password: ${auth.ownerToken}`,
-        "Use this when ChatGPT or Claude asks you to approve DevSpace access.",
-        `Stored at: ${authPath}`,
-      ].join("\n"),
-      "Owner password",
-    );
+    if (displayedOwnerPassword) {
+      prompts.note(
+        [
+          `Owner password: ${displayedOwnerPassword}`,
+          "Use this when ChatGPT or Claude asks you to approve DevSpace access.",
+          "The password is shown only during creation or legacy migration; only its Argon2id hash is stored.",
+          `Stored verifier and master key: ${authPath}`,
+        ].join("\n"),
+        "Owner password",
+      );
+    } else {
+      prompts.note(
+        [
+          "Existing Owner password verifier and master key were preserved.",
+          "DevSpace cannot recover or display the existing Owner password.",
+          `Stored at: ${authPath}`,
+        ].join("\n"),
+        "Owner password",
+      );
+    }
     prompts.outro("Run `devspace serve` to start the MCP server.");
   } catch (error) {
     if (error instanceof SetupCancelledError) {
@@ -339,6 +363,32 @@ async function runDoctor(): Promise<void> {
     console.log(`Public MCP URL: ${new URL("/mcp", config.publicBaseUrl).toString()}`);
     console.log(`Allowed roots: ${config.allowedRoots.join(", ")}`);
     console.log(`Allowed hosts: ${config.allowedHosts.join(", ")}`);
+    console.log(
+      `Master key: ${config.oauth.keys.derivation} ` +
+      `(${config.oauth.keys.source}, ${config.oauth.keys.masterKeyFingerprint})`,
+    );
+    if (config.oauth.keys.legacyCompatibility) {
+      console.log(
+        "Security warning: master key uses legacy-direct compatibility. " +
+        "Rotate it only during a planned global reauthorization.",
+      );
+    }
+    const instructionHealth = await inspectInstructionHealth(
+      config.allowedRoots,
+      config.projectDocFallbackFilenames,
+    );
+    console.log(
+      `Instruction health: ${instructionHealth.instructionFiles} file(s), ` +
+      `${instructionHealth.issues.length} issue(s), ` +
+      `${instructionHealth.scannedDirectories} directories scanned` +
+      `${instructionHealth.truncated ? " (bounded scan truncated)" : ""}`,
+    );
+    for (const issue of instructionHealth.issues) {
+      console.log(
+        `Instruction ${issue.severity} [${issue.code}]: ` +
+        `${join(issue.root, issue.path)} — ${issue.message}`,
+      );
+    }
   } catch (error) {
     console.log(`Config status: ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -371,8 +421,9 @@ function runConfigCommand(args: string[]): void {
 }
 
 async function runAuthCommand(args: string[]): Promise<void> {
-  const [subcommand, principalId, ...rest] = args;
-  if (rest.length > 0) throw new Error(`Unexpected auth argument: ${rest[0]}`);
+  const [subcommand, ...rawRest] = args;
+  const apply = rawRest.includes("--apply");
+  const rest = rawRest.filter((entry) => entry !== "--apply");
   const config = loadConfig();
   const { SqliteOAuthStore } = await import("./oauth-store.js");
   const store = new SqliteOAuthStore(config.stateDir);
@@ -399,6 +450,8 @@ async function runAuthCommand(args: string[]): Promise<void> {
         return;
       }
       case "reconnect-code": {
+        const [principalId, ...unexpected] = rest;
+        if (unexpected.length > 0) throw new Error(`Unexpected auth argument: ${unexpected[0]}`);
         if (!principalId) {
           throw new Error("`devspace auth reconnect-code` requires a connection principal ID.");
         }
@@ -407,6 +460,71 @@ async function runAuthCommand(args: string[]): Promise<void> {
         console.log(`Principal: ${issued.principalId}`);
         console.log(`Expires: ${issued.expiresAt}`);
         console.log("Enter this code once on the DevSpace OAuth approval page for the new connector registration.");
+        return;
+      }
+      case "transfer-workspaces": {
+        const [sourcePrincipalId, targetPrincipalId, ...unexpected] = rest;
+        if (!sourcePrincipalId || !targetPrincipalId || unexpected.length > 0) {
+          throw new Error(
+            "Usage: devspace auth transfer-workspaces <source-principal> <target-principal> [--apply]",
+          );
+        }
+        const preview = store.previewWorkspaceTransfer(sourcePrincipalId, targetPrincipalId);
+        console.log(JSON.stringify({ action: "transfer-workspaces", apply, preview }, null, 2));
+        if (!apply) {
+          console.log("Dry run only. Add --apply after reviewing conflicts and counts.");
+          return;
+        }
+        if (!preview.transferable) {
+          throw new Error("Workspace transfer is not safe; resolve the reported conflicts first.");
+        }
+        await assertBackendStopped(config);
+        console.log(JSON.stringify({
+          action: "transfer-workspaces",
+          result: store.transferPrincipalWorkspaces(sourcePrincipalId, targetPrincipalId),
+        }, null, 2));
+        return;
+      }
+      case "close-orphan": {
+        const [principalId, ...unexpected] = rest;
+        if (!principalId || unexpected.length > 0) {
+          throw new Error("Usage: devspace auth close-orphan <principal-id> [--apply]");
+        }
+        const preview = store.previewOrphanClose(principalId);
+        console.log(JSON.stringify({ action: "close-orphan", apply, preview }, null, 2));
+        if (!apply) {
+          console.log("Dry run only. Add --apply to close active records without deleting worktrees.");
+          return;
+        }
+        if (!preview.closable) throw new Error("The principal still has an active OAuth client.");
+        await assertBackendStopped(config);
+        console.log(JSON.stringify({
+          action: "close-orphan",
+          result: store.closeOrphanPrincipal(principalId),
+        }, null, 2));
+        return;
+      }
+      case "relink-client": {
+        const [clientId, targetPrincipalId, ...unexpected] = rest;
+        if (!clientId || !targetPrincipalId || unexpected.length > 0) {
+          throw new Error(
+            "Usage: devspace auth relink-client <oauth-client-id> <target-principal> [--apply]",
+          );
+        }
+        const preview = store.previewClientRelink(clientId, targetPrincipalId);
+        console.log(JSON.stringify({ action: "relink-client", apply, preview }, null, 2));
+        if (!apply) {
+          console.log("Dry run only. Add --apply to revoke current tokens and relink the client.");
+          return;
+        }
+        if (!preview.relinkable) {
+          throw new Error("Transfer or close the source principal's retained Workspaces first.");
+        }
+        await assertBackendStopped(config);
+        console.log(JSON.stringify({
+          action: "relink-client",
+          result: store.relinkClientToPrincipal(clientId, targetPrincipalId),
+        }, null, 2));
         return;
       }
       case undefined:
@@ -430,11 +548,106 @@ function printAuthHelp(): void {
     "Usage:",
     "  devspace auth principals",
     "  devspace auth reconnect-code <principal-id>",
+    "  devspace auth transfer-workspaces <source> <target> [--apply]",
+    "  devspace auth close-orphan <principal-id> [--apply]",
+    "  devspace auth relink-client <oauth-client-id> <target> [--apply]",
     "",
-    "A connection principal is a local DevSpace identity shared only when you",
-    "explicitly enter a short-lived reconnect code. It is not a verified",
-    "ChatGPT account identity.",
+    "Mutation commands are dry-run by default and require the backend to be stopped",
+    "when --apply is used. OAuth approval can also reuse a principal locally after",
+    "Owner-password verification. A principal is not a verified ChatGPT identity.",
   ].join("\n"));
+}
+
+function runAuditCommand(args: string[]): void {
+  const config = loadConfig();
+  const query: AuditEventQuery = {};
+  let json = false;
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index]!;
+    if (argument === "--json") {
+      json = true;
+      continue;
+    }
+    const value = args[index + 1];
+    if (!value) throw new Error(`Missing value after ${argument}`);
+    switch (argument) {
+      case "--event": query.event = value; break;
+      case "--tool": query.tool = value; break;
+      case "--request": query.requestId = value; break;
+      case "--connection": query.connectionRef = value; break;
+      case "--workspace-activity": query.workspaceActivityRef = value; break;
+      case "--since": {
+        const parsed = new Date(value);
+        if (Number.isNaN(parsed.getTime())) throw new Error("--since must be an ISO timestamp.");
+        query.since = parsed.toISOString();
+        break;
+      }
+      case "--limit": {
+        const limit = Number(value);
+        if (!Number.isInteger(limit) || limit < 1 || limit > 1_000) {
+          throw new Error("--limit must be an integer from 1 to 1000.");
+        }
+        query.limit = limit;
+        break;
+      }
+      default: throw new Error(`Unknown audit option: ${argument}`);
+    }
+    index += 1;
+  }
+  const store = new AuditEventStore(config.stateDir);
+  try {
+    const events = store.query(query).map((event) => ({
+      ...event,
+      timeChina: formatChinaTimestamp(event.ts),
+    }));
+    if (json) {
+      console.log(JSON.stringify(events, null, 2));
+      return;
+    }
+    if (events.length === 0) {
+      console.log("No matching persistent audit events.");
+      return;
+    }
+    for (const event of events) {
+      console.log([
+        event.timeChina,
+        event.level.toUpperCase(),
+        event.event,
+        event.tool ? `tool=${event.tool}` : "",
+        event.requestId ? `request=${event.requestId}` : "",
+        event.connectionRef ? `connection=${event.connectionRef}` : "",
+        event.workspaceActivityRef ? `workspace=${event.workspaceActivityRef}` : "",
+        event.errorCode ? `error=${event.errorCode}` : "",
+        Object.keys(event.details).length > 0 ? `details=${JSON.stringify(event.details)}` : "",
+      ].filter(Boolean).join(" "));
+    }
+  } finally {
+    store.close();
+  }
+}
+
+async function assertBackendStopped(config: ReturnType<typeof loadConfig>): Promise<void> {
+  const host = config.host === "0.0.0.0" || config.host === "localhost"
+    ? "127.0.0.1"
+    : config.host === "::"
+      ? "::1"
+      : config.host;
+  const running = await new Promise<boolean>((resolveProbe) => {
+    const request = httpGet({ host, port: config.port, path: "/readyz", timeout: 500 }, (response) => {
+      response.resume();
+      resolveProbe(response.statusCode === 200);
+    });
+    request.on("timeout", () => {
+      request.destroy();
+      resolveProbe(false);
+    });
+    request.on("error", () => resolveProbe(false));
+  });
+  if (running) {
+    throw new Error(
+      "Stop the DevSpace backend before applying principal state changes, then rerun this command.",
+    );
+  }
 }
 
 function printHelp(): void {
@@ -453,6 +666,10 @@ function printHelp(): void {
       "  devspace config set publicBaseUrl <url|null>",
       "  devspace auth principals List local connection principals",
       "  devspace auth reconnect-code <principal-id>",
+      "  devspace auth transfer-workspaces <source> <target> [--apply]",
+      "  devspace auth close-orphan <principal-id> [--apply]",
+      "  devspace auth relink-client <oauth-client-id> <target> [--apply]",
+      "  devspace audit [filters] Query persistent safe audit events in China time",
       "  devspace agents ls       List subagent sessions",
       "  devspace agents run <profile-or-provider-or-id> [--model <model>] <prompt>",
       "  devspace agents show <id>",
@@ -808,7 +1025,7 @@ function assertSupportedNode(): void {
       `DevSpace requires Node ${SUPPORTED_NODE_RANGE}.`,
       `Current Node: ${process.version}`,
       "",
-      "Install Node 22 LTS or use a version manager such as nvm, fnm, or mise.",
+      "Install a supported Node release (22.19 through 26) or use nvm, fnm, or mise.",
     ].join("\n"),
   );
 }

@@ -30,14 +30,47 @@ import {
   workspaceAppAssetPaths,
 } from "./server.js";
 import type { Skill } from "./skills.js";
+import { InvalidSearchPatternError } from "./pi-tools.js";
 import { UnknownWorkspaceError } from "./workspaces.js";
 import {
+  boundedLogHeader,
   connectionRef,
+  contentLengthForLog,
+  formatChinaTimestamp,
   isLoopbackProxyPeer,
+  logEvent,
   oauthClientRef,
+  originForLog,
+  refererForLog,
   workspaceActivityRef,
 } from "./logger.js";
 
+assert.equal(
+  formatChinaTimestamp("2026-07-25T00:00:00.123Z"),
+  "2026-07-25 08:00:00.123 UTC+08:00",
+);
+const silentAuditEntries: Array<Readonly<Record<string, unknown>>> = [];
+logEvent({
+  level: "silent",
+  format: "json",
+  requests: true,
+  assets: false,
+  toolCalls: true,
+  shellCommands: false,
+  trustProxy: false,
+  auditEvents: true,
+  auditSink: (entry) => silentAuditEntries.push(entry),
+}, "warn", "silent_console_audit_test", { reason: "test" });
+assert.equal(silentAuditEntries.length, 1);
+assert.equal(silentAuditEntries[0]?.event, "silent_console_audit_test");
+assert.equal(originForLog("https://user:secret@example.com/path?q=token"), "https://example.com");
+assert.equal(
+  refererForLog("https://user:secret@example.com/path?q=token#fragment"),
+  "https://example.com/path",
+);
+assert.equal(contentLengthForLog("1234"), 1234);
+assert.equal(contentLengthForLog("invalid"), undefined);
+assert.ok(Buffer.byteLength(boundedLogHeader("中".repeat(500), 64) ?? "", "utf8") <= 67);
 assert.equal(isLoopbackProxyPeer("127.0.0.1"), true);
 assert.equal(isLoopbackProxyPeer("127.12.34.56"), true);
 assert.equal(isLoopbackProxyPeer("::1"), true);
@@ -63,12 +96,22 @@ assert.notEqual(
   workspaceActivityRef("principal-b", "ws_project_a"),
 );
 assert.match(workspaceActivityRef("principal-a", "ws_project_a") ?? "", /^act_[a-f0-9]{12}$/u);
+const auditKeyA = Buffer.alloc(32, 1);
+const auditKeyB = Buffer.alloc(32, 2);
+assert.equal(connectionRef("principal-a", auditKeyA), connectionRef("principal-a", auditKeyA));
+assert.notEqual(connectionRef("principal-a", auditKeyA), connectionRef("principal-a", auditKeyB));
+assert.notEqual(oauthClientRef("client-a", auditKeyA), oauthClientRef("client-a", auditKeyB));
+assert.notEqual(
+  workspaceActivityRef("principal-a", "ws_project_a", auditKeyA),
+  workspaceActivityRef("principal-a", "ws_project_a", auditKeyB),
+);
 assert.equal(workspaceActivityRef(undefined, "ws_project_a"), undefined);
 assert.equal(workspaceActivityRef("principal-a", undefined), undefined);
 assert.equal(isExpectedPiToolError(Object.assign(new Error("missing"), { code: "ENOENT" })), true);
 assert.equal(isExpectedPiToolError(Object.assign(new Error("not a directory"), { code: "ENOTDIR" })), true);
 assert.equal(isExpectedPiToolError(Object.assign(new Error("storage failure"), { code: "EIO" })), false);
 assert.equal(isExpectedPiToolError(new Error("unknown adapter failure")), false);
+assert.equal(isExpectedPiToolError(new InvalidSearchPatternError()), true);
 
 const catalogSkills: Skill[] = Array.from({ length: 80 }, (_, index) => ({
   skillId: `skill_${String(index).padStart(64, "0")}`,
@@ -622,6 +665,10 @@ assert.equal(workspaceToolRootLockMode({
 }), undefined);
 assert.deepEqual(requiredOAuthScopesForTool("read"), ["workspace:read"]);
 assert.deepEqual(requiredOAuthScopesForTool("get_operation_status"), ["workspace:read"]);
+assert.deepEqual(requiredOAuthScopesForTool("resolve_operation"), [
+  "workspace:read",
+  "workspace:write",
+]);
 assert.deepEqual(requiredOAuthScopesForTool("exec_command"), [
   "workspace:read",
   "workspace:write",
@@ -705,11 +752,33 @@ const commonTools = [
   "apply_patch", "batch_inspect", "batch_read", "close_workspace", "exec_command",
   "get_operation_status", "get_workspace_context", "list_workspaces", "load_workspace_instructions",
   "open_workspace", "read", "read_process_output", "resume_workspace", "revoke_workspace", "show_changes",
-  "write_stdin",
+  "resolve_operation", "write_stdin",
 ];
 assert.deepEqual(toolSurface({ widgets: "off", skillsEnabled: true }), [
   ...commonTools, "list_skills", "load_skill",
 ].sort());
+assert.deepEqual(
+  toolSurface({ widgets: "off", skillsEnabled: true, toolProfile: "browse" }),
+  [
+    "batch_inspect",
+    "batch_read",
+    "get_workspace_context",
+    "list_workspaces",
+    "load_workspace_instructions",
+    "open_workspace",
+    "read",
+    "resume_workspace",
+    "show_changes",
+  ],
+);
+assert.deepEqual(
+  toolSurface(
+    { widgets: "off", skillsEnabled: true, toolProfile: "browse" },
+    ["workspace:write", "process:execute", "network:access"],
+  ),
+  [],
+  "browse profile still requires workspace:read and never promotes elevated tools",
+);
 for (const widgets of ["off", "full", "changes"] as const) {
   assert.equal(
     toolSurface({ widgets, skillsEnabled: false }, ["workspace:read"]).includes("show_changes"),
