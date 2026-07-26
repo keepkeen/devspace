@@ -90,6 +90,15 @@ legacy-compatible master-key material so existing local HMAC identifiers do not
 change. `devspace doctor` reports this `legacy-direct` state; move to a new HKDF
 master key only during a planned global reauthorization.
 
+An interrupted upgrade can leave `auth.json` on schema version 2 while the
+SQLite Owner verifier is still the pre-v2 scrypt value. On the next startup,
+DevSpace uses the `legacy-direct` master-key bytes only as an ephemeral migration
+proof. It preserves OAuth tokens only when those bytes match both the old scrypt
+verifier and the new Argon2id verifier. A successful upgrade emits
+`oauth_owner_credential_upgraded` with `tokensPreserved=true`; either mismatch is
+treated as a real credential change and follows the normal token-revocation
+path. The compatibility proof is never persisted as a second password.
+
 Failed approval attempts are not tracked in one global in-memory counter.
 DevSpace persists bounded token-bucket state for the exact authorization
 session, dynamic client registration, source IP, and a global fallback. This

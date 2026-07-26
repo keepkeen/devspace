@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
+import { createHash, scryptSync } from "node:crypto";
 import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -24,6 +24,7 @@ import {
 } from "./oauth-scopes.js";
 import {
   createSecurityKeyring,
+  hashOwnerPassword,
   legacyMasterKeyFromOwnerPassword,
 } from "./security-credentials.js";
 
@@ -61,6 +62,8 @@ try {
   await testAuthorizationThrottling(join(root, "approval-throttling"));
   await testAuditFailuresAreBestEffort(join(root, "audit-failures"));
   await testProviderRestartRotationAndRevocation(join(root, "provider"));
+  await testPartialOwnerCredentialMigrationPreservesTokens(join(root, "partial-owner-migration"));
+  await testPartialOwnerCredentialMigrationRejectsMismatchedHash(join(root, "partial-owner-mismatch"));
   await testOwnerCredentialChangeAndRevokeAll(join(root, "owner-change"));
 } finally {
   await rm(root, { recursive: true, force: true });
@@ -1148,6 +1151,124 @@ async function testProviderRestartRotationAndRevocation(stateDir: string): Promi
     );
   } finally {
     secondProvider.close();
+  }
+}
+
+async function testPartialOwnerCredentialMigrationPreservesTokens(stateDir: string): Promise<void> {
+  const firstProvider = new SingleUserOAuthProvider(oauthConfig, mcpUrl, stateDir);
+  const client = await firstProvider.clientsStore.registerClient?.({
+    redirect_uris: [redirectUri],
+    client_name: "Partial migration client",
+  });
+  assert.ok(client);
+  const issued = (await authorizeAndExchange(firstProvider, client, "partial-migration")).tokens;
+  assert.ok(issued.refresh_token);
+  const before = firstProvider.diagnosticSnapshot();
+  firstProvider.close();
+
+  downgradeOwnerCredentialToLegacy(stateDir, ownerPassword);
+  const passwordHash = hashOwnerPassword(ownerPassword);
+  const migratedProvider = new SingleUserOAuthProvider(
+    {
+      ...oauthConfig,
+      ownerCredential: { passwordHash },
+      keys: createSecurityKeyring({
+        masterKey: legacyMasterKeyFromOwnerPassword(ownerPassword),
+        derivation: "legacy-direct",
+        source: "auth_file",
+      }),
+    },
+    mcpUrl,
+    stateDir,
+  );
+  try {
+    assert.equal(migratedProvider.ownerCredentialChanged, false);
+    assert.equal(migratedProvider.ownerCredentialUpgraded, true);
+    const verified = await migratedProvider.verifyAccessToken(issued.access_token);
+    assert.equal(verified.clientId, client.client_id);
+    assert.deepEqual(migratedProvider.diagnosticSnapshot(), before);
+
+    const refreshed = await migratedProvider.exchangeRefreshToken(
+      client,
+      issued.refresh_token,
+      [...DEFAULT_DEVSPACE_OAUTH_SCOPES],
+      mcpUrl,
+    );
+    assert.ok(refreshed.access_token);
+    assert.ok(refreshed.refresh_token);
+    const afterRefresh = migratedProvider.diagnosticSnapshot();
+    assert.equal(afterRefresh.clients, before.clients);
+    assert.equal(afterRefresh.grants, before.grants);
+    assert.equal(afterRefresh.principals, before.principals);
+    assert.equal(afterRefresh.accessTokens, before.accessTokens + 1);
+    assert.equal(afterRefresh.refreshTokens, before.refreshTokens);
+    assert.equal(afterRefresh.workspaceCleanupJobs, before.workspaceCleanupJobs);
+  } finally {
+    migratedProvider.close();
+  }
+
+  const database = openDatabase(stateDir);
+  try {
+    const credential = database.sqlite
+      .prepare("select salt, verifier from oauth_owner_credential where id = 1")
+      .get() as { salt: string; verifier: string };
+    assert.equal(credential.salt, "argon2id-v1");
+    assert.equal(credential.verifier, passwordHash);
+  } finally {
+    database.close();
+  }
+}
+
+async function testPartialOwnerCredentialMigrationRejectsMismatchedHash(
+  stateDir: string,
+): Promise<void> {
+  const firstProvider = new SingleUserOAuthProvider(oauthConfig, mcpUrl, stateDir);
+  const client = await firstProvider.clientsStore.registerClient?.({
+    redirect_uris: [redirectUri],
+    client_name: "Partial migration mismatch client",
+  });
+  assert.ok(client);
+  const issued = (await authorizeAndExchange(firstProvider, client, "partial-mismatch")).tokens;
+  firstProvider.close();
+
+  downgradeOwnerCredentialToLegacy(stateDir, ownerPassword);
+  const differentPasswordHash = hashOwnerPassword("different-owner-token-that-is-long-enough");
+  const changedProvider = new SingleUserOAuthProvider(
+    {
+      ...oauthConfig,
+      ownerCredential: { passwordHash: differentPasswordHash },
+      keys: createSecurityKeyring({
+        masterKey: legacyMasterKeyFromOwnerPassword(ownerPassword),
+        derivation: "legacy-direct",
+        source: "auth_file",
+      }),
+    },
+    mcpUrl,
+    stateDir,
+  );
+  try {
+    assert.equal(changedProvider.ownerCredentialChanged, true);
+    assert.equal(changedProvider.ownerCredentialUpgraded, false);
+    await assert.rejects(changedProvider.verifyAccessToken(issued.access_token), InvalidTokenError);
+    assert.equal(changedProvider.diagnosticSnapshot().accessTokens, 0);
+    assert.equal(changedProvider.diagnosticSnapshot().refreshTokens, 0);
+  } finally {
+    changedProvider.close();
+  }
+}
+
+function downgradeOwnerCredentialToLegacy(stateDir: string, password: string): void {
+  const salt = Buffer.from("devspace-partial-owner-migration-test", "utf8").toString("base64url");
+  const verifier = scryptSync(password, Buffer.from(salt, "base64url"), 32).toString("base64url");
+  const database = openDatabase(stateDir);
+  try {
+    database.sqlite.prepare(`
+      update oauth_owner_credential
+      set salt = ?, verifier = ?, updated_at = ?
+      where id = 1
+    `).run(salt, verifier, new Date().toISOString());
+  } finally {
+    database.close();
   }
 }
 

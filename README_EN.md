@@ -110,6 +110,9 @@ Normal configuration and security credentials are stored separately:
 key, and its derivation mode. It cannot recover the plaintext password, so save the password shown
 once by the initialization wizard. Never share or commit `auth.json`; its master key derives local
 identity, root, cursor, receipt, audit-reference, and internal-control keys.
+Legacy upgrades use `legacy-direct` to keep existing identifiers stable. If the file migration
+completed while SQLite still has the old verifier, the next startup proves the same secret against
+both old scrypt and new Argon2id state, then upgrades in place without deleting OAuth tokens.
 
 ### 3. Start and check the server
 

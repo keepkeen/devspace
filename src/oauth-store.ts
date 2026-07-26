@@ -15,6 +15,11 @@ import {
   type OwnerCredentialInput,
 } from "./security-credentials.js";
 
+interface OwnerCredentialReconciliationInput extends OwnerCredentialInput {
+  /** Ephemeral compatibility material; never persisted or used for approval. */
+  legacyVerifierSecret?: Uint8Array;
+}
+
 export interface PersistedAccessTokenRecord {
   grantId?: string;
   clientId: string;
@@ -1224,7 +1229,7 @@ export class SqliteOAuthStore {
    * while preserving public dynamic client registrations so browser clients
    * can reauthorize without having to forget and recreate the connector.
    */
-  reconcileOwnerCredential(input: OwnerCredentialInput): {
+  reconcileOwnerCredential(input: OwnerCredentialReconciliationInput): {
     changed: boolean;
     passwordHash: string;
     upgraded: boolean;
@@ -1247,13 +1252,27 @@ export class SqliteOAuthStore {
         if (matches) {
           return { changed: false, passwordHash: row.verifier, upgraded: false };
         }
-      } else if (
-        input.password !== undefined &&
-        verifiersEqual(deriveOwnerCredentialVerifier(input.password, row.salt), row.verifier)
-      ) {
-        const passwordHash = input.passwordHash ?? hashOwnerPassword(input.password);
-        this.saveOwnerCredentialHash(passwordHash);
-        return { changed: false, passwordHash, upgraded: true };
+      } else {
+        const legacySecret = input.password ?? input.legacyVerifierSecret;
+        const legacyVerifierMatches = legacySecret !== undefined && verifiersEqual(
+          deriveOwnerCredentialVerifier(legacySecret, row.salt),
+          row.verifier,
+        );
+        const declaredHashMatches = input.passwordHash === undefined || (
+          legacySecret !== undefined && verifyOwnerPassword(input.passwordHash, legacySecret)
+        );
+        if (legacyVerifierMatches && declaredHashMatches) {
+          const passwordHash = input.passwordHash ?? (
+            typeof legacySecret === "string"
+              ? hashOwnerPassword(legacySecret)
+              : undefined
+          );
+          if (!passwordHash) {
+            throw new Error("Legacy Owner credential upgrade requires an Argon2id hash.");
+          }
+          this.saveOwnerCredentialHash(passwordHash);
+          return { changed: false, passwordHash, upgraded: true };
+        }
       }
 
       this.database.sqlite.prepare("delete from oauth_access_tokens").run();
@@ -1708,7 +1727,10 @@ function normalizeGrantScopes(value: unknown): string[] {
   return DEVSPACE_CAPABILITY_SCOPES.filter((scope) => requested.has(scope));
 }
 
-function deriveOwnerCredentialVerifier(ownerToken: string, salt: string): string {
+function deriveOwnerCredentialVerifier(
+  ownerToken: string | Uint8Array,
+  salt: string,
+): string {
   return scryptSync(ownerToken, Buffer.from(salt, "base64url"), 32).toString("base64url");
 }
 

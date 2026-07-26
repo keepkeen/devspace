@@ -5619,6 +5619,12 @@ export function createServer(configInput?: ServerConfig): RunningServer {
       });
     },
   );
+  if (oauthProvider.ownerCredentialUpgraded) {
+    logEvent(config.logging, "info", "oauth_owner_credential_upgraded", {
+      tokensPreserved: true,
+      clientsPreserved: true,
+    });
+  }
   if (oauthProvider.ownerCredentialChanged) {
     workspaces.bumpAuthorityGenerations();
     logEvent(config.logging, "warn", "oauth_owner_credential_changed", {

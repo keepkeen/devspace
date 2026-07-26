@@ -41,8 +41,14 @@ export function hashOwnerPassword(password: string): string {
   return hashSync(password, ARGON2_OPTIONS);
 }
 
-export function verifyOwnerPassword(passwordHash: string, password: string): boolean {
-  if (!isArgon2idHash(passwordHash) || typeof password !== "string") return false;
+export function verifyOwnerPassword(
+  passwordHash: string,
+  password: string | Uint8Array,
+): boolean {
+  if (
+    !isArgon2idHash(passwordHash) ||
+    (typeof password !== "string" && !(password instanceof Uint8Array))
+  ) return false;
   try {
     return verifySync(passwordHash, password, { algorithm: Algorithm.Argon2id });
   } catch {

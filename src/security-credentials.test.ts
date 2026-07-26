@@ -85,12 +85,18 @@ test("HKDF purpose keys are domain separated and master-key rotation changes all
 
 test("legacy-direct migration preserves pre-v2 HMAC identifiers", () => {
   const ownerPassword = "legacy-owner-token-that-was-also-a-key";
+  const ownerPasswordHash = hashOwnerPassword(ownerPassword);
   const keyring = createSecurityKeyring({
     masterKey: legacyMasterKeyFromOwnerPassword(ownerPassword),
     derivation: "legacy-direct",
     source: "auth_file",
   });
   assert.equal(keyring.legacyCompatibility, true);
+  assert.equal(
+    verifyOwnerPassword(ownerPasswordHash, keyring.hostIdentity),
+    true,
+    "legacy key bytes must prove they describe the same password as the v2 verifier",
+  );
   assert.equal(
     hostIdentityDigest("session", "conversation-a", keyring.hostIdentity),
     hostIdentityDigest("session", "conversation-a", ownerPassword),

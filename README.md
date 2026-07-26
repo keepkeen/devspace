@@ -103,6 +103,8 @@ node dist/cli.js init
 `auth.json` 只保存 Owner 密码的 Argon2id 校验值、独立随机 master key 和派生模式，
 不保存可恢复的明文密码。初始化时请保存向导一次性显示的 Owner 密码。不要分享或提交
 `auth.json`，其中的 master key 会派生本机身份、授权根、cursor、receipt 和内部控制令牌。
+旧版升级使用 `legacy-direct` 保持既有标识稳定；如果文件迁移完成而 SQLite 仍是旧 verifier，
+下次启动会同时校验旧 scrypt 与新 Argon2id，匹配时原位升级并保留现有 OAuth token。
 
 ### 3. 启动并检查
 

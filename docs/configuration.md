@@ -209,6 +209,15 @@ worktrees are removed; dirty worktrees are retained as auditable artifacts
 instead of being deleted. Removed OAuth clients therefore cannot leave active
 orphan Workspace authority.
 
+During the one-way v1 migration, `keyDerivation="legacy-direct"` means the
+master key still contains the former random Owner-token bytes so existing HMAC
+identifiers remain stable. If `auth.json` was already rewritten but SQLite still
+contains the old scrypt verifier, startup performs a dual proof against both
+that scrypt verifier and the stored Argon2id verifier. Matching state upgrades
+in place without deleting access or refresh tokens and logs
+`oauth_owner_credential_upgraded`; mismatched state is handled as an Owner
+password change and revokes tokens.
+
 ## Resource Lifecycle and Limits
 
 | Variable | Default | Purpose |

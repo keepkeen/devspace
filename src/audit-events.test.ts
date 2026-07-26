@@ -35,6 +35,8 @@ test("persistent audit events are queryable, bounded, and omit unsafe fields", (
       tool: "read",
       connectionRef: "conn_abc",
       success: true,
+      tokensPreserved: true,
+      clientsPreserved: true,
     });
 
     const failures = store.query({ event: "mcp_tool_error", connectionRef: "conn_abc" });
@@ -42,6 +44,12 @@ test("persistent audit events are queryable, bounded, and omit unsafe fields", (
     assert.equal(failures[0]?.tool, "grep");
     assert.equal(failures[0]?.errorCode, "invalid_pattern");
     assert.deepEqual(failures[0]?.details, { durationMs: 12, phase: "not_started" });
+    const successes = store.query({ event: "tool_call", connectionRef: "conn_abc" });
+    assert.deepEqual(successes[0]?.details, {
+      clientsPreserved: true,
+      success: true,
+      tokensPreserved: true,
+    });
     const serialized = JSON.stringify(failures);
     assert.doesNotMatch(serialized, /Users|secret|command|errorStack|token/u);
 

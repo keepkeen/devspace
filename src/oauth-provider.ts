@@ -420,6 +420,7 @@ function setAuthorizationResponseHeaders(res: Response, redirectUri: string): vo
 export class SingleUserOAuthProvider implements OAuthServerProvider {
   readonly clientsStore: OAuthRegisteredClientsStore;
   readonly ownerCredentialChanged: boolean;
+  readonly ownerCredentialUpgraded: boolean;
   private readonly codes = new Map<string, AuthorizationCodeRecord>();
   private readonly selections = new Map<string, AuthorizationSelectionRecord>();
   private readonly oauthStore: SqliteOAuthStore;
@@ -437,8 +438,17 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
   ) {
     this.resourceServerUrl = resourceUrlFromServerUrl(resourceServerUrl);
     this.oauthStore = new SqliteOAuthStore(stateDir);
-    const credential = this.oauthStore.reconcileOwnerCredential(config.ownerCredential);
+    const credential = this.oauthStore.reconcileOwnerCredential({
+      ...config.ownerCredential,
+      ...(config.keys.legacyCompatibility &&
+          config.keys.source === "auth_file" &&
+          config.ownerCredential.password === undefined &&
+          config.ownerCredential.passwordHash !== undefined
+        ? { legacyVerifierSecret: config.keys.hostIdentity }
+        : {}),
+    });
     this.ownerCredentialChanged = credential.changed;
+    this.ownerCredentialUpgraded = credential.upgraded;
     this.ownerPasswordHash = credential.passwordHash;
     this.clientsStore = new SqliteOAuthClientsStore(
       this.oauthStore,

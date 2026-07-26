@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, scryptSync } from "node:crypto";
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
 import { tmpdir } from "node:os";
@@ -8,11 +8,17 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { AuditEventStore } from "./audit-events.js";
 import { loadConfig } from "./config.js";
+import { openDatabase } from "./db/client.js";
 import { connectionRef, oauthClientRef, workspaceActivityRef } from "./logger.js";
 import { MutationOperationStore } from "./mutation-operation-store.js";
 import { DEFAULT_DEVSPACE_OAUTH_SCOPES } from "./oauth-scopes.js";
 import { SqliteOAuthStore } from "./oauth-store.js";
+import {
+  hashOwnerPassword,
+  legacyMasterKeyFromOwnerPassword,
+} from "./security-credentials.js";
 import { createServer } from "./server.js";
 import { SqliteWorkspaceStore } from "./workspace-store.js";
 
@@ -673,8 +679,125 @@ try {
   } finally {
     interruptedOperations.close();
   }
-  active = await startServer(mainConfig);
+  const migratedOwnerPasswordHash = hashOwnerPassword(ownerPassword);
+  const authConfigDir = join(root, "config");
+  await mkdir(authConfigDir, { recursive: true });
+  await writeFile(join(authConfigDir, "auth.json"), JSON.stringify({
+    schemaVersion: 2,
+    ownerPasswordHash: migratedOwnerPasswordHash,
+    masterKey: legacyMasterKeyFromOwnerPassword(ownerPassword),
+    keyDerivation: "legacy-direct",
+  }), { mode: 0o600 });
+
+  const legacySalt = Buffer.from("chatgpt-flow-partial-owner-migration", "utf8")
+    .toString("base64url");
+  const legacyVerifier = scryptSync(
+    ownerPassword,
+    Buffer.from(legacySalt, "base64url"),
+    32,
+  ).toString("base64url");
+  const migrationDatabase = openDatabase(mainConfig.stateDir);
+  let tokenCountsBeforeMigration: { accessTokens: number; refreshTokens: number };
+  try {
+    tokenCountsBeforeMigration = migrationDatabase.sqlite.prepare(`
+      select
+        (select count(*) from oauth_access_tokens) as accessTokens,
+        (select count(*) from oauth_refresh_tokens) as refreshTokens
+    `).get() as { accessTokens: number; refreshTokens: number };
+    migrationDatabase.sqlite.prepare(`
+      update oauth_owner_credential
+      set salt = ?, verifier = ?, updated_at = ?
+      where id = 1
+    `).run(legacySalt, legacyVerifier, new Date().toISOString());
+  } finally {
+    migrationDatabase.close();
+  }
+
+  const ownerCredentialChangeEventsBefore = capturedLogs.filter(
+    (line) => line.includes('"event":"oauth_owner_credential_changed"'),
+  ).length;
+  const ownerCredentialUpgradeEventsBefore = capturedLogs.filter(
+    (line) => line.includes('"event":"oauth_owner_credential_upgraded"'),
+  ).length;
+  const restartConfig = loadConfig({
+    DEVSPACE_CONFIG_DIR: authConfigDir,
+    DEVSPACE_STATE_DIR: join(root, "state"),
+    DEVSPACE_ALLOWED_ROOTS: workspaceRoot,
+    DEVSPACE_WORKTREE_ROOT: join(root, "managed-worktrees"),
+    DEVSPACE_ALLOWED_HOSTS: "*",
+    DEVSPACE_PUBLIC_BASE_URL: publicBaseUrl,
+    DEVSPACE_SKILLS: "0",
+    DEVSPACE_SUBAGENTS: "0",
+    DEVSPACE_WIDGETS: "off",
+    DEVSPACE_LOG_LEVEL: "info",
+    DEVSPACE_LOG_FORMAT: "json",
+    DEVSPACE_MAX_MCP_SESSIONS: "8",
+    DEVSPACE_MAX_MCP_SESSIONS_PER_CLIENT: "4",
+    DEVSPACE_MAX_PROCESS_SESSIONS: "8",
+    DEVSPACE_MAX_PROCESS_SESSIONS_PER_CLIENT: "4",
+    DEVSPACE_MAX_PROCESS_SESSIONS_PER_WORKSPACE: "4",
+    PORT: "1",
+  });
+  assert.equal(restartConfig.oauth.ownerCredential.password, undefined);
+  assert.equal(restartConfig.oauth.keys.source, "auth_file");
+  assert.equal(restartConfig.oauth.keys.derivation, "legacy-direct");
+  active = await startServer(restartConfig);
+  assert.equal(
+    capturedLogs.filter((line) => line.includes('"event":"oauth_owner_credential_changed"')).length,
+    ownerCredentialChangeEventsBefore,
+    "the compatibility upgrade must not enter the token-revocation path",
+  );
+  assert.equal(
+    capturedLogs.filter((line) => line.includes('"event":"oauth_owner_credential_upgraded"')).length,
+    ownerCredentialUpgradeEventsBefore + 1,
+    "the compatibility upgrade must emit one explicit token-preserving audit event",
+  );
+  const migrationAudit = new AuditEventStore(mainConfig.stateDir);
+  try {
+    const migrationEvents = migrationAudit.query({
+      event: "oauth_owner_credential_upgraded",
+      limit: 10,
+    });
+    assert.equal(migrationEvents.length, 1);
+    assert.deepEqual(migrationEvents[0]?.details, {
+      clientsPreserved: true,
+      tokensPreserved: true,
+    });
+  } finally {
+    migrationAudit.close();
+  }
+
+  const migratedDatabase = openDatabase(mainConfig.stateDir);
+  try {
+    const migratedCredential = migratedDatabase.sqlite
+      .prepare("select salt, verifier from oauth_owner_credential where id = 1")
+      .get() as { salt: string; verifier: string };
+    assert.equal(migratedCredential.salt, "argon2id-v1");
+    assert.equal(migratedCredential.verifier, migratedOwnerPasswordHash);
+    assert.deepEqual(
+      migratedDatabase.sqlite.prepare(`
+        select
+          (select count(*) from oauth_access_tokens) as accessTokens,
+          (select count(*) from oauth_refresh_tokens) as refreshTokens
+      `).get(),
+      tokenCountsBeforeMigration,
+      "partial credential migration must preserve issued OAuth tokens",
+    );
+  } finally {
+    migratedDatabase.close();
+  }
+
   const afterRestart = await connectClient("same-account-after-restart", oauthA.accessToken, active.origin);
+  const staleReceiptRead = await afterRestart.callTool({
+    name: "read",
+    arguments: { receipt: concurrentReceiptA, path: "payload.txt" },
+  });
+  assertToolRejected(staleReceiptRead, /workspace_context_required/);
+  assert.equal(
+    (staleReceiptRead.structuredContent as { error?: { recovery?: unknown } } | undefined)
+      ?.error?.recovery,
+    "list_then_resume",
+  );
   const interruptedStatus = await afterRestart.callTool({
     name: "get_operation_status",
     arguments: { operationId: interruptedOperationId },
