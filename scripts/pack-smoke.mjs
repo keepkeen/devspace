@@ -2,6 +2,7 @@ import { execFileSync, spawn, spawnSync } from "node:child_process";
 import {
   mkdtempSync,
   mkdirSync,
+  existsSync,
   readFileSync,
   readdirSync,
   rmSync,
@@ -47,21 +48,47 @@ try {
     readFileSync(join(installRoot, "node_modules", "@waishnav", "devspace", "package.json"), "utf8"),
   );
   const cliPath = join(installRoot, "node_modules", "@waishnav", "devspace", "dist", "cli.js");
+  const cliConfigDir = join(scratchRoot, "cli-config");
+  const cliStateDir = join(scratchRoot, "cli-state");
+  const cliWorkspaceRoot = join(scratchRoot, "cli-workspace");
+  mkdirSync(cliConfigDir);
+  mkdirSync(cliStateDir);
+  mkdirSync(cliWorkspaceRoot);
+  const cliEnvironment = smokeEnvironment(process.env, {
+    HOST: "127.0.0.1",
+    PORT: "1",
+    DEVSPACE_CONFIG_DIR: cliConfigDir,
+    DEVSPACE_STATE_DIR: cliStateDir,
+    DEVSPACE_ALLOWED_ROOTS: cliWorkspaceRoot,
+    DEVSPACE_ALLOWED_HOSTS: "127.0.0.1",
+    DEVSPACE_OAUTH_OWNER_TOKEN: "pack-smoke-owner-token-that-is-long-enough",
+    DEVSPACE_PUBLIC_BASE_URL: "http://127.0.0.1:1",
+    DEVSPACE_LOG_LEVEL: "silent",
+  });
   const installedVersion = execFileSync(process.execPath, [cliPath, "--version"], {
     cwd: installRoot,
     encoding: "utf8",
+    env: cliEnvironment,
   }).trim();
 
   if (installedVersion !== installedPackage.version) {
     throw new Error(`Installed CLI reported ${installedVersion}; expected ${installedPackage.version}.`);
   }
-  execFileSync(process.execPath, [cliPath, "help"], { cwd: installRoot, stdio: "ignore" });
+  execFileSync(process.execPath, [cliPath, "help"], {
+    cwd: installRoot,
+    stdio: "ignore",
+    env: cliEnvironment,
+  });
   const doctor = execFileSync(process.execPath, [cliPath, "doctor"], {
     cwd: installRoot,
     encoding: "utf8",
+    env: cliEnvironment,
   });
   if (!doctor.includes("SQLite native dependency: ok")) {
     throw new Error("Installed CLI doctor could not load the packaged SQLite runtime.");
+  }
+  if (existsSync(join(cliStateDir, "devspace.sqlite"))) {
+    throw new Error("Installed CLI doctor mutated its isolated state directory.");
   }
   await smokeServe(cliPath, installRoot);
   process.stdout.write(`Packed CLI smoke test passed (${installedVersion}).\n`);

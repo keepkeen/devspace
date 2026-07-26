@@ -192,6 +192,9 @@ Existing legacy grants may migrate with the compatibility wildcard `*`;
 reauthorize them to select a narrower set. `devspace doctor` and local Admin
 diagnostics count these grants and warn that adding a global root would expand
 their authority; DevSpace does not silently rewrite existing grant semantics.
+The doctor path opens the canonical database read-only and never runs schema
+migrations or changes journal mode, so diagnostics cannot upgrade a live
+backend's state out from under that process.
 
 The granular scopes mean:
 

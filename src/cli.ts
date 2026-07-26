@@ -49,7 +49,7 @@ import { shutdownHttpServers } from "./server-shutdown.js";
 import { AuditEventStore, type AuditEventQuery } from "./audit-events.js";
 import { formatChinaTimestamp } from "./logger.js";
 import { inspectInstructionHealth } from "./instruction-health.js";
-import { SqliteOAuthStore } from "./oauth-store.js";
+import { inspectDoctorOAuthState } from "./doctor-oauth.js";
 
 type Command = "serve" | "admin" | "init" | "doctor" | "config" | "auth" | "audit" | "agents" | "help" | "version";
 const require = createRequire(import.meta.url);
@@ -381,17 +381,17 @@ async function runDoctor(): Promise<void> {
         "Rotate it only during a planned global reauthorization.",
       );
     }
-    const oauthStore = new SqliteOAuthStore(config.stateDir);
-    try {
-      const legacyWildcardGrants = oauthStore.diagnosticSnapshot().legacyWildcardGrants;
-      if (legacyWildcardGrants > 0) {
-        console.log(
-          `Security warning: ${legacyWildcardGrants} active legacy wildcard root grant(s) found. ` +
-          "Adding an allowed root expands those grants; reconnect them through OAuth and select explicit project roots.",
-        );
-      }
-    } finally {
-      oauthStore.close();
+    const oauthInspection = inspectDoctorOAuthState(config.stateDir);
+    if (oauthInspection.schemaVersion !== undefined) {
+      console.log(`Canonical database schema: v${oauthInspection.schemaVersion}`);
+    }
+    if (oauthInspection.error) {
+      console.log("OAuth grant diagnostics: unavailable (read-only inspection failed).");
+    } else if ((oauthInspection.legacyWildcardGrants ?? 0) > 0) {
+      console.log(
+        `Security warning: ${oauthInspection.legacyWildcardGrants} active legacy wildcard root grant(s) found. ` +
+        "Adding an allowed root expands those grants; reconnect them through OAuth and select explicit project roots.",
+      );
     }
     const instructionHealth = await inspectInstructionHealth(
       config.allowedRoots,
