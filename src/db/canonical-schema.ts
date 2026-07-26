@@ -1,8 +1,8 @@
 import type Database from "better-sqlite3";
 import { DEVSPACE_CAPABILITY_SCOPES } from "../oauth-scopes.js";
 
-export const CURRENT_DATABASE_SCHEMA_VERSION = 16 as const;
-export const CURRENT_DATABASE_SCHEMA_NAME = "canonical-state-v16";
+export const CURRENT_DATABASE_SCHEMA_VERSION = 17 as const;
+export const CURRENT_DATABASE_SCHEMA_NAME = "canonical-state-v17";
 
 export function createCanonicalSchema(sqlite: Database.Database): void {
   sqlite.exec(`
@@ -40,6 +40,7 @@ export function createCanonicalSchema(sqlite: Database.Database): void {
       granted_scopes_json text not null,
       allowed_root_ids_json text not null,
       authorization_epoch integer not null check (authorization_epoch >= 1),
+      absolute_expires_at integer check (absolute_expires_at is null or absolute_expires_at >= 1),
       created_at text not null,
       last_used_at text not null,
       revoked_at text,
@@ -213,6 +214,7 @@ export function createCanonicalSchema(sqlite: Database.Database): void {
       client_id text not null,
       principal_id text not null,
       authorization_epoch integer not null check (authorization_epoch >= 1),
+      family_id text not null check (length(family_id) between 16 and 128),
       scopes_json text not null,
       expires_at integer not null,
       resource text,
@@ -234,6 +236,26 @@ export function createCanonicalSchema(sqlite: Database.Database): void {
 
     create index if not exists oauth_refresh_tokens_expires_at_idx
       on oauth_refresh_tokens(expires_at);
+
+    create index if not exists oauth_refresh_tokens_family_id_idx
+      on oauth_refresh_tokens(family_id);
+
+    create table if not exists oauth_refresh_token_tombstones (
+      token_hash text primary key,
+      family_id text not null check (length(family_id) between 16 and 128),
+      grant_id text not null,
+      client_id text not null,
+      principal_id text not null,
+      authorization_epoch integer not null check (authorization_epoch >= 1),
+      consumed_at integer not null,
+      expires_at integer not null check (expires_at > consumed_at)
+    );
+
+    create index if not exists oauth_refresh_token_tombstones_family_idx
+      on oauth_refresh_token_tombstones(family_id, expires_at);
+
+    create index if not exists oauth_refresh_token_tombstones_expires_idx
+      on oauth_refresh_token_tombstones(expires_at);
 
     create table if not exists oauth_owner_credential (
       id integer primary key check (id = 1),
@@ -532,6 +554,20 @@ export function validateCanonicalDatabase(sqlite: Database.Database): void {
       }
     }
   }
+
+  assertNoRows(sqlite, `
+    select token_hash
+    from oauth_refresh_tokens
+    where length(family_id) < 16 or length(family_id) > 128
+  `, "OAuth refresh tokens must have a bounded family identifier");
+
+  assertNoRows(sqlite, `
+    select token_hash
+    from oauth_refresh_token_tombstones
+    where length(family_id) < 16
+       or length(family_id) > 128
+       or expires_at <= consumed_at
+  `, "OAuth refresh-token tombstones must be bounded and expire after consumption");
 }
 
 function assertCanonicalScopes(scopesJson: string, context: string): void {
@@ -543,4 +579,12 @@ function assertCanonicalScopes(scopesJson: string, context: string): void {
   ) {
     throw new Error(`Canonical OAuth scope invariant failed for ${context}.`);
   }
+}
+
+function assertNoRows(
+  sqlite: Database.Database,
+  sql: string,
+  message: string,
+): void {
+  if (sqlite.prepare(sql).get() !== undefined) throw new Error(message);
 }

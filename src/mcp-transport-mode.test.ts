@@ -47,8 +47,18 @@ seedClient(chatGptToken, "https://chatgpt.com/connector/oauth/transport-test", "
 
 const running = createServer(config);
 const httpServer = createHttpServer(running.app);
+const controlHttpServer = createHttpServer(running.controlApp);
 try {
-  const origin = await listen(httpServer);
+  const [origin, controlOrigin] = await Promise.all([
+    listen(httpServer),
+    listen(controlHttpServer),
+  ]);
+  assert.equal(
+    (await fetch(new URL("/internal/diagnostics", origin), {
+      headers: { "x-devspace-internal-token": internalDiagnosticsToken(config.oauth.keys.internalDiagnostics) },
+    })).status,
+    404,
+  );
   const firstObserved: ObservedResponse[] = [];
   const firstChatGpt = await connectClient("chatgpt-one", chatGptToken, origin, firstObserved);
   clients.push(firstChatGpt);
@@ -181,6 +191,7 @@ try {
   for (let index = 0; index < 8; index += 1) {
     await abortStatelessToolCallAfterLease({
       origin,
+      controlOrigin,
       accessToken: chatGptToken,
       ownerToken: config.oauth.keys.internalDiagnostics,
       requestId: 200 + index,
@@ -340,6 +351,7 @@ try {
 } finally {
   for (const client of clients.reverse()) await client.close().catch(() => undefined);
   await closeHttpServer(httpServer);
+  await closeHttpServer(controlHttpServer);
   await running.close();
 }
 
@@ -489,12 +501,13 @@ function rawMcpPost(origin: URL, accessToken: string, sessionId: string): Promis
 
 async function abortStatelessToolCallAfterLease(options: {
   origin: URL;
+  controlOrigin: URL;
   accessToken: string;
   ownerToken: string | Uint8Array;
   requestId: number;
   body: Record<string, unknown>;
 }): Promise<void> {
-  await waitForStatelessRequestCount(options.origin, options.ownerToken, 0);
+  await waitForStatelessRequestCount(options.controlOrigin, options.ownerToken, 0);
   const controller = new AbortController();
   const request = fetch(new URL("/mcp", options.origin), {
     method: "POST",
@@ -508,7 +521,7 @@ async function abortStatelessToolCallAfterLease(options: {
     signal: controller.signal,
   });
 
-  await waitForStatelessRequestCount(options.origin, options.ownerToken, 1);
+  await waitForStatelessRequestCount(options.controlOrigin, options.ownerToken, 1);
   controller.abort();
   const abortError = await request.then(
     async (response) => {
@@ -526,7 +539,7 @@ async function abortStatelessToolCallAfterLease(options: {
     "AbortError",
     `request ${options.requestId} must observe the client abort`,
   );
-  await waitForStatelessRequestCount(options.origin, options.ownerToken, 0);
+  await waitForStatelessRequestCount(options.controlOrigin, options.ownerToken, 0);
 }
 
 async function waitForStatelessRequestCount(

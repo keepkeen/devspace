@@ -140,7 +140,14 @@ try {
     "number",
   );
 
-  const revocation = await fetch(new URL("/internal/security/revoke", active.origin), {
+  assert.equal(
+    (await fetch(new URL("/internal/security/revoke", active.origin), {
+      method: "POST",
+      headers: { "x-devspace-internal-token": internalRevocationToken(changedOwnerToken) },
+    })).status,
+    404,
+  );
+  const revocation = await fetch(new URL("/internal/security/revoke", active.controlOrigin), {
     method: "POST",
     headers: {
       "content-type": "application/json",
@@ -161,7 +168,7 @@ try {
   });
   await mcpClient.close().catch(() => undefined);
 
-  const diagnostics = await fetch(new URL("/internal/diagnostics", active.origin), {
+  const diagnostics = await fetch(new URL("/internal/diagnostics", active.controlOrigin), {
     headers: { "x-devspace-internal-token": internalDiagnosticsToken(changedOwnerToken) },
   });
   assert.equal(diagnostics.status, 200);
@@ -301,15 +308,21 @@ async function issueTokens(
 
 async function startServer(config: ReturnType<typeof loadConfig>): Promise<{
   origin: URL;
+  controlOrigin: URL;
   close(): Promise<void>;
 }> {
   const running = createServer(config);
   const httpServer = createHttpServer(running.app);
-  const origin = await listen(httpServer);
+  const controlServer = createHttpServer(running.controlApp);
+  const [origin, controlOrigin] = await Promise.all([
+    listen(httpServer),
+    listen(controlServer),
+  ]);
   return {
     origin,
+    controlOrigin,
     close: async () => {
-      await closeHttpServer(httpServer);
+      await Promise.all([closeHttpServer(httpServer), closeHttpServer(controlServer)]);
       await running.close();
     },
   };

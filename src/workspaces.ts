@@ -394,7 +394,8 @@ export class WorkspaceRegistry {
     private readonly store?: WorkspaceStore,
   ) {
     this.rootLocks = new WorkspaceRootLockManager({
-      crossProcessLockRoot: defaultWorkspaceRootLockDirectory(),
+      crossProcessLockRoot: defaultWorkspaceRootLockDirectory(config.stateDir),
+      trustedStateRoot: config.stateDir,
     });
   }
 
@@ -526,7 +527,9 @@ export class WorkspaceRegistry {
       }];
     });
     return summaries.sort((left, right) => {
-      const ordering = left.lastUsedAt.localeCompare(right.lastUsedAt) ||
+      // Pagination must not reorder when ordinary tool calls update lastUsedAt.
+      // Creation time plus the immutable Workspace ID is a stable keyset.
+      const ordering = left.createdAt.localeCompare(right.createdAt) ||
         left.workspaceRef.localeCompare(right.workspaceRef);
       return options.recentFirst === false ? ordering : -ordering;
     });

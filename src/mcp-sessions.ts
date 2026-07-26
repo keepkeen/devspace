@@ -60,6 +60,8 @@ export interface McpSessionRegistryOptions {
   maxSessions?: number;
   maxSessionsPerClient?: number;
   closeTimeoutMs?: number;
+  /** Permit a client to reclaim another client's idle stateful session. Off by default. */
+  allowGlobalIdleReclaim?: boolean;
 }
 
 export interface McpSessionUsageSnapshot {
@@ -85,6 +87,7 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
   private readonly reservations = new Set<McpSessionReservation>();
   private readonly statelessRequests = new Set<StatelessMcpRequestLease>();
   private readonly closeTimeoutMs: number;
+  private readonly allowGlobalIdleReclaim: boolean;
   private sealed = false;
 
   constructor(options: McpSessionRegistryOptions = {}) {
@@ -92,6 +95,7 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
     this.maxSessions = options.maxSessions ?? Number.POSITIVE_INFINITY;
     this.maxSessionsPerClient = options.maxSessionsPerClient ?? Number.POSITIVE_INFINITY;
     this.closeTimeoutMs = options.closeTimeoutMs ?? 5_000;
+    this.allowGlobalIdleReclaim = options.allowGlobalIdleReclaim === true;
   }
 
   get size(): number {
@@ -147,7 +151,10 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
     if (this.sealed) return {};
 
     const clientAtCapacity = this.occupiedClientSlots(connectionPrincipalId) >= this.maxSessionsPerClient;
-    const candidate = this.oldestInactiveSession(connectionPrincipalId, clientAtCapacity);
+    const candidate = this.oldestInactiveSession(
+      connectionPrincipalId,
+      clientAtCapacity || !this.allowGlobalIdleReclaim,
+    );
     if (!candidate) return {};
 
     const reservation = {

@@ -6,6 +6,7 @@ import {
   HeadTailBuffer,
   isInteractiveShellCommand,
   MAX_PROCESS_INPUT_BYTES,
+  nextTreeExitPollMs,
   ProcessSessionManager,
 } from "./process-sessions.js";
 import { ProcessOutputStore } from "./process-output-store.js";
@@ -1069,6 +1070,41 @@ try {
   assert.equal(quotaLimited.totalOutputBytes, 150_000);
   assert.equal(quotaLimited.storedOutputBytes, 120_000);
   assert.equal(quotaLimited.droppedBytes, 30_000);
+
+  let batchedAppendCalls = 0;
+  const originalAppend = durableStore.append.bind(durableStore);
+  durableStore.append = (outputId, data) => {
+    batchedAppendCalls += 1;
+    originalAppend(outputId, data);
+  };
+  const batchingManager = new ProcessSessionManager({
+    outputStore: durableStore,
+    durableOutputFlushBytes: 1024 * 1024,
+    durableOutputFlushMs: 10_000,
+  });
+  try {
+    const batched = await batchingManager.start({
+      connectionPrincipalId,
+      workspaceId: "durable-batched",
+      cwd: process.cwd(),
+      command: {
+        program: process.execPath,
+        args: ["-e", [
+          "process.stdout.write('one');",
+          "setTimeout(() => process.stdout.write('two'), 10);",
+          "setTimeout(() => process.stdout.write('three'), 20);",
+          "setTimeout(() => process.exit(0), 35);",
+        ].join("")],
+      },
+      yieldTimeMs: 2_000,
+    });
+    assert.equal(batched.output, "onetwothree");
+    assert.equal(batched.storedOutputBytes, Buffer.byteLength("onetwothree"));
+    assert.equal(batchedAppendCalls, 1, "multiple process chunks must flush in one durable append");
+  } finally {
+    await batchingManager.shutdown();
+    durableStore.append = originalAppend;
+  }
 } finally {
   await durableManager.shutdown();
   durableStore.close();
@@ -1167,6 +1203,63 @@ try {
     () => { rejectedRelease += 1; },
   ), false);
   assert.equal(rejectedRelease, 1, "an unowned or completed session must release immediately");
+
+  assert.deepEqual(
+    [25, 100, 500, 2_000, 2_000].map(nextTreeExitPollMs),
+    [100, 500, 2_000, 2_000, 2_000],
+    "descendant-tree polling must back off to two seconds",
+  );
+
+  let daemonLeaseReleases = 0;
+  const daemonScript = [
+    "const { spawn } = require('node:child_process');",
+    "const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });",
+    "child.unref();",
+  ].join("");
+  let daemon = await leaseManager.start({
+    connectionPrincipalId,
+    workspaceId: "managed-daemon",
+    cwd: process.cwd(),
+    command: { program: process.execPath, args: ["-e", daemonScript] },
+    yieldTimeMs: 250,
+  });
+  assert.equal(daemon.running, true);
+  assert.ok(daemon.sessionId);
+  for (let attempt = 0; attempt < 20 && !daemon.rootExited; attempt += 1) {
+    daemon = await leaseManager.write({
+      connectionPrincipalId,
+      workspaceId: "managed-daemon",
+      sessionId: daemon.sessionId!,
+      yieldTimeMs: 25,
+    });
+  }
+  assert.equal(daemon.rootExited, true);
+  assert.equal(daemon.managedDaemon, true);
+  assert.equal(await leaseManager.attachWorkspaceRootLease(
+    connectionPrincipalId,
+    "managed-daemon",
+    daemon.sessionId!,
+    () => { daemonLeaseReleases += 1; },
+  ), true);
+  const detachedDaemon = await leaseManager.write({
+    connectionPrincipalId,
+    workspaceId: "managed-daemon",
+    sessionId: daemon.sessionId!,
+    detachRootLease: true,
+    yieldTimeMs: 0,
+  });
+  assert.equal(detachedDaemon.running, true);
+  assert.equal(detachedDaemon.managedDaemon, true);
+  assert.equal(detachedDaemon.rootLeaseDetached, true);
+  assert.equal(daemonLeaseReleases, 1, "confirmed daemon detach releases the lease exactly once");
+  leaseManager.terminate(connectionPrincipalId, "managed-daemon", daemon.sessionId!);
+  await leaseManager.write({
+    connectionPrincipalId,
+    workspaceId: "managed-daemon",
+    sessionId: daemon.sessionId!,
+    yieldTimeMs: 2_000,
+  });
+  assert.equal(daemonLeaseReleases, 1, "daemon exit must not double-release a detached lease");
 } finally {
   await leaseManager.shutdown();
 }

@@ -537,4 +537,4 @@ function fileHash(path: string): string {
   return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
 
-console.log("canonical v16 migration matrix passed");
+console.log("canonical v17 migration matrix passed");

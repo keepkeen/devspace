@@ -14,6 +14,17 @@ const baseEnv = {
 };
 
 assert.equal(loadConfig(baseEnv).widgets, "full");
+assert.equal(loadConfig(baseEnv).port, 7676);
+assert.equal(loadConfig(baseEnv).controlPort, 7677);
+assert.equal(loadConfig({ ...baseEnv, PORT: "9000" }).controlPort, 9001);
+assert.equal(
+  loadConfig({ ...baseEnv, PORT: "9000", DEVSPACE_CONTROL_PORT: "9100" }).controlPort,
+  9100,
+);
+assert.throws(
+  () => loadConfig({ ...baseEnv, PORT: "9000", DEVSPACE_CONTROL_PORT: "9000" }),
+  /must differ from PORT/,
+);
 assert.equal(loadConfig(baseEnv).toolProfile, "coding");
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_TOOL_PROFILE: "browse" }).toolProfile, "browse");
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_TOOL_PROFILE: "coding" }).toolProfile, "coding");
@@ -24,6 +35,22 @@ assert.throws(
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_WIDGETS: "changes" }).widgets, "changes");
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_WIDGETS: "full" }).widgets, "full");
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_WIDGETS: "off" }).widgets, "off");
+assert.equal(loadConfig(baseEnv).mcpGlobalIdleReclaim, false);
+assert.equal(
+  loadConfig({ ...baseEnv, DEVSPACE_MCP_GLOBAL_IDLE_RECLAIM: "1" }).mcpGlobalIdleReclaim,
+  true,
+);
+assert.equal(loadConfig(baseEnv).oauth.grantMaxLifetimeSeconds, undefined);
+assert.equal(
+  loadConfig({ ...baseEnv, DEVSPACE_OAUTH_GRANT_MAX_LIFETIME_SECONDS: "86400" })
+    .oauth.grantMaxLifetimeSeconds,
+  86_400,
+);
+assert.equal(
+  loadConfig({ ...baseEnv, DEVSPACE_OAUTH_GRANT_MAX_LIFETIME_SECONDS: "0" })
+    .oauth.grantMaxLifetimeSeconds,
+  undefined,
+);
 assert.equal(loadConfig(baseEnv).skillsEnabled, true);
 assert.deepEqual(loadConfig(baseEnv).skillPaths, []);
 assert.deepEqual(loadConfig(baseEnv).disabledSkillPaths, []);
@@ -327,9 +354,12 @@ writeFileSync(
   join(configDir, "config.json"),
   JSON.stringify({
     port: 8787,
+    controlPort: 8790,
     allowedRoots: [process.cwd()],
     publicBaseUrl: "https://devspace.example.com",
     subagents: true,
+    mcpGlobalIdleReclaim: true,
+    oauthGrantMaxLifetimeSeconds: 604_800,
     widgets: "changes",
     userInstructionsPath: "/tmp/persisted-devspace-user-instructions.md",
     projectDocFallbackFilenames: ["TEAM_GUIDE.md", ".agents.md"],
@@ -358,6 +388,7 @@ writeFileSync(
 
 const fileConfig = loadConfig({ DEVSPACE_CONFIG_DIR: configDir });
 assert.equal(fileConfig.port, 8787);
+assert.equal(fileConfig.controlPort, 8790);
 assert.equal(fileConfig.oauth.ownerCredential.password, "persisted-owner-token-long-enough");
 assert.match(fileConfig.oauth.ownerCredential.passwordHash ?? "", /^\$argon2id\$/u);
 assert.equal(fileConfig.oauth.keys.derivation, "legacy-direct");
@@ -379,6 +410,8 @@ assert.deepEqual(fileConfig.skillPaths, ["workspace-skills"]);
 assert.deepEqual(fileConfig.disabledSkillPaths, ["workspace-skills/disabled/SKILL.md"]);
 assert.equal(fileConfig.adminSkillsDir, "/opt/devspace/admin-skills");
 assert.equal(fileConfig.subagents, true);
+assert.equal(fileConfig.mcpGlobalIdleReclaim, true);
+assert.equal(fileConfig.oauth.grantMaxLifetimeSeconds, 604_800);
 assert.equal(fileConfig.widgets, "changes");
 assert.equal(fileConfig.userInstructionsPath, "/tmp/persisted-devspace-user-instructions.md");
 assert.equal(fileConfig.resources.maxMcpSessions, 11);

@@ -1,8 +1,8 @@
 import { createHash, randomBytes } from "node:crypto";
 import { readFileSync, rmSync } from "node:fs";
-import { link, mkdir, open, readFile, readdir, rm, stat } from "node:fs/promises";
+import { chmod, link, lstat, mkdir, open, readFile, readdir, rm, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import {
   defaultProcessIdentityRuntime,
   processIdentityAlive,
@@ -67,6 +67,8 @@ export interface CrossProcessWorkspaceRootLockOptions {
   pid?: number;
   processIdentityRuntime?: ProcessIdentityRuntime;
   serverIdentity?: ProcessIdentity;
+  /** Trusted state root containing the lock directory; every child is verified. */
+  trustedStateRoot?: string;
 }
 
 export class WorkspaceRootLockTimeoutError extends Error {
@@ -96,6 +98,7 @@ export class CrossProcessWorkspaceRootLock {
   private readonly now: () => number;
   private readonly runtime: ProcessIdentityRuntime;
   private readonly serverIdentity: ProcessIdentity;
+  private readonly trustedStateRoot?: string;
 
   constructor(options: CrossProcessWorkspaceRootLockOptions) {
     if (!options.root) throw new TypeError("Cross-process lock root is required.");
@@ -118,6 +121,15 @@ export class CrossProcessWorkspaceRootLock {
     );
     this.now = options.now ?? Date.now;
     this.runtime = options.processIdentityRuntime ?? defaultProcessIdentityRuntime;
+    this.trustedStateRoot = options.trustedStateRoot === undefined
+      ? undefined
+      : resolve(options.trustedStateRoot);
+    if (this.trustedStateRoot) {
+      const relationship = relative(this.trustedStateRoot, resolve(this.root));
+      if (relationship.startsWith("..") || isAbsolute(relationship)) {
+        throw new Error("Cross-process lock root must be inside the trusted state root.");
+      }
+    }
     const pid = options.pid ?? this.runtime.currentPid;
     this.serverIdentity = options.serverIdentity ?? readProcessIdentity(pid, this.runtime);
   }
@@ -126,6 +138,7 @@ export class CrossProcessWorkspaceRootLock {
     key: string,
     mode: WorkspaceRootLockMode,
     metadata: WorkspaceRootLeaseMetadata = {},
+    deadlineOverride?: number,
   ): Promise<WorkspaceRootLease> {
     if (!key) throw new TypeError("Workspace root lock key is required.");
     if (mode !== "read" && mode !== "write") {
@@ -139,7 +152,10 @@ export class CrossProcessWorkspaceRootLock {
     }
     const paths = this.paths(key);
     await this.ensureDirectories(paths);
-    const deadline = this.now() + this.acquireTimeoutMs;
+    const deadline = deadlineOverride ?? this.now() + this.acquireTimeoutMs;
+    if (!Number.isFinite(deadline) || deadline <= this.now()) {
+      throw new WorkspaceRootLockTimeoutError();
+    }
     return mode === "read"
       ? this.acquireReader(paths, deadline, metadata)
       : this.acquireWriter(paths, deadline, metadata);
@@ -223,9 +239,13 @@ export class CrossProcessWorkspaceRootLock {
   private async ensureDirectories(
     paths: ReturnType<CrossProcessWorkspaceRootLock["paths"]>,
   ): Promise<void> {
-    await mkdir(this.root, { recursive: true, mode: 0o700 });
-    await mkdir(paths.directory, { recursive: true, mode: 0o700 });
-    await mkdir(paths.readers, { recursive: true, mode: 0o700 });
+    if (this.trustedStateRoot) {
+      await ensureSecureDirectoryChain(this.trustedStateRoot, this.root);
+    } else {
+      await ensureSecureDirectory(this.root);
+    }
+    await ensureSecureDirectory(paths.directory);
+    await ensureSecureDirectory(paths.readers);
   }
 
   private newMarker(metadata: WorkspaceRootLeaseMetadata): LockMarker {
@@ -411,11 +431,47 @@ export class CrossProcessWorkspaceRootLock {
   }
 }
 
-export function defaultWorkspaceRootLockDirectory(): string {
+export function defaultWorkspaceRootLockDirectory(stateDir?: string): string {
+  if (stateDir) return join(resolve(stateDir), "locks", "workspace-roots");
   const owner = typeof process.getuid === "function"
     ? String(process.getuid())
     : createHash("sha256").update(homedir(), "utf8").digest("hex").slice(0, 16);
   return join(tmpdir(), `devspace-root-locks-${owner}`);
+}
+
+async function ensureSecureDirectoryChain(trustedRoot: string, target: string): Promise<void> {
+  const canonicalTrustedRoot = resolve(trustedRoot);
+  const canonicalTarget = resolve(target);
+  const relationship = relative(canonicalTrustedRoot, canonicalTarget);
+  if (relationship.startsWith("..") || isAbsolute(relationship)) {
+    throw new Error("Secure lock directory escapes the trusted state root.");
+  }
+  await ensureSecureDirectory(canonicalTrustedRoot);
+  let current = canonicalTrustedRoot;
+  for (const segment of relationship.split(/[\\/]+/u).filter(Boolean)) {
+    current = join(current, segment);
+    await ensureSecureDirectory(current);
+  }
+}
+
+async function ensureSecureDirectory(path: string): Promise<void> {
+  await mkdir(path, { recursive: true, mode: 0o700 });
+  let metadata = await lstat(path);
+  if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+    throw new Error(`Workspace lock path is not a secure directory: ${path}`);
+  }
+  if (typeof process.getuid === "function" && metadata.uid !== process.getuid()) {
+    throw new Error(`Workspace lock directory is owned by another OS user: ${path}`);
+  }
+  if (process.platform !== "win32" && (metadata.mode & 0o777) !== 0o700) {
+    await chmod(path, 0o700);
+    metadata = await lstat(path);
+    if (metadata.isSymbolicLink() || !metadata.isDirectory() || (metadata.mode & 0o777) !== 0o700) {
+      throw new Error(`Workspace lock directory permissions are not 0700: ${path}`);
+    }
+  }
+  const parent = dirname(path);
+  if (parent === path) throw new Error("Workspace lock directory cannot be a filesystem root.");
 }
 
 async function readerMarkers(directory: string): Promise<string[]> {

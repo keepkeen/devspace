@@ -45,10 +45,11 @@ import {
   type DevspaceUserConfig,
 } from "./user-config.js";
 import { expandHomePath } from "./roots.js";
-import { shutdownHttpServer } from "./server-shutdown.js";
+import { shutdownHttpServers } from "./server-shutdown.js";
 import { AuditEventStore, type AuditEventQuery } from "./audit-events.js";
 import { formatChinaTimestamp } from "./logger.js";
 import { inspectInstructionHealth } from "./instruction-health.js";
+import { SqliteOAuthStore } from "./oauth-store.js";
 
 type Command = "serve" | "admin" | "init" | "doctor" | "config" | "auth" | "audit" | "agents" | "help" | "version";
 const require = createRequire(import.meta.url);
@@ -257,7 +258,7 @@ async function serve(): Promise<void> {
   }
 
   const { createServer } = await import("./server.js");
-  const { app, config, beginClose, close, localAgentProviders } = createServer();
+  const { app, controlApp, config, beginClose, close, localAgentProviders } = createServer();
   const httpServer = app.listen(config.port, config.host, () => {
     console.log(`devspace listening on http://${config.host}:${config.port}/mcp`);
     console.log(`public base url: ${config.publicBaseUrl}`);
@@ -272,13 +273,20 @@ async function serve(): Promise<void> {
       console.log(`subagent providers: ${formatLocalAgentProviderAvailabilitySummary(localAgentProviders)}`);
     }
   });
+  const controlServer = controlApp.listen(config.controlPort, "127.0.0.1", () => {
+    console.log(`local control plane: http://127.0.0.1:${config.controlPort}`);
+  });
 
   let shuttingDown = false;
   const shutdown = async () => {
     if (shuttingDown) return;
     shuttingDown = true;
     await beginClose();
-    await shutdownHttpServer(httpServer, close, config.resources.httpDrainTimeoutMs);
+    await shutdownHttpServers(
+      [httpServer, controlServer],
+      close,
+      config.resources.httpDrainTimeoutMs,
+    );
     process.exit(0);
   };
   const handleShutdown = () => {
@@ -372,6 +380,18 @@ async function runDoctor(): Promise<void> {
         "Security warning: master key uses legacy-direct compatibility. " +
         "Rotate it only during a planned global reauthorization.",
       );
+    }
+    const oauthStore = new SqliteOAuthStore(config.stateDir);
+    try {
+      const legacyWildcardGrants = oauthStore.diagnosticSnapshot().legacyWildcardGrants;
+      if (legacyWildcardGrants > 0) {
+        console.log(
+          `Security warning: ${legacyWildcardGrants} active legacy wildcard root grant(s) found. ` +
+          "Adding an allowed root expands those grants; reconnect them through OAuth and select explicit project roots.",
+        );
+      }
+    } finally {
+      oauthStore.close();
     }
     const instructionHealth = await inspectInstructionHealth(
       config.allowedRoots,

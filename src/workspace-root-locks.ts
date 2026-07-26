@@ -2,6 +2,7 @@ export type WorkspaceRootLockMode = "read" | "write";
 
 import {
   CrossProcessWorkspaceRootLock,
+  WorkspaceRootLockTimeoutError,
   type CrossProcessWorkspaceRootLockOptions,
   type WorkspaceRootLease,
   type WorkspaceRootLeaseMetadata,
@@ -9,9 +10,9 @@ import {
 } from "./cross-process-root-lock.js";
 
 export {
-  WorkspaceRootLockTimeoutError,
   defaultWorkspaceRootLockDirectory,
 } from "./cross-process-root-lock.js";
+export { WorkspaceRootLockTimeoutError };
 export type {
   WorkspaceRootLease,
   WorkspaceRootLeaseMetadata,
@@ -21,6 +22,8 @@ export type {
 interface LockWaiter {
   mode: WorkspaceRootLockMode;
   resolve(release: () => void): void;
+  reject(error: unknown): void;
+  timer?: NodeJS.Timeout;
 }
 
 interface RootLockState {
@@ -37,15 +40,24 @@ interface RootLockState {
 export class WorkspaceRootLockManager {
   private readonly states = new Map<string, RootLockState>();
   private readonly crossProcess?: CrossProcessWorkspaceRootLock;
+  private readonly acquireTimeoutMs: number;
 
   constructor(options: {
     crossProcessLockRoot?: string;
+    trustedStateRoot?: string;
     acquireTimeoutMs?: number;
     pollIntervalMs?: number;
   } = {}) {
+    this.acquireTimeoutMs = options.acquireTimeoutMs ?? 30_000;
+    if (!Number.isSafeInteger(this.acquireTimeoutMs) || this.acquireTimeoutMs < 1) {
+      throw new RangeError("acquireTimeoutMs must be a positive integer.");
+    }
     if (options.crossProcessLockRoot) {
       const crossProcessOptions: CrossProcessWorkspaceRootLockOptions = {
         root: options.crossProcessLockRoot,
+        ...(options.trustedStateRoot === undefined
+          ? {}
+          : { trustedStateRoot: options.trustedStateRoot }),
         ...(options.acquireTimeoutMs === undefined
           ? {}
           : { acquireTimeoutMs: options.acquireTimeoutMs }),
@@ -80,10 +92,11 @@ export class WorkspaceRootLockManager {
     if (mode !== "read" && mode !== "write") {
       return Promise.reject(new TypeError("Workspace root lock mode must be read or write."));
     }
-    const releaseLocal = await this.acquireLocal(key, mode);
+    const deadline = Date.now() + this.acquireTimeoutMs;
+    const releaseLocal = await this.acquireLocal(key, mode, deadline);
     let crossProcessLease: WorkspaceRootLease | undefined;
     try {
-      crossProcessLease = await this.crossProcess?.acquire(key, mode, metadata);
+      crossProcessLease = await this.crossProcess?.acquire(key, mode, metadata, deadline);
     } catch (error) {
       releaseLocal();
       throw error;
@@ -106,11 +119,28 @@ export class WorkspaceRootLockManager {
     return lease;
   }
 
-  private acquireLocal(key: string, mode: WorkspaceRootLockMode): Promise<() => void> {
+  private acquireLocal(
+    key: string,
+    mode: WorkspaceRootLockMode,
+    deadline: number,
+  ): Promise<() => void> {
     const state = this.states.get(key) ?? { readers: 0, writer: false, queue: [] };
     this.states.set(key, state);
-    return new Promise((resolve) => {
-      state.queue.push({ mode, resolve });
+    return new Promise((resolve, reject) => {
+      const waiter: LockWaiter = { mode, resolve, reject };
+      const remaining = Math.max(0, deadline - Date.now());
+      waiter.timer = setTimeout(() => {
+        const index = state.queue.indexOf(waiter);
+        if (index < 0) return;
+        state.queue.splice(index, 1);
+        reject(new WorkspaceRootLockTimeoutError());
+        if (!state.writer && state.readers === 0 && state.queue.length === 0) {
+          if (this.states.get(key) === state) this.states.delete(key);
+        } else {
+          this.drain(key, state);
+        }
+      }, remaining);
+      state.queue.push(waiter);
       this.drain(key, state);
     });
   }
@@ -121,6 +151,7 @@ export class WorkspaceRootLockManager {
 
     if (state.readers === 0 && state.queue[0]?.mode === "write") {
       const waiter = state.queue.shift()!;
+      if (waiter.timer) clearTimeout(waiter.timer);
       state.writer = true;
       waiter.resolve(this.releaseOnce(key, state, "write"));
       return;
@@ -128,6 +159,7 @@ export class WorkspaceRootLockManager {
 
     while (state.queue[0]?.mode === "read" && !state.writer) {
       const waiter = state.queue.shift()!;
+      if (waiter.timer) clearTimeout(waiter.timer);
       state.readers += 1;
       waiter.resolve(this.releaseOnce(key, state, "read"));
     }

@@ -64,6 +64,45 @@ export interface ProcessOutputReadResult {
   status: ProcessOutputStatus;
 }
 
+export type ProcessOutputErrorCategory =
+  | "fatal"
+  | "panic"
+  | "traceback"
+  | "exception"
+  | "error"
+  | "failed";
+
+export interface ProcessOutputSearchOptions {
+  offset: number;
+  scanLimit: number;
+  maxMatches: number;
+  query?: string;
+  ignoreCase?: boolean;
+  errorsOnly?: boolean;
+}
+
+export interface ProcessOutputSearchMatch {
+  offsetBytes: number;
+  text: string;
+  category?: ProcessOutputErrorCategory;
+  truncated?: true;
+}
+
+export interface ProcessOutputSearchResult {
+  matches: ProcessOutputSearchMatch[];
+  offset: number;
+  nextOffset: number;
+  scannedBytes: number;
+  eof: boolean;
+  totalMatches: number;
+  matchesTruncated: boolean;
+  categories: Partial<Record<ProcessOutputErrorCategory, number>>;
+  totalBytes: number;
+  storedBytes: number;
+  droppedBytes: number;
+  status: ProcessOutputStatus;
+}
+
 export interface ProcessOutputCleanupResult {
   deleted: number;
   bytesReclaimed: number;
@@ -131,6 +170,9 @@ const OUTPUT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{
 const DEFAULT_CLEANUP_LIMIT = 100;
 const MAX_CLEANUP_LIMIT = 1_000;
 const MAX_READ_BYTES = 1024 * 1024;
+const MAX_SEARCH_MATCHES = 200;
+const MAX_SEARCH_QUERY_BYTES = 512;
+const MAX_SEARCH_LINE_BYTES = 4 * 1024;
 const RECOVERY_BATCH_SIZE = 100;
 const UTF8_LOOKAHEAD_BYTES = 3;
 const DEFAULT_MAX_OUTPUTS = 10_000;
@@ -428,6 +470,142 @@ export class ProcessOutputStore {
       offset,
       nextOffset,
       eof: nextOffset >= row.stored_bytes,
+      totalBytes: row.total_bytes,
+      storedBytes: row.stored_bytes,
+      droppedBytes: row.dropped_bytes,
+      status: row.status,
+    };
+  }
+
+  tail(
+    connectionPrincipalId: string,
+    workspaceId: string,
+    outputId: string,
+    limit: number,
+  ): ProcessOutputReadResult {
+    this.assertOpenAndStorageDirectory();
+    validateOutputId(outputId);
+    boundedNonEmptyString(connectionPrincipalId, "connectionPrincipalId");
+    boundedNonEmptyString(workspaceId, "workspaceId");
+    const boundedLimit = positiveBoundedInteger(limit, "limit", MAX_READ_BYTES);
+    const row = this.getOwnedReadableRow(connectionPrincipalId, workspaceId, outputId);
+    let offset = Math.max(0, row.stored_bytes - boundedLimit);
+    if (offset > 0 && offset < row.stored_bytes) {
+      const descriptor = this.openVerifiedFile(row, constants.O_RDONLY | NO_FOLLOW);
+      try {
+        const byte = Buffer.allocUnsafe(1);
+        while (offset < row.stored_bytes) {
+          if (readSync(descriptor, byte, 0, 1, offset) !== 1) {
+            throw new ProcessOutputIntegrityError("Process output file changed during tail read");
+          }
+          if (!isUtf8ContinuationByte(byte[0]!)) break;
+          offset += 1;
+        }
+      } finally {
+        closeSync(descriptor);
+      }
+    }
+    return this.read(connectionPrincipalId, workspaceId, outputId, {
+      offset,
+      limit: Math.max(1, row.stored_bytes - offset),
+    });
+  }
+
+  search(
+    connectionPrincipalId: string,
+    workspaceId: string,
+    outputId: string,
+    options: ProcessOutputSearchOptions,
+  ): ProcessOutputSearchResult {
+    this.assertOpenAndStorageDirectory();
+    validateOutputId(outputId);
+    boundedNonEmptyString(connectionPrincipalId, "connectionPrincipalId");
+    boundedNonEmptyString(workspaceId, "workspaceId");
+    const offset = nonNegativeSafeInteger(options.offset, "offset");
+    const scanLimit = positiveBoundedInteger(options.scanLimit, "scanLimit", MAX_READ_BYTES);
+    const maxMatches = positiveBoundedInteger(options.maxMatches, "maxMatches", MAX_SEARCH_MATCHES);
+    const query = options.query?.trim();
+    if (!options.errorsOnly && !query) {
+      throw new TypeError("Process output search requires a non-empty query or errorsOnly=true");
+    }
+    if (query && Buffer.byteLength(query, "utf8") > MAX_SEARCH_QUERY_BYTES) {
+      throw new RangeError(`Process output search query exceeds ${MAX_SEARCH_QUERY_BYTES} UTF-8 bytes`);
+    }
+
+    const row = this.getOwnedReadableRow(connectionPrincipalId, workspaceId, outputId);
+    if (offset > row.stored_bytes) throw new RangeError("offset exceeds stored process output bytes");
+    if (offset > 0 && offset < row.stored_bytes) {
+      const descriptor = this.openVerifiedFile(row, constants.O_RDONLY | NO_FOLLOW);
+      try {
+        const byte = Buffer.allocUnsafe(1);
+        if (readSync(descriptor, byte, 0, 1, offset) !== 1) {
+          throw new ProcessOutputIntegrityError("Process output file changed during search");
+        }
+        if (isUtf8ContinuationByte(byte[0]!)) {
+          throw new RangeError("offset is inside a UTF-8 character; use a nextOffset returned by this tool");
+        }
+      } finally {
+        closeSync(descriptor);
+      }
+    }
+
+    const available = row.stored_bytes - offset;
+    const desiredBytes = Math.min(available, scanLimit);
+    let buffer = Buffer.alloc(0);
+    let consumedBytes = 0;
+    if (desiredBytes > 0) {
+      const readLength = Math.min(available, desiredBytes + UTF8_LOOKAHEAD_BYTES);
+      buffer = Buffer.allocUnsafe(readLength);
+      const descriptor = this.openVerifiedFile(row, constants.O_RDONLY | NO_FOLLOW);
+      try {
+        const bytesRead = readSync(descriptor, buffer, 0, readLength, offset);
+        if (bytesRead !== readLength) {
+          throw new ProcessOutputIntegrityError("Process output file changed during search");
+        }
+      } finally {
+        closeSync(descriptor);
+      }
+      consumedBytes = safeUtf8PageEnd(buffer, desiredBytes, available === readLength);
+      buffer = buffer.subarray(0, consumedBytes);
+    }
+
+    const matches: ProcessOutputSearchMatch[] = [];
+    const categories: Partial<Record<ProcessOutputErrorCategory, number>> = {};
+    let totalMatches = 0;
+    const normalizedQuery = options.ignoreCase && query ? query.toLocaleLowerCase("en-US") : query;
+    for (const line of rawOutputLines(buffer)) {
+      const text = new TextDecoder("utf-8", { fatal: false }).decode(line.bytes);
+      const category = errorCategory(text);
+      const queryMatches = normalizedQuery === undefined || (
+        options.ignoreCase
+          ? text.toLocaleLowerCase("en-US").includes(normalizedQuery)
+          : text.includes(normalizedQuery)
+      );
+      if (!queryMatches || (options.errorsOnly && !category)) continue;
+      totalMatches += 1;
+      if (category) categories[category] = (categories[category] ?? 0) + 1;
+      if (matches.length >= maxMatches) continue;
+      const visibleBytes = line.bytes.length > MAX_SEARCH_LINE_BYTES
+        ? line.bytes.subarray(0, completeUtf8PrefixLength(line.bytes, MAX_SEARCH_LINE_BYTES))
+        : line.bytes;
+      matches.push({
+        offsetBytes: offset + line.offset,
+        text: new TextDecoder("utf-8", { fatal: false }).decode(visibleBytes),
+        ...(category ? { category } : {}),
+        ...(visibleBytes.length < line.bytes.length ? { truncated: true as const } : {}),
+      });
+    }
+
+    const nextOffset = offset + consumedBytes;
+    return {
+      matches,
+      offset,
+      nextOffset,
+      scannedBytes: consumedBytes,
+      eof: nextOffset >= row.stored_bytes,
+      totalMatches,
+      matchesTruncated: totalMatches > matches.length,
+      categories,
       totalBytes: row.total_bytes,
       storedBytes: row.stored_bytes,
       droppedBytes: row.dropped_bytes,
@@ -1001,6 +1179,30 @@ function rowToMetadata(row: ProcessOutputRow): ProcessOutputMetadata {
     storedBytes: row.stored_bytes,
     droppedBytes: row.dropped_bytes,
   };
+}
+
+function rawOutputLines(buffer: Buffer): Array<{ offset: number; bytes: Buffer }> {
+  const lines: Array<{ offset: number; bytes: Buffer }> = [];
+  let start = 0;
+  for (let index = 0; index < buffer.length; index += 1) {
+    const byte = buffer[index]!;
+    if (byte !== 0x0a && byte !== 0x0d) continue;
+    lines.push({ offset: start, bytes: buffer.subarray(start, index) });
+    if (byte === 0x0d && buffer[index + 1] === 0x0a) index += 1;
+    start = index + 1;
+  }
+  if (start < buffer.length) lines.push({ offset: start, bytes: buffer.subarray(start) });
+  return lines;
+}
+
+function errorCategory(text: string): ProcessOutputErrorCategory | undefined {
+  if (/\bfatal\b/iu.test(text)) return "fatal";
+  if (/\bpanic\b/iu.test(text)) return "panic";
+  if (/\btraceback\b/iu.test(text)) return "traceback";
+  if (/\bexception\b/iu.test(text)) return "exception";
+  if (/\berror\b/iu.test(text)) return "error";
+  if (/\b(?:failed|failure)\b/iu.test(text)) return "failed";
+  return undefined;
 }
 
 function ensurePrivateDirectory(path: string): void {

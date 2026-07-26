@@ -258,6 +258,18 @@ try {
     } | undefined)?.effects?.reviewCheckpoint?.advanced,
     false,
   );
+  const firstReviewToken = String(
+    (firstPreview.structuredContent as {
+      diff?: { eof?: unknown; reviewToken?: unknown };
+    } | undefined)?.diff?.reviewToken ?? "",
+  );
+  assert.equal(
+    (firstPreview.structuredContent as {
+      diff?: { eof?: unknown };
+    } | undefined)?.diff?.eof,
+    true,
+  );
+  assert.match(firstReviewToken, /^dcur1\./u);
   const advancedChanges = await callAndRecord(
     firstTurn,
     "account-a-main",
@@ -267,6 +279,7 @@ try {
       receipt: alphaReceipt,
       advanceCheckpoint: true,
       operationId: "host-simulation-a-review",
+      reviewToken: firstReviewToken,
     },
   );
   assert.equal(

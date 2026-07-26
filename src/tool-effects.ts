@@ -19,12 +19,14 @@ export interface FileEffect {
   operation: PatchOperation;
   observedBefore: FileVersion | null;
   observedAfter: FileVersion | null;
+  fuzzyMatch?: AppliedPatchFile["fuzzyMatch"];
 }
 
 export interface ProcessSubmittedEffect {
   stdinBytes: number;
   closeStdin: boolean;
   interrupt: boolean;
+  detachRootLease?: boolean;
   resize?: {
     columns?: number;
     rows?: number;
@@ -38,6 +40,9 @@ export interface ProcessObservedEffect {
   signal?: string;
   timedOut: boolean;
   stdinClosed: boolean;
+  rootExited: boolean;
+  managedDaemon: boolean;
+  rootLeaseDetached: boolean;
 }
 
 export interface ProcessEffect {
@@ -125,6 +130,7 @@ export function createApplyPatchEffects(
           operation: file.operation,
           observedBefore: cloneFileVersion(file.observedBefore),
           observedAfter: cloneFileVersion(file.observedAfter),
+          ...(file.fuzzyMatch ? { fuzzyMatch: file.fuzzyMatch } : {}),
         }];
       }
       return [
@@ -142,6 +148,7 @@ export function createApplyPatchEffects(
           operation: file.overwrittenBefore ? "update" : "add",
           observedBefore: cloneFileVersion(file.overwrittenBefore ?? null),
           observedAfter: cloneFileVersion(file.observedAfter),
+          ...(file.fuzzyMatch ? { fuzzyMatch: file.fuzzyMatch } : {}),
         },
       ];
     }),
@@ -228,6 +235,7 @@ function createProcessEffects(
         stdinBytes: submitted.stdinBytes,
         closeStdin: submitted.closeStdin,
         interrupt: submitted.interrupt,
+        ...(submitted.detachRootLease ? { detachRootLease: true } : {}),
         ...(submitted.resize === undefined ? {} : {
           resize: {
             ...(submitted.resize.columns === undefined
@@ -244,6 +252,9 @@ function createProcessEffects(
         ...(snapshot.signal === undefined ? {} : { signal: snapshot.signal }),
         timedOut: snapshot.timedOut,
         stdinClosed: snapshot.stdinClosed,
+        rootExited: snapshot.rootExited === true,
+        managedDaemon: snapshot.managedDaemon === true,
+        rootLeaseDetached: snapshot.rootLeaseDetached === true,
       },
       untrackedSideEffects: true,
     },

@@ -214,10 +214,10 @@ fixed expiry. Revision hints are only a cache optimization in explicit
 bodies. Version 2.0 does not accept the removed `workspaceId`/generation
 request shape.
 
-ChatGPT OAuth clients use stateless MCP POST requests, so an old transport
-session header does not invalidate or consume the workspace. Non-ChatGPT MCP
-hosts remain stateful; an unknown transport session returns a dedicated 404 and
-the server records a redacted `unknown_mcp_session` diagnostic.
+MCP transport behavior follows `DEVSPACE_MCP_HTTP_TRANSPORT`, not the host name
+or OAuth redirect. Stateless is the default. In explicit stateful mode, an
+unknown transport session returns a dedicated 404 and the server records a
+redacted `unknown_mcp_session` diagnostic.
 
 For log correlation, `oauthClientRef` identifies the dynamic OAuth
 registration, while `connectionRef` identifies the local principal. Neither is
@@ -353,14 +353,17 @@ Per-tool widget cards are enabled by default with:
 DEVSPACE_WIDGETS=full
 ```
 
-The aggregate `show_changes` tool is only exposed with
-`DEVSPACE_WIDGETS=changes`. Plain MCP clients may ignore ChatGPT Apps widget
-metadata and only show text results.
+The aggregate `show_changes` tool is exposed according to OAuth/tool profile;
+`DEVSPACE_WIDGETS=changes` only limits which tools receive iframe metadata.
+Plain MCP clients may ignore ChatGPT Apps widget metadata and consume the
+model-visible structured result.
 
 The default `show_changes` call is a read-only preview and does not advance the
-review checkpoint. Repeat it freely with the current receipt. Set
-`advanceCheckpoint: true` only to acknowledge the displayed delta; that form
-requires `workspace:write` and an `operationId`.
+review checkpoint. Repeat it freely with the current Workspace context and page
+with `diff.nextCursor` until `diff.eof=true`. The final page returns a signed
+`reviewToken`. Set `advanceCheckpoint: true` only with that token, or with an
+explicit user-approved `acknowledgeTruncated=true`; advancement requires
+`workspace:write` and a new `operationId`.
 
 ## A Batch Tool Shows Only a Summary
 
@@ -375,10 +378,28 @@ host paths/operations and the former aggregate result are not emitted.
 Update clients or adapters that only display text content, or use single-item
 tools when structured results are unavailable.
 
-Other heavy results also have one canonical model-visible location: single
-file and process bodies are in text `content`, while Skill bodies are in
-structured `skill.content` with source/trust metadata and only actionable
-process handles and paging fields remain structured. Do not fall back to
-`_meta.card.payload.content`; `_meta` is optional widget presentation and may be
-absent. For durable output, display the page from `read_process_output` text
-`content` and continue with structured `nextOffset` until `eof` is true.
+Other heavy results also have one canonical model-visible location: a single
+file body is in text `content`; Skill bodies are in structured `skill.content`;
+process output is in structured `output.text`, `page.text`, or
+`search.matches`. These repository/process payloads include untrusted
+provenance. Do not fall back to `_meta.card.payload.content`; `_meta` is optional
+widget presentation and may be absent. For durable output, use signed cursors
+with page/tail/search/errors modes rather than copying a multi-megabyte log into
+one model turn.
+
+## Safe Backend Restart
+
+A restart necessarily closes existing HTTP connections and invalidates old
+in-memory Workspace bindings and receipts. It does not delete durable aliases,
+Workspace records, operation state, or retained process-output metadata.
+
+Before using the local Admin controlled restart, inspect loopback diagnostics
+and verify that no other MCP request, tracked process, physical-root lease,
+Workspace closing transition, allowed-root cleanup, or active output remains.
+The diagnostics request itself briefly appears as one request/process/lease; it
+must be the only activity. After restart, require a changed PID and readiness
+generation, check public `/readyz`, and recover with
+`list_workspaces → resume_workspace` instead of reopening remembered paths.
+
+If diagnostics show another active request or process, do not restart. Let it
+finish or explicitly coordinate its termination first.

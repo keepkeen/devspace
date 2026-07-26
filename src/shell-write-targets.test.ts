@@ -183,6 +183,58 @@ try {
     )?.reason ?? "",
     /symlink target is outside the workspace/i,
   );
+  assert.equal(
+    validateDirectCommandPaths(
+      "node",
+      ["-e", "require('fs').writeFileSync('build/generated.txt', 'ok')"],
+      root,
+      root,
+      [protectedRoot, stateRoot],
+    ),
+    undefined,
+    "a statically visible interpreter write inside the workspace is allowed",
+  );
+  assert.match(
+    validateDirectCommandPaths(
+      "node",
+      ["--eval", `require('fs').writeFileSync('${join(outside, "node.txt")}', 'x')`],
+      root,
+      root,
+      [protectedRoot, stateRoot],
+    )?.reason ?? "",
+    /outside the workspace/i,
+  );
+  assert.match(
+    validateDirectCommandPaths(
+      "python3",
+      ["-c", `open('${join(outside, "python.txt")}', 'w').write('x')`],
+      root,
+      root,
+      [protectedRoot, stateRoot],
+    )?.reason ?? "",
+    /outside the workspace/i,
+  );
+  assert.match(
+    validateDirectCommandPaths(
+      "node",
+      ["-e", "require('fs').writeFileSync(target, 'x')"],
+      root,
+      root,
+      [protectedRoot, stateRoot],
+    )?.reason ?? "",
+    /cannot be statically confined/i,
+  );
+  assert.equal(
+    validateDirectCommandPaths(
+      "node",
+      ["-e", "process.stdout.write('safe output')"],
+      root,
+      root,
+      [protectedRoot, stateRoot],
+    ),
+    undefined,
+    "read-only or stdout-only inline code remains available",
+  );
 
   assert.match(
     validateShellWriteTargets(`rm -rf ${join(outside, "cache")}`, root, root)?.reason ?? "",

@@ -166,16 +166,18 @@ profile 在服务创建时固定，修改后应重新连接或刷新工具，不
 2. 检查配置是否存在。环境变量优先于 `config.json` 和 `auth.json`，后者再覆盖默认值。
 3. 试加载 `better-sqlite3`，提前发现 Node ABI 不匹配。
 4. 获取本地状态目录的单实例租约，避免两个后端同时写同一份状态。
-5. 打开并迁移 canonical v16 数据库；上次异常中断的 `pending` 操作会恢复为
+5. 打开并迁移 canonical v17 数据库；上次异常中断的 `pending` 操作会恢复为
    `outcome_unknown`，不会被假装成“没执行”。
 6. 初始化 OAuth、Workspace、进程、输出、审计和本次进程的唯一 generation。
 7. `/readyz` 只有在服务未关闭、Workspace 数据库和 OAuth 数据库都就绪时才返回 `200`。
+8. `/internal/*` 只挂载在 `127.0.0.1:DEVSPACE_CONTROL_PORT`；公网 MCP listener 对这些路径返回 404。
 
 `/healthz` 只表示进程活着；排障和服务管理应优先检查 `/readyz`。
 
 收到 `SIGINT` 或 `SIGTERM` 后，DevSpace 先停止接收新工作，再等待 HTTP 请求排空、关闭进程和
 数据库。macOS 受控重启还会验证 **PID 和 readiness generation 都发生变化**，而不是只看命令
-有没有返回成功。
+有没有返回成功。重启不是零中断：旧 receipt 和内存 binding 必然失效，因此应先在本地诊断中
+确认没有其他活跃请求、运行进程、root lease 或待清理任务，再执行受控重启。
 
 ## 对话中的工作流程
 
@@ -198,7 +200,10 @@ profile 在服务创建时固定，修改后应重新连接或刷新工具，不
 5. 每个写操作使用唯一 `operationId`。响应丢失时先查状态，不要直接重做。
 6. 命令优先使用 `program + args`；只有管道、重定向等 shell 语法才使用
    `shell: true + command`。
-7. 长命令可以后台运行，输出和操作状态持久化保存。
+7. 长命令可以后台运行，输出和操作状态持久化保存。日志优先使用 `read_process_output` 的
+   小页、tail、search 或 errors 模式，不要把几十 MiB 一次塞进上下文。
+8. `show_changes` 按不超过 12 KiB 的签名 diff 页提供正文；读到 EOF 后把最终
+   `reviewToken` 交给 `advanceCheckpoint=true`，不要在未读完整 diff 时假装已审核。
 
 默认 MCP HTTP 是 stateless。ChatGPT 对话结束或服务重启后，网络连接、内存 binding 和旧 receipt
 会失效，但下面的信息仍在 SQLite 中：
@@ -257,6 +262,7 @@ node dist/cli.js admin
 ```
 
 管理面板只监听 localhost，可以管理根目录、配额、Widget、诊断、Token 撤销和受控重启。
+后端诊断与安全控制也使用独立的 loopback control listener；两者都不能放进公网 tunnel。
 允许根目录可以热更新；大多数其他运行参数需要重启。
 
 长期运行需要同时托管：
@@ -317,7 +323,7 @@ node dist/cli.js doctor
 ## 升级
 
 升级前先停止 DevSpace，并备份整个状态目录，默认是 `~/.local/share/devspace`。不要只复制主 SQLite
-文件，因为进程输出和其他持久化元数据也属于状态。启动新版本后等待 canonical v16 迁移完成，
+文件，因为进程输出和其他持久化元数据也属于状态。启动新版本后等待 canonical v17 迁移完成，
 再检查 `/readyz` 并刷新 ChatGPT App 工具。
 
 ## 更多文档

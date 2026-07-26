@@ -52,11 +52,14 @@ export interface ResourceLimitsConfig {
 export interface ServerConfig {
   host: string;
   port: number;
+  /** Loopback-only port for diagnostics, root reload, and global revocation. */
+  controlPort: number;
   oauth: OAuthConfig;
   allowedRoots: string[];
   allowedHosts: string[];
   publicBaseUrl: string;
   mcpHttpTransport: McpHttpTransportMode;
+  mcpGlobalIdleReclaim: boolean;
   toolProfile: ToolProfile;
   widgets: WidgetMode;
   stateDir: string;
@@ -82,6 +85,22 @@ function parsePort(value: string | number | undefined): number {
     throw new Error(`Invalid PORT: ${value}`);
   }
 
+  return port;
+}
+
+function parseControlPort(
+  value: string | number | undefined,
+  publicPort: number,
+): number {
+  const fallback = publicPort === 65_535 ? 65_534 : publicPort + 1;
+  if (value === undefined || value === "") return fallback;
+  const port = Number(value);
+  if (!Number.isInteger(port) || port < 1 || port > 65_535) {
+    throw new Error(`Invalid DEVSPACE_CONTROL_PORT: ${value}`);
+  }
+  if (port === publicPort) {
+    throw new Error("DEVSPACE_CONTROL_PORT must differ from PORT.");
+  }
   return port;
 }
 
@@ -194,6 +213,19 @@ function parsePositiveInteger(
     throw new Error(`Invalid ${name}: ${value}`);
   }
 
+  return parsed;
+}
+
+function parseOptionalPositiveInteger(
+  value: string | number | undefined,
+  name: string,
+  maximum = Number.MAX_SAFE_INTEGER,
+): number | undefined {
+  if (value === undefined || value === "" || value === 0 || value === "0") return undefined;
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > maximum) {
+    throw new Error(`Invalid ${name}: ${value}`);
+  }
   return parsed;
 }
 
@@ -421,6 +453,11 @@ function parseOAuthConfig(
       DEFAULT_OAUTH_REFRESH_TOKEN_TTL_SECONDS,
       "DEVSPACE_OAUTH_REFRESH_TOKEN_TTL_SECONDS",
     ),
+    grantMaxLifetimeSeconds: parseOptionalPositiveInteger(
+      env.DEVSPACE_OAUTH_GRANT_MAX_LIFETIME_SECONDS ?? files.config.oauthGrantMaxLifetimeSeconds,
+      "DEVSPACE_OAUTH_GRANT_MAX_LIFETIME_SECONDS",
+      10 * 365 * 24 * 60 * 60,
+    ),
     scopes: parseOAuthScopes(env.DEVSPACE_OAUTH_SCOPES),
     trustProxy: parseBoolean(env.DEVSPACE_TRUST_PROXY, "DEVSPACE_TRUST_PROXY"),
     allowedRedirectHosts: parseStringList(env.DEVSPACE_OAUTH_ALLOWED_REDIRECT_HOSTS, [
@@ -450,6 +487,10 @@ export function loadConfigForAdmin(env: NodeJS.ProcessEnv = process.env): Server
   const files = loadDevspaceFiles(env);
   const host = env.HOST ?? files.config.host ?? "127.0.0.1";
   const port = parsePort(env.PORT ?? files.config.port);
+  const controlPort = parseControlPort(
+    env.DEVSPACE_CONTROL_PORT ?? files.config.controlPort,
+    port,
+  );
   const publicBaseUrl = parsePublicBaseUrl(
     env.DEVSPACE_PUBLIC_BASE_URL ?? files.config.publicBaseUrl ?? localPublicBaseUrl(host, port),
   );
@@ -465,6 +506,7 @@ export function loadConfigForAdmin(env: NodeJS.ProcessEnv = process.env): Server
   return {
     host,
     port,
+    controlPort,
     oauth: parseOAuthConfig(env, files),
     allowedRoots: parseAllowedRoots(env.DEVSPACE_ALLOWED_ROOTS ?? files.config.allowedRoots),
     allowedHosts: parseAllowedHosts(env.DEVSPACE_ALLOWED_HOSTS, derivedAllowedHosts),
@@ -473,6 +515,9 @@ export function loadConfigForAdmin(env: NodeJS.ProcessEnv = process.env): Server
       env.DEVSPACE_MCP_HTTP_TRANSPORT,
       files.config.mcpHttpTransport,
     ),
+    mcpGlobalIdleReclaim: env.DEVSPACE_MCP_GLOBAL_IDLE_RECLAIM === undefined
+      ? files.config.mcpGlobalIdleReclaim ?? false
+      : parseBoolean(env.DEVSPACE_MCP_GLOBAL_IDLE_RECLAIM, "DEVSPACE_MCP_GLOBAL_IDLE_RECLAIM"),
     toolProfile: parseToolProfile(
       env.DEVSPACE_TOOL_PROFILE,
       files.config.toolProfile,

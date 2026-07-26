@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -24,6 +25,14 @@ export interface ReviewChangesResult {
   summary: ReviewSummary;
   files: ReviewFile[];
   patch: string;
+  revision: string;
+}
+
+export class ReviewRevisionChangedError extends Error {
+  constructor() {
+    super("Workspace changes changed after the reviewed diff was generated.");
+    this.name = "ReviewRevisionChangedError";
+  }
 }
 
 interface WorkspaceReviewState {
@@ -45,6 +54,7 @@ export interface ReviewCheckpointManager {
     root: string;
     since?: ReviewSince;
     markReviewed?: boolean;
+    expectedRevision?: string;
   }): Promise<ReviewChangesResult>;
   cleanupWorkspace(input: { workspaceId: string; root?: string }): Promise<void>;
   cleanupStaleRefs(input: {
@@ -120,7 +130,13 @@ export function createReviewCheckpointManager(): ReviewCheckpointManager {
       return initializeWorkspace(workspaceId, root);
     },
 
-    async reviewChanges({ workspaceId, root, since = "last_shown", markReviewed = true }) {
+    async reviewChanges({
+      workspaceId,
+      root,
+      since = "last_shown",
+      markReviewed = true,
+      expectedRevision,
+    }) {
       await initializeWorkspace(workspaceId, root);
       const state = states.get(workspaceId);
 
@@ -143,8 +159,16 @@ export function createReviewCheckpointManager(): ReviewCheckpointManager {
         })).stdout;
         const files = parseNumstat(numstat);
         const summary = summarizeFiles(files);
+        const revision = `review_${createHash("sha256")
+          .update(baseline, "utf8")
+          .update("\0", "utf8")
+          .update(patch, "utf8")
+          .digest("base64url")}`;
 
         if (markReviewed) {
+          if (expectedRevision !== undefined && expectedRevision !== revision) {
+            throw new ReviewRevisionChangedError();
+          }
           await git(gitRoot, ["update-ref", state.baselineRef, current]);
         }
 
@@ -156,6 +180,7 @@ export function createReviewCheckpointManager(): ReviewCheckpointManager {
           summary,
           files,
           patch,
+          revision,
         };
       });
     },

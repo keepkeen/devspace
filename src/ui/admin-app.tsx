@@ -547,6 +547,8 @@ function AdminForm({
           </SectionHeading>
           {diagnosticsState === "error" && <div className="inline-banner error" role="alert">后端尚未提供内部诊断端点，或当前网络不可用。</div>}
           {diagnostics && <>
+            {(diagnostics.diagnostics.usage?.oauth?.legacyWildcardGrants ?? 0) > 0 && <div className="inline-banner warning" role="alert">检测到 {diagnostics.diagnostics.usage?.oauth?.legacyWildcardGrants} 个遗留通配根授权。新增 allowed root 会扩大这些授权的访问范围；请重新执行 OAuth 审批并选择明确项目根。</div>}
+            {(diagnostics.diagnostics.observability?.audit?.auditWriteFailures ?? 0) > 0 && <div className="inline-banner warning" role="alert">安全审计持久化已失败 {diagnostics.diagnostics.observability?.audit?.auditWriteFailures} 次；最近一次为 {diagnostics.diagnostics.observability?.audit?.lastAuditWriteFailureAt ? formatTimestamp(diagnostics.diagnostics.observability.audit.lastAuditWriteFailureAt) : "未知时间"}。工具结果未受影响，但请检查本地 SQLite 状态和磁盘。</div>}
             <div className="usage-grid">
               <UsageCard label="MCP 会话" metric={diagnostics.diagnostics.usage?.mcpSessions} />
               <UsageCard label="进程会话" metric={diagnostics.diagnostics.usage?.processSessions} />

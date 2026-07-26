@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { resolve } from "node:path";
+import { basename, resolve } from "node:path";
 import { and, eq, gt, lt, or } from "drizzle-orm";
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
 import {
@@ -272,26 +272,29 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
     maxActiveSessionsPerClient?: number;
   }): WorkspaceSession {
     const now = new Date().toISOString();
-    const alias = input.alias ?? generateWorkspaceAlias();
-    const session: WorkspaceSession = {
-      id: input.id,
-      connectionPrincipalId: input.connectionPrincipalId,
-      alias,
-      root: input.root,
-      status: "active",
-      mode: input.mode ?? "checkout",
-      sourceRoot: input.sourceRoot,
-      baseRef: input.baseRef,
-      baseSha: input.baseSha,
-      dirtySource: input.dirtySource ?? false,
-      managed: input.managed ?? false,
-      writeAccess: input.writeAccess ?? "read_write",
-      stateGeneration: validateStateGeneration(input.stateGeneration ?? 1),
-      createdAt: now,
-      lastUsedAt: now,
-    };
-
-    const create = this.database.sqlite.transaction(() => {
+    const create = this.database.sqlite.transaction((): WorkspaceSession => {
+      const session: WorkspaceSession = {
+        id: input.id,
+        connectionPrincipalId: input.connectionPrincipalId,
+        alias: input.alias ?? generateWorkspaceAlias(
+          this.database,
+          input.connectionPrincipalId,
+          input.sourceRoot ?? input.root,
+          input.id,
+        ),
+        root: input.root,
+        status: "active",
+        mode: input.mode ?? "checkout",
+        sourceRoot: input.sourceRoot,
+        baseRef: input.baseRef,
+        baseSha: input.baseSha,
+        dirtySource: input.dirtySource ?? false,
+        managed: input.managed ?? false,
+        writeAccess: input.writeAccess ?? "read_write",
+        stateGeneration: validateStateGeneration(input.stateGeneration ?? 1),
+        createdAt: now,
+        lastUsedAt: now,
+      };
       this.assertActiveSessionQuota(session.connectionPrincipalId, input.maxActiveSessionsPerClient);
       this.database.db
         .insert(workspaceSessions)
@@ -314,10 +317,9 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
           lastUsedAt: session.lastUsedAt,
         })
         .run();
+      return session;
     });
-    create.immediate();
-
-    return session;
+    return create.immediate();
   }
 
   createOrReuseManagedSession(input: {
@@ -336,7 +338,6 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
     const now = new Date().toISOString();
     const values = {
       ...input,
-      alias: input.alias ?? generateWorkspaceAlias(),
       stateGeneration: validateStateGeneration(input.stateGeneration ?? 1),
       now,
     };
@@ -404,6 +405,12 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
       this.assertActiveSessionQuota(input.connectionPrincipalId, input.maxActiveSessionsPerClient);
       return insertManaged.get({
         ...values,
+        alias: input.alias ?? generateWorkspaceAlias(
+          this.database,
+          input.connectionPrincipalId,
+          input.sourceRoot,
+          input.id,
+        ),
         dirtySource: String(input.dirtySource),
       }) as WorkspaceSessionRow;
     });
@@ -424,7 +431,6 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
     maxActiveSessionsPerClient?: number;
   }): WorkspaceSession {
     const now = new Date().toISOString();
-    const alias = input.alias ?? generateWorkspaceAlias();
     const writeAccess = input.writeAccess ?? "read_write";
     const stateGeneration = validateStateGeneration(input.stateGeneration ?? 1);
     const selectCanonical = this.database.sqlite.prepare(`
@@ -549,7 +555,15 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
         }
 
         this.assertActiveSessionQuota(values.connectionPrincipalId, values.maxActiveSessionsPerClient);
-        const inserted = insertCheckout.get(values) as WorkspaceSessionRow | undefined;
+        const inserted = insertCheckout.get({
+          ...values,
+          alias: values.alias ?? generateWorkspaceAlias(
+            this.database,
+            values.connectionPrincipalId,
+            values.root,
+            values.id,
+          ),
+        }) as WorkspaceSessionRow | undefined;
         if (inserted) return inserted;
         const concurrent = selectCanonical.get(values) as WorkspaceSessionRow | undefined;
         if (!concurrent) throw new Error("Concurrent checkout workspace creation did not return a Workspace.");
@@ -558,7 +572,6 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
     );
     const row = getOrCreate.immediate({
       ...input,
-      alias,
       writeAccess,
       replaceWriteAccess: input.replaceWriteAccess ? 1 : 0,
       requestedAlias: input.requestedAlias === undefined
@@ -1255,8 +1268,33 @@ function rowToRevocationDirtyWorktreeArtifact(
   };
 }
 
-function generateWorkspaceAlias(): string {
-  return `ws-${randomUUID()}`;
+function generateWorkspaceAlias(
+  database: DatabaseHandle,
+  connectionPrincipalId: string,
+  identityPath: string,
+  workspaceId: string,
+): string {
+  const pathName = basename(resolve(identityPath));
+  const sanitized = pathName
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/gu, "")
+    .replace(/[^A-Za-z0-9]+/gu, "-")
+    .replace(/^-+|-+$/gu, "")
+    .toLocaleLowerCase("en-US");
+  const fallback = `workspace-${workspaceId.replace(/[^A-Za-z0-9]/gu, "").slice(0, 12) || "new"}`;
+  const base = (sanitized || fallback).slice(0, 64);
+  const used = new Set(
+    (database.sqlite.prepare(`
+      select alias from workspace_sessions where connection_principal_id = ?
+    `).all(connectionPrincipalId) as Array<{ alias: string }>).map((row) => row.alias),
+  );
+  if (!used.has(base)) return base;
+  for (let suffix = 2; suffix < 1_000_000; suffix += 1) {
+    const suffixText = `-${suffix}`;
+    const candidate = `${base.slice(0, Math.max(1, 64 - suffixText.length))}${suffixText}`;
+    if (!used.has(candidate)) return candidate;
+  }
+  return fallback.slice(0, 64);
 }
 
 function validateStateGeneration(stateGeneration: number): number {

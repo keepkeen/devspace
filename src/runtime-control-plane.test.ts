@@ -6,7 +6,11 @@ import {
   internalDiagnosticsToken,
   internalRevocationToken,
 } from "./internal-auth.js";
-import { createRuntimeControlPlane } from "./runtime-control-plane.js";
+import {
+  createRuntimeControlPlane,
+  createRuntimeReadinessPlane,
+  type RuntimeControlPlaneOptions,
+} from "./runtime-control-plane.js";
 import { RuntimeDiagnostics } from "./runtime-diagnostics.js";
 
 const ownerToken = "runtime-control-plane-owner-token";
@@ -16,8 +20,7 @@ let revocationCount = 0;
 let loggedRevocationCount = 0;
 let rootsReloadCount = 0;
 let rootsCleanupPending = 0;
-const app = express();
-app.use(createRuntimeControlPlane({
+const options: RuntimeControlPlaneOptions = {
   internalAuth: {
     diagnostics: ownerToken,
     configReload: ownerToken,
@@ -56,6 +59,11 @@ app.use(createRuntimeControlPlane({
     workspaceCleanupJobs: 0,
     expiredAccessTokens: 1,
     expiredRefreshTokens: 0,
+    legacyWildcardGrants: 2,
+  }),
+  auditWriteHealth: () => ({
+    auditWriteFailures: 3,
+    lastAuditWriteFailureAt: "2026-07-26T00:00:00.000Z",
   }),
   reloadAllowedRoots: async () => {
     rootsReloadCount += 1;
@@ -78,23 +86,39 @@ app.use(createRuntimeControlPlane({
   onGlobalRevocation: ({ clients }) => {
     loggedRevocationCount += clients;
   },
-}));
+};
+const publicApp = express();
+publicApp.use(createRuntimeReadinessPlane(options));
+const controlApp = express();
+controlApp.use(createRuntimeReadinessPlane(options));
+controlApp.use(createRuntimeControlPlane(options));
 
-const server = createServer(app);
-await new Promise<void>((resolveListen, rejectListen) => {
+const publicServer = createServer(publicApp);
+const controlServer = createServer(controlApp);
+const listen = (server: ReturnType<typeof createServer>) => new Promise<string>((resolveListen, rejectListen) => {
   server.once("error", rejectListen);
-  server.listen(0, "127.0.0.1", () => resolveListen());
+  server.listen(0, "127.0.0.1", () => {
+    const address = server.address();
+    assert(address && typeof address !== "string");
+    resolveListen(`http://127.0.0.1:${address.port}`);
+  });
 });
 
 try {
-  const address = server.address();
-  assert(address && typeof address !== "string");
-  const origin = `http://127.0.0.1:${address.port}`;
-  assert.equal((await fetch(`${origin}/readyz`)).status, 200);
-  assert.equal((await fetch(`${origin}/internal/diagnostics`)).status, 404);
+  const [publicOrigin, controlOrigin] = await Promise.all([
+    listen(publicServer),
+    listen(controlServer),
+  ]);
+  assert.equal((await fetch(`${publicOrigin}/readyz`)).status, 200);
+  assert.equal((await fetch(`${controlOrigin}/readyz`)).status, 200);
 
   const headers = { "x-devspace-internal-token": internalDiagnosticsToken(ownerToken) };
-  const diagnosticsResponse = await fetch(`${origin}/internal/diagnostics`, { headers });
+  assert.equal(
+    (await fetch(`${publicOrigin}/internal/diagnostics`, { headers })).status,
+    404,
+    "the public listener must not register internal control routes even with a valid token",
+  );
+  const diagnosticsResponse = await fetch(`${controlOrigin}/internal/diagnostics`, { headers });
   assert.equal(diagnosticsResponse.status, 200);
   assert.equal(diagnosticsResponse.headers.get("cache-control"), "no-store");
   const body = await diagnosticsResponse.json() as any;
@@ -128,6 +152,10 @@ try {
     activeOutputs: 1,
     droppedBytes: 12,
   });
+  assert.deepEqual(body.observability.audit, {
+    auditWriteFailures: 3,
+    lastAuditWriteFailureAt: "2026-07-26T00:00:00.000Z",
+  });
   assert.deepEqual(body.recentFailures, [{
     at: body.recentFailures[0].at,
     event: "test_failure",
@@ -135,12 +163,12 @@ try {
   }]);
   assert.equal(JSON.stringify(body).includes("not exposed"), false);
 
-  assert.equal((await fetch(`${origin}/internal/config/reload-roots`, { method: "POST" })).status, 404);
-  assert.equal((await fetch(`${origin}/internal/config/reload-roots`, {
+  assert.equal((await fetch(`${controlOrigin}/internal/config/reload-roots`, { method: "POST" })).status, 404);
+  assert.equal((await fetch(`${controlOrigin}/internal/config/reload-roots`, {
     method: "POST",
     headers,
   })).status, 404);
-  const rootsReloadResponse = await fetch(`${origin}/internal/config/reload-roots`, {
+  const rootsReloadResponse = await fetch(`${controlOrigin}/internal/config/reload-roots`, {
     method: "POST",
     headers: { "x-devspace-internal-token": internalConfigReloadToken(ownerToken) },
   });
@@ -148,12 +176,12 @@ try {
   assert.equal((await rootsReloadResponse.json() as any).reload.changed, true);
   assert.equal(rootsReloadCount, 1);
   rootsCleanupPending = 1;
-  assert.equal((await fetch(`${origin}/internal/config/reload-roots`, {
+  assert.equal((await fetch(`${controlOrigin}/internal/config/reload-roots`, {
     method: "POST",
     headers: { "x-devspace-internal-token": internalConfigReloadToken(ownerToken) },
   })).status, 409);
 
-  assert.equal((await fetch(`${origin}/internal/security/revoke`, {
+  assert.equal((await fetch(`${controlOrigin}/internal/security/revoke`, {
     method: "POST",
     headers: { ...headers, "content-type": "application/json" },
     body: JSON.stringify({ scope: "all_clients_and_tokens" }),
@@ -162,12 +190,12 @@ try {
     "x-devspace-internal-token": internalRevocationToken(ownerToken),
     "content-type": "application/json",
   };
-  assert.equal((await fetch(`${origin}/internal/security/revoke`, {
+  assert.equal((await fetch(`${controlOrigin}/internal/security/revoke`, {
     method: "POST",
     headers: revocationHeaders,
     body: JSON.stringify({ scope: "invalid" }),
   })).status, 400);
-  const revokeResponse = await fetch(`${origin}/internal/security/revoke`, {
+  const revokeResponse = await fetch(`${controlOrigin}/internal/security/revoke`, {
     method: "POST",
     headers: revocationHeaders,
     body: JSON.stringify({ scope: "all_clients_and_tokens" }),
@@ -177,6 +205,22 @@ try {
   assert.equal(loggedRevocationCount, 1);
 } finally {
   await new Promise<void>((resolveClose, rejectClose) => {
-    server.close((error) => error ? rejectClose(error) : resolveClose());
+    let remaining = 2;
+    let settled = false;
+    const complete = (error?: Error) => {
+      if (settled) return;
+      if (error) {
+        settled = true;
+        rejectClose(error);
+        return;
+      }
+      remaining -= 1;
+      if (remaining === 0) {
+        settled = true;
+        resolveClose();
+      }
+    };
+    publicServer.close(complete);
+    controlServer.close(complete);
   });
 }

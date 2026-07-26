@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   PI_TOOL_ERROR_MAX_CHARACTERS,
+  MAX_TEXT_READ_FILE_BYTES,
   InvalidSearchPatternError,
   editFileTool,
   findFilesTool,
@@ -141,6 +142,34 @@ try {
     { type: "text", text: "Read image file [image/png]" },
     { type: "image", data: png.toString("base64"), mimeType: "image/png" },
   ]);
+
+  await writeFile(join(adapterRoot, "binary.dat"), Buffer.from([0x41, 0x00, 0x42]));
+  const binary = await readFileTool(
+    { path: "binary.dat" },
+    { cwd: adapterRoot, root: adapterRoot },
+  );
+  assert.equal(binary.isError, true);
+  assert.equal(binary.error?.code, "binary_file");
+  assert.equal(binary.error?.safeToRetry, false);
+
+  await writeFile(join(adapterRoot, "invalid-utf8.txt"), Buffer.from([0x61, 0xc3, 0x28]));
+  const invalidUtf8 = await readFileTool(
+    { path: "invalid-utf8.txt" },
+    { cwd: adapterRoot, root: adapterRoot },
+  );
+  assert.equal(invalidUtf8.isError, true);
+  assert.equal(invalidUtf8.error?.code, "invalid_utf8");
+
+  await writeFile(
+    join(adapterRoot, "oversized.txt"),
+    Buffer.alloc(MAX_TEXT_READ_FILE_BYTES + 1, 0x61),
+  );
+  const oversizedFile = await readFileTool(
+    { path: "oversized.txt", offset: 1, limit: 1 },
+    { cwd: adapterRoot, root: adapterRoot },
+  );
+  assert.equal(oversizedFile.isError, true);
+  assert.equal(oversizedFile.error?.code, "file_too_large");
 
   assert.equal((await writeFileTool(
     { path: "generated/new.txt", content: "before\n" },

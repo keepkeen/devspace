@@ -26,7 +26,6 @@ export interface AdminBackendClient {
 }
 
 export interface HttpAdminBackendClientOptions {
-  host: string;
   port: number;
   keys: Pick<
     SecurityKeyring,
@@ -36,7 +35,7 @@ export interface HttpAdminBackendClientOptions {
 }
 
 export class HttpAdminBackendClient implements AdminBackendClient {
-  private readonly host: string | undefined;
+  private readonly host = "127.0.0.1";
   private readonly port: number;
   private readonly internalToken: string;
   private readonly configReloadToken: string;
@@ -44,7 +43,6 @@ export class HttpAdminBackendClient implements AdminBackendClient {
   private readonly configReloadTimeoutMs: number;
 
   constructor(options: HttpAdminBackendClientOptions) {
-    this.host = internalLoopbackHost(options.host);
     this.port = options.port;
     this.internalToken = deriveInternalAdminToken(options.keys.internalDiagnostics);
     this.configReloadToken = internalConfigReloadToken(options.keys.internalConfigReload);
@@ -85,13 +83,6 @@ export class HttpAdminBackendClient implements AdminBackendClient {
     internalToken = this.internalToken,
     timeoutMs = 3_000,
   ): Promise<unknown> {
-    if (!this.host) {
-      return Promise.reject(new AdminBackendProxyError(
-        503,
-        "backend_admin_unavailable",
-        "Backend admin telemetry requires a loopback backend endpoint.",
-      ));
-    }
     return new Promise((resolveRequest, rejectRequest) => {
       const encodedBody = body === undefined ? undefined : Buffer.from(JSON.stringify(body));
       const request = httpRequest({
@@ -150,12 +141,6 @@ export class HttpAdminBackendClient implements AdminBackendClient {
       request.end();
     });
   }
-}
-
-function internalLoopbackHost(host: string): string | undefined {
-  if (host === "0.0.0.0" || host === "127.0.0.1" || host === "localhost") return "127.0.0.1";
-  if (host === "::" || host === "::1") return "::1";
-  return undefined;
 }
 
 export function deriveInternalAdminToken(key: string | Uint8Array): string {

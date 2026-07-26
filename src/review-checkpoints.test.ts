@@ -42,6 +42,7 @@ try {
   assert.equal(firstReview.files.some((file) => file.path === "README.md"), true);
   assert.equal(firstReview.files.some((file) => file.path === "new.txt"), true);
   assert.match(firstReview.patch, /world/);
+  assert.match(firstReview.revision, /^review_[A-Za-z0-9_-]+$/u);
 
   const restartedManager = createReviewCheckpointManager();
   const afterRestart = await restartedManager.reviewChanges({
@@ -56,6 +57,7 @@ try {
     workspaceId: "ws_review",
     root,
     markReviewed: true,
+    expectedRevision: firstReview.revision,
   });
   assert.equal(stillUnreviewed.summary.files, 2);
 

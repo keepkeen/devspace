@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { shutdownHttpServer } from "./server-shutdown.js";
+import { shutdownHttpServer, shutdownHttpServers } from "./server-shutdown.js";
 
 let finishHttpClose: (() => void) | undefined;
 let applicationCloseStarted = false;
@@ -47,8 +47,8 @@ void delayedShutdown.then(() => {
 });
 
 await Promise.resolve();
-for (let attempt = 0; attempt < 5 && !finishApplicationClose; attempt += 1) {
-  await Promise.resolve();
+for (let attempt = 0; attempt < 20 && !finishApplicationClose; attempt += 1) {
+  await new Promise<void>((resolve) => setImmediate(resolve));
 }
 assert.equal(
   shutdownResolved,
@@ -135,3 +135,15 @@ await shutdownHttpServer(
   10,
 );
 assert.equal(forcedCloseCalls, 1);
+
+let multiApplicationCloses = 0;
+await shutdownHttpServers(
+  [
+    { close(callback) { callback(); } },
+    { close(callback) { callback(); } },
+  ],
+  async () => {
+    multiApplicationCloses += 1;
+  },
+);
+assert.equal(multiApplicationCloses, 1, "shared application resources close once after both listeners drain");

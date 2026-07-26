@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createHash } from "node:crypto";
-import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, chmod, lstat, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "./config.js";
@@ -54,6 +54,22 @@ await Promise.all([
 ]);
 assert.deepEqual(new Set(independent), new Set(["a", "b"]));
 
+const timedLocal = new WorkspaceRootLockManager({ acquireTimeoutMs: 50 });
+const releaseTimedHolder = await timedLocal.acquire("timed-root", "write");
+await assert.rejects(
+  timedLocal.acquire("timed-root", "write"),
+  WorkspaceRootLockTimeoutError,
+  "a queued local waiter must time out",
+);
+await assert.rejects(
+  timedLocal.acquire("timed-root", "read"),
+  WorkspaceRootLockTimeoutError,
+  "timing out one waiter must not release the real writer",
+);
+releaseTimedHolder();
+const releaseAfterLocalTimeout = await timedLocal.acquire("timed-root", "write");
+releaseAfterLocalTimeout();
+
 const crossProcessRoot = await mkdtemp(join(tmpdir(), "devspace-cross-process-root-lock-"));
 try {
   const processA = new WorkspaceRootLockManager({
@@ -61,6 +77,32 @@ try {
     acquireTimeoutMs: 2_000,
     pollIntervalMs: 10,
   });
+
+  if (process.platform !== "win32") {
+    await chmod(crossProcessRoot, 0o755);
+    const permissionLock = new CrossProcessWorkspaceRootLock({
+      root: crossProcessRoot,
+      acquireTimeoutMs: 500,
+    });
+    const permissionLease = await permissionLock.acquire("permission-root", "read");
+    permissionLease();
+    assert.equal((await lstat(crossProcessRoot)).mode & 0o777, 0o700);
+
+    const symlinkParent = await mkdtemp(join(tmpdir(), "devspace-lock-symlink-parent-"));
+    const symlinkTarget = await mkdtemp(join(tmpdir(), "devspace-lock-symlink-target-"));
+    const symlinkRoot = join(symlinkParent, "locks");
+    await symlink(symlinkTarget, symlinkRoot, "dir");
+    try {
+      const unsafeLock = new CrossProcessWorkspaceRootLock({ root: symlinkRoot });
+      await assert.rejects(
+        unsafeLock.acquire("unsafe", "write"),
+        /not a secure directory/iu,
+      );
+    } finally {
+      await rm(symlinkParent, { recursive: true, force: true });
+      await rm(symlinkTarget, { recursive: true, force: true });
+    }
+  }
   const processB = new WorkspaceRootLockManager({
     crossProcessLockRoot: crossProcessRoot,
     acquireTimeoutMs: 2_000,
@@ -142,7 +184,7 @@ try {
     .digest("hex");
   const temporaryCleanupDirectory = join(crossProcessRoot, temporaryCleanupDigest);
   const temporaryReaderDirectory = join(temporaryCleanupDirectory, "readers");
-  await mkdir(temporaryReaderDirectory, { recursive: true });
+  await mkdir(temporaryReaderDirectory, { recursive: true, mode: 0o700 });
   const deadTemporaryMarker = join(
     temporaryCleanupDirectory,
     "writer.json.2147483647-dead.tmp",

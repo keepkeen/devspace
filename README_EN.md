@@ -181,18 +181,22 @@ is created; reconnect or refresh tools after changing it rather than changing to
 3. Load `better-sqlite3` early so a Node ABI mismatch fails before the server starts.
 4. Acquire a singleton lease for the local state directory so two backends cannot write the same
    state at once.
-5. Open and migrate the canonical v16 database. A `pending` mutation left by an abnormal stop is
+5. Open and migrate the canonical v17 database. A `pending` mutation left by an abnormal stop is
    recovered as `outcome_unknown`; DevSpace does not pretend that it never ran.
 6. Initialize OAuth, Workspaces, processes, output, audit storage, and a unique process generation.
 7. `/readyz` returns `200` only while the service is not closing and both the Workspace and OAuth
    databases are ready.
+8. `/internal/*` exists only on `127.0.0.1:DEVSPACE_CONTROL_PORT`; the public MCP listener returns
+   404 for those paths.
 
 `/healthz` only means that the process is alive. Use `/readyz` for troubleshooting and service
 management.
 
 On `SIGINT` or `SIGTERM`, DevSpace stops accepting new work, drains HTTP requests, and then closes
 process and database resources. A controlled macOS restart verifies that **both the PID and the
-readiness generation changed** instead of trusting only the restart command's exit status.
+readiness generation changed** instead of trusting only the restart command's exit status. Restart
+is not zero-downtime: old receipts and in-memory bindings necessarily expire, so first confirm in
+local diagnostics that no other request, process, root lease, or cleanup job is active.
 
 ## Workflow inside a conversation
 
@@ -221,6 +225,10 @@ The actual workflow is:
 6. Prefer `program + args` for commands. Use `shell: true + command` only for pipes, redirection,
    and other shell syntax.
 7. Long-running commands may continue in the background; output and operation state are persisted.
+   Prefer small pages or `read_process_output` tail/search/errors modes instead of loading tens of
+   MiB into model context.
+8. `show_changes` exposes signed diff pages of at most 12 KiB. Read to EOF and pass the final
+   `reviewToken` with `advanceCheckpoint=true`; do not claim a truncated diff was fully reviewed.
 
 The default MCP HTTP transport is stateless. When a ChatGPT conversation ends or the service
 restarts, the network transport, in-memory binding, and old receipt expire, but SQLite still keeps:
@@ -282,8 +290,9 @@ node dist/cli.js admin
 ```
 
 The admin panel listens only on localhost. It manages roots, quotas, Widgets, diagnostics, token
-revocation, and controlled restart. Allowed roots can hot-reload; most other runtime settings
-require a restart.
+revocation, and controlled restart. Backend diagnostics and security control also use a separate
+loopback control listener; neither local listener belongs behind the public tunnel. Allowed roots
+can hot-reload; most other runtime settings require a restart.
 
 For continuous availability, keep both of these running:
 
@@ -350,7 +359,7 @@ do not reopen paths at random and create duplicate Workspaces.
 
 Stop DevSpace and back up the entire state directory, normally `~/.local/share/devspace`, before
 upgrading. Do not copy only the primary SQLite file because process output and other persistent
-metadata are part of the state. Start the new version, let the canonical v16 migration complete,
+metadata are part of the state. Start the new version, let the canonical v17 migration complete,
 check `/readyz`, and then refresh the ChatGPT app tools.
 
 ## More documentation

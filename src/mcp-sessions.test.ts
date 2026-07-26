@@ -193,6 +193,28 @@ assert.equal(ownerNewest.closeCalls, 0);
 assert.equal(reclaiming.size, 2);
 reclaiming.releaseReservation(reclaimedReservation.reservation);
 
+const isolatedReclaim = new McpSessionRegistry<FakeTransport>({ maxSessions: 1 });
+const isolatedOther = createTransport();
+isolatedReclaim.register("other-only", "client-b", isolatedOther);
+assert.deepEqual(
+  await isolatedReclaim.reserveWithIdleReclaim(connectionPrincipalId),
+  {},
+  "default stateful reclaim must not evict another principal",
+);
+assert.equal(isolatedOther.closeCalls, 0);
+
+const globalReclaim = new McpSessionRegistry<FakeTransport>({
+  maxSessions: 1,
+  allowGlobalIdleReclaim: true,
+});
+const globallyReclaimed = createTransport();
+globalReclaim.register("global-other", "client-b", globallyReclaimed);
+const globalReservation = await globalReclaim.reserveWithIdleReclaim(connectionPrincipalId);
+assert.equal(globalReservation.reclaimed?.sessionId, "global-other");
+assert(globalReservation.reservation);
+assert.equal(globallyReclaimed.closeCalls, 1);
+globalReclaim.releaseReservation(globalReservation.reservation);
+
 const allActive = new McpSessionRegistry<FakeTransport>({ maxSessions: 1 });
 const allActiveTransport = createTransport();
 allActive.register("active-at-capacity", connectionPrincipalId, allActiveTransport);

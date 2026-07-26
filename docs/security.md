@@ -106,6 +106,11 @@ prevents one attacker from consuming every legitimate client's allowance and
 keeps backoff consistent across process restarts. A successful approval clears
 only that exact authorization-session key.
 
+Owner-password verification uses the asynchronous Argon2 implementation behind
+a small FIFO concurrency gate. Expensive verification therefore does not block
+the Node event loop, and excess queued attempts receive bounded backpressure
+instead of unbounded memory growth.
+
 When proxy trust is enabled, forwarded IP information is accepted only from a
 loopback direct peer. Do not expose the backend directly while also trusting
 arbitrary forwarding headers.
@@ -119,6 +124,14 @@ granted scope set, authorized root-ID set, and authorization epoch.
 Authorization codes, access tokens, and refresh tokens reference that grant
 directly. Refresh rotation preserves the original grant and never derives a
 principal from `clientId`.
+
+Refresh tokens also belong to a random family. Rotation consumes the presented
+token and stores only a short-lived hash tombstone. Presenting a consumed token
+again is treated as replay: DevSpace records
+`oauth_refresh_token_replay_detected`, revokes the grant and family, increments
+the authorization boundary, deletes issued access/refresh tokens, and clears
+affected in-memory Workspace authority. An optional absolute grant expiry caps
+all token lifetimes and cannot be extended by refresh.
 
 A fresh grant and principal are isolated by default. After Owner verification,
 the local approval page may explicitly reuse an existing principal. Reuse
@@ -196,7 +209,10 @@ it may do it. `open_workspace`, `list_workspaces`, `resume_workspace`, and every
 receipt/session-bound Workspace call recheck the current grant's root set. Two
 accounts with identical scopes can therefore receive non-overlapping project
 roots. Legacy grants migrate with the compatibility wildcard `*` and retain the
-configured global roots until they are reauthorized more narrowly.
+configured global roots until they are reauthorized more narrowly. Local
+Admin diagnostics and `devspace doctor` identify these grants because adding a
+global root expands their authority; existing grants are never silently
+rewritten.
 
 ## Public URL And Host Allowlist
 
@@ -213,6 +229,11 @@ Do not include `/mcp` in `DEVSPACE_PUBLIC_BASE_URL`.
 
 By default, DevSpace derives allowed Host headers from the local host and public
 URL. Use `DEVSPACE_ALLOWED_HOSTS=*` only for intentional local debugging.
+
+The public listener contains OAuth, MCP, app assets, `/healthz`, and `/readyz`.
+All `/internal/*` diagnostics and destructive control routes are mounted only on
+a separate loopback listener at `DEVSPACE_CONTROL_PORT`. A public request to an
+internal path receives 404 even if it somehow carries a valid internal token.
 
 ## Tunnels
 
@@ -235,6 +256,9 @@ session cookie, strict Host/Origin checks, and CSRF protection. The panel does
 not expose OAuth owner tokens or tunnel credentials. Both the Admin UI and OAuth
 approval page deny iframe embedding with CSP `frame-ancestors 'none'` and
 `X-Frame-Options: DENY`.
+
+The panel talks to the backend's loopback control listener; neither the panel
+port nor `DEVSPACE_CONTROL_PORT` belongs behind the public tunnel.
 
 Runtime restart is available only for an explicitly enrolled user-level
 launchd service. It requires the authenticated local session, CSRF, a short-lived
@@ -287,6 +311,9 @@ Repository files, repository instructions, and Skill content are untrusted
 workspace-scoped data. They may guide work inside their scope, but their text
 cannot grant OAuth capability, alter the filesystem allowlist, disclose
 secrets, bypass file preconditions, or authorize operations outside the Workspace.
+Repository reads, grep results, diffs, and process output carry a structured
+provenance marker with `trust="untrusted"` and `authority="none"`. DevSpace does
+not modify or filter the underlying bytes merely to make them look safer.
 Structured tool results are the source of truth for execution and retry state.
 Do not retry a mutation unless `safeToRetry` is explicitly true.
 
@@ -299,12 +326,15 @@ operation ID remains a tombstone and is never reused for a new effect.
 
 Workspace operations first use a fair process-local read/write queue keyed by
 the canonical physical root. Write operations additionally acquire a
-cross-process lock under a per-user lock directory, using hashed root keys so
+cross-process lock under `<stateDir>/locks/workspace-roots`, using hashed root keys so
 absolute paths are not disclosed. Reader markers, writer intent, and writer
 markers prevent writer starvation. Versioned lock markers record the server PID,
 process start identity, boot identity, random lease token, heartbeat, and
 Workspace generation. This prevents a recycled PID from making a stale lock
-look live. Lock timeouts return `workspace_root_busy` before effects.
+look live. Every startup/acquisition validates directory type, symlink status,
+owner UID, and mode. Process-local and cross-process waiters share a deadline;
+timing out a waiter does not release the real holder. Lock timeouts return
+`workspace_root_busy` before effects.
 
 Reads and default change previews may overlap. Patches, commands, mutating
 process input, checkpoint advancement, close, and revoke serialize even when
@@ -319,6 +349,12 @@ server still sees the child-owned lease and cannot write the same physical root;
 the lock is reclaimed only after both the owner process and process group exit.
 Polling and stdin tools operate on the existing lease rather than deadlocking by
 reacquiring it.
+
+After a root process exits, descendant polling backs off from 25 ms to 2 seconds
+and the session is labeled a managed daemon. Serialization remains held by
+default. The user may explicitly detach it through a separate, idempotent
+`write_stdin` mutation with `confirmUnserializedWrites=true`; the daemon remains
+tracked, but its future writes can race other Workspace writers.
 
 This coordination covers DevSpace instances, not arbitrary external editors.
 Every patch therefore still requires strict `ifMatch` versions. Use separate
@@ -352,5 +388,10 @@ or error stacks. Query it locally with `devspace audit`; human-readable output i
 rendered in `Asia/Shanghai`, while stored timestamps remain canonical UTC ISO.
 Console log level does not suppress this index; set `DEVSPACE_AUDIT_EVENTS=0`
 only when intentionally disabling persistent audit records.
+
+Audit persistence remains best-effort so a logging failure cannot change an
+authorization decision or tool result. Such failures are nevertheless visible
+through in-memory `auditWriteFailures` and `lastAuditWriteFailureAt` diagnostics;
+the counters are not recursively written back into the failing audit store.
 
 Do not enable shell command logging if commands may contain secrets.

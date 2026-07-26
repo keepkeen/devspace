@@ -205,6 +205,11 @@ assert.equal(recoverableProcessState.outputId, "output-test-id");
 assert.deepEqual(recoverableProcessState.output, {
   stream: "combined",
   text: "head\ntail\n",
+  provenance: {
+    source: "process",
+    trust: "untrusted",
+    authority: "none",
+  },
   truncated: true,
   originalTokenCount: 50_000,
   omittedBytes: 100_000,

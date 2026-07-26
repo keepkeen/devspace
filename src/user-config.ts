@@ -54,6 +54,7 @@ const devspaceUserConfigSchema = z.object({
   schemaVersion: z.literal(CURRENT_CONFIG_SCHEMA_VERSION),
   host: z.string().min(1).optional(),
   port: z.number().int().min(1).max(65_535).optional(),
+  controlPort: z.number().int().min(1).max(65_535).optional(),
   allowedRoots: z.array(z.string()).optional(),
   publicBaseUrl: z.string().nullable().optional(),
   allowedHosts: z.array(z.string()).optional(),
@@ -67,6 +68,9 @@ const devspaceUserConfigSchema = z.object({
   subagents: z.boolean().optional(),
   toolProfile: z.enum(["browse", "coding"]).optional(),
   widgets: z.enum(["off", "changes", "full"]).optional(),
+  mcpHttpTransport: z.enum(["stateless", "stateful"]).optional(),
+  mcpGlobalIdleReclaim: z.boolean().optional(),
+  oauthGrantMaxLifetimeSeconds: z.number().int().min(0).max(10 * 365 * 24 * 60 * 60).optional(),
   resources: z.object({
     maxMcpSessions: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxMcpSessions).optional(),
     maxMcpSessionsPerClient: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxMcpSessionsPerClient).optional(),
@@ -95,6 +99,7 @@ export interface DevspaceUserConfig {
   schemaVersion?: typeof CURRENT_CONFIG_SCHEMA_VERSION;
   host?: string;
   port?: number;
+  controlPort?: number;
   allowedRoots?: string[];
   publicBaseUrl?: string | null;
   allowedHosts?: string[];
@@ -109,6 +114,8 @@ export interface DevspaceUserConfig {
   toolProfile?: "browse" | "coding";
   widgets?: "off" | "changes" | "full";
   mcpHttpTransport?: "stateless" | "stateful";
+  mcpGlobalIdleReclaim?: boolean;
+  oauthGrantMaxLifetimeSeconds?: number;
   resources?: {
     maxMcpSessions?: number;
     maxMcpSessionsPerClient?: number;

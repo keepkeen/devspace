@@ -8,6 +8,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { dirname, relative, sep } from "node:path";
+import { TextDecoder } from "node:util";
 import { minimatch } from "minimatch";
 import { resolveAllowedPath } from "./roots.js";
 
@@ -69,10 +70,21 @@ interface ReadToolDetails {
 }
 
 export interface PiToolStructuredError {
-  code: "invalid_pattern" | "invalid_glob" | "invalid_tool_input";
-  retryable: true;
-  safeToRetry: true;
-  recovery: "correct_pattern" | "correct_glob" | "correct_input";
+  code:
+    | "invalid_pattern"
+    | "invalid_glob"
+    | "invalid_tool_input"
+    | "binary_file"
+    | "invalid_utf8"
+    | "file_too_large";
+  retryable: boolean;
+  safeToRetry: boolean;
+  recovery:
+    | "correct_pattern"
+    | "correct_glob"
+    | "correct_input"
+    | "use_binary_aware_tool"
+    | "use_search_or_command";
   phase: "not_started";
   effectsKnown: true;
 }
@@ -130,6 +142,23 @@ export class InvalidToolInputError extends PiToolInputError {
   }
 }
 
+export class UnsupportedTextFileError extends PiToolInputError {
+  constructor(
+    code: "binary_file" | "invalid_utf8" | "file_too_large",
+    publicText: string,
+  ) {
+    super({
+      code,
+      retryable: false,
+      safeToRetry: false,
+      recovery: code === "binary_file" ? "use_binary_aware_tool" : "use_search_or_command",
+      phase: "not_started",
+      effectsKnown: true,
+    }, publicText);
+    this.name = "UnsupportedTextFileError";
+  }
+}
+
 interface EditToolDetails {
   patch: string;
   diff: string;
@@ -145,6 +174,7 @@ const DEFAULT_LS_LIMIT = 500;
 const GREP_MAX_LINE_LENGTH = 500;
 const MAX_WALK_ENTRIES = 100_000;
 const MAX_IMAGE_BYTES = 10 * 1_024 * 1_024;
+export const MAX_TEXT_READ_FILE_BYTES = 16 * 1_024 * 1_024;
 const IGNORED_DIRECTORIES = new Set([".git", "node_modules"]);
 
 export type ToolResponse<TDetails = unknown> = {
@@ -249,11 +279,20 @@ export async function readFileTool(
     await access(path, constants.R_OK);
     const metadata = await stat(path);
     if (!metadata.isFile()) throw new Error(`Not a file: ${path}`);
+    if (metadata.size > MAX_TEXT_READ_FILE_BYTES) {
+      throw new UnsupportedTextFileError(
+        "file_too_large",
+        `The file is ${formatSize(metadata.size)}, above the ${formatSize(MAX_TEXT_READ_FILE_BYTES)} text-read limit. Use a bounded search, tail, or workspace command instead.`,
+      );
+    }
     const buffer = await readFile(path);
     const imageMimeType = supportedImageMimeType(path, buffer);
     if (imageMimeType) {
       if (buffer.length > MAX_IMAGE_BYTES) {
-        throw new Error(`Image exceeds ${formatSize(MAX_IMAGE_BYTES)} limit: ${path}`);
+        throw new UnsupportedTextFileError(
+          "file_too_large",
+          `The image exceeds the ${formatSize(MAX_IMAGE_BYTES)} inline-image limit.`,
+        );
       }
       return {
         content: [
@@ -263,7 +302,21 @@ export async function readFileTool(
       };
     }
 
-    const text = buffer.toString("utf8");
+    if (probablyBinary(buffer)) {
+      throw new UnsupportedTextFileError(
+        "binary_file",
+        "The file appears to be binary. Use a binary-aware inspection tool instead of text read.",
+      );
+    }
+    let text: string;
+    try {
+      text = new TextDecoder("utf-8", { fatal: true }).decode(buffer);
+    } catch {
+      throw new UnsupportedTextFileError(
+        "invalid_utf8",
+        "The file is not valid UTF-8 text. Use a binary-aware inspection or convert it explicitly.",
+      );
+    }
     const allLines = text.split("\n");
     const startIndex = Math.max(0, (input.offset ?? 1) - 1);
     if (startIndex >= allLines.length) {
@@ -293,6 +346,18 @@ export async function readFileTool(
     }
     return { content: [{ type: "text", text: output }], details };
   });
+}
+
+function probablyBinary(bytes: Buffer): boolean {
+  const sample = bytes.subarray(0, Math.min(bytes.length, 8 * 1_024));
+  let controls = 0;
+  for (const byte of sample) {
+    if (byte === 0) return true;
+    if ((byte < 0x20 && ![0x08, 0x09, 0x0a, 0x0c, 0x0d].includes(byte)) || byte === 0x7f) {
+      controls += 1;
+    }
+  }
+  return sample.length >= 32 && controls / sample.length > 0.01;
 }
 
 export async function writeFileTool(

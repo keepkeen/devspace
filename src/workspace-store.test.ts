@@ -71,7 +71,7 @@ try {
       migratedDatabase.prepare(
         "select version, name from devspace_schema_migrations order by version",
       ).all(),
-      [{ version: 16, name: "canonical-state-v16" }],
+      [{ version: 17, name: "canonical-state-v17" }],
     );
     const workspaceColumns = migratedDatabase.prepare("pragma table_info(workspace_sessions)")
       .all() as Array<{ name: string }>;
@@ -157,6 +157,7 @@ try {
     "client-fields-other",
     "client-managed",
     "client-generation",
+    "client-generated-alias",
   ]);
   const first = new SqliteWorkspaceStore(stateDir);
   const second = new SqliteWorkspaceStore(stateDir);
@@ -169,7 +170,7 @@ try {
       maxActiveSessionsPerClient: 1,
     });
     assert.equal(original.id, "ws-a");
-    assert.match(original.alias ?? "", /^ws-[0-9a-f-]{36}$/);
+    assert.equal(original.alias, "a");
     assert.equal(original.writeAccess, "read_write");
     assert.equal(original.stateGeneration, 1);
     assert.equal(first.countActiveSessions(), 1);
@@ -221,6 +222,19 @@ try {
     });
     assert.equal(upgraded.writeAccess, "read_write");
     assert.equal(upgraded.stateGeneration, 3);
+
+    const generatedFirst = first.createSession({
+      id: "ws-generated-first",
+      connectionPrincipalId: "client-generated-alias",
+      root: "/projects/latent_flow",
+    });
+    const generatedSecond = first.createSession({
+      id: "ws-generated-second",
+      connectionPrincipalId: "client-generated-alias",
+      root: "/archive/latent_flow",
+    });
+    assert.equal(generatedFirst.alias, "latent-flow");
+    assert.equal(generatedSecond.alias, "latent-flow-2");
 
     const aliasGuarded = first.createOrReuseCheckoutSession({
       id: "ws-alias-guarded",
@@ -287,7 +301,7 @@ try {
       root: "/workspace/b",
       maxActiveSessionsPerClient: 1,
     });
-    assert.equal(second.countActiveSessions(), 2);
+    assert.equal(second.countActiveSessions(), 4);
     assert.equal(second.countActiveSessions("client-b"), 1);
     assert.deepEqual(
       second.listActiveSessions()
@@ -296,6 +310,8 @@ try {
       [
         { id: "ws-a", connectionPrincipalId: "client-a" },
         { id: "ws-b", connectionPrincipalId: "client-b" },
+        { id: "ws-generated-first", connectionPrincipalId: "client-generated-alias" },
+        { id: "ws-generated-second", connectionPrincipalId: "client-generated-alias" },
       ],
     );
     assert.deepEqual(

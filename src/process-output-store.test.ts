@@ -36,6 +36,7 @@ try {
   testVersionTwoOwnershipMigration(join(root, "version-two-migration"));
   testWriterLock(join(root, "writer-lock"));
   testPagingReplayAndUtf8(join(root, "paging"));
+  testTailSearchAndErrorIndex(join(root, "tail-search"));
   testFileQuotaAndDrops(join(root, "file-quota"));
   testUtf8QuotaBoundary(join(root, "utf8-quota"));
   testTotalQuota(join(root, "total-quota"));
@@ -212,6 +213,75 @@ function testPagingReplayAndUtf8(stateDir: string): void {
     assert.throws(
       () => store.read("owner", "workspace", outputId, { offset: 0, limit: 1024 * 1024 + 1 }),
       /limit/,
+    );
+  } finally {
+    store.close();
+  }
+}
+
+function testTailSearchAndErrorIndex(stateDir: string): void {
+  const store = createStore(stateDir, { maxFileBytes: 100_000, maxStorageBytes: 100_000 });
+  try {
+    const outputId = store.create({ connectionPrincipalId: "owner", workspaceId: "workspace" });
+    store.append(outputId, [
+      "startup ok",
+      "ERROR first failure",
+      "中间状态 ok",
+      "Traceback: second failure",
+      "final ok",
+      "",
+    ].join("\n"));
+
+    const tail = store.tail("owner", "workspace", outputId, 12);
+    assert.match(tail.content, /final ok\n$/u);
+    assert.equal(tail.eof, true);
+    assert.equal(tail.nextOffset, Buffer.byteLength([
+      "startup ok",
+      "ERROR first failure",
+      "中间状态 ok",
+      "Traceback: second failure",
+      "final ok",
+      "",
+    ].join("\n"), "utf8"));
+
+    const search = store.search("owner", "workspace", outputId, {
+      offset: 0,
+      scanLimit: 100_000,
+      maxMatches: 10,
+      query: "OK",
+      ignoreCase: true,
+    });
+    assert.equal(search.totalMatches, 3);
+    assert.equal(search.matches.length, 3);
+    assert.equal(search.eof, true);
+    assert.deepEqual(search.matches.map((match) => match.text), [
+      "startup ok",
+      "中间状态 ok",
+      "final ok",
+    ]);
+
+    const errors = store.search("owner", "workspace", outputId, {
+      offset: 0,
+      scanLimit: 100_000,
+      maxMatches: 10,
+      errorsOnly: true,
+    });
+    assert.equal(errors.totalMatches, 2);
+    assert.deepEqual(errors.categories, { error: 1, traceback: 1 });
+    assert.deepEqual(errors.matches.map((match) => match.category), ["error", "traceback"]);
+    assert.equal(errors.matches[0]?.offsetBytes, Buffer.byteLength("startup ok\n", "utf8"));
+
+    assert.throws(
+      () => store.search("owner", "workspace", outputId, {
+        offset: 0,
+        scanLimit: 100,
+        maxMatches: 10,
+      }),
+      /requires a non-empty query/iu,
+    );
+    assert.throws(
+      () => store.tail("other", "workspace", outputId, 10),
+      ProcessOutputNotFoundError,
     );
   } finally {
     store.close();

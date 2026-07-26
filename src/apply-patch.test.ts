@@ -231,6 +231,92 @@ const trailingSpaceResult = await applyPatch(
 assert.equal(trailingSpaceResult.patch.endsWith("+new   "), true);
 assert.equal(await readFile(join(trailingSpaceRoot, "spaces.txt"), "utf8"), "new   \n");
 
+const fidelityRoot = await mkdtemp(join(tmpdir(), "devspace-apply-patch-fidelity-"));
+const bomPath = join(fidelityRoot, "bom.txt");
+await writeFile(bomPath, Buffer.concat([
+  Buffer.from([0xef, 0xbb, 0xbf]),
+  Buffer.from("alpha\nbeta\n", "utf8"),
+]));
+await applyPatch(
+  fidelityRoot,
+  `*** Begin Patch
+*** Update File: bom.txt
+@@
+-alpha
++ALPHA
+ beta
+*** End Patch`,
+);
+const bomBytes = await readFile(bomPath);
+assert.deepEqual([...bomBytes.subarray(0, 3)], [0xef, 0xbb, 0xbf]);
+assert.equal(bomBytes.subarray(3).toString("utf8"), "ALPHA\nbeta\n");
+
+await writeFile(join(fidelityRoot, "mixed.txt"), "one\r\ntwo\nthree\r\n");
+await applyPatch(
+  fidelityRoot,
+  `*** Begin Patch
+*** Update File: mixed.txt
+@@
+ one
+-two
++TWO
+ three
+*** End Patch`,
+);
+assert.equal(await readFile(join(fidelityRoot, "mixed.txt"), "utf8"), "one\r\nTWO\nthree\r\n");
+
+await writeFile(join(fidelityRoot, "no-final.txt"), "one\ntwo");
+await applyPatch(
+  fidelityRoot,
+  `*** Begin Patch
+*** Update File: no-final.txt
+@@
+ one
+-two
++TWO
+*** End Patch`,
+);
+assert.equal(await readFile(join(fidelityRoot, "no-final.txt"), "utf8"), "one\nTWO");
+
+await applyPatch(
+  fidelityRoot,
+  `*** Begin Patch
+*** Add File: empty.txt
+*** End Patch`,
+);
+assert.equal((await readFile(join(fidelityRoot, "empty.txt"))).length, 0);
+
+await writeFile(join(fidelityRoot, "fuzzy.txt"), "alpha   \nother\n");
+const fuzzyResult = await applyPatch(
+  fidelityRoot,
+  `*** Begin Patch
+*** Update File: fuzzy.txt
+@@
+-alpha
++ALPHA
+*** End Patch`,
+);
+assert.deepEqual(fuzzyResult.files[0]?.fuzzyMatch, {
+  fuzzy: true,
+  count: 1,
+  modes: ["trim_end"],
+});
+assert.equal(await readFile(join(fidelityRoot, "fuzzy.txt"), "utf8"), "ALPHA\nother\n");
+
+await writeFile(join(fidelityRoot, "ambiguous.txt"), "same   \nmiddle\nsame\t\n");
+await assert.rejects(
+  applyPatch(
+    fidelityRoot,
+    `*** Begin Patch
+*** Update File: ambiguous.txt
+@@
+-same
++changed
+*** End Patch`,
+  ),
+  /ambiguous fuzzy hunk context/,
+);
+
 let syntaxError: InvalidPatchError | undefined;
 assert.throws(
   () => parsePatch("*** Begin Patch\n*** End Patch"),
@@ -247,17 +333,18 @@ assert.equal(syntaxError.path, undefined);
 assert.throws(
   () => parsePatch(`*** Begin Patch
 *** Add File: ${join(root, "private.txt")}
+not-an-added-line
 *** End Patch`),
   (error: unknown) =>
     error instanceof InvalidPatchError &&
     error.path === undefined &&
-    /has no content/.test(error.publicText) &&
+    /added file lines must start/.test(error.publicText) &&
     !error.publicText.includes(root),
 );
 assert.throws(() => parsePatch("*** Add File: bad.txt\n+x"), /missing .* marker/);
-assert.throws(
-  () => parsePatch("*** Begin Patch\n*** Add File: empty.txt\n*** End Patch"),
-  /has no content/,
+assert.deepEqual(
+  parsePatch("*** Begin Patch\n*** Add File: empty.txt\n*** End Patch"),
+  [{ kind: "add", path: "empty.txt", content: "" }],
 );
 
 const preparedRoot = await mkdtemp(join(tmpdir(), "devspace-prepared-patch-"));
@@ -483,7 +570,7 @@ await applyPatch(
 +new
 *** End Patch`,
 );
-assert.equal(await readFile(join(noNewlineRoot, "no-newline.txt"), "utf8"), "new\n");
+assert.equal(await readFile(join(noNewlineRoot, "no-newline.txt"), "utf8"), "new");
 
 const eofRoot = await mkdtemp(join(tmpdir(), "devspace-apply-patch-eof-"));
 await writeFile(join(eofRoot, "tail.txt"), "first\nsecond\n");

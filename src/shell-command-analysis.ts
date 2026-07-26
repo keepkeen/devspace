@@ -280,10 +280,87 @@ export function unwrapShellWrappers(tokens: string[]): string[] {
 export function shellIsParseOnly(tokens: string[]): boolean {
   const effective = unwrapShellWrappers(tokens);
   if (!isShellProgram(effective[0])) return false;
-  return effective.slice(1).some((token) =>
-    token === "--noexec" || token === "--no-exec" || token === "--no-execute" ||
-    (/^-[^-]+/u.test(token) && token.slice(1).includes("n"))
-  );
+  let parseOnly = false;
+  for (let index = 1; index < effective.length; index += 1) {
+    const token = effective[index]!;
+    if (token === "--") break;
+    if (token === "--noexec" || token === "--no-exec" || token === "--no-execute") {
+      parseOnly = true;
+      continue;
+    }
+    if (token === "-c" || token === "--command" || token.startsWith("--command=")) {
+      return parseOnly;
+    }
+    if (/^-[^-]+/u.test(token)) {
+      const options = token.slice(1);
+      if (options.includes("n")) parseOnly = true;
+      if (options.includes("c")) return parseOnly;
+      continue;
+    }
+    break;
+  }
+  return parseOnly;
+}
+
+export interface StaticInterpreterCommandPayload {
+  program: string;
+  option: string;
+  payload: string;
+}
+
+/** Extract statically supplied inline code from common interpreter argv forms. */
+export function staticInterpreterCommandPayload(
+  tokens: string[],
+): StaticInterpreterCommandPayload | undefined {
+  const effective = unwrapShellWrappers(tokens);
+  const program = programBasename(effective[0]);
+  if (!program || isShellProgram(program)) return undefined;
+  const args = effective.slice(1);
+
+  if (/^python(?:\d+(?:\.\d+)*)?$/u.test(program)) {
+    return optionPayload(program, args, new Set(["-c"]));
+  }
+  if (["node", "nodejs", "bun"].includes(program)) {
+    return optionPayload(program, args, new Set(["-e", "--eval", "-p", "--print"]));
+  }
+  if (["perl", "ruby", "lua", "luajit", "r", "rscript"].includes(program)) {
+    return optionPayload(program, args, new Set(["-e", "-E"]), true);
+  }
+  if (program === "php") {
+    return optionPayload(program, args, new Set(["-r"]), true);
+  }
+  if (program === "deno") {
+    const evalIndex = args.indexOf("eval");
+    if (evalIndex >= 0 && args[evalIndex + 1] !== undefined) {
+      return { program, option: "eval", payload: args[evalIndex + 1]! };
+    }
+  }
+  return undefined;
+}
+
+function optionPayload(
+  program: string,
+  args: string[],
+  options: ReadonlySet<string>,
+  allowAttached = false,
+): StaticInterpreterCommandPayload | undefined {
+  for (let index = 0; index < args.length; index += 1) {
+    const token = args[index]!;
+    if (token === "--") return undefined;
+    if (options.has(token)) {
+      const payload = args[index + 1];
+      return payload === undefined ? undefined : { program, option: token, payload };
+    }
+    for (const option of options) {
+      if (token.startsWith(`${option}=`)) {
+        return { program, option, payload: token.slice(option.length + 1) };
+      }
+      if (allowAttached && option.length === 2 && token.startsWith(option) && token.length > 2) {
+        return { program, option, payload: token.slice(option.length) };
+      }
+    }
+  }
+  return undefined;
 }
 
 export function staticShellCommandPayload(tokens: string[]): string | undefined {
@@ -340,6 +417,8 @@ export function delegatedCommandPayloads(tokens: string[]): string[] {
   const program = programBasename(effective[0]);
   const shellPayload = staticShellCommandPayload(tokens);
   if (shellPayload) pushNestedPayload(payloads, shellPayload);
+  const interpreterPayload = staticInterpreterCommandPayload(tokens);
+  if (interpreterPayload) pushNestedPayload(payloads, interpreterPayload.payload);
 
   if (program === "eval" && effective.length > 1) {
     pushNestedPayload(payloads, effective.slice(effective[1] === "--" ? 2 : 1).join(" "));

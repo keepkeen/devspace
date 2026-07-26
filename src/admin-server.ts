@@ -109,8 +109,7 @@ export async function startAdminServer(
     onEvent: (event, fields) => logEvent(logging, "info", event, fields),
   });
   const backendClient = options.backendClient ?? new HttpAdminBackendClient({
-    host: initialConfig.host,
-    port: initialConfig.port,
+    port: initialConfig.controlPort,
     keys: initialConfig.oauth.keys,
     processShutdownGraceMs: initialConfig.resources.processShutdownGraceMs,
   });

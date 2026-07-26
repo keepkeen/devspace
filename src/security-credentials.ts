@@ -1,5 +1,5 @@
 import { createHash, hkdfSync, randomBytes } from "node:crypto";
-import { Algorithm, hashSync, verifySync } from "@node-rs/argon2";
+import { Algorithm, hashSync, verify, verifySync } from "@node-rs/argon2";
 
 export const DEVSPACE_AUTH_SCHEMA_VERSION = 2 as const;
 export type MasterKeyDerivation = "hkdf-v1" | "legacy-direct";
@@ -51,6 +51,22 @@ export function verifyOwnerPassword(
   ) return false;
   try {
     return verifySync(passwordHash, password, { algorithm: Algorithm.Argon2id });
+  } catch {
+    return false;
+  }
+}
+
+/** Asynchronous request-path verifier; native Argon2 work runs off the Node event loop. */
+export async function verifyOwnerPasswordAsync(
+  passwordHash: string,
+  password: string | Uint8Array,
+): Promise<boolean> {
+  if (
+    !isArgon2idHash(passwordHash) ||
+    (typeof password !== "string" && !(password instanceof Uint8Array))
+  ) return false;
+  try {
+    return await verify(passwordHash, password, { algorithm: Algorithm.Argon2id });
   } catch {
     return false;
   }

@@ -62,6 +62,8 @@ try {
   await testAuthorizationThrottling(join(root, "approval-throttling"));
   await testAuditFailuresAreBestEffort(join(root, "audit-failures"));
   await testProviderRestartRotationAndRevocation(join(root, "provider"));
+  await testRefreshReplayRevokesFamily(join(root, "refresh-replay"));
+  await testAbsoluteGrantLifetime(join(root, "absolute-grant-lifetime"));
   await testPartialOwnerCredentialMigrationPreservesTokens(join(root, "partial-owner-migration"));
   await testPartialOwnerCredentialMigrationRejectsMismatchedHash(join(root, "partial-owner-mismatch"));
   await testOwnerCredentialChangeAndRevokeAll(join(root, "owner-change"));
@@ -240,14 +242,14 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
     const migrations = database.sqlite
       .prepare("select version, name from devspace_schema_migrations order by version")
       .all();
-    assert.deepEqual(migrations, [{ version: 16, name: "canonical-state-v16" }]);
+    assert.deepEqual(migrations, [{ version: 17, name: "canonical-state-v17" }]);
   } finally {
     database.close();
   }
 
   const simulatedOldLifecycle = openDatabase(stateDir);
   simulatedOldLifecycle.sqlite.prepare(
-    "update devspace_schema_migrations set version = 15, name = 'canonical-state-v15' where version = 16",
+    "update devspace_schema_migrations set version = 16, name = 'canonical-state-v16' where version = 17",
   ).run();
   simulatedOldLifecycle.sqlite.exec(`
     drop trigger if exists oauth_grants_principal_insert_check;
@@ -694,6 +696,7 @@ function testExpiredTokenCleanup(stateDir: string): void {
     workspaceCleanupJobs: 0,
     expiredAccessTokens: 1,
     expiredRefreshTokens: 1,
+    legacyWildcardGrants: 1,
   });
   assert.deepEqual(store.cleanupExpired(expiredAt + 1), {
     accessTokens: 1,
@@ -1057,7 +1060,11 @@ function testTransactionalTokenRotation(stateDir: string): void {
     );
     assert.equal(store.getRefreshToken("old-refresh-hash"), undefined);
     assert.ok(store.getAccessToken("new-access-hash"));
-    assert.ok(store.getRefreshToken("new-refresh-hash"));
+    const rotatedRefresh = store.getRefreshToken("new-refresh-hash");
+    assert.ok(rotatedRefresh);
+    const tombstone = store.getRefreshTokenTombstone("old-refresh-hash");
+    assert.ok(tombstone);
+    assert.equal(tombstone.familyId, rotatedRefresh.familyId);
 
     assert.equal(
       store.saveTokenPair(
@@ -1105,8 +1112,134 @@ function testTransactionalTokenRotation(stateDir: string): void {
     );
     assert.equal(store.getAccessToken("cross-grant-access-hash"), undefined);
     assert.equal(store.getRefreshToken("cross-grant-refresh-hash"), undefined);
+
+    const revoked = store.revokeRefreshTokenFamilyOnReplay(tombstone);
+    assert.deepEqual(revoked, {
+      changed: true,
+      connectionPrincipalId: tombstone.principalId,
+      grantId: tombstone.grantId,
+    });
+    assert.equal(store.getAccessToken("new-access-hash"), undefined);
+    assert.equal(store.getRefreshToken("new-refresh-hash"), undefined);
   } finally {
     store.close();
+  }
+}
+
+async function testRefreshReplayRevokesFamily(stateDir: string): Promise<void> {
+  const auditEvents: OAuthAuditEvent[] = [];
+  const boundaryChanges: Array<{ connectionPrincipalId: string; reason: string }> = [];
+  const provider = new SingleUserOAuthProvider(
+    oauthConfig,
+    mcpUrl,
+    stateDir,
+    (event) => auditEvents.push(event),
+    (change) => boundaryChanges.push(change),
+  );
+  try {
+    const client = await provider.clientsStore.registerClient?.({
+      redirect_uris: [redirectUri],
+      client_name: "Refresh replay client",
+    });
+    assert.ok(client);
+    const issued = (await authorizeAndExchange(provider, client, "refresh-replay-initial")).tokens;
+    assert.ok(issued.refresh_token);
+    const initialContext = provider.authorizeRequest(await provider.verifyAccessToken(issued.access_token));
+    const refreshed = await provider.exchangeRefreshToken(
+      client,
+      issued.refresh_token,
+      [...DEFAULT_DEVSPACE_OAUTH_SCOPES],
+      mcpUrl,
+    );
+    assert.ok(refreshed.refresh_token);
+
+    await assert.rejects(
+      provider.exchangeRefreshToken(
+        client,
+        issued.refresh_token,
+        [...DEFAULT_DEVSPACE_OAUTH_SCOPES],
+        mcpUrl,
+      ),
+      /replay detected/iu,
+    );
+    assert.equal(
+      auditEvents.some((event) =>
+        event.event === "oauth_refresh_token_replay_detected" &&
+        event.connectionPrincipalId === initialContext.connectionPrincipalId),
+      true,
+    );
+    assert.deepEqual(boundaryChanges.at(-1), {
+      connectionPrincipalId: initialContext.connectionPrincipalId,
+      reason: "refresh_token_replay",
+    });
+    await assert.rejects(provider.verifyAccessToken(refreshed.access_token), InvalidTokenError);
+    await assert.rejects(
+      provider.exchangeRefreshToken(
+        client,
+        refreshed.refresh_token,
+        [...DEFAULT_DEVSPACE_OAUTH_SCOPES],
+        mcpUrl,
+      ),
+      InvalidGrantError,
+    );
+  } finally {
+    provider.close();
+  }
+}
+
+async function testAbsoluteGrantLifetime(stateDir: string): Promise<void> {
+  const grantLifetimeSeconds = 120;
+  const provider = new SingleUserOAuthProvider(
+    { ...oauthConfig, grantMaxLifetimeSeconds: grantLifetimeSeconds },
+    mcpUrl,
+    stateDir,
+  );
+  try {
+    const client = await provider.clientsStore.registerClient?.({
+      redirect_uris: [redirectUri],
+      client_name: "Absolute lifetime client",
+    });
+    assert.ok(client);
+    const issued = (await authorizeAndExchange(provider, client, "absolute-lifetime")).tokens;
+    assert.ok(issued.refresh_token);
+    assert.equal((issued.expires_in ?? 0) > 0, true);
+    assert.equal((issued.expires_in ?? 0) <= grantLifetimeSeconds, true);
+
+    const database = openDatabase(stateDir);
+    try {
+      const grant = database.sqlite.prepare(`
+        select grant_id as grantId, absolute_expires_at as absoluteExpiresAt
+        from oauth_grants where client_id = ? and revoked_at is null
+      `).get(client.client_id) as { grantId: string; absoluteExpiresAt: number };
+      const now = Math.floor(Date.now() / 1_000);
+      assert.equal(grant.absoluteExpiresAt > now, true);
+      assert.equal(grant.absoluteExpiresAt <= now + grantLifetimeSeconds, true);
+      const tokenExpiries = database.sqlite.prepare(`
+        select
+          (select expires_at from oauth_access_tokens where grant_id = @grantId) as accessExpiresAt,
+          (select expires_at from oauth_refresh_tokens where grant_id = @grantId) as refreshExpiresAt
+      `).get({ grantId: grant.grantId }) as { accessExpiresAt: number; refreshExpiresAt: number };
+      assert.equal(tokenExpiries.accessExpiresAt <= grant.absoluteExpiresAt, true);
+      assert.equal(tokenExpiries.refreshExpiresAt <= grant.absoluteExpiresAt, true);
+      database.sqlite.prepare(
+        "update oauth_grants set absolute_expires_at = ? where grant_id = ?",
+      ).run(now - 1, grant.grantId);
+    } finally {
+      database.close();
+    }
+
+    await assert.rejects(provider.verifyAccessToken(issued.access_token), InvalidTokenError);
+    await assert.rejects(
+      provider.exchangeRefreshToken(
+        client,
+        issued.refresh_token,
+        [...DEFAULT_DEVSPACE_OAUTH_SCOPES],
+        mcpUrl,
+      ),
+      InvalidGrantError,
+    );
+  } finally {
+    provider.close();
   }
 }
 
@@ -1286,6 +1419,7 @@ async function testOwnerCredentialChangeAndRevokeAll(stateDir: string): Promise<
     workspaceCleanupJobs: 0,
     expiredAccessTokens: 0,
     expiredRefreshTokens: 0,
+    legacyWildcardGrants: 1,
   });
   assert.deepEqual(firstProvider.revokeAll(), {
     clients: 1,
@@ -1328,6 +1462,7 @@ async function testOwnerCredentialChangeAndRevokeAll(stateDir: string): Promise<
       workspaceCleanupJobs: 0,
       expiredAccessTokens: 0,
       expiredRefreshTokens: 0,
+      legacyWildcardGrants: 1,
     });
   } finally {
     changedProvider.close();

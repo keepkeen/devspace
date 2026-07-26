@@ -214,12 +214,25 @@ try {
     } | undefined)?.effects?.reviewCheckpoint?.advanced,
     false,
   );
+  assert.equal(
+    (writePreview.structuredContent as {
+      diff?: { eof?: unknown };
+    } | undefined)?.diff?.eof,
+    true,
+  );
+  const writeReviewToken = String(
+    (writePreview.structuredContent as {
+      diff?: { reviewToken?: unknown };
+    } | undefined)?.diff?.reviewToken ?? "",
+  );
+  assert.match(writeReviewToken, /^dcur1\./u);
   const writeAdvance = await writeClient.callTool({
     name: "show_changes",
     arguments: {
       receipt: writeReceipt,
       advanceCheckpoint: true,
       operationId: "write-scope-review-advance",
+      reviewToken: writeReviewToken,
     },
   });
   assertSucceeded(writeAdvance);

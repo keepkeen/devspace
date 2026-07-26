@@ -29,6 +29,7 @@ const patchEffects = createApplyPatchEffects(observedAt, [
     path: "deleted.txt",
     observedBefore: before,
     observedAfter: null,
+    fuzzyMatch: { fuzzy: true, count: 1, modes: ["trim_end"] },
   },
 ]);
 assert.deepEqual(patchEffects, {
@@ -55,6 +56,7 @@ assert.deepEqual(patchEffects, {
       path: "deleted.txt",
       observedBefore: before,
       observedAfter: null,
+      fuzzyMatch: { fuzzy: true, count: 1, modes: ["trim_end"] },
     },
   ],
 });
@@ -95,6 +97,9 @@ assert.deepEqual(createProcessStartEffects(startInput), {
       running: true,
       timedOut: false,
       stdinClosed: false,
+      rootExited: false,
+      managedDaemon: false,
+      rootLeaseDetached: false,
     },
     untrackedSideEffects: true,
   },
@@ -134,8 +139,42 @@ assert.deepEqual(interactEffects.process, {
     signal: "SIGINT",
     timedOut: true,
     stdinClosed: true,
+    rootExited: false,
+    managedDaemon: false,
+    rootLeaseDetached: false,
   },
   untrackedSideEffects: true,
+});
+
+const detachedDaemonEffects = createProcessInteractEffects({
+  observedAt,
+  submitted: {
+    stdinBytes: 0,
+    closeStdin: false,
+    interrupt: false,
+    detachRootLease: true,
+  },
+  snapshot: {
+    ...runningSnapshot,
+    rootExited: true,
+    managedDaemon: true,
+    rootLeaseDetached: true,
+  },
+});
+assert.deepEqual(detachedDaemonEffects.process?.submitted, {
+  stdinBytes: 0,
+  closeStdin: false,
+  interrupt: false,
+  detachRootLease: true,
+});
+assert.deepEqual(detachedDaemonEffects.process?.observed, {
+  sessionId: 42,
+  running: true,
+  timedOut: false,
+  stdinClosed: false,
+  rootExited: true,
+  managedDaemon: true,
+  rootLeaseDetached: true,
 });
 const serializedProcessEffects = JSON.stringify(interactEffects);
 assert.equal(serializedProcessEffects.includes("secret command output"), false);

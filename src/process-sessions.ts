@@ -27,6 +27,10 @@ const MAX_POLL_YIELD_MS = 110_000;
 const DEFAULT_MAX_OUTPUT_TOKENS = 10_000;
 const DEFAULT_BUFFER_BYTES = 1024 * 1024;
 const COMPLETED_SESSION_TTL_MS = 5 * 60 * 1_000;
+const DEFAULT_DURABLE_OUTPUT_FLUSH_BYTES = 64 * 1_024;
+const DEFAULT_DURABLE_OUTPUT_FLUSH_MS = 50;
+const INITIAL_TREE_EXIT_POLL_MS = 25;
+const MAX_TREE_EXIT_POLL_MS = 2_000;
 const DEFAULT_COLUMNS = 80;
 const DEFAULT_ROWS = 24;
 export const MAX_PROCESS_INPUT_BYTES = 1024 * 1024;
@@ -69,6 +73,8 @@ export interface WriteStdinInput {
   yieldTimeMs?: number;
   maxOutputTokens?: number;
   closeStdin?: boolean;
+  /** Release root write serialization after the root process exits but descendants remain. */
+  detachRootLease?: boolean;
   instructionScopePaths?: string[];
   preparedInput?: PreparedProcessInput;
 }
@@ -96,6 +102,12 @@ export interface ProcessSnapshot {
   outputStorageError?: string;
   timedOut: boolean;
   stdinClosed: boolean;
+  /** The originally spawned process exited, while zero or more descendants may remain. */
+  rootExited?: boolean;
+  /** A descendant process tree remains after the root process exited. */
+  managedDaemon?: boolean;
+  /** The user explicitly released root serialization while the daemon remains tracked. */
+  rootLeaseDetached?: boolean;
 }
 
 export class UnknownProcessSessionError extends Error {
@@ -154,10 +166,15 @@ interface ProcessSession {
   timedOut: boolean;
   cancelRequested: boolean;
   rootExited: boolean;
+  treeExitPollMs: number;
+  rootLeaseDetached: boolean;
   outputId?: string;
   totalOutputBytes: number;
   quotaDroppedBytes: number;
   durableQuotaReached: boolean;
+  pendingDurableOutput: string[];
+  pendingDurableOutputBytes: number;
+  durableFlushTimer?: NodeJS.Timeout;
   outputStorageError?: string;
   releaseWorkspaceRootLease?: () => void;
 }
@@ -170,6 +187,8 @@ export interface ProcessSessionManagerOptions {
   maxSessionsPerWorkspace?: number;
   maxRuntimeMs?: number;
   terminationGraceMs?: number;
+  durableOutputFlushBytes?: number;
+  durableOutputFlushMs?: number;
   outputStore?: ProcessOutputStore;
   onOutputStorageError?: (
     error: unknown,
@@ -208,6 +227,12 @@ function assertProcessInputSize(value: string | undefined): void {
   if (value !== undefined && Buffer.byteLength(value, "utf8") > MAX_PROCESS_INPUT_BYTES) {
     throw new Error(`Process input exceeds the ${MAX_PROCESS_INPUT_BYTES}-byte limit.`);
   }
+}
+
+export function nextTreeExitPollMs(current: number): number {
+  if (current < 100) return 100;
+  if (current < 500) return 500;
+  return MAX_TREE_EXIT_POLL_MS;
 }
 
 function workspaceKey(connectionPrincipalId: string, workspaceId: string): string {
@@ -546,6 +571,8 @@ export class ProcessSessionManager {
   private readonly maxSessionsPerWorkspace: number;
   private readonly maxRuntimeMs: number;
   private readonly terminationGraceMs: number;
+  private readonly durableOutputFlushBytes: number;
+  private readonly durableOutputFlushMs: number;
   private readonly outputStore?: ProcessOutputStore;
   private readonly onOutputStorageError?: ProcessSessionManagerOptions["onOutputStorageError"];
   private nextSessionId = 1;
@@ -561,6 +588,18 @@ export class ProcessSessionManager {
     this.maxSessionsPerWorkspace = options.maxSessionsPerWorkspace ?? Number.POSITIVE_INFINITY;
     this.maxRuntimeMs = options.maxRuntimeMs ?? 60 * 60 * 1_000;
     this.terminationGraceMs = options.terminationGraceMs ?? 5_000;
+    this.durableOutputFlushBytes = positiveBoundedInteger(
+      options.durableOutputFlushBytes,
+      DEFAULT_DURABLE_OUTPUT_FLUSH_BYTES,
+      4 * 1_024 * 1_024,
+      "durableOutputFlushBytes",
+    );
+    this.durableOutputFlushMs = positiveBoundedInteger(
+      options.durableOutputFlushMs,
+      DEFAULT_DURABLE_OUTPUT_FLUSH_MS,
+      10_000,
+      "durableOutputFlushMs",
+    );
     this.outputStore = options.outputStore;
     this.onOutputStorageError = options.onOutputStorageError;
   }
@@ -646,15 +685,36 @@ export class ProcessSessionManager {
     if (input.closeStdin && chars.includes("\u0003")) {
       throw new Error("Send Ctrl-C and closeStdin in separate write_stdin calls.");
     }
+    const ordinaryInteractionRequested =
+      (input.chars ?? "").length > 0 || input.closeStdin === true ||
+      input.columns !== undefined || input.rows !== undefined;
+    if (input.detachRootLease && ordinaryInteractionRequested) {
+      throw new Error("Detach the daemon root lease in a separate write_stdin call without input, resize, or closeStdin.");
+    }
+    if (session.rootExited && ordinaryInteractionRequested) {
+      throw new Error(`Process session ${session.id} root process exited; only polling, termination, or confirmed root-lease detach is available.`);
+    }
     if (session.stdinClosed && chars.length > 0) {
       throw new Error(`Process session ${session.id} stdin is already closed.`);
     }
     if (input.closeStdin && !session.process?.end) {
       throw new Error(`Process session ${session.id} is a PTY and its stdin cannot be closed reliably.`);
     }
-    const interactionRequested =
-      (input.chars ?? "").length > 0 || input.closeStdin === true ||
-      input.columns !== undefined || input.rows !== undefined;
+    const interactionRequested = ordinaryInteractionRequested || input.detachRootLease === true;
+
+    if (input.detachRootLease) {
+      if (!session.running || !session.rootExited || !session.process?.treeAlive()) {
+        throw new Error("The process is not a managed daemon with a live descendant tree.");
+      }
+      if (session.rootLeaseDetached) {
+        throw new Error("The managed daemon root lease is already detached.");
+      }
+      if (!session.releaseWorkspaceRootLease) {
+        throw new Error("The managed daemon does not currently own a workspace root lease.");
+      }
+      this.releaseWorkspaceRootLease(session);
+      session.rootLeaseDetached = true;
+    }
 
     if (input.columns !== undefined || input.rows !== undefined) {
       session.columns = terminalSize(input.columns, session.columns);
@@ -876,6 +936,8 @@ export class ProcessSessionManager {
       totalOutputBytes: 0,
       quotaDroppedBytes: 0,
       durableQuotaReached: false,
+      pendingDurableOutput: [],
+      pendingDurableOutputBytes: 0,
       startedAt: Date.now(),
       columns: terminalSize(input.columns, DEFAULT_COLUMNS),
       rows: terminalSize(input.rows, DEFAULT_ROWS),
@@ -884,6 +946,8 @@ export class ProcessSessionManager {
       timedOut: false,
       cancelRequested: false,
       rootExited: false,
+      treeExitPollMs: INITIAL_TREE_EXIT_POLL_MS,
+      rootLeaseDetached: false,
       exitPromise,
       resolveExit,
     };
@@ -1005,13 +1069,16 @@ export class ProcessSessionManager {
     session.stdinClosed = true;
     session.exitCode = exitCode;
     session.signal = signal;
+    session.treeExitPollMs = INITIAL_TREE_EXIT_POLL_MS;
     this.finishWhenTreeExits(session);
   }
 
   private finishWhenTreeExits(session: ProcessSession): void {
     if (!session.running) return;
     if (session.process?.treeAlive()) {
-      session.treeExitTimer = setTimeout(() => this.finishWhenTreeExits(session), 25);
+      const delay = session.treeExitPollMs;
+      session.treeExitPollMs = nextTreeExitPollMs(delay);
+      session.treeExitTimer = setTimeout(() => this.finishWhenTreeExits(session), delay);
       session.treeExitTimer.unref();
       return;
     }
@@ -1040,24 +1107,18 @@ export class ProcessSessionManager {
       session.quotaDroppedBytes += outputBytes;
       return;
     }
-    try {
-      session.outputId ??= this.outputStore.create({
-        connectionPrincipalId: session.connectionPrincipalId,
-        workspaceId: session.workspaceId,
-      });
-      this.outputStore.append(session.outputId, output);
-    } catch (error) {
-      if (error instanceof ProcessOutputQuotaError) {
-        session.durableQuotaReached = true;
-        session.quotaDroppedBytes += outputBytes;
-      } else {
-        session.outputStorageError = "unavailable";
-        this.onOutputStorageError?.(error, {
-          connectionPrincipalId: session.connectionPrincipalId,
-          workspaceId: session.workspaceId,
-          outputId: session.outputId,
-        });
-      }
+    session.pendingDurableOutput.push(output);
+    session.pendingDurableOutputBytes += outputBytes;
+    if (session.pendingDurableOutputBytes >= this.durableOutputFlushBytes) {
+      this.flushDurableOutput(session);
+      return;
+    }
+    if (!session.durableFlushTimer) {
+      session.durableFlushTimer = setTimeout(() => {
+        session.durableFlushTimer = undefined;
+        this.flushDurableOutput(session);
+      }, this.durableOutputFlushMs);
+      session.durableFlushTimer.unref();
     }
   }
 
@@ -1090,12 +1151,52 @@ export class ProcessSessionManager {
       outputStorageError: session.outputStorageError,
       timedOut: session.timedOut,
       stdinClosed: session.stdinClosed,
+      rootExited: session.rootExited,
+      managedDaemon: session.running && session.rootExited,
+      rootLeaseDetached: session.rootLeaseDetached,
     };
   }
 
   private flushDurableOutput(session: ProcessSession): void {
-    // Output chunks are persisted as they arrive. This method remains as the
-    // synchronization point used before snapshots and read_process_output.
+    if (session.durableFlushTimer) {
+      clearTimeout(session.durableFlushTimer);
+      session.durableFlushTimer = undefined;
+    }
+    if (session.pendingDurableOutputBytes === 0) return;
+    const pending = session.pendingDurableOutput.join("");
+    const pendingBytes = session.pendingDurableOutputBytes;
+    session.pendingDurableOutput = [];
+    session.pendingDurableOutputBytes = 0;
+    if (!this.outputStore || session.outputStorageError) return;
+    if (session.durableQuotaReached) {
+      session.quotaDroppedBytes += pendingBytes;
+      return;
+    }
+    try {
+      session.outputId ??= this.outputStore.create({
+        connectionPrincipalId: session.connectionPrincipalId,
+        workspaceId: session.workspaceId,
+      });
+      this.outputStore.append(session.outputId, pending);
+      const metadata = this.outputStore.metadata(
+        session.connectionPrincipalId,
+        session.workspaceId,
+        session.outputId,
+      );
+      if (metadata.droppedBytes > 0) session.durableQuotaReached = true;
+    } catch (error) {
+      if (error instanceof ProcessOutputQuotaError) {
+        session.durableQuotaReached = true;
+        session.quotaDroppedBytes += pendingBytes;
+      } else {
+        session.outputStorageError = "unavailable";
+        this.onOutputStorageError?.(error, {
+          connectionPrincipalId: session.connectionPrincipalId,
+          workspaceId: session.workspaceId,
+          outputId: session.outputId,
+        });
+      }
+    }
   }
 
   private finalizeDurableOutput(session: ProcessSession): void {
@@ -1157,6 +1258,7 @@ export class ProcessSessionManager {
     if (session?.runtimeTimer) clearTimeout(session.runtimeTimer);
     if (session?.escalationTimer) clearTimeout(session.escalationTimer);
     if (session?.treeExitTimer) clearTimeout(session.treeExitTimer);
+    if (session?.durableFlushTimer) clearTimeout(session.durableFlushTimer);
     this.sessions.delete(sessionId);
   }
 
@@ -1204,6 +1306,7 @@ export class ProcessSessionManager {
       if (session.cleanupTimer) clearTimeout(session.cleanupTimer);
       if (session.runtimeTimer) clearTimeout(session.runtimeTimer);
       if (session.escalationTimer) clearTimeout(session.escalationTimer);
+      if (session.durableFlushTimer) clearTimeout(session.durableFlushTimer);
     }
     const errors: unknown[] = [];
     for (const session of running) {
@@ -1224,6 +1327,7 @@ export class ProcessSessionManager {
       errors.push(new Error(`Failed to terminate ${survivors.length} process session(s) during shutdown.`));
       throw new AggregateError(errors, "Process shutdown incomplete");
     }
+    for (const session of this.sessions.values()) this.flushDurableOutput(session);
     this.sessions.clear();
   }
 
@@ -1250,6 +1354,19 @@ export class ProcessSessionManager {
       if (timer) clearTimeout(timer);
     }
   }
+}
+
+function positiveBoundedInteger(
+  value: number | undefined,
+  fallback: number,
+  maximum: number,
+  label: string,
+): number {
+  const effective = value ?? fallback;
+  if (!Number.isSafeInteger(effective) || effective < 1 || effective > maximum) {
+    throw new RangeError(`${label} must be an integer between 1 and ${maximum}.`);
+  }
+  return effective;
 }
 
 function unknownProcessSessionError(_sessionId: number): Error {

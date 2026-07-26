@@ -7,6 +7,7 @@ import {
 import type { RuntimeDiagnostics } from "./runtime-diagnostics.js";
 import type { McpSessionUsageSnapshot } from "./mcp-sessions.js";
 import { DEVSPACE_VERSION } from "./version.js";
+import type { AuditWriteHealth } from "./logger.js";
 
 interface ProcessUsage {
   sessions: number;
@@ -38,6 +39,7 @@ interface OAuthUsage {
   workspaceCleanupJobs: number;
   expiredAccessTokens: number;
   expiredRefreshTokens: number;
+  legacyWildcardGrants: number;
 }
 
 interface RevocationCounts {
@@ -77,6 +79,7 @@ export interface RuntimeControlPlaneOptions {
   processOutputUsage(): ProcessOutputUsage;
   workspaceUsage(): WorkspaceUsage;
   oauthUsage(): OAuthUsage;
+  auditWriteHealth(): Readonly<AuditWriteHealth>;
   reloadAllowedRoots(): Promise<AllowedRootsReloadResult>;
   beforeGlobalRevocation(): void | Promise<void>;
   revokeAll(): RevocationCounts;
@@ -84,13 +87,17 @@ export interface RuntimeControlPlaneOptions {
   onGlobalRevocation(counts: RevocationCounts): void | Promise<void>;
 }
 
-export function createRuntimeControlPlane(options: RuntimeControlPlaneOptions): Router {
-  const router = Router();
+export type RuntimeReadinessOptions = Pick<
+  RuntimeControlPlaneOptions,
+  "generation" | "isClosing" | "workspaceDatabaseReady" | "oauthDatabaseReady"
+>;
 
+/** Public liveness/readiness endpoints. This router never exposes control actions. */
+export function createRuntimeReadinessPlane(options: RuntimeReadinessOptions): Router {
+  const router = Router();
   router.get("/healthz", (_req, res) => {
     res.json({ ok: true, name: "devspace", status: "alive" });
   });
-
   router.get("/readyz", (_req, res) => {
     const snapshot = readinessSnapshot({
       closing: options.isClosing(),
@@ -100,6 +107,11 @@ export function createRuntimeControlPlane(options: RuntimeControlPlaneOptions): 
     });
     res.status(snapshot.statusCode).json(snapshot.body);
   });
+  return router;
+}
+
+export function createRuntimeControlPlane(options: RuntimeControlPlaneOptions): Router {
+  const router = Router();
 
   router.get("/internal/diagnostics", (req, res) => {
     if (!validInternalDiagnosticsToken(
@@ -161,7 +173,11 @@ export function createRuntimeControlPlane(options: RuntimeControlPlaneOptions): 
           refreshTokens: oauthUsage.refreshTokens,
           workspaceCleanupJobs: oauthUsage.workspaceCleanupJobs,
           expiredRecords: oauthUsage.expiredAccessTokens + oauthUsage.expiredRefreshTokens,
+          legacyWildcardGrants: oauthUsage.legacyWildcardGrants,
         },
+      },
+      observability: {
+        audit: options.auditWriteHealth(),
       },
       recentFailures: options.runtimeDiagnostics.snapshot(),
     });

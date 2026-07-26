@@ -1,7 +1,7 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 
 export const CURSOR_SCHEMA_VERSION = 1 as const;
-export type CursorResourceType = "workspace" | "skill" | "instruction" | "process";
+export type CursorResourceType = "workspace" | "skill" | "instruction" | "process" | "diff";
 
 export interface CursorEnvelope {
   schemaVersion: typeof CURSOR_SCHEMA_VERSION;
@@ -76,15 +76,29 @@ export function decodeCursor(
     }
     const framed = cursor.slice(CURSOR_PREFIX.length);
     const [body, signature, extra] = framed.split(".");
-    if (!body || !signature || extra !== undefined || !/^[A-Za-z0-9_-]{43}$/u.test(signature)) {
+    if (
+      !body ||
+      !signature ||
+      extra !== undefined ||
+      !/^[A-Za-z0-9_-]+$/u.test(body) ||
+      !/^[A-Za-z0-9_-]{43}$/u.test(signature)
+    ) {
       throw new CursorProtocolError("invalid");
     }
     const expected = cursorSignature(body, key);
     const supplied = Buffer.from(signature, "base64url");
-    if (supplied.byteLength !== expected.byteLength || !timingSafeEqual(supplied, expected)) {
+    if (
+      supplied.toString("base64url") !== signature ||
+      supplied.byteLength !== expected.byteLength ||
+      !timingSafeEqual(supplied, expected)
+    ) {
       throw new CursorProtocolError("invalid");
     }
-    const value = JSON.parse(Buffer.from(body, "base64url").toString("utf8")) as unknown;
+    const decodedBody = Buffer.from(body, "base64url");
+    if (decodedBody.toString("base64url") !== body) {
+      throw new CursorProtocolError("invalid");
+    }
+    const value = JSON.parse(decodedBody.toString("utf8")) as unknown;
     assertCursorEnvelope(value);
     if (value.expiresAt <= now) throw new CursorProtocolError("expired");
     if (value.expiresAt > now + MAX_CURSOR_TTL_MS) throw new CursorProtocolError("invalid");
@@ -132,7 +146,7 @@ function assertCursorEnvelope(value: unknown): asserts value is CursorEnvelope {
   const record = value as Partial<CursorEnvelope>;
   if (
     record.schemaVersion !== CURSOR_SCHEMA_VERSION ||
-    !["workspace", "skill", "instruction", "process"].includes(String(record.resourceType)) ||
+    !["workspace", "skill", "instruction", "process", "diff"].includes(String(record.resourceType)) ||
     !boundedString(record.principalRef) ||
     !boundedString(record.queryHash) ||
     !boundedString(record.revision) ||

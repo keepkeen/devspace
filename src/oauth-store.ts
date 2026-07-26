@@ -35,10 +35,27 @@ export interface PersistedRefreshTokenRecord {
   clientId: string;
   principalId?: string;
   authorizationEpoch?: number;
+  familyId?: string;
   scopes: string[];
   expiresAt: number;
   resource?: string;
 }
+
+export interface OAuthRefreshTokenTombstone {
+  tokenHash: string;
+  familyId: string;
+  grantId: string;
+  clientId: string;
+  principalId: string;
+  authorizationEpoch: number;
+  consumedAt: number;
+  expiresAt: number;
+}
+
+export type TokenPairRotationResult =
+  | { status: "saved" }
+  | { status: "invalid" }
+  | { status: "replay"; tombstone: OAuthRefreshTokenTombstone };
 
 export interface PersistedTokenPair {
   accessTokenHash: string;
@@ -59,6 +76,7 @@ export interface OAuthDiagnosticSnapshot extends OAuthRevocationCounts {
   principals: number;
   expiredAccessTokens: number;
   expiredRefreshTokens: number;
+  legacyWildcardGrants: number;
 }
 
 export interface OAuthCleanupCounts {
@@ -80,6 +98,7 @@ export interface OAuthGrantRecord {
   grantedScopes: string[];
   allowedRootIds: string[];
   authorizationEpoch: number;
+  absoluteExpiresAt?: number;
   createdAt: string;
   lastUsedAt: string;
   revokedAt?: string;
@@ -211,6 +230,7 @@ const MAX_AUTHORIZATION_LIMIT_KEY_LENGTH = 4_096;
 const PENDING_OAUTH_CLIENT_TTL_SECONDS = 60 * 60;
 const MAX_PENDING_OAUTH_CLIENTS = 64;
 const MAX_TOTAL_OAUTH_CLIENTS = 512;
+const REFRESH_REPLAY_TOMBSTONE_TTL_SECONDS = 7 * 24 * 60 * 60;
 
 interface AuthorizationLimitRow {
   tokens: number;
@@ -228,6 +248,7 @@ interface OAuthGrantRow {
   grantedScopesJson: string;
   allowedRootIdsJson: string;
   authorizationEpoch: number;
+  absoluteExpiresAt: number | null;
   createdAt: string;
   lastUsedAt: string;
   revokedAt: string | null;
@@ -241,6 +262,21 @@ interface OAuthTokenRow {
   scopes_json: string;
   expires_at: number;
   resource: string | null;
+}
+
+interface OAuthRefreshTokenRow extends OAuthTokenRow {
+  family_id: string;
+}
+
+interface OAuthRefreshTokenTombstoneRow {
+  token_hash: string;
+  family_id: string;
+  grant_id: string;
+  client_id: string;
+  principal_id: string;
+  authorization_epoch: number;
+  consumed_at: number;
+  expires_at: number;
 }
 
 function redirectHostAllowed(redirectUri: string, allowedHosts: string[]): boolean {
@@ -367,6 +403,7 @@ export class SqliteOAuthStore {
     reconnectCode?: string;
     reusePrincipalId?: string;
     allowedRootIds?: string[];
+    absoluteExpiresAt?: number;
   }): OAuthGrantCreationResult {
     const scopes = normalizeGrantScopes(input.scopes);
     const allowedRootIds = normalizeAuthorizedRootIds(
@@ -374,6 +411,12 @@ export class SqliteOAuthStore {
     );
     if (input.reconnectCode && input.reusePrincipalId) {
       throw new InvalidRequestError("Choose either reconnect code or an existing principal, not both");
+    }
+    if (
+      input.absoluteExpiresAt !== undefined &&
+      (!Number.isSafeInteger(input.absoluteExpiresAt) || input.absoluteExpiresAt < 1)
+    ) {
+      throw new InvalidRequestError("OAuth grant absolute expiry must be a positive Unix timestamp");
     }
     const create = this.database.sqlite.transaction((): OAuthGrantCreationResult => {
       const client = this.database.sqlite.prepare(`
@@ -451,15 +494,16 @@ export class SqliteOAuthStore {
       this.database.sqlite.prepare(`
         insert into oauth_grants (
           grant_id, client_id, principal_id, subject_hash, organization_hash,
-          granted_scopes_json, allowed_root_ids_json, authorization_epoch,
+          granted_scopes_json, allowed_root_ids_json, authorization_epoch, absolute_expires_at,
           created_at, last_used_at, revoked_at
-        ) values (?, ?, ?, null, null, ?, ?, 1, ?, ?, null)
+        ) values (?, ?, ?, null, null, ?, ?, 1, ?, ?, ?, null)
       `).run(
         grantId,
         input.clientId,
         principalId,
         JSON.stringify(scopes),
         JSON.stringify(allowedRootIds),
+        input.absoluteExpiresAt ?? null,
         now,
         now,
       );
@@ -471,6 +515,7 @@ export class SqliteOAuthStore {
         grantedScopes: scopes,
         allowedRootIds,
         authorizationEpoch: 1,
+        ...(input.absoluteExpiresAt ? { absoluteExpiresAt: input.absoluteExpiresAt } : {}),
         createdAt: now,
         lastUsedAt: now,
         principalCreated,
@@ -492,6 +537,7 @@ export class SqliteOAuthStore {
         grant.granted_scopes_json as grantedScopesJson,
         grant.allowed_root_ids_json as allowedRootIdsJson,
         grant.authorization_epoch as authorizationEpoch,
+        grant.absolute_expires_at as absoluteExpiresAt,
         grant.created_at as createdAt,
         grant.last_used_at as lastUsedAt,
         grant.revoked_at as revokedAt
@@ -500,6 +546,7 @@ export class SqliteOAuthStore {
         on principal.principal_id = grant.principal_id
       where grant.grant_id = ?
         and grant.revoked_at is null
+        and (grant.absolute_expires_at is null or grant.absolute_expires_at > cast(strftime('%s','now') as integer))
         and principal.revoked_at is null
     `).get(grantId) as OAuthGrantRow | undefined;
     return row ? rowToOAuthGrantRecord(row) : undefined;
@@ -1115,6 +1162,7 @@ export class SqliteOAuthStore {
       where token.token_hash = ?
         and token.authorization_epoch = grant.authorization_epoch
         and grant.revoked_at is null
+        and (grant.absolute_expires_at is null or grant.absolute_expires_at > cast(strftime('%s','now') as integer))
         and principal.revoked_at is null
     `).get(tokenHash) as OAuthTokenRow | undefined;
 
@@ -1127,17 +1175,19 @@ export class SqliteOAuthStore {
 
   saveRefreshToken(tokenHash: string, record: PersistedRefreshTokenRecord): void {
     const normalized = this.resolveTokenGrant(record);
+    const familyId = normalizeRefreshFamilyId(record.familyId ?? newRefreshFamilyId());
     this.database.sqlite
       .prepare(
         `insert into oauth_refresh_tokens (
            token_hash, grant_id, client_id, principal_id, authorization_epoch,
-           scopes_json, expires_at, resource
-         ) values (?, ?, ?, ?, ?, ?, ?, ?)
+           family_id, scopes_json, expires_at, resource
+         ) values (?, ?, ?, ?, ?, ?, ?, ?, ?)
          on conflict(token_hash) do update set
            grant_id = excluded.grant_id,
            client_id = excluded.client_id,
            principal_id = excluded.principal_id,
            authorization_epoch = excluded.authorization_epoch,
+           family_id = excluded.family_id,
            scopes_json = excluded.scopes_json,
            expires_at = excluded.expires_at,
            resource = excluded.resource`,
@@ -1148,6 +1198,7 @@ export class SqliteOAuthStore {
         normalized.clientId,
         normalized.principalId,
         normalized.authorizationEpoch,
+        familyId,
         JSON.stringify(normalized.scopes),
         normalized.expiresAt,
         normalized.resource ?? null,
@@ -1155,7 +1206,18 @@ export class SqliteOAuthStore {
   }
 
   saveTokenPair(pair: PersistedTokenPair, consumedRefreshTokenHash?: string): boolean {
-    const save = this.database.sqlite.transaction(() => {
+    return this.rotateTokenPair(pair, consumedRefreshTokenHash).status === "saved";
+  }
+
+  rotateTokenPair(
+    pair: PersistedTokenPair,
+    consumedRefreshTokenHash?: string,
+    nowSeconds = Math.floor(Date.now() / 1_000),
+  ): TokenPairRotationResult {
+    if (!Number.isSafeInteger(nowSeconds) || nowSeconds < 0) {
+      throw new RangeError("Refresh-token rotation time must be a non-negative Unix timestamp.");
+    }
+    const save = this.database.sqlite.transaction((): TokenPairRotationResult => {
       const access = this.resolveTokenGrant(pair.accessToken);
       const refresh = this.resolveTokenGrant(pair.refreshToken);
       if (
@@ -1171,23 +1233,56 @@ export class SqliteOAuthStore {
           "OAuth access and refresh tokens in one pair must belong to the same authorization grant",
         );
       }
+      let familyId = pair.refreshToken.familyId
+        ? normalizeRefreshFamilyId(pair.refreshToken.familyId)
+        : newRefreshFamilyId();
       if (consumedRefreshTokenHash) {
         const consumed = this.getRefreshToken(consumedRefreshTokenHash);
+        if (!consumed) {
+          const tombstone = this.getRefreshTokenTombstone(consumedRefreshTokenHash, nowSeconds);
+          return tombstone ? { status: "replay", tombstone } : { status: "invalid" };
+        }
         if (
-          !consumed ||
           consumed.grantId !== refresh.grantId ||
           consumed.principalId !== refresh.principalId ||
           consumed.clientId !== refresh.clientId
-        ) return false;
+        ) return { status: "invalid" };
+        familyId = normalizeRefreshFamilyId(consumed.familyId ?? familyId);
         const result = this.database.sqlite
           .prepare("delete from oauth_refresh_tokens where token_hash = ?")
           .run(consumedRefreshTokenHash);
-        if (result.changes !== 1) return false;
+        if (result.changes !== 1) {
+          const tombstone = this.getRefreshTokenTombstone(consumedRefreshTokenHash, nowSeconds);
+          return tombstone ? { status: "replay", tombstone } : { status: "invalid" };
+        }
+        this.database.sqlite.prepare(`
+          insert into oauth_refresh_token_tombstones (
+            token_hash, family_id, grant_id, client_id, principal_id,
+            authorization_epoch, consumed_at, expires_at
+          ) values (?, ?, ?, ?, ?, ?, ?, ?)
+          on conflict(token_hash) do update set
+            family_id = excluded.family_id,
+            grant_id = excluded.grant_id,
+            client_id = excluded.client_id,
+            principal_id = excluded.principal_id,
+            authorization_epoch = excluded.authorization_epoch,
+            consumed_at = excluded.consumed_at,
+            expires_at = excluded.expires_at
+        `).run(
+          consumedRefreshTokenHash,
+          familyId,
+          consumed.grantId,
+          consumed.clientId,
+          consumed.principalId,
+          consumed.authorizationEpoch,
+          nowSeconds,
+          Math.max(consumed.expiresAt, nowSeconds + REFRESH_REPLAY_TOMBSTONE_TTL_SECONDS),
+        );
       }
 
       this.saveAccessToken(pair.accessTokenHash, pair.accessToken);
-      this.saveRefreshToken(pair.refreshTokenHash, pair.refreshToken);
-      return true;
+      this.saveRefreshToken(pair.refreshTokenHash, { ...pair.refreshToken, familyId });
+      return { status: "saved" };
     });
 
     return save.immediate();
@@ -1200,6 +1295,7 @@ export class SqliteOAuthStore {
         token.client_id,
         token.principal_id,
         token.authorization_epoch,
+        token.family_id,
         token.scopes_json,
         token.expires_at,
         token.resource
@@ -1213,10 +1309,60 @@ export class SqliteOAuthStore {
       where token.token_hash = ?
         and token.authorization_epoch = grant.authorization_epoch
         and grant.revoked_at is null
+        and (grant.absolute_expires_at is null or grant.absolute_expires_at > cast(strftime('%s','now') as integer))
         and principal.revoked_at is null
-    `).get(tokenHash) as OAuthTokenRow | undefined;
+    `).get(tokenHash) as OAuthRefreshTokenRow | undefined;
 
     return row ? rowToRefreshTokenRecord(row) : undefined;
+  }
+
+  getRefreshTokenTombstone(
+    tokenHash: string,
+    nowSeconds = Math.floor(Date.now() / 1_000),
+  ): OAuthRefreshTokenTombstone | undefined {
+    const row = this.database.sqlite.prepare(`
+      select
+        token_hash, family_id, grant_id, client_id, principal_id,
+        authorization_epoch, consumed_at, expires_at
+      from oauth_refresh_token_tombstones
+      where token_hash = ? and expires_at > ?
+    `).get(tokenHash, nowSeconds) as OAuthRefreshTokenTombstoneRow | undefined;
+    return row ? rowToRefreshTokenTombstone(row) : undefined;
+  }
+
+  revokeRefreshTokenFamilyOnReplay(
+    tombstone: OAuthRefreshTokenTombstone,
+  ): { changed: boolean; connectionPrincipalId: string; grantId: string } {
+    const revoke = this.database.sqlite.transaction(() => {
+      const now = new Date().toISOString();
+      const result = this.database.sqlite.prepare(`
+        update oauth_grants
+        set revoked_at = ?, last_used_at = ?, authorization_epoch = authorization_epoch + 1
+        where grant_id = ?
+          and client_id = ?
+          and principal_id = ?
+          and authorization_epoch = ?
+          and revoked_at is null
+      `).run(
+        now,
+        now,
+        tombstone.grantId,
+        tombstone.clientId,
+        tombstone.principalId,
+        tombstone.authorizationEpoch,
+      );
+      this.database.sqlite.prepare("delete from oauth_access_tokens where grant_id = ?")
+        .run(tombstone.grantId);
+      this.database.sqlite.prepare(`
+        delete from oauth_refresh_tokens where grant_id = ? or family_id = ?
+      `).run(tombstone.grantId, tombstone.familyId);
+      return {
+        changed: result.changes === 1,
+        connectionPrincipalId: tombstone.principalId,
+        grantId: tombstone.grantId,
+      };
+    });
+    return revoke.immediate();
   }
 
   deleteRefreshToken(tokenHash: string): void {
@@ -1341,6 +1487,7 @@ export class SqliteOAuthStore {
       this.database.sqlite.prepare("delete from oauth_principal_reconnect_codes").run();
       this.database.sqlite.prepare("delete from oauth_access_tokens").run();
       this.database.sqlite.prepare("delete from oauth_refresh_tokens").run();
+      this.database.sqlite.prepare("delete from oauth_refresh_token_tombstones").run();
       this.database.sqlite.prepare("delete from oauth_clients").run();
       return {
         clients: counts.clients,
@@ -1405,32 +1552,66 @@ export class SqliteOAuthStore {
     const row = this.database.sqlite.prepare(`
       select
         (select count(*) from oauth_clients) as clients,
-        (select count(*) from oauth_grants where revoked_at is null) as grants,
+        (select count(*) from oauth_grants
+          where revoked_at is null
+            and (absolute_expires_at is null or absolute_expires_at > @nowSeconds)) as grants,
         (select count(*) from connection_principals where revoked_at is null) as principals,
         (select count(*) from oauth_access_tokens) as accessTokens,
         (select count(*) from oauth_refresh_tokens) as refreshTokens,
         (select count(*) from oauth_revocation_cleanup_jobs where status != 'completed') as workspaceCleanupJobs,
         (select count(*) from oauth_access_tokens where expires_at < @nowSeconds) as expiredAccessTokens,
-        (select count(*) from oauth_refresh_tokens where expires_at < @nowSeconds) as expiredRefreshTokens
+        (select count(*) from oauth_refresh_tokens where expires_at < @nowSeconds) as expiredRefreshTokens,
+        (select count(*)
+          from oauth_grants as grant
+          where grant.revoked_at is null
+            and (grant.absolute_expires_at is null or grant.absolute_expires_at > @nowSeconds)
+            and exists (
+              select 1 from json_each(grant.allowed_root_ids_json) where value = '*'
+            )) as legacyWildcardGrants
     `).get({ nowSeconds }) as OAuthDiagnosticSnapshot;
     return row;
   }
 
   cleanupExpired(nowSeconds = Math.floor(Date.now() / 1000)): OAuthCleanupCounts {
     const nowMs = nowSeconds * 1_000;
-    const cleanup = this.database.sqlite.transaction(() => ({
-      accessTokens: this.database.sqlite
-        .prepare("delete from oauth_access_tokens where expires_at < ?")
-        .run(nowSeconds).changes,
-      refreshTokens: this.database.sqlite
-        .prepare("delete from oauth_refresh_tokens where expires_at < ?")
-        .run(nowSeconds).changes,
-      reconnectCodes: this.cleanupExpiredReconnectCodes(nowMs),
-      authorizationLimits: this.database.sqlite
+    const cleanup = this.database.sqlite.transaction(() => {
+      const nowIso = new Date(nowMs).toISOString();
+      this.database.sqlite.prepare(`
+        update oauth_grants
+        set revoked_at = @nowIso,
+            last_used_at = @nowIso,
+            authorization_epoch = authorization_epoch + 1
+        where revoked_at is null
+          and absolute_expires_at is not null
+          and absolute_expires_at <= @nowSeconds
+      `).run({ nowIso, nowSeconds });
+      const accessTokens = this.database.sqlite.prepare(`
+        delete from oauth_access_tokens
+        where expires_at < @nowSeconds
+           or exists (
+             select 1 from oauth_grants as grant
+             where grant.grant_id = oauth_access_tokens.grant_id
+               and grant.revoked_at is not null
+           )
+      `).run({ nowSeconds }).changes;
+      const refreshTokens = this.database.sqlite.prepare(`
+        delete from oauth_refresh_tokens
+        where expires_at < @nowSeconds
+           or exists (
+             select 1 from oauth_grants as grant
+             where grant.grant_id = oauth_refresh_tokens.grant_id
+               and grant.revoked_at is not null
+           )
+      `).run({ nowSeconds }).changes;
+      this.database.sqlite.prepare(
+        "delete from oauth_refresh_token_tombstones where expires_at <= ?",
+      ).run(nowSeconds);
+      const reconnectCodes = this.cleanupExpiredReconnectCodes(nowMs);
+      const authorizationLimits = this.database.sqlite
         .prepare("delete from oauth_authorization_limits where expires_at <= ?")
-        .run(nowMs).changes,
-      unapprovedClients: this.cleanupExpiredUnapprovedClients(nowSeconds),
-      orphanedGrants: this.database.sqlite.prepare(`
+        .run(nowMs).changes;
+      const unapprovedClients = this.cleanupExpiredUnapprovedClients(nowSeconds);
+      const orphanedGrants = this.database.sqlite.prepare(`
         delete from oauth_grants
         where grant_id in (
           select grant.grant_id
@@ -1447,8 +1628,8 @@ export class SqliteOAuthStore {
           order by grant.created_at, grant.grant_id
           limit 1000
         )
-      `).run(new Date(nowMs - PENDING_OAUTH_CLIENT_TTL_SECONDS * 1_000).toISOString()).changes,
-      revokedPrincipals: this.database.sqlite.prepare(`
+      `).run(new Date(nowMs - PENDING_OAUTH_CLIENT_TTL_SECONDS * 1_000).toISOString()).changes;
+      const revokedPrincipals = this.database.sqlite.prepare(`
         delete from connection_principals
         where principal_id in (
           select principal.principal_id
@@ -1469,8 +1650,17 @@ export class SqliteOAuthStore {
           order by principal.last_used_at, principal.principal_id
           limit 1000
         )
-      `).run().changes,
-    }));
+      `).run().changes;
+      return {
+        accessTokens,
+        refreshTokens,
+        reconnectCodes,
+        authorizationLimits,
+        unapprovedClients,
+        orphanedGrants,
+        revokedPrincipals,
+      };
+    });
     return cleanup.immediate();
   }
 
@@ -1515,6 +1705,7 @@ export class SqliteOAuthStore {
         grant.granted_scopes_json as grantedScopesJson,
         grant.allowed_root_ids_json as allowedRootIdsJson,
         grant.authorization_epoch as authorizationEpoch,
+        grant.absolute_expires_at as absoluteExpiresAt,
         grant.created_at as createdAt,
         grant.last_used_at as lastUsedAt,
         grant.revoked_at as revokedAt
@@ -1523,6 +1714,7 @@ export class SqliteOAuthStore {
         on principal.principal_id = grant.principal_id
       where grant.client_id = @clientId
         and grant.revoked_at is null
+        and (grant.absolute_expires_at is null or grant.absolute_expires_at > cast(strftime('%s','now') as integer))
         and principal.revoked_at is null
         and (@grantId is null or grant.grant_id = @grantId)
       order by grant.last_used_at desc
@@ -1684,15 +1876,31 @@ function rowToAccessTokenRecord(row: OAuthTokenRow): PersistedAccessTokenRecord 
   };
 }
 
-function rowToRefreshTokenRecord(row: OAuthTokenRow): PersistedRefreshTokenRecord {
+function rowToRefreshTokenRecord(row: OAuthRefreshTokenRow): PersistedRefreshTokenRecord {
   return {
     grantId: row.grant_id,
     clientId: row.client_id,
     principalId: row.principal_id,
     authorizationEpoch: row.authorization_epoch,
+    familyId: row.family_id,
     scopes: JSON.parse(row.scopes_json) as string[],
     expiresAt: row.expires_at,
     resource: row.resource ?? undefined,
+  };
+}
+
+function rowToRefreshTokenTombstone(
+  row: OAuthRefreshTokenTombstoneRow,
+): OAuthRefreshTokenTombstone {
+  return {
+    tokenHash: row.token_hash,
+    familyId: row.family_id,
+    grantId: row.grant_id,
+    clientId: row.client_id,
+    principalId: row.principal_id,
+    authorizationEpoch: row.authorization_epoch,
+    consumedAt: row.consumed_at,
+    expiresAt: row.expires_at,
   };
 }
 
@@ -1706,6 +1914,7 @@ function rowToOAuthGrantRecord(row: OAuthGrantRow): OAuthGrantRecord {
     grantedScopes: normalizeGrantScopes(JSON.parse(row.grantedScopesJson) as unknown),
     allowedRootIds: normalizeAuthorizedRootIds(JSON.parse(row.allowedRootIdsJson) as unknown),
     authorizationEpoch: row.authorizationEpoch,
+    ...(row.absoluteExpiresAt ? { absoluteExpiresAt: row.absoluteExpiresAt } : {}),
     createdAt: row.createdAt,
     lastUsedAt: row.lastUsedAt,
     ...(row.revokedAt ? { revokedAt: row.revokedAt } : {}),
@@ -1725,6 +1934,17 @@ function normalizeGrantScopes(value: unknown): string[] {
     throw new InvalidRequestError("OAuth grant contains an unsupported scope");
   }
   return DEVSPACE_CAPABILITY_SCOPES.filter((scope) => requested.has(scope));
+}
+
+function newRefreshFamilyId(): string {
+  return `family-${randomBytes(32).toString("base64url")}`;
+}
+
+function normalizeRefreshFamilyId(value: string): string {
+  if (typeof value !== "string" || value.length < 16 || value.length > 128) {
+    throw new InvalidRequestError("OAuth refresh-token family identifier is invalid");
+  }
+  return value;
 }
 
 function deriveOwnerCredentialVerifier(

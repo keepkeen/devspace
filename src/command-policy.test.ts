@@ -146,6 +146,11 @@ for (const command of [
 ]) {
   assert.equal(classifyCommand(command).decision, "allow", `${command} is parse-only`);
 }
+assert.equal(
+  classifyCommand("bash -c 'sudo id' -n").decision,
+  "deny",
+  "a positional -n after the -c payload is not a shell option",
+);
 
 // Segment evaluation: a privileged tail denies the whole command.
 const compound = classifyCommand("git status && sudo id");

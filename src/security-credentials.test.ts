@@ -9,6 +9,7 @@ import {
   hashOwnerPassword,
   legacyMasterKeyFromOwnerPassword,
   verifyOwnerPassword,
+  verifyOwnerPasswordAsync,
 } from "./security-credentials.js";
 
 test("Owner passwords are stored as Argon2id verifiers", () => {
@@ -18,6 +19,20 @@ test("Owner passwords are stored as Argon2id verifiers", () => {
   assert.equal(passwordHash.includes(password), false);
   assert.equal(verifyOwnerPassword(passwordHash, password), true);
   assert.equal(verifyOwnerPassword(passwordHash, `${password}-wrong`), false);
+});
+
+test("request-path Argon2 verification is asynchronous", async () => {
+  const password = "owner-password-for-async-argon2-test";
+  const passwordHash = hashOwnerPassword(password);
+  let immediateObserved = false;
+  const verification = verifyOwnerPasswordAsync(passwordHash, password);
+  await new Promise<void>((resolve) => setImmediate(() => {
+    immediateObserved = true;
+    resolve();
+  }));
+  assert.equal(immediateObserved, true);
+  assert.equal(await verification, true);
+  assert.equal(await verifyOwnerPasswordAsync(passwordHash, `${password}-wrong`), false);
 });
 
 test("password rotation is independent from the persistent HMAC master key", () => {

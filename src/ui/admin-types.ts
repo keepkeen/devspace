@@ -156,6 +156,13 @@ export interface AdminDiagnostics {
       accessTokens?: number | null;
       refreshTokens?: number | null;
       expiredRecords?: number | null;
+      legacyWildcardGrants?: number | null;
+    };
+  };
+  observability?: {
+    audit?: {
+      auditWriteFailures?: number;
+      lastAuditWriteFailureAt?: string;
     };
   };
   recentFailures?: AdminRecentFailure[];

@@ -20,6 +20,7 @@ import {
   type OAuthDiagnosticSnapshot,
   type OAuthCleanupCounts,
   type OAuthGrantRecord,
+  type OAuthRefreshTokenTombstone,
   type OAuthRevocationCounts,
   type ConnectionPrincipalSummary,
 } from "./oauth-store.js";
@@ -37,16 +38,22 @@ import {
   oauthScopeDescription,
 } from "./oauth-scopes.js";
 import {
-  verifyOwnerPassword,
+  verifyOwnerPasswordAsync,
   type OwnerCredentialInput,
   type SecurityKeyring,
 } from "./security-credentials.js";
+import {
+  AsyncConcurrencyGate,
+  AsyncConcurrencyGateBusyError,
+} from "./async-concurrency-gate.js";
 
 export interface OAuthConfig {
   ownerCredential: OwnerCredentialInput;
   keys: SecurityKeyring;
   accessTokenTtlSeconds: number;
   refreshTokenTtlSeconds: number;
+  /** Optional absolute authorization-grant lifetime; omitted means no wall-clock maximum. */
+  grantMaxLifetimeSeconds?: number;
   scopes: string[];
   allowedRedirectHosts: string[];
   trustProxy?: boolean;
@@ -61,7 +68,8 @@ export type OAuthAuditEventName =
   | "oauth_authorization_rate_limited"
   | "oauth_principal_linked"
   | "oauth_token_issued"
-  | "oauth_token_refreshed";
+  | "oauth_token_refreshed"
+  | "oauth_refresh_token_replay_detected";
 
 export interface OAuthAuditEvent {
   event: OAuthAuditEventName;
@@ -74,7 +82,7 @@ export interface OAuthAuditEvent {
 
 export interface OAuthAuthorizationBoundaryChange {
   connectionPrincipalId: string;
-  reason: "principal_created" | "principal_relinked";
+  reason: "principal_created" | "principal_relinked" | "refresh_token_replay";
 }
 
 interface AuthorizationCodeRecord {
@@ -110,6 +118,8 @@ const AUTH_EXTRA_AUTHORIZATION_EPOCH = "devspace/authorization-epoch";
 const CODE_TTL_MS = 5 * 60 * 1000;
 const SELECTION_TTL_MS = 5 * 60 * 1000;
 const AUTHORIZATION_LIMIT_TTL_MS = 24 * 60 * 60_000;
+const OWNER_PASSWORD_VERIFY_CONCURRENCY = 3;
+const OWNER_PASSWORD_VERIFY_QUEUE = 32;
 
 const AUTHORIZATION_LIMIT_POLICIES = {
   session: {
@@ -426,6 +436,10 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
   private readonly oauthStore: SqliteOAuthStore;
   private readonly resourceServerUrl: URL;
   private readonly ownerPasswordHash: string;
+  private readonly ownerPasswordVerificationGate = new AsyncConcurrencyGate(
+    OWNER_PASSWORD_VERIFY_CONCURRENCY,
+    OWNER_PASSWORD_VERIFY_QUEUE,
+  );
 
   constructor(
     private readonly config: OAuthConfig,
@@ -576,7 +590,26 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     }
 
     const providedToken = String(res.req.body?.owner_token ?? "");
-    const tokenMatches = verifyOwnerPassword(this.ownerPasswordHash, providedToken);
+    let tokenMatches: boolean;
+    try {
+      tokenMatches = await this.ownerPasswordVerificationGate.run(
+        () => verifyOwnerPasswordAsync(this.ownerPasswordHash, providedToken),
+      );
+    } catch (error) {
+      if (!(error instanceof AsyncConcurrencyGateBusyError)) throw error;
+      this.emitAudit("oauth_authorization_rate_limited", client.client_id);
+      res.status(503).setHeader("Retry-After", "1");
+      res.setHeader("Content-Type", "text/html; charset=utf-8");
+      res.send(formHtml({
+        error: "Owner password verification is temporarily busy. Retry shortly.",
+        clientName: client.client_name ?? client.client_id,
+        scopes,
+        resource: authorizedParams.resource,
+        fields: authorizationFormFields(client, authorizedParams),
+        runtimeCapabilities: this.config.runtimeCapabilities,
+      }));
+      return;
+    }
     if (!tokenMatches) {
       this.emitAudit("oauth_authorization_failed", client.client_id);
       const failure = this.oauthStore.recordAuthorizationFailure(authorizationLimits, now);
@@ -664,6 +697,12 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
         clientId: client.client_id,
         scopes: input.scopes,
         allowedRootIds: input.allowedRootIds,
+        ...(this.config.grantMaxLifetimeSeconds
+          ? {
+              absoluteExpiresAt:
+                Math.floor(Date.now() / 1_000) + this.config.grantMaxLifetimeSeconds,
+            }
+          : {}),
         ...(input.reusePrincipalId ? { reusePrincipalId: input.reusePrincipalId } : {}),
       });
     } catch (error) {
@@ -760,7 +799,12 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
   ): Promise<OAuthTokens> {
     const refreshTokenHash = hashToken(refreshToken);
     const record = this.oauthStore.getRefreshToken(refreshTokenHash);
-    if (!record || record.clientId !== client.client_id || record.expiresAt < Math.floor(Date.now() / 1000)) {
+    if (!record) {
+      const tombstone = this.oauthStore.getRefreshTokenTombstone(refreshTokenHash);
+      if (tombstone?.clientId === client.client_id) this.handleRefreshTokenReplay(tombstone);
+      throw new InvalidGrantError("Invalid refresh token");
+    }
+    if (record.clientId !== client.client_id || record.expiresAt < Math.floor(Date.now() / 1000)) {
       throw new InvalidGrantError("Invalid refresh token");
     }
     if (resource && !checkResourceAllowed({ requestedResource: resource, configuredResource: this.resourceServerUrl })) {
@@ -786,6 +830,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
       requestedScopes,
       resource ?? (record.resource ? new URL(record.resource) : undefined),
       refreshTokenHash,
+      record.familyId,
     );
     this.oauthStore.touchPrincipal(grant.principalId);
     this.emitAudit("oauth_token_refreshed", client.client_id, grant);
@@ -930,19 +975,35 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
   private issueTokens(
     grant: Pick<
       OAuthGrantRecord,
-      "grantId" | "clientId" | "principalId" | "authorizationEpoch"
+      "grantId" | "clientId" | "principalId" | "authorizationEpoch" | "absoluteExpiresAt"
     >,
     scopes: string[],
     resource?: URL,
     consumedRefreshTokenHash?: string,
+    refreshFamilyId?: string,
   ): OAuthTokens {
     const now = Math.floor(Date.now() / 1000);
+    const remainingGrantSeconds = grant.absoluteExpiresAt === undefined
+      ? Number.POSITIVE_INFINITY
+      : grant.absoluteExpiresAt - now;
+    if (remainingGrantSeconds <= 0) {
+      throw new InvalidGrantError("OAuth authorization grant has expired");
+    }
+    const accessTtlSeconds = Math.min(
+      this.config.accessTokenTtlSeconds,
+      remainingGrantSeconds,
+    );
+    const refreshTtlSeconds = Math.min(
+      this.config.refreshTokenTtlSeconds,
+      remainingGrantSeconds,
+    );
     const accessToken = randomToken();
     const refreshToken = randomToken();
-    const accessExpiresAt = now + this.config.accessTokenTtlSeconds;
-    const refreshExpiresAt = now + this.config.refreshTokenTtlSeconds;
+    const accessExpiresAt = now + accessTtlSeconds;
+    const refreshExpiresAt = now + refreshTtlSeconds;
+    const familyId = refreshFamilyId ?? `family-${randomToken()}`;
 
-    const saved = this.oauthStore.saveTokenPair(
+    const rotation = this.oauthStore.rotateTokenPair(
       {
         accessTokenHash: hashToken(accessToken),
         accessToken: {
@@ -960,6 +1021,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
           clientId: grant.clientId,
           principalId: grant.principalId,
           authorizationEpoch: grant.authorizationEpoch,
+          familyId,
           scopes,
           expiresAt: refreshExpiresAt,
           resource: resource?.href,
@@ -967,17 +1029,35 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
       },
       consumedRefreshTokenHash,
     );
-    if (!saved) {
+    if (rotation.status === "replay") {
+      this.handleRefreshTokenReplay(rotation.tombstone);
+    }
+    if (rotation.status !== "saved") {
       throw new InvalidGrantError("Invalid refresh token");
     }
 
     return {
       access_token: accessToken,
       token_type: "bearer",
-      expires_in: this.config.accessTokenTtlSeconds,
+      expires_in: accessTtlSeconds,
       refresh_token: refreshToken,
       scope: scopes.join(" "),
     };
+  }
+
+  private handleRefreshTokenReplay(tombstone: OAuthRefreshTokenTombstone): never {
+    const revoked = this.oauthStore.revokeRefreshTokenFamilyOnReplay(tombstone);
+    this.emitAudit("oauth_refresh_token_replay_detected", tombstone.clientId, {
+      grantId: tombstone.grantId,
+      principalId: tombstone.principalId,
+    });
+    if (revoked.changed) {
+      this.onAuthorizationBoundaryChanged?.({
+        connectionPrincipalId: revoked.connectionPrincipalId,
+        reason: "refresh_token_replay",
+      });
+    }
+    throw new InvalidGrantError("Refresh token replay detected; authorization grant revoked");
   }
 
   private requireActiveGrant(input: {

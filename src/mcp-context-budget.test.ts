@@ -451,6 +451,43 @@ try {
     arguments: { receipt: readonlyContextReceipt, path: "payload.txt" },
   });
   assert.notEqual(readonlyRead.isError, true);
+  const firstWorkspacePage = await client.callTool({
+    name: "list_workspaces",
+    arguments: { limit: 1, recentFirst: false },
+  });
+  assert.notEqual(firstWorkspacePage.isError, true);
+  assert.ok(
+    Number((firstWorkspacePage.structuredContent as { total?: unknown } | undefined)?.total) >= 2,
+  );
+  const stableWorkspaceCursor = String(
+    (firstWorkspacePage.structuredContent as { nextCursor?: unknown } | undefined)?.nextCursor ?? "",
+  );
+  const firstWorkspaceRef = String(
+    (firstWorkspacePage.structuredContent as {
+      workspaces?: Array<{ workspaceRef?: unknown }>;
+    } | undefined)?.workspaces?.[0]?.workspaceRef ?? "",
+  );
+  assert.match(stableWorkspaceCursor, /^dcur1\./u);
+  assert.ok(firstWorkspaceRef);
+  // Ordinary access changes lastUsedAt. It must not invalidate a cursor whose
+  // ordering and revision use stable Workspace fields.
+  const activityTouch = await client.callTool({
+    name: "read",
+    arguments: { receipt: scopedContextReceipt, path: "payload.txt" },
+  });
+  assert.notEqual(activityTouch.isError, true);
+  const secondWorkspacePage = await client.callTool({
+    name: "list_workspaces",
+    arguments: { limit: 1, recentFirst: false, cursor: stableWorkspaceCursor },
+  });
+  assert.notEqual(secondWorkspacePage.isError, true, JSON.stringify(secondWorkspacePage.content));
+  const secondWorkspaceRef = String(
+    (secondWorkspacePage.structuredContent as {
+      workspaces?: Array<{ workspaceRef?: unknown }>;
+    } | undefined)?.workspaces?.[0]?.workspaceRef ?? "",
+  );
+  assert.ok(secondWorkspaceRef);
+  assert.notEqual(secondWorkspaceRef, firstWorkspaceRef);
   const readonlyExec = await client.callTool({
     name: "exec_command",
     arguments: { receipt: readonlyContextReceipt, shell: true, command: "touch denied.txt" },
@@ -1054,7 +1091,18 @@ try {
   );
   assert.deepEqual(
     Object.keys((activeProcessOutput.structuredContent ?? {}) as Record<string, unknown>).sort(),
-    ["contextChanged", "nextCursor", "nextOffset", "ok", "page", "status", "workspaceAlias"],
+    [
+      "contextChanged", "mode", "nextCursor", "nextOffset", "notice", "ok", "page",
+      "status", "workspaceAlias",
+    ],
+  );
+  assert.equal(
+    (activeProcessOutput.structuredContent as { mode?: unknown } | undefined)?.mode,
+    "page",
+  );
+  assert.match(
+    String((activeProcessOutput.structuredContent as { notice?: unknown } | undefined)?.notice),
+    /untrusted local content/iu,
   );
   assert.match(
     String((activeProcessOutput.structuredContent as { nextCursor?: unknown }).nextCursor),
@@ -1078,6 +1126,93 @@ try {
     (unknownProcessSession._meta as { error?: { code?: unknown } } | undefined)?.error?.code,
     "unknown_process_session",
   );
+
+  const indexedCommand = await client.callTool({
+    name: "exec_command",
+    arguments: {
+      receipt: scopedContextReceipt,
+      program: process.execPath,
+      args: [
+        "-e",
+        "console.log('startup ok'); console.error('ERROR expected failure'); console.log('final sentinel')",
+      ],
+      yieldTimeMs: 2_000,
+    },
+  });
+  assert.notEqual(indexedCommand.isError, true, JSON.stringify(indexedCommand.content));
+  const indexedOutputId = String(
+    (indexedCommand.structuredContent as { outputId?: unknown } | undefined)?.outputId ?? "",
+  );
+  assert.ok(indexedOutputId);
+
+  const tailedOutput = await client.callTool({
+    name: "read_process_output",
+    arguments: {
+      receipt: scopedContextReceipt,
+      outputId: indexedOutputId,
+      mode: "tail",
+      tailBytes: 32,
+    },
+  });
+  assert.notEqual(tailedOutput.isError, true);
+  assert.equal(
+    (tailedOutput.structuredContent as { mode?: unknown } | undefined)?.mode,
+    "tail",
+  );
+  assert.match(processOutputPageText(tailedOutput), /final sentinel/u);
+  assert.doesNotMatch(toolText(tailedOutput), /final sentinel/u);
+
+  const searchedOutput = await client.callTool({
+    name: "read_process_output",
+    arguments: {
+      receipt: scopedContextReceipt,
+      outputId: indexedOutputId,
+      mode: "search",
+      query: "EXPECTED FAILURE",
+      ignoreCase: true,
+      scanBytes: 1_024,
+      maxMatches: 10,
+    },
+  });
+  assert.notEqual(searchedOutput.isError, true);
+  const searched = (searchedOutput.structuredContent as {
+    mode?: unknown;
+    search?: {
+      matches?: Array<{ text?: unknown; category?: unknown }>;
+      totalMatches?: unknown;
+      eof?: unknown;
+    };
+  } | undefined);
+  assert.equal(searched?.mode, "search");
+  assert.equal(searched?.search?.totalMatches, 1);
+  assert.equal(searched?.search?.eof, true);
+  assert.match(String(searched?.search?.matches?.[0]?.text), /ERROR expected failure/u);
+  assert.equal(searched?.search?.matches?.[0]?.category, "error");
+  assert.doesNotMatch(toolText(searchedOutput), /ERROR expected failure/u);
+
+  const indexedErrors = await client.callTool({
+    name: "read_process_output",
+    arguments: {
+      receipt: scopedContextReceipt,
+      outputId: indexedOutputId,
+      mode: "errors",
+      scanBytes: 1_024,
+      maxMatches: 10,
+    },
+  });
+  assert.notEqual(indexedErrors.isError, true);
+  const errorIndex = (indexedErrors.structuredContent as {
+    mode?: unknown;
+    search?: {
+      categories?: Record<string, unknown>;
+      totalMatches?: unknown;
+      matches?: Array<{ category?: unknown }>;
+    };
+  } | undefined);
+  assert.equal(errorIndex?.mode, "errors");
+  assert.equal(errorIndex?.search?.totalMatches, 1);
+  assert.equal(errorIndex?.search?.categories?.error, 1);
+  assert.equal(errorIndex?.search?.matches?.[0]?.category, "error");
 
   const missingProcessOutput = await client.callTool({
     name: "read_process_output",
@@ -1366,12 +1501,43 @@ try {
   });
   assert.equal(missingAdvanceOperation.isError, true);
   assert.match(toolText(missingAdvanceOperation), /^operation_id_required:/u);
+  let completedReviewPage = previewChanges;
+  let reviewCursor = String(
+    (completedReviewPage.structuredContent as {
+      diff?: { nextCursor?: unknown };
+    } | undefined)?.diff?.nextCursor ?? "",
+  );
+  while (reviewCursor) {
+    completedReviewPage = await client.callTool({
+      name: "show_changes",
+      arguments: { receipt: scopedContextReceipt, cursor: reviewCursor },
+    });
+    assert.notEqual(completedReviewPage.isError, true);
+    reviewCursor = String(
+      (completedReviewPage.structuredContent as {
+        diff?: { nextCursor?: unknown };
+      } | undefined)?.diff?.nextCursor ?? "",
+    );
+  }
+  assert.equal(
+    (completedReviewPage.structuredContent as {
+      diff?: { eof?: unknown };
+    } | undefined)?.diff?.eof,
+    true,
+  );
+  const completedReviewToken = String(
+    (completedReviewPage.structuredContent as {
+      diff?: { reviewToken?: unknown };
+    } | undefined)?.diff?.reviewToken ?? "",
+  );
+  assert.match(completedReviewToken, /^dcur1\./u);
   const advanceChanges = await client.callTool({
     name: "show_changes",
     arguments: {
       receipt: scopedContextReceipt,
       advanceCheckpoint: true,
       operationId: "advance-review-checkpoint",
+      reviewToken: completedReviewToken,
     },
   });
   assert.notEqual(advanceChanges.isError, true);
@@ -1907,8 +2073,15 @@ try {
   for (const item of batchInspectStructured.items as Array<Record<string, unknown>>) {
     assert.deepEqual(
       Object.keys(item).sort(),
-      item.truncated === true ? ["ok", "result", "truncated"] : ["ok", "result"],
+      item.truncated === true
+        ? ["ok", "provenance", "result", "truncated"]
+        : ["ok", "provenance", "result"],
     );
+    assert.deepEqual(item.provenance, {
+      source: "repository",
+      trust: "untrusted",
+      authority: "none",
+    });
   }
   assert.equal(measurements.batchRead.hiddenMetaHeavyCopies, 0);
   assert.equal(measurements.batchInspect.hiddenMetaHeavyCopies, 0);

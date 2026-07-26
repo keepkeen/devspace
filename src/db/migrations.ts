@@ -48,6 +48,7 @@ interface NormalizedOAuthGrant {
   grantedScopes: string[];
   allowedRootIds: string[];
   authorizationEpoch: number;
+  absoluteExpiresAt: number | null;
   createdAt: string;
   lastUsedAt: string;
   revokedAt: string | null;
@@ -233,6 +234,7 @@ function migrateLegacyData(
   insertOAuthOwnerCredential(source, target);
   insertOAuthTokens(source, target, "oauth_access_tokens", grants, principalMap);
   insertOAuthTokens(source, target, "oauth_refresh_tokens", grants, principalMap);
+  insertRefreshTokenTombstones(source, target);
   insertReconnectCodes(source, target, principalMap);
   insertAuthorizationLimits(source, target);
   insertCleanupJobs(source, target, sourceVersion, clientPrincipalMap, legacyOwner);
@@ -323,6 +325,7 @@ function normalizeOAuthGrants(
           nullableString(row, "allowed_root_ids_json"),
         ),
         authorizationEpoch: positiveInteger(row.authorization_epoch, 1),
+        absoluteExpiresAt: nullablePositiveInteger(row.absolute_expires_at),
         createdAt: optionalString(row, "created_at") ?? now,
         lastUsedAt: optionalString(row, "last_used_at") ?? now,
         revokedAt: nullableString(row, "revoked_at"),
@@ -346,6 +349,7 @@ function normalizeOAuthGrants(
       grantedScopes,
       allowedRootIds: [ALL_AUTHORIZED_ROOTS_ID],
       authorizationEpoch: 1,
+      absoluteExpiresAt: null,
       createdAt,
       lastUsedAt: principals.get(client.principalId)?.lastUsedAt ?? createdAt,
       revokedAt: null,
@@ -536,9 +540,9 @@ function insertOAuthGrants(
   const insert = target.prepare(`
     insert into oauth_grants (
       grant_id, client_id, principal_id, subject_hash, organization_hash,
-      granted_scopes_json, allowed_root_ids_json, authorization_epoch,
+      granted_scopes_json, allowed_root_ids_json, authorization_epoch, absolute_expires_at,
       created_at, last_used_at, revoked_at
-    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   for (const grant of grants) {
     insert.run(
@@ -550,6 +554,7 @@ function insertOAuthGrants(
       JSON.stringify(grant.grantedScopes),
       JSON.stringify(grant.allowedRootIds),
       grant.authorizationEpoch,
+      grant.absoluteExpiresAt,
       grant.createdAt,
       grant.lastUsedAt,
       grant.revokedAt,
@@ -751,29 +756,92 @@ function insertOAuthTokens(
   principals: ReadonlyMap<string, NormalizedPrincipal>,
 ): void {
   const grantByClientId = new Map(grants.map((grant) => [grant.clientId, grant]));
-  const insert = target.prepare(`
-    insert into ${table} (
-      token_hash, grant_id, client_id, principal_id, authorization_epoch,
-      scopes_json, expires_at, resource
-    ) values (?, ?, ?, ?, ?, ?, ?, ?)
-  `);
+  const insert = table === "oauth_refresh_tokens"
+    ? target.prepare(`
+        insert into oauth_refresh_tokens (
+          token_hash, grant_id, client_id, principal_id, authorization_epoch,
+          family_id, scopes_json, expires_at, resource
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+    : target.prepare(`
+        insert into oauth_access_tokens (
+          token_hash, grant_id, client_id, principal_id, authorization_epoch,
+          scopes_json, expires_at, resource
+        ) values (?, ?, ?, ?, ?, ?, ?, ?)
+      `);
   for (const row of tableRows(source, table)) {
     const clientId = optionalString(row, "client_id");
     const grant = clientId ? grantByClientId.get(clientId) : undefined;
     if (!grant || principals.get(grant.principalId)?.revokedAt) continue;
     const scopes = normalizeOAuthScopes(nullableString(row, "scopes_json"));
     if (!scopes) continue;
-    insert.run(
-      requiredString(row, "token_hash"),
+    const tokenHash = requiredString(row, "token_hash");
+    const common = [
+      tokenHash,
       grant.grantId,
       clientId,
       grant.principalId,
       grant.authorizationEpoch,
-      JSON.stringify(scopes),
-      nonNegativeInteger(row.expires_at, 0),
-      nullableString(row, "resource"),
+    ] as const;
+    if (table === "oauth_refresh_tokens") {
+      insert.run(
+        ...common,
+        optionalString(row, "family_id") ?? migratedRefreshFamilyId(tokenHash),
+        JSON.stringify(scopes),
+        nonNegativeInteger(row.expires_at, 0),
+        nullableString(row, "resource"),
+      );
+    } else {
+      insert.run(
+        ...common,
+        JSON.stringify(scopes),
+        nonNegativeInteger(row.expires_at, 0),
+        nullableString(row, "resource"),
+      );
+    }
+  }
+}
+
+function insertRefreshTokenTombstones(
+  source: Database.Database,
+  target: Database.Database,
+): void {
+  if (!tableExists(source, "oauth_refresh_token_tombstones")) return;
+  const insert = target.prepare(`
+    insert or ignore into oauth_refresh_token_tombstones (
+      token_hash, family_id, grant_id, client_id, principal_id,
+      authorization_epoch, consumed_at, expires_at
+    ) values (?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  for (const row of tableRows(source, "oauth_refresh_token_tombstones")) {
+    const tokenHash = optionalString(row, "token_hash");
+    const grantId = optionalString(row, "grant_id");
+    const clientId = optionalString(row, "client_id");
+    const principalId = optionalString(row, "principal_id");
+    const consumedAt = nullablePositiveInteger(row.consumed_at);
+    const expiresAt = nullablePositiveInteger(row.expires_at);
+    if (
+      !tokenHash || !grantId || !clientId || !principalId ||
+      !consumedAt || !expiresAt || expiresAt <= consumedAt
+    ) continue;
+    insert.run(
+      tokenHash,
+      optionalString(row, "family_id") ?? migratedRefreshFamilyId(tokenHash),
+      grantId,
+      clientId,
+      principalId,
+      positiveInteger(row.authorization_epoch, 1),
+      consumedAt,
+      expiresAt,
     );
   }
+}
+
+function migratedRefreshFamilyId(tokenHash: string): string {
+  return `family-migrated-${createHash("sha256")
+    .update("devspace-refresh-family-migration-v1\0", "utf8")
+    .update(tokenHash, "utf8")
+    .digest("base64url")}`;
 }
 
 function insertReconnectCodes(
@@ -1177,6 +1245,10 @@ function positiveInteger(value: unknown, fallback: number | undefined): number {
 
 function nonNegativeInteger(value: unknown, fallback: number): number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : fallback;
+}
+
+function nullablePositiveInteger(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : null;
 }
 
 function booleanText(value: unknown, fallback: "true" | "false"): "true" | "false" {

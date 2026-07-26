@@ -14,6 +14,27 @@ export interface LoggingConfig {
   trustProxy: boolean;
   auditEvents?: boolean;
   auditSink?: (entry: Readonly<Record<string, unknown>>) => void;
+  auditWriteHealth?: AuditWriteHealth;
+}
+
+export interface AuditWriteHealth {
+  auditWriteFailures: number;
+  lastAuditWriteFailureAt?: string;
+}
+
+export function createAuditWriteHealth(): AuditWriteHealth {
+  return { auditWriteFailures: 0 };
+}
+
+export function auditWriteHealthSnapshot(
+  health: AuditWriteHealth,
+): Readonly<AuditWriteHealth> {
+  return {
+    auditWriteFailures: health.auditWriteFailures,
+    ...(health.lastAuditWriteFailureAt
+      ? { lastAuditWriteFailureAt: health.lastAuditWriteFailureAt }
+      : {}),
+  };
 }
 
 type LogFields = Record<string, unknown>;
@@ -59,6 +80,10 @@ export function logEvent(
   } catch {
     // Persistent observability is best-effort and must never change the tool
     // result or authorization decision being logged.
+    if (config.auditWriteHealth) {
+      config.auditWriteHealth.auditWriteFailures += 1;
+      config.auditWriteHealth.lastAuditWriteFailureAt = entry.ts;
+    }
   }
   if (!shouldLog(config, level)) return;
 

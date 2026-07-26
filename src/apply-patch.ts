@@ -8,6 +8,14 @@ import { readFileVersion, type FileVersion } from "./file-version.js";
 
 export type PatchOperation = "add" | "update" | "delete" | "move";
 
+export type PatchFuzzyMatchMode = "trim_end" | "trim";
+
+export interface PatchFuzzyMatch {
+  fuzzy: true;
+  count: number;
+  modes: PatchFuzzyMatchMode[];
+}
+
 export interface AppliedPatchFile {
   path: string;
   previousPath?: string;
@@ -16,6 +24,8 @@ export interface AppliedPatchFile {
   observedAfter: FileVersion | null;
   /** Prior version of a distinct move destination; undefined when not a move. */
   overwrittenBefore?: FileVersion | null;
+  /** Present only when one or more hunks required unique fuzzy matching. */
+  fuzzyMatch?: PatchFuzzyMatch;
 }
 
 export interface ApplyPatchResult {
@@ -85,7 +95,20 @@ export interface PreparedPatch {
 
 interface TextFile {
   content: string;
+  bom: boolean;
   mode?: number;
+}
+
+type LineEnding = "\n" | "\r\n" | "\r" | "";
+
+interface TextLine {
+  text: string;
+  eol: LineEnding;
+}
+
+interface SequenceMatch {
+  index: number;
+  mode: "exact" | PatchFuzzyMatchMode;
 }
 
 type StagedTextFile = TextFile | null;
@@ -153,18 +176,27 @@ export function parsePatch(patch: string): PatchAction[] {
     if (header.startsWith("*** Add File: ")) {
       const path = header.slice("*** Add File: ".length);
       const content: string[] = [];
+      let finalNewline = true;
       while (index < lines.length && !isTopLevelHeader(lines[index])) {
         const line = lines[index++];
+        if (line === "\\ No newline at end of file") {
+          if (content.length === 0) {
+            throw patchError(`no-newline marker has no added line: ${path}`, path);
+          }
+          finalNewline = false;
+          continue;
+        }
         if (!line.startsWith("+")) {
           throw patchError(`added file lines must start with +: ${path}`, path);
         }
         content.push(line.slice(1));
       }
-      if (content.length === 0) throw patchError(`add file has no content: ${path}`, path);
       actions.push({
         kind: "add",
         path,
-        content: `${content.join("\n")}\n`,
+        content: content.length === 0
+          ? ""
+          : `${content.join("\n")}${finalNewline ? "\n" : ""}`,
       });
       continue;
     }
@@ -316,70 +348,168 @@ async function resolveConfinedPath(rootPath: string, input: string): Promise<str
   return target;
 }
 
-function splitFile(content: string): { lines: string[]; eol: string; finalNewline: boolean } {
-  const eol = content.includes("\r\n") ? "\r\n" : "\n";
-  const normalized = content.replace(/\r\n/g, "\n");
-  const finalNewline = normalized.endsWith("\n");
-  const lines = normalized.split("\n");
-  if (finalNewline) lines.pop();
-  return { lines, eol, finalNewline };
+function splitFile(content: string): {
+  lines: TextLine[];
+  defaultEol: Exclude<LineEnding, "">;
+  finalNewline: boolean;
+} {
+  const lines: TextLine[] = [];
+  const endings: Array<Exclude<LineEnding, "">> = [];
+  const matcher = /\r\n|\n|\r/gu;
+  let offset = 0;
+  for (const match of content.matchAll(matcher)) {
+    const index = match.index ?? offset;
+    const eol = match[0] as Exclude<LineEnding, "">;
+    lines.push({ text: content.slice(offset, index), eol });
+    endings.push(eol);
+    offset = index + eol.length;
+  }
+  if (offset < content.length) lines.push({ text: content.slice(offset), eol: "" });
+  const defaultEol = endings[0] ?? "\n";
+  return {
+    lines,
+    defaultEol,
+    finalNewline: lines.length > 0 && lines.at(-1)!.eol !== "",
+  };
 }
 
-function findSequence(haystack: string[], needle: string[], from: number, endOfFile = false): number {
-  if (needle.length === 0) return from;
+function findSequence(
+  path: string,
+  haystack: string[],
+  needle: string[],
+  from: number,
+  endOfFile = false,
+): SequenceMatch | undefined {
+  if (needle.length === 0) return { index: from, mode: "exact" };
 
   const matchAt = (index: number, normalize: (value: string) => string): boolean =>
     needle.every((line, offset) => normalize(haystack[index + offset] ?? "") === normalize(line));
 
-  for (const normalize of [
-    (value: string) => value,
-    (value: string) => value.trimEnd(),
-    (value: string) => value.trim(),
-  ]) {
-    const start = endOfFile ? haystack.length - needle.length : from;
-    const end = haystack.length - needle.length;
-    for (let index = start; index <= end; index += 1) {
-      if (index >= from && matchAt(index, normalize)) return index;
-    }
+  const start = Math.max(from, endOfFile ? haystack.length - needle.length : from);
+  const end = haystack.length - needle.length;
+  for (let index = start; index <= end; index += 1) {
+    if (matchAt(index, (value) => value)) return { index, mode: "exact" };
   }
 
-  return -1;
+  for (const [mode, normalize] of [
+    ["trim_end", (value: string) => value.trimEnd()],
+    ["trim", (value: string) => value.trim()],
+  ] as const) {
+    const matches: number[] = [];
+    for (let index = start; index <= end; index += 1) {
+      if (matchAt(index, normalize)) matches.push(index);
+    }
+    if (matches.length > 1) {
+      throw patchError(
+        `ambiguous fuzzy hunk context in ${path}; include more exact surrounding lines`,
+        path,
+      );
+    }
+    if (matches.length === 1) return { index: matches[0]!, mode };
+  }
+
+  return undefined;
 }
 
-function applyHunks(path: string, content: string, hunks: UpdateHunk[]): string {
+function nearestLineEnding(
+  lines: readonly TextLine[],
+  index: number,
+  defaultEol: Exclude<LineEnding, "">,
+): Exclude<LineEnding, ""> {
+  for (let distance = 0; distance <= lines.length; distance += 1) {
+    const after = lines[index + distance]?.eol;
+    if (after) return after;
+    const before = lines[index - distance - 1]?.eol;
+    if (before) return before;
+  }
+  return defaultEol;
+}
+
+function applyHunks(
+  path: string,
+  content: string,
+  hunks: UpdateHunk[],
+): { content: string; fuzzyMatch?: PatchFuzzyMatch } {
   const file = splitFile(content);
   const lines = [...file.lines];
   let cursor = 0;
+  const fuzzyModes: PatchFuzzyMatchMode[] = [];
+
+  const recordMatch = (match: SequenceMatch): number => {
+    if (match.mode !== "exact") fuzzyModes.push(match.mode);
+    return match.index;
+  };
 
   for (const hunk of hunks) {
     if (hunk.changeContext) {
-      const contextIndex = findSequence(lines, [hunk.changeContext], cursor);
-      if (contextIndex < 0) {
+      const contextMatch = findSequence(
+        path,
+        lines.map((line) => line.text),
+        [hunk.changeContext],
+        cursor,
+      );
+      if (!contextMatch) {
         throw patchError(`could not find hunk context in ${path}; read the file and regenerate the patch`, path);
       }
-      cursor = contextIndex + 1;
+      cursor = recordMatch(contextMatch) + 1;
     }
 
     const oldLines = hunk.lines
       .filter((line) => line.kind !== "add")
       .map((line) => line.text);
-    const newLines = hunk.lines
-      .filter((line) => line.kind !== "remove")
-      .map((line) => line.text);
-    const index = hunk.endOfFile && oldLines.length === 0
-      ? lines.length
-      : findSequence(lines, oldLines, cursor, hunk.endOfFile);
+    const sequenceMatch = hunk.endOfFile && oldLines.length === 0
+      ? { index: lines.length, mode: "exact" as const }
+      : findSequence(path, lines.map((line) => line.text), oldLines, cursor, hunk.endOfFile);
 
-    if (index < 0) {
+    if (!sequenceMatch) {
       throw patchError(`could not find hunk context in ${path}; read the file and regenerate the patch`, path);
     }
+    const index = recordMatch(sequenceMatch);
+    const oldRecords = lines.slice(index, index + oldLines.length);
+    const newRecords: TextLine[] = [];
+    let oldOffset = 0;
+    let insertionEol: Exclude<LineEnding, ""> | undefined;
+    for (const hunkLine of hunk.lines) {
+      if (hunkLine.kind === "add") {
+        insertionEol ??= nearestLineEnding(
+          oldRecords,
+          oldOffset,
+          nearestLineEnding(lines, index + oldOffset, file.defaultEol),
+        );
+        newRecords.push({ text: hunkLine.text, eol: insertionEol });
+        continue;
+      }
+      const existing = oldRecords[oldOffset++];
+      if (!existing) {
+        throw patchError(`hunk context changed while applying ${path}`, path);
+      }
+      if (hunkLine.kind === "context") {
+        newRecords.push(existing);
+        insertionEol = existing.eol || insertionEol;
+      } else if (existing.eol) {
+        insertionEol = existing.eol;
+      }
+    }
 
-    lines.splice(index, oldLines.length, ...newLines);
-    cursor = index + newLines.length;
+    lines.splice(index, oldLines.length, ...newRecords);
+    cursor = index + newRecords.length;
   }
 
-  const normalized = `${lines.join("\n")}\n`;
-  return file.eol === "\r\n" ? normalized.replace(/\n/g, "\r\n") : normalized;
+  if (lines.length > 0) {
+    if (file.finalNewline) {
+      if (lines.at(-1)!.eol === "") lines.at(-1)!.eol = file.defaultEol;
+    } else {
+      lines.at(-1)!.eol = "";
+    }
+  }
+  const updated = lines.map((line) => `${line.text}${line.eol}`).join("");
+  const uniqueModes = [...new Set(fuzzyModes)];
+  return {
+    content: updated,
+    ...(fuzzyModes.length > 0
+      ? { fuzzyMatch: { fuzzy: true as const, count: fuzzyModes.length, modes: uniqueModes } }
+      : {}),
+  };
 }
 
 async function fileExists(path: string): Promise<boolean> {
@@ -476,7 +606,11 @@ export async function applyPreparedPatch(
     if (action.kind === "add") {
       const absolute = await resolveTouchedPath(action.path);
       const original = await readStagedOptional(absolute, action.path);
-      staged.set(absolute, { content: action.content, mode: original?.mode });
+      staged.set(absolute, {
+        content: action.content,
+        bom: original?.bom ?? false,
+        mode: original?.mode,
+      });
       patches.push(unifiedFilePatch(action.path, action.path, original?.content ?? null, action.content));
       results.push({
         path: action.path,
@@ -508,9 +642,9 @@ export async function applyPreparedPatch(
       const samePatchFile = await isSamePatchFile(absolute, destination);
       if (!samePatchFile) await readStagedOptional(destination, action.moveTo);
       if (samePatchFile) staged.delete(absolute);
-      staged.set(destination, { content: updated, mode: file.mode });
+      staged.set(destination, { content: updated.content, bom: file.bom, mode: file.mode });
       if (!samePatchFile) staged.set(absolute, null);
-      patches.push(unifiedFilePatch(action.path, action.moveTo, file.content, updated));
+      patches.push(unifiedFilePatch(action.path, action.moveTo, file.content, updated.content));
       results.push({
         path: action.moveTo,
         previousPath: action.path,
@@ -518,15 +652,17 @@ export async function applyPreparedPatch(
         observedBefore: null,
         observedAfter: null,
         ...(!samePatchFile ? { overwrittenBefore: null } : {}),
+        ...(updated.fuzzyMatch ? { fuzzyMatch: updated.fuzzyMatch } : {}),
       });
     } else {
-      staged.set(absolute, { content: updated, mode: file.mode });
-      patches.push(unifiedFilePatch(action.path, action.path, file.content, updated));
+      staged.set(absolute, { content: updated.content, bom: file.bom, mode: file.mode });
+      patches.push(unifiedFilePatch(action.path, action.path, file.content, updated.content));
       results.push({
         path: action.path,
         operation: "update",
         observedBefore: null,
         observedAfter: null,
+        ...(updated.fuzzyMatch ? { fuzzyMatch: updated.fuzzyMatch } : {}),
       });
     }
   }
@@ -571,6 +707,7 @@ async function observeAppliedFiles(
       ...(file.previousPath !== undefined && afterPath !== beforePath
         ? { overwrittenBefore: destinationBefore!.observedVersion }
         : {}),
+      ...(file.fuzzyMatch ? { fuzzyMatch: file.fuzzyMatch } : {}),
     };
   }));
 }
@@ -647,19 +784,31 @@ async function readOptionalTextFile(absolute: string, displayPath: string): Prom
   if (!(await fileExists(absolute))) return null;
   const metadata = await stat(absolute);
   if (!metadata.isFile()) throw patchError(`path is not a regular file: ${displayPath}`, displayPath);
-  return { content: await readUtf8Text(absolute, displayPath), mode: metadata.mode };
+  const text = await readUtf8Text(absolute, displayPath);
+  return { ...text, mode: metadata.mode };
 }
 
-async function readUtf8Text(absolute: string, displayPath: string): Promise<string> {
+async function readUtf8Text(
+  absolute: string,
+  displayPath: string,
+): Promise<{ content: string; bom: boolean }> {
   const bytes = await readFile(absolute);
+  const bom = bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf;
   let content: string;
   try {
-    content = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    content = new TextDecoder("utf-8", { fatal: true }).decode(bom ? bytes.subarray(3) : bytes);
   } catch {
     throw patchError(`file is not valid UTF-8 text: ${displayPath}`, displayPath);
   }
   if (content.includes("\0")) throw patchError(`file appears to be binary: ${displayPath}`, displayPath);
-  return content;
+  return { content, bom };
+}
+
+function serializedTextFile(file: TextFile): Buffer {
+  const content = Buffer.from(file.content, "utf8");
+  return file.bom
+    ? Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), content])
+    : content;
 }
 
 async function commitPatchTransaction(
@@ -689,7 +838,7 @@ async function commitPatchTransaction(
       if (file && replacement) {
         await writeFile(
           replacement,
-          file.content,
+          serializedTextFile(file),
           file.mode === undefined ? undefined : { mode: file.mode },
         );
       }

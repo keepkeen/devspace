@@ -60,6 +60,11 @@ The control panel provides:
 - one-click revocation of every registered OAuth client and access/refresh token
 - inline validation, environment-override sources, discard/reset, and unsaved-change protection
 
+The running backend also exposes diagnostics and destructive runtime control on
+a separate `127.0.0.1:DEVSPACE_CONTROL_PORT` listener. `/internal/*` is not
+mounted on the public MCP listener, so a tunnel to `PORT` cannot reach those
+routes even with a valid internal token. Never proxy the control listener.
+
 Configuration documents use `schemaVersion: 1`. Legacy documents are migrated
 with a versioned backup, and failed writes roll back. Admin reads return a
 revision/ETag and saves use compare-and-swap, so a CLI or second panel cannot
@@ -88,6 +93,7 @@ does not start, stop, or adopt `cloudflared` processes.
 | --- | --- |
 | `HOST` | Local bind host. Defaults to `127.0.0.1`. |
 | `PORT` | Local port. Defaults to `7676`. |
+| `DEVSPACE_CONTROL_PORT` | Loopback-only diagnostics/control port. Defaults to `PORT+1`; never tunnel this listener. |
 | `DEVSPACE_ALLOWED_ROOTS` | Comma-separated local roots that workspaces may open. |
 | `DEVSPACE_PUBLIC_BASE_URL` | Public origin for the server, without `/mcp`. |
 | `DEVSPACE_ALLOWED_HOSTS` | Optional Host header allowlist override. |
@@ -97,18 +103,20 @@ does not start, stop, or adopt `cloudflared` processes.
 | `DEVSPACE_USER_INSTRUCTIONS_PATH` | Optional user-level instruction file loaded before project instructions. Supports `~` or an absolute path; unset by default. |
 | `DEVSPACE_LAUNCHD_SERVICE_LABEL` | Explicitly enrolled user launchd service that the local panel may restart; unset/empty disables control. |
 | `DEVSPACE_MCP_HTTP_TRANSPORT` | `stateless` (default) or explicit `stateful`; never inferred from redirect hosts. |
+| `DEVSPACE_MCP_GLOBAL_IDLE_RECLAIM` | Stateful-only escape hatch. Defaults to `0`; same-principal idle sessions are reclaimed first, and another principal is considered only when this is explicitly enabled. |
 
 ## OAuth
 
 DevSpace uses a single-user OAuth approval flow.
 
-| Variable | Default |
-| --- | --- |
+| Variable | Default | Purpose |
+| --- | --- | --- |
 | `DEVSPACE_MASTER_KEY` | auth-file master key; legacy-compatible password key only for old/env-only installs | Persistent base64url master key for HKDF-derived identities and internal tokens. |
-| `DEVSPACE_OAUTH_ACCESS_TOKEN_TTL_SECONDS` | `3600` |
-| `DEVSPACE_OAUTH_REFRESH_TOKEN_TTL_SECONDS` | `2592000` |
-| `DEVSPACE_OAUTH_SCOPES` | `workspace:read,workspace:write,process:execute,network:access,worktree:create,workspace:revoke` |
-| `DEVSPACE_OAUTH_ALLOWED_REDIRECT_HOSTS` | `chatgpt.com,localhost,127.0.0.1` |
+| `DEVSPACE_OAUTH_ACCESS_TOKEN_TTL_SECONDS` | `3600` | Access-token lifetime, additionally capped by any absolute grant expiry. |
+| `DEVSPACE_OAUTH_REFRESH_TOKEN_TTL_SECONDS` | `2592000` | Refresh-token lifetime, additionally capped by any absolute grant expiry. |
+| `DEVSPACE_OAUTH_GRANT_MAX_LIFETIME_SECONDS` | disabled | Optional wall-clock maximum for a newly approved grant. Unset or `0` disables it; the maximum accepted value is ten years. |
+| `DEVSPACE_OAUTH_SCOPES` | `workspace:read,workspace:write,process:execute,network:access,worktree:create,workspace:revoke` | Supported capability set. |
+| `DEVSPACE_OAUTH_ALLOWED_REDIRECT_HOSTS` | `chatgpt.com,localhost,127.0.0.1` | Non-loopback HTTPS redirect-host allowlist. |
 
 MCP clients discover metadata from:
 
@@ -121,7 +129,16 @@ OAuth `client_id` identifies a dynamic registration. Authorization belongs to
 a durable grant that records the connection principal, granted scopes, and
 authorization epoch. Authorization codes and access/refresh tokens reference the
 grant directly; refresh rotation preserves it and does not derive a principal
-from `clientId`.
+from `clientId`. Refresh tokens also carry a random family ID. A consumed token
+leaves a short-lived hash tombstone; replaying it emits
+`oauth_refresh_token_replay_detected`, revokes the authorization grant and its
+token family, advances the authorization boundary, and invalidates current
+Workspace bindings. Raw refresh tokens are never retained in tombstones or
+audit records.
+
+When `DEVSPACE_OAUTH_GRANT_MAX_LIFETIME_SECONDS` is configured, the absolute
+expiry is stored on the grant and bounds every access/refresh token issued from
+it. Refresh cannot extend the grant past that wall-clock deadline.
 
 The first successful Owner approval normally creates a new grant and principal.
 After the Owner password succeeds, a second local-only page selects either a new
@@ -171,8 +188,10 @@ current grant and handlers repeat scope checks.
 Scopes and root IDs are independent. Scopes determine the permitted operation;
 root IDs determine the local project trees visible to `open_workspace`,
 `list_workspaces`, `resume_workspace`, and all receipt/session-bound tools.
-Existing pre-v16 grants migrate with the compatibility wildcard `*`; reauthorize
-them to select a narrower set.
+Existing legacy grants may migrate with the compatibility wildcard `*`;
+reauthorize them to select a narrower set. `devspace doctor` and local Admin
+diagnostics count these grants and warn that adding a global root would expand
+their authority; DevSpace does not silently rewrite existing grant semantics.
 
 The granular scopes mean:
 
@@ -224,6 +243,7 @@ password change and revokes tokens.
 | --- | ---: | --- |
 | `DEVSPACE_MCP_SESSION_IDLE_TIMEOUT_SECONDS` | `1800` | Close inactive transports when `DEVSPACE_MCP_HTTP_TRANSPORT=stateful`; stateless is the default. |
 | `DEVSPACE_MCP_SESSION_CLOSE_TIMEOUT_SECONDS` | `5` | Maximum wait for one transport to close. |
+| `DEVSPACE_MCP_GLOBAL_IDLE_RECLAIM` | `0` | In explicit stateful mode, permit global cross-principal idle eviction only after no idle session owned by the requesting principal is available. |
 | `DEVSPACE_RESOURCE_CLEANUP_INTERVAL_SECONDS` | `300` | Sweep interval for idle resources. |
 | `DEVSPACE_MAX_MCP_SESSIONS` | `64` | Combined cap for live stateful transports and concurrent stateless ChatGPT requests. |
 | `DEVSPACE_MAX_MCP_SESSIONS_PER_CLIENT` | `8` | Per-connection-principal cap for that same combined MCP concurrency. |
@@ -248,6 +268,11 @@ active-request barriers, process tracking, and mutation-operation records keep
 tracking its real outcome. Protected internal diagnostics report current
 stateless lease ages and occupancy grouped by anonymous `connectionRef` and
 `oauthClientRef`, without exposing principal IDs or OAuth client IDs.
+
+In stateful mode, capacity pressure first reclaims the requesting principal's
+oldest inactive session. Cross-principal idle reclaim is disabled by default and
+requires `DEVSPACE_MCP_GLOBAL_IDLE_RECLAIM=1`. Stateless requests continue to
+share the configured global cap while the per-principal cap limits one owner.
 
 Clients must not call `close_workspace` as routine turn or conversation cleanup.
 Call it only after the user explicitly asks to close or release that workspace.
@@ -329,6 +354,27 @@ two calls when necessary.
 `timeoutMs` can set a shorter per-command hard limit, but cannot exceed the
 global limit. `yieldTimeMs` only controls how long the tool waits before
 returning a process session.
+
+Ordinary text reads fail closed before decoding when the target is binary,
+contains invalid UTF-8, or exceeds the bounded text-file limit. The structured
+codes are `binary_file`, `invalid_utf8`, and `file_too_large`. DevSpace does not
+strip ANSI, Unicode controls, or other bytes from repository evidence; model-
+visible repository and process payloads instead carry an explicit untrusted
+provenance envelope.
+
+`read_process_output` defaults to a 40,000-byte page and accepts explicit pages
+up to 256,000 bytes. `mode="tail"` returns a bounded UTF-8-safe suffix;
+`mode="search"` performs a bounded literal server-side search; and
+`mode="errors"` indexes lines containing fatal, panic, traceback, exception,
+error, or failure markers. Search scans at most 1,000,000 bytes per call and
+returns at most 50 bounded matches through the MCP schema. Continuation cursors
+bind the caller, Workspace generation, output, mode, query, and scan settings.
+
+`show_changes` exposes at most 12 KiB of UTF-8-safe diff text per model-visible
+page, together with file summaries and a signed diff cursor. The final page
+returns a signed `reviewToken`. `advanceCheckpoint=true` requires either that
+token or an explicit `acknowledgeTruncated=true`; the server recomputes the
+review revision before advancing so a changed diff cannot reuse stale approval.
 
 ## Fixed Tool Surface
 
@@ -418,8 +464,9 @@ authority during migration.
 require an `operationId` of at most 128 characters. `show_changes` is a
 read-only preview by default and does not move its checkpoint; only
 `advanceCheckpoint: true` requires `workspace:write` and an `operationId`. A
-`write_stdin` call also requires one whenever it sends input, closes stdin, or
-resizes a process; polling alone does not. The ID is unique within the current
+`write_stdin` call also requires one whenever it sends input, closes stdin,
+resizes a process, or explicitly detaches a managed daemon's root lease;
+polling alone does not. The ID is unique within the current
 connection principal, and its record stores the Workspace, generation, and
 tool. Retrying an identical request with the same ID replays its stored result;
 changing the request conflicts, and an uncertain post-crash outcome is never
@@ -438,17 +485,31 @@ an existing path and explicit `null` for a path expected not to exist. Missing
 preconditions are rejected before the patch starts; there is no blind-write
 bypass.
 
+On `file_version_conflict`, the structured result includes the expected and
+actual version. Recovery is always: read the current file, rebuild the patch
+against that content, and submit a new `operationId`; the previous ID remains
+bound to the previous request body.
+
 Workspace operations first use a fair process-local read/write queue keyed by
 the canonical physical root and then coordinate through a cross-process lock in
-a per-user lock directory. Reads and inspections may share the read side;
+`<stateDir>/locks/workspace-roots`. Startup and acquisition reject symlinks,
+non-directories, foreign ownership, and unsafe modes. Process-local waiters use
+the same acquisition deadline as cross-process waiters; timing out one queued
+waiter never releases a lease still held by the real owner. Reads and
+inspections may share the read side;
 `show_changes` preview also uses it and is available to every `workspace:read`
 grant.
 `apply_patch`, `exec_command`, mutating `write_stdin`, explicit checkpoint
 advancement, close, and revoke use the write side even when different principals
 or different DevSpace state directories opened the same checkout. A live
 background or interactive process retains the write lease until its complete
-process tree exits. External editors are outside this protocol, so strict
-`ifMatch` file versions remain required.
+process tree exits. Descendant polling backs off from 25 ms to 2 seconds. When
+the root exits but descendants remain, the session is reported as a managed
+daemon and keeps serialization by default. A separate mutating `write_stdin`
+call may set `detachRootLease=true` only together with
+`confirmUnserializedWrites=true`; this releases serialization while the daemon
+continues and therefore permits write races. External editors are outside this
+protocol, so strict `ifMatch` file versions remain required.
 
 ## Widgets
 
