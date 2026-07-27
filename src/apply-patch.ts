@@ -369,7 +369,9 @@ function splitFile(content: string): {
   return {
     lines,
     defaultEol,
-    finalNewline: lines.length > 0 && lines.at(-1)!.eol !== "",
+    // An empty file has no last line, so it carries no "missing final newline"
+    // state; content added to it should terminate normally.
+    finalNewline: lines.length === 0 || lines.at(-1)!.eol !== "",
   };
 }
 
@@ -434,6 +436,13 @@ function applyHunks(
   const lines = [...file.lines];
   let cursor = 0;
   const fuzzyModes: PatchFuzzyMatchMode[] = [];
+  const addedLines = new Set<TextLine>();
+  // A missing final newline belongs to the file's original last line. It can
+  // only carry over to a line that took that line's place, which means a line
+  // added by the same hunk that consumed it — not to any created line that
+  // happens to end up last after an unrelated insertion elsewhere.
+  const originalLastLine = file.lines.at(-1);
+  let endSuccessor: TextLine | undefined;
 
   const recordMatch = (match: SequenceMatch): number => {
     if (match.mode !== "exact") fuzzyModes.push(match.mode);
@@ -476,7 +485,9 @@ function applyHunks(
           oldOffset,
           nearestLineEnding(lines, index + oldOffset, file.defaultEol),
         );
-        newRecords.push({ text: hunkLine.text, eol: insertionEol });
+        const added: TextLine = { text: hunkLine.text, eol: insertionEol };
+        addedLines.add(added);
+        newRecords.push(added);
         continue;
       }
       const existing = oldRecords[oldOffset++];
@@ -491,15 +502,27 @@ function applyHunks(
       }
     }
 
+    if (originalLastLine && oldRecords.includes(originalLastLine)) {
+      endSuccessor = [...newRecords].reverse().find((record) => addedLines.has(record));
+    }
+
     lines.splice(index, oldLines.length, ...newRecords);
     cursor = index + newRecords.length;
   }
 
-  if (lines.length > 0) {
-    if (file.finalNewline) {
-      if (lines.at(-1)!.eol === "") lines.at(-1)!.eol = file.defaultEol;
-    } else {
-      lines.at(-1)!.eol = "";
+  // An empty terminator is only meaningful on the file's last line. A line that
+  // was pushed off the end by an insertion has to regain one, or it would be
+  // welded to the line that now follows it.
+  for (let index = 0; index < lines.length - 1; index += 1) {
+    const line = lines[index]!;
+    if (line.eol === "") line.eol = nearestLineEnding(lines, index, file.defaultEol);
+  }
+  const last = lines.at(-1);
+  if (last) {
+    if (!file.finalNewline && (last === originalLastLine || last === endSuccessor)) {
+      last.eol = "";
+    } else if (last.eol === "") {
+      last.eol = nearestLineEnding(lines, lines.length - 1, file.defaultEol);
     }
   }
   const updated = lines.map((line) => `${line.text}${line.eol}`).join("");

@@ -8,7 +8,11 @@ import {
   DEVSPACE_CAPABILITY_SCOPES,
   FULL_DEVSPACE_OAUTH_SCOPES,
 } from "./oauth-scopes.js";
-import { MAX_TIMER_MS, RESOURCE_LIMIT_MAXIMUMS } from "./resource-limits.js";
+import {
+  DEFAULT_MAX_REQUEST_BODY_BYTES,
+  MAX_TIMER_MS,
+  RESOURCE_LIMIT_MAXIMUMS,
+} from "./resource-limits.js";
 import { normalizeProjectDocFallbackFilenames } from "./project-instructions.js";
 import {
   devspaceAgentsDir,
@@ -47,6 +51,8 @@ export interface ResourceLimitsConfig {
   maxResidentWorkspaces: number;
   maxActiveWorkspacesPerClient: number;
   maxManagedWorktrees: number;
+  /** Ceiling for an inbound MCP request body, which bounds patch and stdin size. */
+  maxRequestBodyBytes: number;
 }
 
 export interface ServerConfig {
@@ -330,6 +336,14 @@ function parseResourceLimits(
       configured?.maxManagedWorktrees ?? 64,
       "DEVSPACE_MAX_MANAGED_WORKTREES",
       RESOURCE_LIMIT_MAXIMUMS.maxManagedWorktrees,
+    ),
+    // The 4 MiB patch field is the largest and JSON escaping can expand one byte
+    // to six wire bytes. The default leaves room for that plus the envelope.
+    maxRequestBodyBytes: parsePositiveInteger(
+      env.DEVSPACE_MAX_REQUEST_BODY_BYTES,
+      configured?.maxRequestBodyBytes ?? DEFAULT_MAX_REQUEST_BODY_BYTES,
+      "DEVSPACE_MAX_REQUEST_BODY_BYTES",
+      RESOURCE_LIMIT_MAXIMUMS.maxRequestBodyBytes,
     ),
   };
   return limits;

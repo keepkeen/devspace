@@ -13,6 +13,7 @@ export interface AdminResourceLimits {
   maxResidentWorkspaces: number;
   maxActiveWorkspacesPerClient: number;
   maxManagedWorktrees: number;
+  maxRequestBodyBytes: number;
 }
 
 export interface AdminConfig {
@@ -140,6 +141,7 @@ export interface AdminDiagnostics {
     widgets: WidgetMode;
     allowedRootsRevision?: string;
     allowedRootsCleanupPending?: number;
+    maxRequestBodyBytes?: number;
   };
   usage?: {
     mcpSessions?: AdminUsageMetric & {

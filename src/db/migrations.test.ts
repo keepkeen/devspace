@@ -26,6 +26,7 @@ try {
     testHistoricalVersion(version);
   }
   testVersionFifteenPreservesGrantIdentity();
+  testVersionSixteenDoesNotPromoteClientIdToPrincipal();
   testAmbiguousOwnershipIsAtomic();
 } finally {
   rmSync(root, { recursive: true, force: true });
@@ -307,6 +308,10 @@ function testVersionFifteenPreservesGrantIdentity(): void {
       rootIdsJson: JSON.stringify(["*"]),
       authorizationEpoch: 7,
     });
+    assert.deepEqual(
+      migrated.prepare("select principal_id from connection_principals order by principal_id").all(),
+      [{ principal_id: "principal-v15" }],
+    );
     assert.deepEqual(migrated.prepare(`
       select state, resolution_method as resolutionMethod, resolved_at as resolvedAt
       from mutation_operations where operation_id = 'unknown-v15'
@@ -314,6 +319,89 @@ function testVersionFifteenPreservesGrantIdentity(): void {
       state: "outcome_unknown",
       resolutionMethod: null,
       resolvedAt: null,
+    });
+  } finally {
+    migrated.close();
+  }
+}
+
+function testVersionSixteenDoesNotPromoteClientIdToPrincipal(): void {
+  const directory = join(root, "v16");
+  const databasePath = join(directory, "devspace.sqlite");
+  mkdirSync(directory, { recursive: true });
+  const source = new Database(databasePath);
+  try {
+    source.exec(`
+      create table devspace_schema_migrations (
+        version integer primary key,
+        name text not null,
+        applied_at text not null
+      );
+      insert into devspace_schema_migrations values (
+        16, 'canonical-state-v16', '2026-01-01T00:00:00.000Z'
+      );
+      create table connection_principals (
+        principal_id text primary key,
+        created_at text not null,
+        last_used_at text not null,
+        revoked_at text
+      );
+      create table oauth_clients (
+        client_id text primary key,
+        client_json text not null,
+        issued_at integer not null
+      );
+      create table oauth_grants (
+        grant_id text primary key,
+        client_id text not null,
+        principal_id text not null,
+        subject_hash text,
+        organization_hash text,
+        granted_scopes_json text not null,
+        allowed_root_ids_json text not null,
+        authorization_epoch integer not null,
+        created_at text not null,
+        last_used_at text not null,
+        revoked_at text
+      );
+    `);
+    source.prepare("insert into connection_principals values (?, ?, ?, null)").run(
+      "principal-v16",
+      "2026-01-01T00:00:00.000Z",
+      "2026-01-02T00:00:00.000Z",
+    );
+    source.prepare("insert into oauth_clients values (?, ?, ?)").run(
+      "client-v16",
+      JSON.stringify({ redirect_uris: ["https://chatgpt.com/callback"] }),
+      1,
+    );
+    source.prepare("insert into oauth_grants values (?, ?, ?, null, null, ?, ?, 3, ?, ?, null)").run(
+      "grant-v16",
+      "client-v16",
+      "principal-v16",
+      JSON.stringify(["workspace:read"]),
+      JSON.stringify(["root-v16"]),
+      "2026-01-01T00:00:00.000Z",
+      "2026-01-02T00:00:00.000Z",
+    );
+  } finally {
+    source.close();
+  }
+
+  const preparation = prepareDatabaseFile(databasePath);
+  assert.equal(preparation.sourceVersion, 16);
+  const migrated = new Database(databasePath, { readonly: true });
+  try {
+    assert.deepEqual(
+      migrated.prepare("select principal_id from connection_principals order by principal_id").all(),
+      [{ principal_id: "principal-v16" }],
+    );
+    assert.deepEqual(migrated.prepare(`
+      select client_id as clientId, principal_id as principalId
+      from oauth_grants
+    `).get(), {
+      clientId: "client-v16",
+      principalId: "principal-v16",
     });
   } finally {
     migrated.close();

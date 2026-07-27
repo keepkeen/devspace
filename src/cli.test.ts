@@ -6,6 +6,8 @@ import { join } from "node:path";
 import { loadConfig } from "./config.js";
 import { AuditEventStore } from "./audit-events.js";
 import { LocalAgentStore } from "./local-agent-store.js";
+import { writeLocalAgentOutput } from "./local-agent-output.js";
+import { MAX_LOCAL_AGENT_RESPONSE_BYTES } from "./local-agent-limits.js";
 import { SqliteOAuthClientsStore, SqliteOAuthStore } from "./oauth-store.js";
 import { SqliteWorkspaceStore } from "./workspace-store.js";
 
@@ -205,24 +207,36 @@ try {
   );
   store.close();
 
+  const agentEnv = {
+    ...process.env,
+    DEVSPACE_CONFIG_DIR: configDir,
+    DEVSPACE_ALLOWED_ROOTS: projectRoot,
+    DEVSPACE_STATE_DIR: stateDir,
+    DEVSPACE_WORKSPACE_ID: "ws_current",
+    DEVSPACE_WORKSPACE_ROOT: projectRoot,
+    DEVSPACE_SUBAGENTS: "1",
+    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+  };
   const output = execFileSync("node", ["--import", "tsx", "src/cli.ts", "agents", "ls"], {
     cwd: process.cwd(),
     encoding: "utf8",
-    env: {
-      ...process.env,
-      DEVSPACE_CONFIG_DIR: configDir,
-      DEVSPACE_ALLOWED_ROOTS: projectRoot,
-      DEVSPACE_STATE_DIR: stateDir,
-      DEVSPACE_WORKSPACE_ID: "ws_current",
-      DEVSPACE_WORKSPACE_ROOT: projectRoot,
-      DEVSPACE_SUBAGENTS: "1",
-      DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
-    },
+    env: agentEnv,
   });
 
   assert.match(output, new RegExp(`${current.id} idle reviewer codex gpt-5\\.4 thinking=high`));
   assert.doesNotMatch(output, /profile reviewer/);
   assert.doesNotMatch(output, new RegExp(other.id));
+
+  const fullResponse = `FULL-BEGIN\n${"x".repeat(MAX_LOCAL_AGENT_RESPONSE_BYTES + 4_096)}\nFULL-END`;
+  assert.equal(writeLocalAgentOutput(stateDir, current.id, fullResponse), true);
+  const shown = execFileSync(
+    "node",
+    ["--import", "tsx", "src/cli.ts", "agents", "show", current.id],
+    { cwd: process.cwd(), encoding: "utf8", env: agentEnv, maxBuffer: 2 * 1024 * 1024 },
+  );
+  assert.match(shown, /FULL-BEGIN/u);
+  assert.match(shown, /FULL-END/u);
+  assert.equal(Buffer.byteLength(shown, "utf8") > MAX_LOCAL_AGENT_RESPONSE_BYTES, true);
 
   assert.equal(loadConfig({
     DEVSPACE_CONFIG_DIR: configDir,

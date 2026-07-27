@@ -68,6 +68,7 @@ export interface RuntimeControlPlaneOptions {
   generation: string;
   runtimeConfig: {
     widgets: "full" | "changes" | "off";
+    maxRequestBodyBytes?: number;
   };
   allowedRootsRevision(): string;
   allowedRootsCleanupPending(): number;

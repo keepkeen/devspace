@@ -3,6 +3,14 @@ import { Readable, Writable } from "node:stream";
 import type { LocalAgentProvider } from "./local-agent-profiles.js";
 import { removeDevspaceNodeModulesBinFromPath } from "./local-agent-path.js";
 import {
+  appendBoundedTailText,
+  BoundedAgentTextCollector,
+  boundedLocalAgentText,
+  MAX_LOCAL_AGENT_CAPTURE_BYTES,
+  MAX_LOCAL_AGENT_ERROR_BYTES,
+  MAX_LOCAL_AGENT_EVENT_BYTES,
+} from "./local-agent-limits.js";
+import {
   createCodexSdkLocalAgentRuntime,
   type LocalAgentRunInput,
   type LocalAgentRunResult,
@@ -62,7 +70,12 @@ class ClaudeLocalAgentAdapter implements LocalAgentAdapter {
       "--output-format",
       "stream-json",
       "--verbose",
-      "--dangerously-skip-permissions",
+      // writeMode is the caller's authorization decision. Skipping permission
+      // prompts unconditionally turned "may write in the workspace" into
+      // unrestricted machine access.
+      ...(input.writeMode === "allowed"
+        ? ["--permission-mode", "acceptEdits"]
+        : ["--permission-mode", "plan"]),
     ];
     if (input.model) args.push("--model", input.model);
     if (input.thinking) args.push("--effort", input.thinking);
@@ -92,7 +105,11 @@ class ClaudeLocalAgentAdapter implements LocalAgentAdapter {
       }
     }
 
-    finalResponse = requireFinalResponse("Claude", finalResponse);
+    finalResponse = boundedLocalAgentText(
+      requireFinalResponse("Claude", finalResponse),
+      MAX_LOCAL_AGENT_CAPTURE_BYTES,
+      "Claude response",
+    );
     return {
       provider: this.provider,
       providerSessionId,
@@ -109,7 +126,8 @@ async function collectJsonLineProcess(
   timeoutMs: number,
 ): Promise<unknown[]> {
   return new Promise((resolve, reject) => {
-    let stdout = "";
+    const stdout: Buffer[] = [];
+    let stdoutBytes = 0;
     let stderr = "";
     let settled = false;
     const timer = setTimeout(() => {
@@ -122,13 +140,25 @@ async function collectJsonLineProcess(
       clearTimeout(timer);
       callback();
     };
-    child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString("utf8"); });
-    child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString("utf8"); });
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdoutBytes += chunk.length;
+      if (stdoutBytes > MAX_LOCAL_AGENT_CAPTURE_BYTES) {
+        child.kill("SIGTERM");
+        finish(() => reject(new Error(
+          `${provider} CLI output exceeded the ${MAX_LOCAL_AGENT_CAPTURE_BYTES}-byte capture limit.`,
+        )));
+        return;
+      }
+      stdout.push(chunk);
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr = appendBoundedTailText(stderr, chunk, MAX_LOCAL_AGENT_ERROR_BYTES);
+    });
     child.on("error", (error) => finish(() => reject(error)));
     child.on("close", (code, signal) => finish(() => {
       const items: unknown[] = [];
       const malformed: string[] = [];
-      for (const rawLine of stdout.split(/\r?\n/u)) {
+      for (const rawLine of Buffer.concat(stdout).toString("utf8").split(/\r?\n/u)) {
         const line = rawLine.trim();
         if (!line) continue;
         try {
@@ -206,9 +236,13 @@ class OpencodeLocalAgentAdapter implements LocalAgentAdapter {
       const promptResult = await promptOpencodeSession(client, sessionId, input);
       await waitForOpencodeSession(client, sessionId);
       const messages = await readOpencodeMessages(client, sessionId);
-      const finalResponse = requireFinalResponse(
-        "OpenCode",
-        extractOpenCodeFinalResponse(messages) || extractOpenCodeFinalResponse(promptResult),
+      const finalResponse = boundedLocalAgentText(
+        requireFinalResponse(
+          "OpenCode",
+          extractOpenCodeFinalResponse(messages) || extractOpenCodeFinalResponse(promptResult),
+        ),
+        MAX_LOCAL_AGENT_CAPTURE_BYTES,
+        "OpenCode response",
       );
       return {
         provider: this.provider,
@@ -242,7 +276,7 @@ class AcpLocalAgentAdapter implements LocalAgentAdapter {
     assertPipedChild(child);
     let stderr = "";
     child.stderr.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString("utf8");
+      stderr = appendBoundedTailText(stderr, chunk, MAX_LOCAL_AGENT_ERROR_BYTES);
     });
 
     const stream = ndJsonStream(
@@ -253,7 +287,11 @@ class AcpLocalAgentAdapter implements LocalAgentAdapter {
       let providerSessionId = input.providerSessionId ?? null;
       const finalResponse = await client({ name: "DevSpace" })
         .onRequest(methods.client.session.requestPermission, (context) => {
-          const selected = selectAcpAllowPermissionOption(context.params.options);
+          // Auto-approving regardless of writeMode made a read-only subagent
+          // able to accept edit prompts, including ones outside the workspace.
+          const selected = input.writeMode === "allowed"
+            ? selectAcpAllowPermissionOption(context.params.options)
+            : undefined;
           return selected
             ? { outcome: { outcome: "selected", optionId: selected.optionId } }
             : { outcome: { outcome: "cancelled" } };
@@ -271,18 +309,18 @@ class AcpLocalAgentAdapter implements LocalAgentAdapter {
               await context.request(methods.agent.session.setConfigOption, config);
             }
             const prompt = session.prompt(input.prompt);
-            const textParts: string[] = [];
+            const response = new BoundedAgentTextCollector(MAX_LOCAL_AGENT_CAPTURE_BYTES);
             for (;;) {
               const message = await session.nextUpdate();
               if (message.kind === "stop") {
                 await prompt;
-                return textParts.join("").trim();
+                return response.result(`${this.provider} response`).trim();
               }
 
               const update = message.update;
               if (update.sessionUpdate !== "agent_message_chunk") continue;
               const content = update.content;
-              if (content.type === "text") textParts.push(content.text);
+              if (content.type === "text") response.append(content.text);
             }
           } finally {
             session.dispose();
@@ -380,11 +418,14 @@ function flattenAcpSelectValues(option: Record<string, unknown>): string[] {
   return values;
 }
 
-function selectAcpAllowPermissionOption(options: Array<{ optionId: string; kind: string }>): { optionId: string } | undefined {
-  return (
-    options.find((option) => option.kind === "allow_once") ??
-    options.find((option) => option.kind === "allow_always")
-  );
+export function selectAcpAllowPermissionOption(
+  options: Array<{ optionId: string; kind: string }>,
+): { optionId: string } | undefined {
+  // Full-trust mode prefers a one-operation grant but does not reject an
+  // operation merely because the provider exposes only a persistent option.
+  const selected = options.find((option) => option.kind === "allow_once") ??
+    options.find((option) => option.kind === "allow_always");
+  return selected ? { optionId: selected.optionId } : undefined;
 }
 
 class PiRpcLocalAgentAdapter implements LocalAgentAdapter {
@@ -404,7 +445,13 @@ class PiRpcLocalAgentAdapter implements LocalAgentAdapter {
     assertPipedChild(child);
     const rpc = new JsonLineRpc(child);
     const events: unknown[] = [];
-    rpc.onEvent((event) => events.push(event));
+    let eventBytes = 0;
+    rpc.onEvent((event) => {
+      const bytes = Buffer.byteLength(JSON.stringify(event), "utf8");
+      if (eventBytes + bytes > MAX_LOCAL_AGENT_EVENT_BYTES) return;
+      eventBytes += bytes;
+      events.push(event);
+    });
     try {
       const state = await rpc.request({ type: "get_state" });
       const providerSessionId = readNestedString(state, ["sessionId"]) ?? input.providerSessionId ?? null;
@@ -423,11 +470,15 @@ class PiRpcLocalAgentAdapter implements LocalAgentAdapter {
           extractPiProviderError(events);
         if (providerError) throw new Error(`Pi returned an error: ${providerError}`);
       }
-      requireFinalResponse("Pi", finalResponse);
+      const boundedResponse = boundedLocalAgentText(
+        requireFinalResponse("Pi", finalResponse),
+        MAX_LOCAL_AGENT_CAPTURE_BYTES,
+        "Pi response",
+      );
       return {
         provider: this.provider,
         providerSessionId,
-        finalResponse,
+        finalResponse: boundedResponse,
         items: [...events, sessionMessages],
       };
     } finally {
@@ -456,12 +507,17 @@ class JsonLineRpc {
   private buffer = "";
   private nextId = 1;
   private stderr = "";
+  private stdoutBytes = 0;
   private fatalError: Error | undefined;
 
   constructor(private readonly child: ChildProcessWithoutNullStreams) {
-    child.stdout.on("data", (chunk: Buffer) => this.handleStdout(chunk.toString("utf8")));
+    child.stdout.on("data", (chunk: Buffer) => this.handleStdout(chunk));
     child.stderr.on("data", (chunk: Buffer) => {
-      this.stderr += chunk.toString("utf8");
+      this.stderr = appendBoundedTailText(
+        this.stderr,
+        chunk,
+        MAX_LOCAL_AGENT_ERROR_BYTES,
+      );
     });
     child.on("exit", (code, signal) => {
       this.failAll(new Error(`Pi RPC process exited with code ${code ?? "null"} and signal ${signal ?? "null"}\n${this.stderr}`.trim()));
@@ -500,8 +556,16 @@ class JsonLineRpc {
     });
   }
 
-  private handleStdout(chunk: string): void {
-    this.buffer += chunk;
+  private handleStdout(chunk: Buffer): void {
+    this.stdoutBytes += chunk.length;
+    if (this.stdoutBytes > MAX_LOCAL_AGENT_CAPTURE_BYTES) {
+      this.child.kill("SIGTERM");
+      this.failAll(new Error(
+        `Pi RPC output exceeded the ${MAX_LOCAL_AGENT_CAPTURE_BYTES}-byte capture limit.`,
+      ));
+      return;
+    }
+    this.buffer += chunk.toString("utf8");
     for (;;) {
       const newline = this.buffer.indexOf("\n");
       if (newline === -1) return;
@@ -512,8 +576,18 @@ class JsonLineRpc {
       try {
         message = JSON.parse(line) as Record<string, unknown>;
       } catch {
-        this.stderr += `${line}\n`;
-        this.failAll(new Error(`Pi RPC emitted malformed JSON on stdout: ${line}`));
+        this.stderr = appendBoundedTailText(
+          this.stderr,
+          `${line}\n`,
+          MAX_LOCAL_AGENT_ERROR_BYTES,
+        );
+        this.failAll(new Error(
+          `Pi RPC emitted malformed JSON on stdout: ${boundedLocalAgentText(
+            line,
+            MAX_LOCAL_AGENT_ERROR_BYTES,
+            "malformed Pi output",
+          )}`,
+        ));
         return;
       }
       if (message.type !== "response") {

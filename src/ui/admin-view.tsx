@@ -22,6 +22,7 @@ const overrideSources: Record<string, string> = {
   "resources.maxResidentWorkspaces": "DEVSPACE_MAX_RESIDENT_WORKSPACES",
   "resources.maxActiveWorkspacesPerClient": "DEVSPACE_MAX_ACTIVE_WORKSPACES_PER_CLIENT",
   "resources.maxManagedWorktrees": "DEVSPACE_MAX_MANAGED_WORKTREES",
+  "resources.maxRequestBodyBytes": "DEVSPACE_MAX_REQUEST_BODY_BYTES",
 };
 
 export function SectionHeading({ kicker, title, description, children }: { kicker: string; title: string; description: string; children?: ReactNode }): React.JSX.Element {

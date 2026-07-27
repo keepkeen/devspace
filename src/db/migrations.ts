@@ -268,7 +268,15 @@ function normalizeOAuthClients(
   const hasPrincipalColumn = tableColumns(source, "oauth_clients").has("principal_id");
   return tableRows(source, "oauth_clients").map((row) => {
     const clientId = requiredString(row, "client_id");
-    let principalId = hasPrincipalColumn ? nullableString(row, "principal_id") : clientId;
+    // Pre-grant schemas used OAuth client identity as the ownership boundary.
+    // Canonical v15+ intentionally removed oauth_clients.principal_id because
+    // the authorization grant is the source of truth. Do not resurrect a
+    // client ID as an orphan connection principal when migrating those schemas.
+    let principalId = hasPrincipalColumn
+      ? nullableString(row, "principal_id")
+      : sourceVersion < 13
+        ? clientId
+        : null;
     if (!principalId && sourceVersion < 13) principalId = clientId;
     if (principalId) {
       const existing = principals.get(principalId);

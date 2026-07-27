@@ -129,6 +129,7 @@ export interface DevspaceUserConfig {
     maxResidentWorkspaces?: number;
     maxActiveWorkspacesPerClient?: number;
     maxManagedWorktrees?: number;
+    maxRequestBodyBytes?: number;
     [key: string]: unknown;
   };
   [key: string]: unknown;

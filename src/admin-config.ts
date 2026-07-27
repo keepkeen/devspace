@@ -8,6 +8,7 @@ import { expandHomePath } from "./roots.js";
 import {
   MAX_TIMER_MS,
   MIN_COMMAND_RUNTIME_MS,
+  MIN_RECOMMENDED_REQUEST_BODY_BYTES,
   RESOURCE_LIMIT_MAXIMUMS,
 } from "./resource-limits.js";
 import {
@@ -34,6 +35,7 @@ export interface AdminResourceLimits {
   maxResidentWorkspaces: number;
   maxActiveWorkspacesPerClient: number;
   maxManagedWorktrees: number;
+  maxRequestBodyBytes: number;
 }
 
 export interface AdminConfig {
@@ -99,6 +101,7 @@ const adminConfigSchema = z.object({
     maxResidentWorkspaces: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxResidentWorkspaces),
     maxActiveWorkspacesPerClient: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxActiveWorkspacesPerClient),
     maxManagedWorktrees: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxManagedWorktrees),
+    maxRequestBodyBytes: z.number().int().min(64 * 1024).max(RESOURCE_LIMIT_MAXIMUMS.maxRequestBodyBytes),
   }).strict(),
 }).strict();
 
@@ -267,6 +270,10 @@ export function adminConfigWarnings(config: AdminConfig): AdminConfigWarnings {
     warnings["resources.maxProcessOutputFileBytes"] =
       "The per-output file limit exceeds total process-output storage.";
   }
+  if (config.resources.maxRequestBodyBytes < MIN_RECOMMENDED_REQUEST_BODY_BYTES) {
+    warnings["resources.maxRequestBodyBytes"] =
+      "This limit may reject a valid maximum-size apply_patch request after JSON escaping.";
+  }
   return warnings;
 }
 
@@ -292,6 +299,7 @@ export function adminConfigOverridePaths(env: NodeJS.ProcessEnv = process.env): 
     ["maxResidentWorkspaces", "DEVSPACE_MAX_RESIDENT_WORKSPACES"],
     ["maxActiveWorkspacesPerClient", "DEVSPACE_MAX_ACTIVE_WORKSPACES_PER_CLIENT"],
     ["maxManagedWorktrees", "DEVSPACE_MAX_MANAGED_WORKTREES"],
+    ["maxRequestBodyBytes", "DEVSPACE_MAX_REQUEST_BODY_BYTES"],
   ];
   for (const [field, variable] of resourceOverrides) {
     if (env[variable] !== undefined) paths.push(`resources.${field}`);
@@ -447,6 +455,7 @@ function pickAdminResourceLimits(resources: AdminResourceLimits): AdminResourceL
     maxResidentWorkspaces: resources.maxResidentWorkspaces,
     maxActiveWorkspacesPerClient: resources.maxActiveWorkspacesPerClient,
     maxManagedWorktrees: resources.maxManagedWorktrees,
+    maxRequestBodyBytes: resources.maxRequestBodyBytes,
   };
 }
 

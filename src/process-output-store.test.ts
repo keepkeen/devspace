@@ -271,6 +271,70 @@ function testTailSearchAndErrorIndex(stateDir: string): void {
     assert.deepEqual(errors.matches.map((match) => match.category), ["error", "traceback"]);
     assert.equal(errors.matches[0]?.offsetBytes, Buffer.byteLength("startup ok\n", "utf8"));
 
+    // A page that cannot carry every match must resume at the first match it
+    // suppressed. Resuming past the whole scan window instead dropped those
+    // matches permanently, with no way for the caller to get them back.
+    const capped = store.search("owner", "workspace", outputId, {
+      offset: 0,
+      scanLimit: 100_000,
+      maxMatches: 1,
+      query: "OK",
+      ignoreCase: true,
+    });
+    assert.equal(capped.totalMatches, 3);
+    assert.equal(capped.matches.length, 1);
+    assert.equal(capped.matchesTruncated, true);
+    assert.deepEqual(capped.matches.map((match) => match.text), ["startup ok"]);
+
+    const continued = store.search("owner", "workspace", outputId, {
+      offset: capped.nextOffset,
+      scanLimit: 100_000,
+      maxMatches: 10,
+      query: "OK",
+      ignoreCase: true,
+    });
+    assert.deepEqual(
+      continued.matches.map((match) => match.text),
+      ["中间状态 ok", "final ok"],
+      "continuing must recover exactly the matches the first page suppressed",
+    );
+
+    const boundaryId = store.create({
+      connectionPrincipalId: "owner",
+      workspaceId: "workspace",
+    });
+    store.append(boundaryId, "aaaaMATCHbbbb\naaaa ERROR bbbb\n");
+    const boundaryFirst = store.search("owner", "workspace", boundaryId, {
+      offset: 0,
+      scanLimit: 7,
+      maxMatches: 10,
+      query: "MATCH",
+    });
+    assert.equal(boundaryFirst.matches.length, 0);
+    const boundarySecond = store.search("owner", "workspace", boundaryId, {
+      offset: boundaryFirst.nextOffset,
+      scanLimit: 7,
+      maxMatches: 10,
+      query: "MATCH",
+    });
+    assert.equal(boundarySecond.matches.length, 1);
+    assert.match(boundarySecond.matches[0]?.text ?? "", /MATCH/u);
+
+    const errorBoundaryFirst = store.search("owner", "workspace", boundaryId, {
+      offset: 0,
+      scanLimit: 21,
+      maxMatches: 10,
+      errorsOnly: true,
+    });
+    assert.equal(errorBoundaryFirst.matches.length, 0);
+    const errorBoundarySecond = store.search("owner", "workspace", boundaryId, {
+      offset: errorBoundaryFirst.nextOffset,
+      scanLimit: 20,
+      maxMatches: 10,
+      errorsOnly: true,
+    });
+    assert.deepEqual(errorBoundarySecond.matches.map((match) => match.category), ["error"]);
+
     assert.throws(
       () => store.search("owner", "workspace", outputId, {
         offset: 0,

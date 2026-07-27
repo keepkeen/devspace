@@ -118,6 +118,18 @@ try {
   ]) {
     assert.equal(readTools.has(name), false, `${name} must be hidden from workspace:read grants`);
   }
+  const malformedUnavailableTool = await readClient.callTool({
+    name: "exec_command",
+    arguments: { program: 123 as unknown as string, args: "not-an-array" as unknown as string[] },
+  });
+  assert.equal(malformedUnavailableTool.isError, true);
+  assert.equal(
+    (malformedUnavailableTool.structuredContent as {
+      error?: { code?: unknown };
+    } | undefined)?.error?.code,
+    "tool_unavailable",
+  );
+  assert.doesNotMatch(JSON.stringify(malformedUnavailableTool.content), /invalid_tool_input|Expected string|Expected array/u);
   const readOpen = await readClient.callTool({
     name: "open_workspace",
     arguments: { path: workspaceRoot, alias: "read", contextMode: "full" },
@@ -226,12 +238,33 @@ try {
     } | undefined)?.diff?.reviewToken ?? "",
   );
   assert.match(writeReviewToken, /^dcur1\./u);
+  // Advancing without a reviewToken is a preflight rejection that ran nothing,
+  // so its operationId must stay reusable for the retry the error asks for.
+  // Settling it here would fail that retry with operation_id_conflict.
+  const advanceWithoutToken = await writeClient.callTool({
+    name: "show_changes",
+    arguments: {
+      receipt: writeReceipt,
+      advanceCheckpoint: true,
+      operationId: "write-scope-review-retry",
+    },
+  });
+  assert.equal(advanceWithoutToken.isError, true);
+  assert.equal(
+    (advanceWithoutToken.structuredContent as {
+      error?: { code?: unknown };
+    } | undefined)?.error?.code,
+    "review_confirmation_required",
+  );
+  // The retry the error asked for, reusing the rejected operationId. Before the
+  // preflight code was made releasable this failed with operation_id_conflict,
+  // leaving the caller no way to advance at all.
   const writeAdvance = await writeClient.callTool({
     name: "show_changes",
     arguments: {
       receipt: writeReceipt,
       advanceCheckpoint: true,
-      operationId: "write-scope-review-advance",
+      operationId: "write-scope-review-retry",
       reviewToken: writeReviewToken,
     },
   });
@@ -522,8 +555,16 @@ async function assertToolUnavailable(
     return;
   }
   assert.equal(result.isError, true, JSON.stringify(result.content));
-  assert.match(JSON.stringify(result.content), new RegExp(`Tool ${toolName} not found`));
-  assert.equal(result.structuredContent, undefined);
+  const error = (result.structuredContent as {
+    error?: { code?: unknown; recovery?: unknown };
+  } | undefined)?.error;
+  if (error) {
+    assert.equal(error.code, "tool_unavailable");
+    assert.equal(error.recovery, "refresh_tools_or_reauthorize");
+    assert.match(JSON.stringify(result.content), new RegExp(toolName));
+  } else {
+    assert.match(JSON.stringify(result.content), new RegExp(`Tool ${toolName} not found`));
+  }
 }
 
 function hashToken(token: string): string {

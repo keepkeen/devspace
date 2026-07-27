@@ -1057,7 +1057,7 @@ try {
   assert.deepEqual(
     initialActiveKeys,
     [
-      "commandExecuted", "contextChanged", "effects", "ok", "operation",
+      "commandExecuted", "contextChanged", "effects", "notice", "ok", "operation",
       "output",
       ...(
         typeof (activeCommand.structuredContent as { outputId?: unknown } | undefined)?.outputId === "string"
@@ -1161,6 +1161,52 @@ try {
   );
   assert.match(processOutputPageText(tailedOutput), /final sentinel/u);
   assert.doesNotMatch(toolText(tailedOutput), /final sentinel/u);
+
+  // An input-schema rejection has to arrive on the same contract as every other
+  // error. The SDK validates before the handler, so without a pre-flight check
+  // the caller gets a raw Zod dump with no code, no recovery, and no
+  // structuredContent at all.
+  const invalidInput = await client.callTool({
+    name: "read",
+    arguments: { receipt: scopedContextReceipt, path: "package.json", offset: 0 },
+  });
+  assert.equal(invalidInput.isError, true);
+  const invalidInputError = (invalidInput.structuredContent as {
+    ok?: unknown;
+    error?: { code?: unknown; recovery?: unknown };
+  } | undefined);
+  assert.equal(invalidInputError?.ok, false);
+  assert.equal(invalidInputError?.error?.code, "invalid_tool_input");
+  assert.equal(invalidInputError?.error?.recovery, "correct_and_retry");
+  assert.match(toolText(invalidInput), /offset/u);
+  assert.match(toolText(invalidInput), /nothing was executed/u);
+  assert.ok(
+    Buffer.byteLength(toolText(invalidInput), "utf8") < 400,
+    "an input rejection must stay compact instead of dumping the schema",
+  );
+
+  // tailBytes sizes only the first window, so following the returned cursor
+  // must not require echoing it back; demanding it produced a stale-cursor
+  // error that blamed the output for changing when nothing had.
+  const tailCursor = (tailedOutput.structuredContent as {
+    page?: { nextCursor?: unknown };
+  } | undefined)?.page?.nextCursor;
+  if (typeof tailCursor === "string" && tailCursor.length > 0) {
+    const tailFollowUp = await client.callTool({
+      name: "read_process_output",
+      arguments: {
+        receipt: scopedContextReceipt,
+        outputId: indexedOutputId,
+        mode: "tail",
+        cursor: tailCursor,
+      },
+    });
+    assert.notEqual(
+      tailFollowUp.isError,
+      true,
+      "following a tail cursor without repeating tailBytes must not be stale",
+    );
+  }
 
   const searchedOutput = await client.callTool({
     name: "read_process_output",

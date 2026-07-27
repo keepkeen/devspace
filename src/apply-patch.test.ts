@@ -572,6 +572,45 @@ await applyPatch(
 );
 assert.equal(await readFile(join(noNewlineRoot, "no-newline.txt"), "utf8"), "new");
 
+// A line pushed off the end by an insertion must regain its terminator, or it
+// would be welded to the line that now follows it.
+const promotedLineCases: Array<{
+  name: string;
+  initial: string;
+  hunk: string;
+  expected: string;
+}> = [
+  { name: "append-one", initial: "a\nb", hunk: " b\n+c", expected: "a\nb\nc" },
+  { name: "append-two", initial: "a\nb", hunk: " b\n+c\n+d", expected: "a\nb\nc\nd" },
+  { name: "append-crlf", initial: "a\r\nb", hunk: " b\n+c", expected: "a\r\nb\r\nc" },
+  { name: "append-single", initial: "x", hunk: " x\n+y", expected: "x\ny" },
+  { name: "append-mixed", initial: "a\r\nb\nc", hunk: " c\n+d", expected: "a\r\nb\nc\nd" },
+  // Deleting the newline-less last line must not strip the newline from the
+  // untouched line before it.
+  { name: "delete-last", initial: "a\nb\nc", hunk: "-c", expected: "a\nb\n" },
+  // An empty file carries no missing-final-newline state.
+  { name: "empty-file", initial: "", hunk: "+hello", expected: "hello\n" },
+  { name: "insert-middle", initial: "a\nb", hunk: " a\n+x", expected: "a\nx\nb" },
+  { name: "replace-last", initial: "a\nb", hunk: "-b\n+B", expected: "a\nB" },
+  // The missing newline belonged to the deleted last line, so it does not
+  // follow a line inserted earlier in the file by a different hunk.
+  { name: "insert-middle-delete-last", initial: "a\nb", hunk: " a\n+x\n@@\n-b", expected: "a\nx\n" },
+  { name: "insert-middle-keep-last", initial: "a\nb\nc", hunk: " a\n+x\n@@\n-c", expected: "a\nx\nb\n" },
+];
+for (const { name, initial, hunk, expected } of promotedLineCases) {
+  const caseRoot = await mkdtemp(join(tmpdir(), "devspace-apply-patch-promote-"));
+  await writeFile(join(caseRoot, "file.txt"), initial);
+  await applyPatch(
+    caseRoot,
+    `*** Begin Patch
+*** Update File: file.txt
+@@
+${hunk}
+*** End Patch`,
+  );
+  assert.equal(await readFile(join(caseRoot, "file.txt"), "utf8"), expected, name);
+}
+
 const eofRoot = await mkdtemp(join(tmpdir(), "devspace-apply-patch-eof-"));
 await writeFile(join(eofRoot, "tail.txt"), "first\nsecond\n");
 await applyPatch(

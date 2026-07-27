@@ -67,6 +67,8 @@ interface TruncationResult {
 
 interface ReadToolDetails {
   truncation?: TruncationResult;
+  /** 1-based line to resume from, so callers never parse it out of the notice. */
+  nextOffset?: number;
 }
 
 export interface PiToolStructuredError {
@@ -340,24 +342,46 @@ export async function readFileTool(
         ? ` (${formatSize(DEFAULT_MAX_BYTES)} limit)`
         : "";
       output += `\n\n[Showing lines ${startLine}-${endLine} of ${allLines.length}${sizeNote}. Use offset=${nextOffset} to continue.]`;
-      details = { truncation: truncated.details };
+      details = { truncation: truncated.details, nextOffset };
     } else if (requestedEnd < allLines.length) {
       output += `\n\n[${allLines.length - requestedEnd} more lines in file. Use offset=${requestedEnd + 1} to continue.]`;
+      details = { nextOffset: requestedEnd + 1 };
     }
     return { content: [{ type: "text", text: output }], details };
   });
 }
 
+// Control bytes that occur in ordinary text files and captured terminal output:
+// backspace, tab, newline, form feed, carriage return, and the escape that
+// introduces ANSI sequences. Colored build and test logs carry enough escapes to
+// exceed the ratio below, so counting them would classify every such log as
+// binary. Vertical tab is deliberately absent: it does not appear in text but is
+// common binary filler.
+const TEXT_CONTROL_BYTES = new Set([0x08, 0x09, 0x0a, 0x0c, 0x0d, 0x1b]);
+
 function probablyBinary(bytes: Buffer): boolean {
-  const sample = bytes.subarray(0, Math.min(bytes.length, 8 * 1_024));
+  // NUL is a strong binary signal wherever it occurs. The whole file is already
+  // resident and capped at 16 MiB, so limiting this check to the first 8 KiB
+  // only allowed a binary suffix to be returned as model-visible text.
+  if (bytes.includes(0)) return true;
+  const sampleBytes = 8 * 1_024;
+  const starts = new Set([
+    0,
+    Math.max(0, Math.floor((bytes.length - sampleBytes) / 2)),
+    Math.max(0, bytes.length - sampleBytes),
+  ]);
   let controls = 0;
-  for (const byte of sample) {
-    if (byte === 0) return true;
-    if ((byte < 0x20 && ![0x08, 0x09, 0x0a, 0x0c, 0x0d].includes(byte)) || byte === 0x7f) {
-      controls += 1;
+  let sampled = 0;
+  for (const start of starts) {
+    const sample = bytes.subarray(start, Math.min(bytes.length, start + sampleBytes));
+    sampled += sample.length;
+    for (const byte of sample) {
+      if ((byte < 0x20 && !TEXT_CONTROL_BYTES.has(byte)) || byte === 0x7f) {
+        controls += 1;
+      }
     }
   }
-  return sample.length >= 32 && controls / sample.length > 0.01;
+  return sampled >= 32 && controls / sampled > 0.01;
 }
 
 export async function writeFileTool(
@@ -424,8 +448,14 @@ export async function grepFilesTool(
       const relativePath = displayRelative(searchPath, file.path, file.singleFile);
       if (input.glob && !globMatches(relativePath, input.glob)) continue;
       const buffer = await readFile(file.path);
-      if (buffer.subarray(0, 8_192).includes(0)) continue;
-      const lines = buffer.toString("utf8").split("\n");
+      if (probablyBinary(buffer)) continue;
+      let text: string;
+      try {
+        text = new TextDecoder("utf-8", { fatal: true }).decode(buffer);
+      } catch {
+        continue;
+      }
+      const lines = text.split("\n");
       for (let index = 0; index < lines.length && matches < effectiveLimit; index += 1) {
         expression.lastIndex = 0;
         if (!expression.test(lines[index] ?? "")) continue;

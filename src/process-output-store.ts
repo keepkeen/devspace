@@ -173,6 +173,11 @@ const MAX_READ_BYTES = 1024 * 1024;
 const MAX_SEARCH_MATCHES = 200;
 const MAX_SEARCH_QUERY_BYTES = 512;
 const MAX_SEARCH_LINE_BYTES = 4 * 1024;
+const ERROR_SEARCH_OVERLAP_BYTES = 16;
+// Per-match and per-count limits alone allow 200 x 4 KiB of model-visible text
+// in one response. Matches stop accumulating once this aggregate is reached;
+// totalMatches still reports the full count, so matchesTruncated stays honest.
+const MAX_SEARCH_RESULT_BYTES = 64 * 1024;
 const RECOVERY_BATCH_SIZE = 100;
 const UTF8_LOOKAHEAD_BYTES = 3;
 const DEFAULT_MAX_OUTPUTS = 10_000;
@@ -551,52 +556,109 @@ export class ProcessOutputStore {
 
     const available = row.stored_bytes - offset;
     const desiredBytes = Math.min(available, scanLimit);
+    const requestedOverlap = Math.max(
+      query ? Math.max(0, Buffer.byteLength(query, "utf8") - 1) : 0,
+      options.errorsOnly ? ERROR_SEARCH_OVERLAP_BYTES : 0,
+    );
+    let readStart = Math.max(0, offset - requestedOverlap);
+    if (readStart > 0) {
+      const descriptor = this.openVerifiedFile(row, constants.O_RDONLY | NO_FOLLOW);
+      try {
+        const byte = Buffer.allocUnsafe(1);
+        while (readStart > 0) {
+          if (readSync(descriptor, byte, 0, 1, readStart) !== 1) {
+            throw new ProcessOutputIntegrityError("Process output file changed during search");
+          }
+          if (!isUtf8ContinuationByte(byte[0]!)) break;
+          readStart -= 1;
+        }
+      } finally {
+        closeSync(descriptor);
+      }
+    }
+    const prefixBytes = offset - readStart;
     let buffer = Buffer.alloc(0);
     let consumedBytes = 0;
     if (desiredBytes > 0) {
-      const readLength = Math.min(available, desiredBytes + UTF8_LOOKAHEAD_BYTES);
+      const readLength = Math.min(
+        row.stored_bytes - readStart,
+        prefixBytes + desiredBytes + requestedOverlap + UTF8_LOOKAHEAD_BYTES,
+      );
       buffer = Buffer.allocUnsafe(readLength);
       const descriptor = this.openVerifiedFile(row, constants.O_RDONLY | NO_FOLLOW);
       try {
-        const bytesRead = readSync(descriptor, buffer, 0, readLength, offset);
+        const bytesRead = readSync(descriptor, buffer, 0, readLength, readStart);
         if (bytesRead !== readLength) {
           throw new ProcessOutputIntegrityError("Process output file changed during search");
         }
       } finally {
         closeSync(descriptor);
       }
-      consumedBytes = safeUtf8PageEnd(buffer, desiredBytes, available === readLength);
-      buffer = buffer.subarray(0, consumedBytes);
+      consumedBytes = safeUtf8PageEnd(
+        buffer.subarray(prefixBytes),
+        desiredBytes,
+        readStart + readLength >= row.stored_bytes,
+      );
     }
 
     const matches: ProcessOutputSearchMatch[] = [];
     const categories: Partial<Record<ProcessOutputErrorCategory, number>> = {};
     let totalMatches = 0;
-    const normalizedQuery = options.ignoreCase && query ? query.toLocaleLowerCase("en-US") : query;
+    let matchedBytes = 0;
+    // Offset of the first match this page could not carry. Resuming from the end
+    // of the scan window instead would skip every suppressed match for good.
+    let firstSuppressedOffset: number | undefined;
+    const logicalEnd = offset + consumedBytes;
     for (const line of rawOutputLines(buffer)) {
       const text = new TextDecoder("utf-8", { fatal: false }).decode(line.bytes);
-      const category = errorCategory(text);
-      const queryMatches = normalizedQuery === undefined || (
-        options.ignoreCase
-          ? text.toLocaleLowerCase("en-US").includes(normalizedQuery)
-          : text.includes(normalizedQuery)
-      );
-      if (!queryMatches || (options.errorsOnly && !category)) continue;
+      const lineStart = readStart + line.offset;
+      const minimumEnd = Math.max(0, offset - lineStart);
+      const maximumEnd = logicalEnd - lineStart;
+      if (maximumEnd <= 0) continue;
+      const match = options.errorsOnly
+        ? errorMatchInByteRange(text, minimumEnd, maximumEnd)
+        : query
+          ? literalMatchInByteRange(
+              text,
+              query,
+              options.ignoreCase === true,
+              minimumEnd,
+              maximumEnd,
+            )
+          : undefined;
+      if (!match) continue;
+      const category = options.errorsOnly ? match.category : errorCategory(text);
       totalMatches += 1;
       if (category) categories[category] = (categories[category] ?? 0) + 1;
-      if (matches.length >= maxMatches) continue;
       const visibleBytes = line.bytes.length > MAX_SEARCH_LINE_BYTES
         ? line.bytes.subarray(0, completeUtf8PrefixLength(line.bytes, MAX_SEARCH_LINE_BYTES))
         : line.bytes;
+      // Checked against the line that is about to be added, so the budget is a
+      // real ceiling rather than one that a final oversized line can overshoot.
+      if (
+        matches.length >= maxMatches ||
+        matchedBytes + visibleBytes.length > MAX_SEARCH_RESULT_BYTES
+      ) {
+        firstSuppressedOffset ??= Math.max(offset, lineStart);
+        continue;
+      }
+      matchedBytes += visibleBytes.length;
       matches.push({
-        offsetBytes: offset + line.offset,
+        offsetBytes: lineStart,
         text: new TextDecoder("utf-8", { fatal: false }).decode(visibleBytes),
         ...(category ? { category } : {}),
         ...(visibleBytes.length < line.bytes.length ? { truncated: true as const } : {}),
       });
     }
 
-    const nextOffset = offset + consumedBytes;
+    // Resume where the page stopped emitting, not where scanning stopped, so a
+    // continuation re-reads the suppressed matches instead of skipping them.
+    const scanEnd = logicalEnd;
+    const nextOffset = firstSuppressedOffset !== undefined &&
+        firstSuppressedOffset > offset &&
+        firstSuppressedOffset < scanEnd
+      ? firstSuppressedOffset
+      : scanEnd;
     return {
       matches,
       offset,
@@ -1193,6 +1255,77 @@ function rawOutputLines(buffer: Buffer): Array<{ offset: number; bytes: Buffer }
   }
   if (start < buffer.length) lines.push({ offset: start, bytes: buffer.subarray(start) });
   return lines;
+}
+
+interface ProcessOutputTextMatch {
+  startBytes: number;
+  endBytes: number;
+  category?: ProcessOutputErrorCategory;
+}
+
+function literalMatchInByteRange(
+  text: string,
+  query: string,
+  ignoreCase: boolean,
+  minimumEndBytes: number,
+  maximumEndBytes: number,
+): ProcessOutputTextMatch | undefined {
+  const expression = new RegExp(escapeRegExp(query), ignoreCase ? "giu" : "gu");
+  for (const match of text.matchAll(expression)) {
+    const range = matchByteRange(text, match.index ?? 0, match[0]?.length ?? 0);
+    if (range.endBytes > minimumEndBytes && range.endBytes <= maximumEndBytes) {
+      return range;
+    }
+  }
+  return undefined;
+}
+
+const ERROR_CATEGORY_MATCHERS: Array<{
+  category: ProcessOutputErrorCategory;
+  expression: RegExp;
+}> = [
+  { category: "fatal", expression: /\bfatal\b/giu },
+  { category: "panic", expression: /\bpanic\b/giu },
+  { category: "traceback", expression: /\btraceback\b/giu },
+  { category: "exception", expression: /\bexception\b/giu },
+  { category: "error", expression: /\berror\b/giu },
+  { category: "failed", expression: /\b(?:failed|failure)\b/giu },
+];
+
+function errorMatchInByteRange(
+  text: string,
+  minimumEndBytes: number,
+  maximumEndBytes: number,
+): ProcessOutputTextMatch | undefined {
+  const matches: ProcessOutputTextMatch[] = [];
+  for (const { category, expression } of ERROR_CATEGORY_MATCHERS) {
+    expression.lastIndex = 0;
+    for (const match of text.matchAll(expression)) {
+      const range = matchByteRange(text, match.index ?? 0, match[0]?.length ?? 0);
+      if (range.endBytes > minimumEndBytes && range.endBytes <= maximumEndBytes) {
+        matches.push({ ...range, category });
+      }
+    }
+  }
+  return matches.sort((left, right) =>
+    left.startBytes - right.startBytes || left.endBytes - right.endBytes)[0];
+}
+
+function matchByteRange(
+  text: string,
+  startCharacters: number,
+  lengthCharacters: number,
+): ProcessOutputTextMatch {
+  const startBytes = Buffer.byteLength(text.slice(0, startCharacters), "utf8");
+  const endBytes = startBytes + Buffer.byteLength(
+    text.slice(startCharacters, startCharacters + lengthCharacters),
+    "utf8",
+  );
+  return { startBytes, endBytes };
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
 }
 
 function errorCategory(text: string): ProcessOutputErrorCategory | undefined {

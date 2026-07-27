@@ -10,6 +10,7 @@ import {
   piCommandEnvironment,
   resolveAcpModelConfigUpdate,
   resolveAcpThinkingConfigUpdate,
+  selectAcpAllowPermissionOption,
 } from "./local-agent-adapters.js";
 import { removeDevspaceNodeModulesBinFromPath } from "./local-agent-path.js";
 import type { LocalAgentProvider } from "./local-agent-profiles.js";
@@ -28,6 +29,19 @@ for (const provider of providers) {
   assert.equal(adapter.provider, provider);
   assert.equal(typeof adapter.run, "function");
 }
+
+assert.deepEqual(
+  selectAcpAllowPermissionOption([
+    { optionId: "forever", kind: "allow_always" },
+    { optionId: "once", kind: "allow_once" },
+  ]),
+  { optionId: "once" },
+);
+assert.deepEqual(
+  selectAcpAllowPermissionOption([{ optionId: "forever", kind: "allow_always" }]),
+  { optionId: "forever" },
+  "full-trust mode falls back when the provider exposes only a persistent option",
+);
 
 assert.deepEqual(
   resolveAcpModelConfigUpdate({

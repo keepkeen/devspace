@@ -27,7 +27,7 @@ const options: RuntimeControlPlaneOptions = {
     revocation: ownerToken,
   },
   generation: "runtime-generation",
-  runtimeConfig: { widgets: "changes" },
+  runtimeConfig: { widgets: "changes", maxRequestBodyBytes: 33_554_432 },
   allowedRootsRevision: () => "roots-revision-test",
   allowedRootsCleanupPending: () => rootsCleanupPending,
   isClosing: () => false,
@@ -125,6 +125,7 @@ try {
   assert.equal(body.generation, "runtime-generation");
   assert.deepEqual(body.runtimeConfig, {
     widgets: "changes",
+    maxRequestBodyBytes: 33_554_432,
     allowedRootsRevision: "roots-revision-test",
     allowedRootsCleanupPending: 0,
   });

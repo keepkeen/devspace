@@ -152,6 +152,48 @@ try {
   assert.equal(binary.error?.code, "binary_file");
   assert.equal(binary.error?.safeToRetry, false);
 
+  const lateBinaryBytes = Buffer.concat([
+    Buffer.from("needle\n", "utf8"),
+    Buffer.alloc(9_000, 0x61),
+    Buffer.from([0x00, 0x62]),
+  ]);
+  await writeFile(join(adapterRoot, "late-binary.dat"), lateBinaryBytes);
+  const lateBinary = await readFileTool(
+    { path: "late-binary.dat" },
+    { cwd: adapterRoot, root: adapterRoot },
+  );
+  assert.equal(lateBinary.isError, true);
+  assert.equal(lateBinary.error?.code, "binary_file");
+  const lateBinaryGrep = await grepFilesTool(
+    { pattern: "needle", path: "late-binary.dat", literal: true },
+    { cwd: adapterRoot, root: adapterRoot },
+  );
+  assert.equal(
+    lateBinaryGrep.content[0]?.type === "text" ? lateBinaryGrep.content[0].text : "",
+    "No matches found",
+  );
+
+  // ANSI escapes are ordinary text: a colored build log carries enough of them
+  // to exceed the control-character ratio, so it must not read as binary.
+  const escape = String.fromCharCode(27);
+  await writeFile(
+    join(adapterRoot, "colored.log"),
+    Array.from(
+      { length: 60 },
+      (_unused, index) =>
+        `${escape}[32m✓${escape}[0m src/module-${index}/component.test.ts (12 tests) passed`,
+    ).join("\n"),
+  );
+  const coloredLog = await readFileTool(
+    { path: "colored.log" },
+    { cwd: adapterRoot, root: adapterRoot },
+  );
+  assert.equal(coloredLog.isError, undefined);
+  assert.match(
+    coloredLog.content[0]?.type === "text" ? coloredLog.content[0].text : "",
+    /component\.test\.ts/u,
+  );
+
   await writeFile(join(adapterRoot, "invalid-utf8.txt"), Buffer.from([0x61, 0xc3, 0x28]));
   const invalidUtf8 = await readFileTool(
     { path: "invalid-utf8.txt" },
@@ -159,6 +201,14 @@ try {
   );
   assert.equal(invalidUtf8.isError, true);
   assert.equal(invalidUtf8.error?.code, "invalid_utf8");
+  const invalidUtf8Grep = await grepFilesTool(
+    { pattern: "a", path: "invalid-utf8.txt", literal: true },
+    { cwd: adapterRoot, root: adapterRoot },
+  );
+  assert.equal(
+    invalidUtf8Grep.content[0]?.type === "text" ? invalidUtf8Grep.content[0].text : "",
+    "No matches found",
+  );
 
   await writeFile(
     join(adapterRoot, "oversized.txt"),

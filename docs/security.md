@@ -299,6 +299,14 @@ isolation, and only guardrail-level filesystem confinement. Unsupported
 control that always fails. Workspace generations and file versions do not
 replace OS isolation.
 
+DevSpace intentionally does not try to infer filesystem intent from inline
+interpreter programs such as `python -c`, `node -e`, `ruby -e`, or equivalent
+forms. Once `exec_command` is granted, these programs are full-trust local code:
+they can access anything available to the DevSpace OS user, create subprocesses,
+use the inherited network, and deliberately detach into another process group.
+Literal path checks and Workspace locks remain accident-prevention and
+coordination mechanisms; they are not a security boundary against such code.
+
 Spawned commands do not inherit the server's complete environment. DevSpace
 passes only basic executable-path, home/user, temporary-directory, locale, and
 platform variables, then adds its Workspace markers and any variables supplied
@@ -349,6 +357,14 @@ server still sees the child-owned lease and cannot write the same physical root;
 the lock is reclaimed only after both the owner process and process group exit.
 Polling and stdin tools operate on the existing lease rather than deadlocking by
 reacquiring it.
+
+Workers created by `devspace agents run` stay in the launching command's process
+group, so the process session and root lease remain live after the short CLI
+launcher exits. Provider children normally inherit that group as well. This
+cannot constrain a trusted command or provider that deliberately calls
+`setsid`, registers an OS service, or otherwise creates an independently managed
+daemon. Preventing that requires a sandbox, container/VM, dedicated OS account,
+cgroup, launchd job, or Windows Job Object rather than more command parsing.
 
 After a root process exits, descendant polling backs off from 25 ms to 2 seconds
 and the session is labeled a managed daemon. Serialization remains held by

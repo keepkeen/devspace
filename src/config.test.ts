@@ -163,6 +163,8 @@ assert.deepEqual(loadConfig(baseEnv).resources, {
   maxResidentWorkspaces: 256,
   maxActiveWorkspacesPerClient: 32,
   maxManagedWorktrees: 64,
+  // Allows the maximum 4 MiB UTF-8 patch even under worst-case JSON escaping.
+  maxRequestBodyBytes: 32 * 1024 * 1024,
 });
 const limitedConfig = loadConfig({
   ...baseEnv,
@@ -178,6 +180,7 @@ const limitedConfig = loadConfig({
   DEVSPACE_WORKSPACE_IDLE_TTL_SECONDS: "60",
   DEVSPACE_MAX_MANAGED_WORKTREES: "3",
   DEVSPACE_MAX_ACTIVE_WORKSPACES_PER_CLIENT: "2",
+  DEVSPACE_MAX_REQUEST_BODY_BYTES: "41943040",
 });
 assert.equal(limitedConfig.resources.maxMcpSessions, 4);
 assert.equal(limitedConfig.resources.maxMcpSessionsPerClient, 3);
@@ -191,6 +194,7 @@ assert.equal(limitedConfig.resources.maxCommandRuntimeMs, 30_000);
 assert.equal(limitedConfig.resources.workspaceIdleTtlMs, 60_000);
 assert.equal(limitedConfig.resources.maxManagedWorktrees, 3);
 assert.equal(limitedConfig.resources.maxActiveWorkspacesPerClient, 2);
+assert.equal(limitedConfig.resources.maxRequestBodyBytes, 40 * 1024 * 1024);
 
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_LOG_LEVEL: "silent" }).logging.level, "silent");
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_LOG_LEVEL: "error" }).logging.level, "error");

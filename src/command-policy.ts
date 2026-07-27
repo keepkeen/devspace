@@ -30,7 +30,6 @@ import {
   MAX_SHELL_ANALYSIS_DEPTH,
   preprocessHeredocs,
   programBasename,
-  shellIsParseOnly,
   splitShellSegments,
   staticEnvSplitPayload,
   tokenizeShellSegment,
@@ -284,7 +283,7 @@ function classifyCommandWithinLimits(
     }
 
     const effective = unwrapWrappers(tokens);
-    const heredocShell = isShellProgram(effective[0]) && !shellIsParseOnly(tokens);
+    const heredocShell = isShellProgram(effective[0]);
     if (heredocShell) {
       for (const payload of extractHereStringPayloads(segment)) {
         const nested = classifyNested(payload, allowPrefixes, depth);
@@ -354,11 +353,11 @@ function findPipedShellSegment(command: string): string | undefined {
     if (!segment) continue;
     const tokens = tokenizeSegment(segment);
     const effective = unwrapWrappers(tokens);
-    if (isShellProgram(effective[0]) && !shellIsParseOnly(tokens)) return segment;
+    if (isShellProgram(effective[0])) return segment;
     const envPayload = staticEnvSplitPayload(tokens);
     if (envPayload) {
       const splitTokens = tokenizeSegment(envPayload);
-      if (isShellProgram(splitTokens[0]) && !shellIsParseOnly(splitTokens)) return segment;
+      if (isShellProgram(splitTokens[0])) return segment;
     }
   }
   return undefined;

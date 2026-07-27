@@ -120,6 +120,12 @@ disabled: true
 The body is the profile prompt prefix DevSpace prepends when launching that
 profile. It is not included in `open_workspace` by default.
 
+Profile sources are layered user-first, project-second. A project profile with
+the same name replaces the user profile for that Workspace. This is deliberate,
+Codex-style configuration layering rather than a trust elevation check: a
+repository profile is code-like local-agent configuration and should be run only
+when the repository is trusted for full command execution.
+
 Recommended body content:
 
 - When to use this profile.
@@ -154,6 +160,12 @@ it does not list profile definitions.
 
 The full profile body stays out of the model context until DevSpace launches the
 profile.
+
+The worker stays in the launching DevSpace process group and retains the root
+lease while it runs. Final responses are shown directly up to 256 KiB; larger
+responses are privately retained up to the 4 MiB provider capture limit and are
+streamed by `devspace agents show`, allowing the enclosing `exec_command` output
+store to expose an `outputId` for paging.
 
 ## Current non-goals
 

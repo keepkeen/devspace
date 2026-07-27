@@ -1105,6 +1105,62 @@ try {
     await batchingManager.shutdown();
     durableStore.append = originalAppend;
   }
+
+  // An incomplete shutdown is exactly when the retained log matters most, so
+  // pending output must be persisted before the survivor error is raised. The
+  // tiny grace period makes shutdown give up before the exit event lands, which
+  // is the path that previously threw ahead of the flush.
+  const shutdownFlushManager = new ProcessSessionManager({
+    outputStore: durableStore,
+    durableOutputFlushBytes: 1024 * 1024,
+    durableOutputFlushMs: 10_000,
+    terminationGraceMs: 1,
+  });
+  let shutdownFlushOutputId: string | undefined;
+  try {
+    let pending = await shutdownFlushManager.start({
+      connectionPrincipalId,
+      workspaceId: "durable-shutdown-flush",
+      cwd: process.cwd(),
+      command: {
+        program: process.execPath,
+        args: ["-e", [
+          "process.on('SIGTERM', () => {});",
+          "process.stdout.write('early');",
+          "setTimeout(() => process.stdout.write('late'), 400);",
+          "setTimeout(() => process.exit(0), 5000);",
+        ].join("")],
+      },
+      yieldTimeMs: 100,
+    });
+    const pendingDeadline = Date.now() + 2_000;
+    while (pending.running && !pending.outputId && Date.now() < pendingDeadline) {
+      pending = await shutdownFlushManager.write({
+        connectionPrincipalId,
+        workspaceId: "durable-shutdown-flush",
+        sessionId: pending.sessionId!,
+        yieldTimeMs: 50,
+      });
+    }
+    shutdownFlushOutputId = pending.outputId;
+    assert.ok(shutdownFlushOutputId, "a durable output id is required for this check");
+    // "late" lands after the final snapshot, so it is only in the pending
+    // buffer; the flush timer is far longer than this wait.
+    await new Promise((resolveWait) => setTimeout(resolveWait, 600));
+  } finally {
+    // The survivor error is expected here; the flush must already have happened.
+    await shutdownFlushManager.shutdown().catch(() => undefined);
+  }
+  assert.equal(
+    durableStore.read(
+      connectionPrincipalId,
+      "durable-shutdown-flush",
+      shutdownFlushOutputId!,
+      { offset: 0, limit: 1_000 },
+    ).content,
+    "earlylate",
+    "shutdown must persist output still pending in the flush buffer",
+  );
 } finally {
   await durableManager.shutdown();
   durableStore.close();

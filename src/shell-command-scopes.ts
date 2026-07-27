@@ -8,7 +8,6 @@ import {
   isShellAnalysisLimitError,
   MAX_SHELL_ANALYSIS_DEPTH,
   preprocessHeredocs,
-  shellIsParseOnly,
   splitShellSegments,
   tokenizeShellSegment,
   unwrapShellWrappers,
@@ -198,7 +197,7 @@ function analyzeShellCommandScopesUnchecked(
     for (const payload of delegatedCommandPayloads(tokens)) nestedPayloads.add(payload);
 
     const effective = unwrapShellWrappers(tokens);
-    const heredocShell = isShellProgram(effective[0]) && !shellIsParseOnly(tokens);
+    const heredocShell = isShellProgram(effective[0]);
     if (heredocShell) {
       for (const payload of extractHereStringPayloads(segment)) nestedPayloads.add(payload);
     }

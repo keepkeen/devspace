@@ -800,6 +800,10 @@ export class ProcessSessionManager {
       }
     }
     session.releaseWorkspaceRootLease = releaseOnce(release);
+    // A newly attached lease has not been detached, whatever happened to the
+    // previous one. Leaving the flag set would make the next detach request
+    // fail as "already detached" and pin the lease until the tree exits.
+    session.rootLeaseDetached = false;
     return true;
   }
 
@@ -1306,7 +1310,13 @@ export class ProcessSessionManager {
       if (session.cleanupTimer) clearTimeout(session.cleanupTimer);
       if (session.runtimeTimer) clearTimeout(session.runtimeTimer);
       if (session.escalationTimer) clearTimeout(session.escalationTimer);
-      if (session.durableFlushTimer) clearTimeout(session.durableFlushTimer);
+      if (session.durableFlushTimer) {
+        clearTimeout(session.durableFlushTimer);
+        // Leaving the handle set would make append() believe a flush is still
+        // scheduled, so output produced while we wait for the processes to die
+        // would never be written.
+        session.durableFlushTimer = undefined;
+      }
     }
     const errors: unknown[] = [];
     for (const session of running) {
@@ -1322,12 +1332,15 @@ export class ProcessSessionManager {
     if (remaining.length > 0) {
       await this.waitForSessions(remaining, this.terminationGraceMs);
     }
+    // Persist buffered output before reporting survivors. An incomplete
+    // shutdown is exactly when the retained log matters most, and throwing
+    // first would discard it.
+    for (const session of this.sessions.values()) this.flushDurableOutput(session);
     const survivors = running.filter((session) => session.running);
     if (survivors.length > 0) {
       errors.push(new Error(`Failed to terminate ${survivors.length} process session(s) during shutdown.`));
       throw new AggregateError(errors, "Process shutdown incomplete");
     }
-    for (const session of this.sessions.values()) this.flushDurableOutput(session);
     this.sessions.clear();
   }
 

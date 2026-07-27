@@ -87,6 +87,7 @@ const resourceFields: Array<{
   { key: "maxResidentWorkspaces", label: "驻留 workspace 上限", description: "内存中保留的 workspace 会话数量。" },
   { key: "maxActiveWorkspacesPerClient", label: "单连接主体 workspace 上限", description: "单个本机连接主体可保持的活跃 workspace 数。" },
   { key: "maxManagedWorktrees", label: "托管 worktree 上限", description: "DevSpace 同时维护的 Git worktree 数量。" },
+  { key: "maxRequestBodyBytes", label: "MCP 请求体上限", description: "单个 MCP JSON 请求的最大字节数；必须容纳转义后的最大 patch。", unit: "字节" },
 ];
 
 const builtinInstructionFilenames = new Set([

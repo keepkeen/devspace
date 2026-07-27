@@ -55,8 +55,6 @@ try {
     "printf x >/dev/stderr",
     "printf x >/dev/fd/3",
     "tee /dev/stdout",
-    `bash -n <<'EOF'\ntouch ${join(outside, "parse-only.txt")}\nEOF`,
-    `bash -n <<< 'touch ${join(outside, "parse-only-here-string.txt")}'`,
     `cat <<EOF\ntouch ${join(outside, "heredoc-data.txt")}\nEOF`,
   ];
   for (const command of allowed) {
@@ -114,6 +112,11 @@ try {
     `env --argv0 custom-name touch ${join(outside, "env-argv0-long.txt")}`,
     `if true; then touch ${join(outside, "conditional.txt")}; fi`,
     `2>/dev/null touch ${join(outside, "redirect-prefixed.txt")}`,
+    // Shell no-execute flags are not interpreted; the payload is analyzed
+    // regardless, because every unhandled spelling was a total bypass.
+    `bash -n <<'EOF'\ntouch ${join(outside, "parse-only.txt")}\nEOF`,
+    `bash -n <<< 'touch ${join(outside, "parse-only-here-string.txt")}'`,
+    `bash -n +o noexec -c 'touch ${join(outside, "plus-o-noexec.txt")}'`,
   ];
   for (const command of denied) {
     const violation = validateShellWriteTargets(command, root, root);
@@ -183,57 +186,45 @@ try {
     )?.reason ?? "",
     /symlink target is outside the workspace/i,
   );
-  assert.equal(
-    validateDirectCommandPaths(
-      "node",
-      ["-e", "require('fs').writeFileSync('build/generated.txt', 'ok')"],
-      root,
-      root,
-      [protectedRoot, stateRoot],
-    ),
-    undefined,
-    "a statically visible interpreter write inside the workspace is allowed",
-  );
+  // Inline interpreter code is not parsed. Reading intent out of `python -c`
+  // or `node -e` only ever caught the textbook spelling: clustered flags
+  // (`perl -we`), attached payloads (`python -c'…'`), keyword arguments, and
+  // child_process all slipped past, while ordinary one-liners such as
+  // `items.remove(x)` were rejected. Confinement here comes from running under
+  // a dedicated OS user, container, or VM, not from reading the payload.
+  for (const args of [
+    ["-e", `require('fs').writeFileSync('${join(outside, "node.txt")}', 'x')`],
+    ["-e", "require('fs').writeFileSync('build/generated.txt', 'ok')"],
+    ["-e", "require('fs').writeFileSync(target, 'x')"],
+    ["-e", "process.stdout.write('safe output')"],
+  ]) {
+    assert.equal(
+      validateDirectCommandPaths("node", args, root, root, [protectedRoot, stateRoot]),
+      undefined,
+      "inline interpreter payloads are not statically analyzed",
+    );
+  }
+  for (const args of [
+    ["-c", `open('${join(outside, "python.txt")}', 'w').write('x')`],
+    ["-c", "items.remove(x)"],
+    ["-c", "d2 = d.copy()"],
+  ]) {
+    assert.equal(
+      validateDirectCommandPaths("python3", args, root, root, [protectedRoot, stateRoot]),
+      undefined,
+      "ordinary interpreter one-liners are never rejected for their contents",
+    );
+  }
+  // Literal path operands are still confined, including for interpreters.
   assert.match(
     validateDirectCommandPaths(
-      "node",
-      ["--eval", `require('fs').writeFileSync('${join(outside, "node.txt")}', 'x')`],
+      "cp",
+      ["build/a.txt", join(outside, "escaped.txt")],
       root,
       root,
       [protectedRoot, stateRoot],
     )?.reason ?? "",
     /outside the workspace/i,
-  );
-  assert.match(
-    validateDirectCommandPaths(
-      "python3",
-      ["-c", `open('${join(outside, "python.txt")}', 'w').write('x')`],
-      root,
-      root,
-      [protectedRoot, stateRoot],
-    )?.reason ?? "",
-    /outside the workspace/i,
-  );
-  assert.match(
-    validateDirectCommandPaths(
-      "node",
-      ["-e", "require('fs').writeFileSync(target, 'x')"],
-      root,
-      root,
-      [protectedRoot, stateRoot],
-    )?.reason ?? "",
-    /cannot be statically confined/i,
-  );
-  assert.equal(
-    validateDirectCommandPaths(
-      "node",
-      ["-e", "process.stdout.write('safe output')"],
-      root,
-      root,
-      [protectedRoot, stateRoot],
-    ),
-    undefined,
-    "read-only or stdout-only inline code remains available",
   );
 
   assert.match(

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 
@@ -38,6 +39,37 @@ export function assertAllowedPath(path: string, allowedRoots: string[]): string 
     return resolvedPath;
   }
 
+  throw new AccessDeniedError(`Path is outside allowed roots: ${path}`);
+}
+
+/**
+ * Canonical confinement for an existing directory used as an execution root.
+ *
+ * The ordinary path helper is intentionally lexical because it also resolves
+ * not-yet-created file destinations. A process working directory already
+ * exists, so following both it and the configured roots through realpath closes
+ * the directory-symlink escape without changing file-creation semantics.
+ */
+export function assertAllowedDirectory(path: string, allowedRoots: string[]): string {
+  let canonicalPath: string;
+  try {
+    canonicalPath = realpathSync(resolve(expandHomePath(path)));
+    if (!statSync(canonicalPath).isDirectory()) throw new Error("not a directory");
+  } catch {
+    throw new AccessDeniedError(`Path is not an existing directory: ${path}`);
+  }
+
+  const canonicalRoots = allowedRoots.flatMap((root) => {
+    try {
+      const canonicalRoot = realpathSync(resolve(expandHomePath(root)));
+      return statSync(canonicalRoot).isDirectory() ? [canonicalRoot] : [];
+    } catch {
+      return [];
+    }
+  });
+  if (canonicalRoots.some((root) => isPathInsideRoot(canonicalPath, root))) {
+    return canonicalPath;
+  }
   throw new AccessDeniedError(`Path is outside allowed roots: ${path}`);
 }
 

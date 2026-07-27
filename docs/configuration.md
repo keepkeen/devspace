@@ -263,6 +263,7 @@ password change and revokes tokens.
 | `DEVSPACE_MAX_RESIDENT_WORKSPACES` | `256` | Maximum workspaces retained in memory. |
 | `DEVSPACE_MAX_ACTIVE_WORKSPACES_PER_CLIENT` | `32` | Maximum active persisted workspaces owned by one connection principal. |
 | `DEVSPACE_MAX_MANAGED_WORKTREES` | `64` | Maximum managed worktrees retained on disk. |
+| `DEVSPACE_MAX_REQUEST_BODY_BYTES` | `33554432` | Largest inbound MCP JSON body. The default accommodates the 4 MiB UTF-8 `apply_patch` limit even under worst-case JSON escaping, as well as command stdin; an oversized body is rejected before anything runs. |
 
 Stateless request capacity is released through one idempotent path when the
 request is aborted, the HTTP response closes, or normal request cleanup runs.
@@ -560,6 +561,13 @@ from:
 - `~/.devspace/agents/*.md`
 - project `.devspace/agents/*.md`
 
+Profiles are layered in that order. A project profile with the same `name`
+replaces the user-level definition for that Workspace, matching the usual
+repository-overrides-user configuration model. Project profile bodies are
+repository-controlled executable-agent instructions; enable Subagents only for
+repositories whose profiles you are willing to run with the Workspace's full
+command authority.
+
 Full context from `get_workspace_context` or `resume_workspace` returns a
 compact catalog containing profile names,
 descriptions, providers, and optional models/thinking levels so the host model can choose an
@@ -568,6 +576,20 @@ lists existing subagent sessions for the current workspace, scoped by the
 workspace environment injected into shell commands. The `subagent-delegation`
 skill teaches the model to use only the minimal `devspace agents ls`,
 `devspace agents run`, and `devspace agents show` workflow.
+
+DevSpace-created workers remain in the enclosing `exec_command` process group,
+so the Workspace root lease stays held until the worker and its inherited
+children exit. ACP permission requests in writable mode are automatically
+approved in full-trust mode. DevSpace prefers `allow_once`, but falls back to
+`allow_always` when that is the only permitting option exposed by the provider;
+such a grant may persist according to that provider's own session policy.
+
+Provider capture is bounded at 4 MiB, errors at 64 KiB, and the SQLite response
+summary at 256 KiB. Responses larger than the summary budget are retained in a
+private `stateDir/local-agent-output` file. `devspace agents show` streams that
+retained response; when invoked through `exec_command`, the existing durable
+process-output store returns an `outputId` for paging with
+`read_process_output`. Pruning the agent record removes its retained sidecar.
 
 Starter profile templates are available under `examples/agents/`. Copy or adapt
 them into one of the active profile directories before use.

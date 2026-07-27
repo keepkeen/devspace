@@ -28,6 +28,15 @@ import {
   resolveLocalAgentTarget,
 } from "./local-agent-targets.js";
 import { createLocalAgentStore, type LocalAgentRecord } from "./local-agent-store.js";
+import {
+  readLocalAgentOutput,
+  removeLocalAgentOutputSync,
+  writeLocalAgentOutput,
+} from "./local-agent-output.js";
+import {
+  localAgentWorkerSpawnOptions,
+  shouldUnrefLocalAgentWorker,
+} from "./local-agent-worker.js";
 import type { LocalAgentRunResult } from "./local-agent-runtime.js";
 import {
   cleanupDetachedAgentPromptArtifacts,
@@ -44,7 +53,7 @@ import {
   updateDevspaceConfig,
   type DevspaceUserConfig,
 } from "./user-config.js";
-import { expandHomePath } from "./roots.js";
+import { assertAllowedDirectory, expandHomePath } from "./roots.js";
 import { shutdownHttpServers } from "./server-shutdown.js";
 import { AuditEventStore, type AuditEventQuery } from "./audit-events.js";
 import { formatChinaTimestamp } from "./logger.js";
@@ -276,6 +285,35 @@ async function serve(): Promise<void> {
   const controlServer = controlApp.listen(config.controlPort, "127.0.0.1", () => {
     console.log(`local control plane: http://127.0.0.1:${config.controlPort}`);
   });
+
+  // A bind failure would otherwise be an unhandled 'error' event that exits the
+  // process with the databases open and the singleton locks held. A second
+  // instance collides on both ports, so this runs once and closes the listener
+  // that did bind rather than leaving it accepting connections while draining.
+  let listenFailureHandled = false;
+  const listenerFailed = (listener: "public" | "control", error: unknown) => {
+    const code = error && typeof error === "object"
+      ? (error as { code?: unknown }).code
+      : undefined;
+    const bindFailure = code === "EADDRINUSE" || code === "EACCES" || code === "EADDRNOTAVAIL";
+    if (listenFailureHandled) return;
+    listenFailureHandled = true;
+    const port = listener === "control" ? config.controlPort : config.port;
+    console.error(
+      bindFailure
+        ? `devspace could not bind the ${listener} listener on port ${port}:`
+        : `devspace ${listener} listener failed after startup on port ${port}:`,
+      error,
+    );
+    httpServer.close();
+    controlServer.close();
+    void beginClose()
+      .then(close)
+      .catch((closeError) => console.error("devspace shutdown failed", closeError))
+      .finally(() => process.exit(1));
+  };
+  httpServer.on("error", (error) => listenerFailed("public", error));
+  controlServer.on("error", (error) => listenerFailed("control", error));
 
   let shuttingDown = false;
   const shutdown = async () => {
@@ -731,9 +769,10 @@ async function runAgentsCommand(args: string[]): Promise<void> {
 
 async function runAgentsList(): Promise<void> {
   const config = loadConfig();
+  const workspaceRoot = resolveCurrentWorkspaceRoot(config.allowedRoots);
   const store = createLocalAgentStore(config);
   store.cleanup();
-  const agents = store.list(resolveCurrentWorkspaceScope());
+  const agents = store.list(resolveCurrentWorkspaceScope(workspaceRoot));
 
   if (agents.length === 0) {
     console.log("No subagent sessions found for this workspace.");
@@ -749,10 +788,11 @@ async function runAgentsRun(args: string[]): Promise<void> {
   const parsed = parseLocalAgentRunArgs(args);
 
   const config = loadConfig();
-  const workspaceRoot = resolveCurrentWorkspaceRoot();
+  const workspaceRoot = resolveCurrentWorkspaceRoot(config.allowedRoots);
+  const workspaceScope = resolveCurrentWorkspaceScope(workspaceRoot);
   const store = createLocalAgentStore(config);
   store.cleanup();
-  const existing = store.get(parsed.target);
+  const existing = store.get(parsed.target, workspaceScope);
 
   if (existing) {
     if (!isLocalAgentProvider(existing.provider)) {
@@ -761,6 +801,7 @@ async function runAgentsRun(args: string[]): Promise<void> {
     assertLocalAgentProviderAvailable(existing.provider);
     const promptFile = writeAgentPromptFile(parsed.prompt);
     try {
+      removeLocalAgentOutputSync(config.stateDir, existing.id);
       store.update(existing.id, {
         status: "starting",
         model: parsed.model ?? existing.model,
@@ -815,18 +856,26 @@ async function runAgentsShow(args: string[]): Promise<void> {
   if (!id) throw new Error("Usage: devspace agents show <id>");
 
   const config = loadConfig();
+  const workspaceRoot = resolveCurrentWorkspaceRoot(config.allowedRoots);
+  const workspaceScope = resolveCurrentWorkspaceScope(workspaceRoot);
   const store = createLocalAgentStore(config);
   store.cleanup();
-  let record = store.get(id);
+  let record = store.get(id, workspaceScope);
   if (!record) throw new Error(`Unknown subagent id: ${id}`);
 
   const deadline = Date.now() + 15_000;
   while ((record.status === "starting" || record.status === "running") && Date.now() < deadline) {
     await sleep(500);
-    record = store.get(id) ?? record;
+    record = store.get(id, workspaceScope) ?? record;
   }
 
   console.log(formatAgentLine(record));
+  const retainedOutput = readLocalAgentOutput(config.stateDir, record.id);
+  if (retainedOutput !== undefined) {
+    output.write(retainedOutput);
+    if (!retainedOutput.endsWith("\n")) output.write("\n");
+    return;
+  }
   if (record.latestResponse) {
     console.log(record.latestResponse);
     return;
@@ -850,25 +899,32 @@ async function runAgentsWorker(args: string[]): Promise<void> {
   const store = createLocalAgentStore(config);
   try {
     store.cleanup();
-    const record = store.get(id);
+    const record = store.getForWorker(id);
     if (!record) throw new Error(`Unknown subagent id: ${id}`);
+    // The worker learns its workspace from the record, so the recorded root has
+    // to be confined here. Otherwise a stale or hand-written row could run an
+    // agent rooted outside every authorized project.
+    const workspaceRoot = assertAllowedDirectory(record.workspaceRoot, config.allowedRoots);
+    const effectiveRecord = { ...record, workspaceRoot };
 
-    store.update(record.id, { status: "running", error: undefined });
+    store.update(record.id, { workspaceRoot, status: "running", error: undefined });
     try {
-      const profiles = await loadLocalAgentProfiles(config, record.workspaceRoot);
-      const profile = profiles.find((candidate) => candidate.name === record.profileName);
+      const profiles = await loadLocalAgentProfiles(config, workspaceRoot);
+      const profile = profiles.find((candidate) => candidate.name === effectiveRecord.profileName);
       const prompt = await readFile(promptFile, "utf8");
       const result = profile
-        ? await runLocalAgentProfile(profile, record, prompt)
-        : await runRawLocalAgentProvider(record, prompt);
-      store.update(record.id, {
+        ? await runLocalAgentProfile(profile, effectiveRecord, prompt)
+        : await runRawLocalAgentProvider(effectiveRecord, prompt);
+      writeLocalAgentOutput(config.stateDir, effectiveRecord.id, result.finalResponse);
+      store.update(effectiveRecord.id, {
         providerSessionId: result.providerSessionId ?? undefined,
         status: "idle",
         latestResponse: result.finalResponse,
         error: undefined,
       });
     } catch (error) {
-      store.update(record.id, {
+      removeLocalAgentOutputSync(config.stateDir, effectiveRecord.id);
+      store.update(effectiveRecord.id, {
         status: "error",
         error: error instanceof Error ? error.message : String(error),
       });
@@ -922,15 +978,11 @@ function spawnAgentWorker(agentId: string, promptFile: string): void {
     agentId,
     "--prompt-file",
     promptFile,
-  ], {
-    detached: true,
-    stdio: "ignore",
-    env: process.env,
-  });
+  ], localAgentWorkerSpawnOptions(process.env));
   child.once("error", () => {
     void removeDetachedAgentPrompt(promptFile);
   });
-  child.unref();
+  if (shouldUnrefLocalAgentWorker()) child.unref();
 }
 
 function writeAgentPromptFile(prompt: string): string {
@@ -940,14 +992,20 @@ function writeAgentPromptFile(prompt: string): string {
   return filePath;
 }
 
-function resolveCurrentWorkspaceRoot(): string {
-  return resolve(process.env.DEVSPACE_WORKSPACE_ROOT || process.cwd());
+function resolveCurrentWorkspaceRoot(allowedRoots?: string[]): string {
+  const workspaceRoot = resolve(process.env.DEVSPACE_WORKSPACE_ROOT || process.cwd());
+  // DEVSPACE_WORKSPACE_ROOT is only protected on the MCP `environment` input, so
+  // any other entry point could otherwise root a subagent outside every
+  // authorized project.
+  return allowedRoots ? assertAllowedDirectory(workspaceRoot, allowedRoots) : workspaceRoot;
 }
 
-function resolveCurrentWorkspaceScope(): { workspaceId?: string; workspaceRoot: string } {
+function resolveCurrentWorkspaceScope(
+  workspaceRoot = resolveCurrentWorkspaceRoot(),
+): { workspaceId?: string; workspaceRoot: string } {
   return {
     workspaceId: process.env.DEVSPACE_WORKSPACE_ID,
-    workspaceRoot: resolveCurrentWorkspaceRoot(),
+    workspaceRoot,
   };
 }
 

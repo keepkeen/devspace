@@ -149,7 +149,16 @@ async function assertToolUnavailable(
   try {
     const result = await resultPromise;
     assert.equal(result.isError, true, JSON.stringify(result.content));
-    assert.match(JSON.stringify(result.content), new RegExp(`Tool ${toolName} not found`, "u"));
+    const error = (result.structuredContent as {
+      error?: { code?: unknown; recovery?: unknown };
+    } | undefined)?.error;
+    if (error) {
+      assert.equal(error.code, "tool_unavailable");
+      assert.equal(error.recovery, "refresh_tools_or_reauthorize");
+      assert.match(JSON.stringify(result.content), new RegExp(toolName, "u"));
+    } else {
+      assert.match(JSON.stringify(result.content), new RegExp(`Tool ${toolName} not found`, "u"));
+    }
   } catch (error) {
     assert.match(String(error), /Method not found/u);
   }

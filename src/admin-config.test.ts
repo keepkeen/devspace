@@ -48,6 +48,7 @@ assert.equal(initial.resources.maxMcpSessions, 12);
 assert.equal(initial.resources.maxProcessOutputFileBytes, 64 * 1024 * 1024);
 assert.equal(initial.resources.maxProcessOutputStorageBytes, 1024 * 1024 * 1024);
 assert.equal(initial.resources.completedProcessOutputTtlMs, 24 * 60 * 60 * 1_000);
+assert.equal(initial.resources.maxRequestBodyBytes, 32 * 1024 * 1024);
 
 const next = validateAdminConfig({
   ...initial,
@@ -64,6 +65,7 @@ const next = validateAdminConfig({
     maxProcessOutputFileBytes: 2_097_152,
     maxProcessOutputStorageBytes: 4_194_304,
     completedProcessOutputTtlMs: 120_000,
+    maxRequestBodyBytes: 40 * 1024 * 1024,
   },
 });
 assert.deepEqual(next.allowedRoots, [realpathSync(rootB), realpathSync(rootA)]);
@@ -83,6 +85,7 @@ assert.equal(persisted.resources.maxMcpSessions, 20);
 assert.equal(persisted.resources.maxProcessOutputFileBytes, 2_097_152);
 assert.equal(persisted.resources.maxProcessOutputStorageBytes, 4_194_304);
 assert.equal(persisted.resources.completedProcessOutputTtlMs, 120_000);
+assert.equal(persisted.resources.maxRequestBodyBytes, 40 * 1024 * 1024);
 assert.deepEqual(persisted.projectDocFallbackFilenames, ["TEAM_GUIDE.md"]);
 assert.equal(persisted.userInstructionsPath, realpathSync(userInstructionsPath));
 const unchangedSave = saveAdminConfig(next, env);
@@ -99,10 +102,12 @@ const outputOverrideEnv = {
   DEVSPACE_MAX_PROCESS_OUTPUT_FILE_BYTES: "1048576",
   DEVSPACE_MAX_PROCESS_OUTPUT_STORAGE_BYTES: "8388608",
   DEVSPACE_COMPLETED_PROCESS_OUTPUT_TTL_SECONDS: "60",
+  DEVSPACE_MAX_REQUEST_BODY_BYTES: "33554432",
 };
 assert.equal(loadAdminConfig(outputOverrideEnv).resources.maxProcessOutputFileBytes, 1_048_576);
 assert.equal(loadAdminConfig(outputOverrideEnv).resources.maxProcessOutputStorageBytes, 8_388_608);
 assert.equal(loadAdminConfig(outputOverrideEnv).resources.completedProcessOutputTtlMs, 60_000);
+assert.equal(loadAdminConfig(outputOverrideEnv).resources.maxRequestBodyBytes, 33_554_432);
 assert.deepEqual(
   adminConfigOverridePaths({
     ...env,
@@ -111,6 +116,7 @@ assert.deepEqual(
     DEVSPACE_MAX_PROCESS_OUTPUT_FILE_BYTES: "1048576",
     DEVSPACE_MAX_PROCESS_OUTPUT_STORAGE_BYTES: "8388608",
     DEVSPACE_COMPLETED_PROCESS_OUTPUT_TTL_SECONDS: "60",
+    DEVSPACE_MAX_REQUEST_BODY_BYTES: "33554432",
     DEVSPACE_PROJECT_DOC_FALLBACK_FILENAMES: "LOCAL_RULES.md",
     DEVSPACE_USER_INSTRUCTIONS_PATH: userInstructionsPath,
   }),
@@ -122,8 +128,15 @@ assert.deepEqual(
     "resources.maxProcessOutputFileBytes",
     "resources.maxProcessOutputStorageBytes",
     "resources.completedProcessOutputTtlMs",
+    "resources.maxRequestBodyBytes",
   ],
 );
+
+const bodyWarning = adminConfigWarnings({
+  ...initial,
+  resources: { ...initial.resources, maxRequestBodyBytes: 64 * 1024 },
+});
+assert.match(bodyWarning["resources.maxRequestBodyBytes"] ?? "", /apply_patch/u);
 
 const instructionsOverrideEnv = {
   ...env,
