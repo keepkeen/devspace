@@ -2132,6 +2132,27 @@ export function listenerErrorKind(error: unknown): "bind" | "runtime" {
   return isListenBindError(error) ? "bind" : "runtime";
 }
 
+/**
+ * Compatibility aliases used by some MCP hosts during OAuth rediscovery.
+ *
+ * RFC 9728 advertises the path-qualified protected-resource endpoint for the
+ * `/mcp` resource, while RFC 8414 uses the root issuer metadata endpoint. Some
+ * host reconnect flows probe the opposite path variants before consulting the
+ * bearer challenge. Serving the same metadata for both variants keeps an
+ * existing Connector reconnectable without changing the canonical URLs we
+ * advertise to standards-compliant clients.
+ */
+export function oauthDiscoveryCompatibilityPath(pathname: string): string | undefined {
+  switch (pathname) {
+    case "/.well-known/oauth-protected-resource":
+      return "/.well-known/oauth-protected-resource/mcp";
+    case "/.well-known/oauth-authorization-server/mcp":
+      return "/.well-known/oauth-authorization-server";
+    default:
+      return undefined;
+  }
+}
+
 function isPayloadTooLargeError(error: unknown): boolean {
   return Boolean(error) && typeof error === "object" &&
     (error as { type?: unknown }).type === "entity.too.large";
@@ -6690,6 +6711,21 @@ export function createServer(configInput?: ServerConfig): RunningServer {
     } catch (error) {
       next(error);
     }
+  });
+
+  app.use((req, _res, next) => {
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      next();
+      return;
+    }
+    const canonicalPath = oauthDiscoveryCompatibilityPath(req.path);
+    if (!canonicalPath) {
+      next();
+      return;
+    }
+    const queryOffset = req.url.indexOf("?");
+    req.url = `${canonicalPath}${queryOffset >= 0 ? req.url.slice(queryOffset) : ""}`;
+    next();
   });
 
   app.use(

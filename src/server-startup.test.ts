@@ -6,7 +6,12 @@ import { join } from "node:path";
 import { loadConfig } from "./config.js";
 import { openDatabase } from "./db/client.js";
 import { MutationOperationStore } from "./mutation-operation-store.js";
-import { createServer, listenerErrorKind, patchFitsUtf8ByteLimit } from "./server.js";
+import {
+  createServer,
+  listenerErrorKind,
+  oauthDiscoveryCompatibilityPath,
+  patchFitsUtf8ByteLimit,
+} from "./server.js";
 import { SqliteWorkspaceStore } from "./workspace-store.js";
 
 const root = await mkdtemp(join(tmpdir(), "devspace-server-startup-test-"));
@@ -18,6 +23,15 @@ let workspaceStore: SqliteWorkspaceStore | undefined;
 
 assert.equal(listenerErrorKind(Object.assign(new Error("busy"), { code: "EADDRINUSE" })), "bind");
 assert.equal(listenerErrorKind(Object.assign(new Error("files"), { code: "EMFILE" })), "runtime");
+assert.equal(
+  oauthDiscoveryCompatibilityPath("/.well-known/oauth-protected-resource"),
+  "/.well-known/oauth-protected-resource/mcp",
+);
+assert.equal(
+  oauthDiscoveryCompatibilityPath("/.well-known/oauth-authorization-server/mcp"),
+  "/.well-known/oauth-authorization-server",
+);
+assert.equal(oauthDiscoveryCompatibilityPath("/.well-known/oauth-authorization-server"), undefined);
 assert.equal(patchFitsUtf8ByteLimit("a".repeat(4 * 1024 * 1024)), true);
 assert.equal(patchFitsUtf8ByteLimit("中".repeat(2 * 1024 * 1024)), false);
 

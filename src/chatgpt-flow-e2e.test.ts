@@ -1122,6 +1122,11 @@ async function discoverOAuth(origin: URL): Promise<OAuthMetadata> {
   };
   assert.equal(resourceMetadata.resource, resource);
   assert.deepEqual(resourceMetadata.authorization_servers, [`${publicBaseUrl}/`]);
+  const compatibilityResourceMetadataResponse = await fetch(
+    new URL("/.well-known/oauth-protected-resource", origin),
+  );
+  assert.equal(compatibilityResourceMetadataResponse.status, 200);
+  assert.deepEqual(await compatibilityResourceMetadataResponse.json(), resourceMetadata);
 
   const authorizationMetadataResponse = await fetch(
     new URL("/.well-known/oauth-authorization-server", origin),
@@ -1132,6 +1137,14 @@ async function discoverOAuth(origin: URL): Promise<OAuthMetadata> {
   assert.equal(authorizationMetadata.authorization_endpoint, `${publicBaseUrl}/authorize`);
   assert.equal(authorizationMetadata.token_endpoint, `${publicBaseUrl}/token`);
   assert.equal(authorizationMetadata.registration_endpoint, `${publicBaseUrl}/register`);
+  const compatibilityAuthorizationMetadataResponse = await fetch(
+    new URL("/.well-known/oauth-authorization-server/mcp", origin),
+  );
+  assert.equal(compatibilityAuthorizationMetadataResponse.status, 200);
+  assert.deepEqual(
+    await compatibilityAuthorizationMetadataResponse.json(),
+    authorizationMetadata,
+  );
   return authorizationMetadata as OAuthMetadata;
 }
 
