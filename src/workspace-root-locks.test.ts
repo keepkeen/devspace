@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createHash } from "node:crypto";
-import { access, chmod, lstat, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { access, chmod, lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "./config.js";
@@ -209,6 +209,63 @@ try {
   await assert.rejects(access(deadTemporaryMarker), { code: "ENOENT" });
   await access(livePartialMarker);
   await rm(livePartialMarker, { force: true });
+
+  const corruptReleaseKey = "corrupt-release-root";
+  const corruptReleaseDigest = createHash("sha256")
+    .update("devspace-cross-process-root-lock-v1\0", "utf8")
+    .update(corruptReleaseKey, "utf8")
+    .digest("hex");
+  const corruptWriterPath = join(crossProcessRoot, corruptReleaseDigest, "writer.json");
+  const corruptReleaseLock = new CrossProcessWorkspaceRootLock({
+    root: crossProcessRoot,
+    acquireTimeoutMs: 500,
+    pollIntervalMs: 10,
+    heartbeatIntervalMs: 60_000,
+    heartbeatStaleMs: 5,
+  });
+  const corruptReleaseLease = await corruptReleaseLock.acquire(corruptReleaseKey, "write");
+  const validMarker = await readFile(corruptWriterPath, "utf8");
+  await writeFile(corruptWriterPath, `${validMarker}${validMarker}`);
+  assert.doesNotThrow(
+    () => corruptReleaseLease.release(),
+    "a malformed marker observed during release must not terminate DevSpace",
+  );
+  const releaseAfterCorruptMarker = await new CrossProcessWorkspaceRootLock({
+    root: crossProcessRoot,
+    acquireTimeoutMs: 500,
+    pollIntervalMs: 10,
+    heartbeatStaleMs: 5,
+    now: () => Date.now() + 1_000,
+  }).acquire(corruptReleaseKey, "write");
+  releaseAfterCorruptMarker();
+
+  const concurrentHeartbeatKey = "concurrent-heartbeat-root";
+  const concurrentHeartbeatDigest = createHash("sha256")
+    .update("devspace-cross-process-root-lock-v1\0", "utf8")
+    .update(concurrentHeartbeatKey, "utf8")
+    .digest("hex");
+  const concurrentHeartbeatPath = join(
+    crossProcessRoot,
+    concurrentHeartbeatDigest,
+    "writer.json",
+  );
+  const concurrentHeartbeatLock = new CrossProcessWorkspaceRootLock({
+    root: crossProcessRoot,
+    acquireTimeoutMs: 500,
+    pollIntervalMs: 10,
+    heartbeatIntervalMs: 60_000,
+  });
+  const concurrentHeartbeatLease = await concurrentHeartbeatLock.acquire(
+    concurrentHeartbeatKey,
+    "write",
+  );
+  await Promise.all(Array.from({ length: 32 }, () => concurrentHeartbeatLease.heartbeat()));
+  const concurrentHeartbeatMarker = await readFile(concurrentHeartbeatPath, "utf8");
+  assert.doesNotThrow(
+    () => JSON.parse(concurrentHeartbeatMarker),
+    "concurrent heartbeat requests must leave one complete marker document",
+  );
+  concurrentHeartbeatLease.release();
 
   const lockModuleUrl = new URL("./cross-process-root-lock.ts", import.meta.url).href;
   const childSource = `

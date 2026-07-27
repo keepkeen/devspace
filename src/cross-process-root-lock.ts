@@ -303,10 +303,22 @@ export class CrossProcessWorkspaceRootLock {
   private createLease(path: string, initialMarker: LockMarker): WorkspaceRootLease {
     let marker = initialMarker;
     let released = false;
+    let pendingUpdates: Promise<void> = Promise.resolve();
+    const updateMarker = (
+      createNext: (current: LockMarker) => LockMarker,
+    ): Promise<boolean> => {
+      const operation = pendingUpdates.then(async () => {
+        if (released) return false;
+        const next = createNext(marker);
+        if (!await updateOwnedMarker(path, next)) return false;
+        marker = next;
+        return true;
+      });
+      pendingUpdates = operation.then(() => undefined, () => undefined);
+      return operation;
+    };
     const heartbeat = async (): Promise<void> => {
-      if (released) return;
-      const next = { ...marker, heartbeatAt: this.now() };
-      if (await updateOwnedMarker(path, next)) marker = next;
+      await updateMarker((current) => ({ ...current, heartbeatAt: this.now() }));
     };
     const timer = setInterval(() => {
       void heartbeat().catch(() => undefined);
@@ -316,7 +328,14 @@ export class CrossProcessWorkspaceRootLock {
       if (released) return;
       released = true;
       clearInterval(timer);
-      releaseOwnedMarkerSync(path, marker.token);
+      const token = marker.token;
+      // A heartbeat may already be inside its filesystem write. Make the
+      // synchronous release best-effort, then retry after all queued updates
+      // settle. A malformed transient marker must never terminate the server.
+      releaseOwnedMarkerSync(path, token);
+      void pendingUpdates
+        .then(() => removeOwnedMarker(path, token))
+        .catch(() => undefined);
     };
     const lease = (() => release()) as WorkspaceRootLease;
     lease.release = release;
@@ -324,19 +343,18 @@ export class CrossProcessWorkspaceRootLock {
     lease.attachProcess = async (owner): Promise<void> => {
       if (released) throw new Error("Workspace root lease was already released.");
       const identity = readProcessIdentity(owner.pid, this.runtime);
-      const next: LockMarker = {
-        ...marker,
+      const updated = await updateMarker((current) => ({
+        ...current,
         ownerPid: identity.pid,
         ...(identity.startIdentity
           ? { ownerStartIdentity: identity.startIdentity }
           : { ownerStartIdentity: undefined }),
         processGroupId: owner.processGroupId ?? identity.processGroupId,
         heartbeatAt: this.now(),
-      };
-      if (!await updateOwnedMarker(path, next)) {
+      }));
+      if (!updated) {
         throw new Error("Workspace root lease marker is no longer owned by this process.");
       }
-      marker = next;
     };
     return lease;
   }
@@ -534,12 +552,26 @@ async function updateOwnedMarker(path: string, marker: LockMarker): Promise<bool
     const current = parseLockMarker(JSON.parse(await handle.readFile("utf8")) as unknown);
     if (!current || current.token !== marker.token) return false;
     const bytes = Buffer.from(JSON.stringify(marker), "utf8");
-    await handle.truncate(0);
-    await handle.write(bytes, 0, bytes.byteLength, 0);
+    let written = 0;
+    while (written < bytes.byteLength) {
+      const result = await handle.write(
+        bytes,
+        written,
+        bytes.byteLength - written,
+        written,
+      );
+      if (result.bytesWritten < 1) {
+        throw new Error("Workspace root lease marker write made no progress.");
+      }
+      written += result.bytesWritten;
+    }
+    await handle.truncate(bytes.byteLength);
     await handle.sync();
     return true;
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    if ((error as NodeJS.ErrnoException).code === "ENOENT" || error instanceof SyntaxError) {
+      return false;
+    }
     throw error;
   } finally {
     await handle?.close();
@@ -551,7 +583,9 @@ async function removeOwnedMarker(path: string, token: string): Promise<void> {
     const marker = parseLockMarker(JSON.parse(await readFile(path, "utf8")) as unknown);
     if (marker?.token === token) await rm(path, { force: true });
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT" && !(error instanceof SyntaxError)) {
+      throw error;
+    }
   }
 }
 
@@ -560,7 +594,9 @@ function releaseOwnedMarkerSync(path: string, token: string): void {
     const marker = parseLockMarker(JSON.parse(readFileSync(path, "utf8")) as unknown);
     if (marker?.token === token) rmSync(path, { force: true });
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT" && !(error instanceof SyntaxError)) {
+      throw error;
+    }
   }
 }
 
