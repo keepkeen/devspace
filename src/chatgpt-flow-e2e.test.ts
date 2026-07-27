@@ -1122,9 +1122,20 @@ async function discoverOAuth(origin: URL): Promise<OAuthMetadata> {
   };
   assert.equal(resourceMetadata.resource, resource);
   assert.deepEqual(resourceMetadata.authorization_servers, [`${publicBaseUrl}/`]);
-  const compatibilityResourceMetadataResponse = await fetch(
+  const compatibilityResourceRedirect = await fetch(
     new URL("/.well-known/oauth-protected-resource", origin),
+    { redirect: "manual" },
   );
+  assert.equal(compatibilityResourceRedirect.status, 307);
+  assert.equal(
+    compatibilityResourceRedirect.headers.get("location"),
+    `${publicBaseUrl}/.well-known/oauth-protected-resource/mcp`,
+  );
+  assert.equal(compatibilityResourceRedirect.headers.get("cache-control"), "no-store");
+  const compatibilityResourceMetadataResponse = await fetch(localUrl(
+    origin,
+    compatibilityResourceRedirect.headers.get("location") ?? "",
+  ));
   assert.equal(compatibilityResourceMetadataResponse.status, 200);
   assert.deepEqual(await compatibilityResourceMetadataResponse.json(), resourceMetadata);
 
@@ -1137,9 +1148,20 @@ async function discoverOAuth(origin: URL): Promise<OAuthMetadata> {
   assert.equal(authorizationMetadata.authorization_endpoint, `${publicBaseUrl}/authorize`);
   assert.equal(authorizationMetadata.token_endpoint, `${publicBaseUrl}/token`);
   assert.equal(authorizationMetadata.registration_endpoint, `${publicBaseUrl}/register`);
-  const compatibilityAuthorizationMetadataResponse = await fetch(
+  const compatibilityAuthorizationRedirect = await fetch(
     new URL("/.well-known/oauth-authorization-server/mcp", origin),
+    { redirect: "manual" },
   );
+  assert.equal(compatibilityAuthorizationRedirect.status, 307);
+  assert.equal(
+    compatibilityAuthorizationRedirect.headers.get("location"),
+    `${publicBaseUrl}/.well-known/oauth-authorization-server`,
+  );
+  assert.equal(compatibilityAuthorizationRedirect.headers.get("cache-control"), "no-store");
+  const compatibilityAuthorizationMetadataResponse = await fetch(localUrl(
+    origin,
+    compatibilityAuthorizationRedirect.headers.get("location") ?? "",
+  ));
   assert.equal(compatibilityAuthorizationMetadataResponse.status, 200);
   assert.deepEqual(
     await compatibilityAuthorizationMetadataResponse.json(),

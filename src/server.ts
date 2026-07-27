@@ -2138,9 +2138,9 @@ export function listenerErrorKind(error: unknown): "bind" | "runtime" {
  * RFC 9728 advertises the path-qualified protected-resource endpoint for the
  * `/mcp` resource, while RFC 8414 uses the root issuer metadata endpoint. Some
  * host reconnect flows probe the opposite path variants before consulting the
- * bearer challenge. Serving the same metadata for both variants keeps an
- * existing Connector reconnectable without changing the canonical URLs we
- * advertise to standards-compliant clients.
+ * bearer challenge. Redirecting those probes to the canonical endpoints keeps
+ * an existing Connector reconnectable while ensuring the final metadata URL
+ * still agrees with its `resource` or `issuer` identifier.
  */
 export function oauthDiscoveryCompatibilityPath(pathname: string): string | undefined {
   switch (pathname) {
@@ -6713,7 +6713,7 @@ export function createServer(configInput?: ServerConfig): RunningServer {
     }
   });
 
-  app.use((req, _res, next) => {
+  app.use((req, res, next) => {
     if (req.method !== "GET" && req.method !== "HEAD") {
       next();
       return;
@@ -6724,8 +6724,10 @@ export function createServer(configInput?: ServerConfig): RunningServer {
       return;
     }
     const queryOffset = req.url.indexOf("?");
-    req.url = `${canonicalPath}${queryOffset >= 0 ? req.url.slice(queryOffset) : ""}`;
-    next();
+    const target = new URL(canonicalPath, config.publicBaseUrl);
+    if (queryOffset >= 0) target.search = req.url.slice(queryOffset + 1);
+    res.setHeader("Cache-Control", "no-store");
+    res.redirect(307, target.href);
   });
 
   app.use(

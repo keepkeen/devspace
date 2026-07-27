@@ -31,6 +31,7 @@ assert.equal(
   oauthDiscoveryCompatibilityPath("/.well-known/oauth-authorization-server/mcp"),
   "/.well-known/oauth-authorization-server",
 );
+assert.equal(oauthDiscoveryCompatibilityPath("/.well-known/oauth-protected-resource/mcp"), undefined);
 assert.equal(oauthDiscoveryCompatibilityPath("/.well-known/oauth-authorization-server"), undefined);
 assert.equal(patchFitsUtf8ByteLimit("a".repeat(4 * 1024 * 1024)), true);
 assert.equal(patchFitsUtf8ByteLimit("中".repeat(2 * 1024 * 1024)), false);
