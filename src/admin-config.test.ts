@@ -13,6 +13,11 @@ import {
   saveAdminConfigIfMatch,
   validateAdminConfig,
 } from "./admin-config.js";
+import {
+  DevspaceConfigConflictError,
+  readDevspaceConfigFileVersion,
+  writeDevspaceConfig,
+} from "./user-config.js";
 
 const testDir = mkdtempSync(join(tmpdir(), "devspace-admin-config-test-"));
 const configDir = join(testDir, "config");
@@ -60,7 +65,6 @@ const next = validateAdminConfig({
     ...initial.resources,
     maxMcpSessions: 20,
     maxProcessSessions: 10,
-    maxProcessSessionsPerClient: 10,
     maxProcessSessionsPerWorkspace: 5,
     maxProcessOutputFileBytes: 2_097_152,
     maxProcessOutputStorageBytes: 4_194_304,
@@ -166,6 +170,115 @@ const rejectedConcurrent = concurrentResults.find((result) => result.status === 
 assert(rejectedConcurrent?.status === "rejected");
 assert(rejectedConcurrent.reason instanceof AdminConfigConflictError);
 
+const interleavedSnapshot = await loadAdminConfigSnapshot(env);
+const externalConfig = {
+  ...JSON.parse(readFileSync(join(configDir, "config.json"), "utf8")),
+  widgets: "off",
+  externallyEdited: true,
+};
+let externalEditWritten = false;
+const interleavedInput = new Proxy({
+  ...interleavedSnapshot.config,
+  widgets: "full" as const,
+}, {
+  get(target, property, receiver) {
+    if (property === "widgets" && !externalEditWritten) {
+      externalEditWritten = true;
+      writeFileSync(join(configDir, "config.json"), JSON.stringify(externalConfig, null, 2) + "\n");
+    }
+    return Reflect.get(target, property, receiver);
+  },
+});
+await assert.rejects(
+  saveAdminConfigIfMatch(interleavedInput, interleavedSnapshot.revision, env),
+  (error) => error instanceof AdminConfigConflictError,
+);
+assert.equal(externalEditWritten, true);
+assert.equal(
+  JSON.parse(readFileSync(join(configDir, "config.json"), "utf8")).externallyEdited,
+  true,
+  "an external edit between the initial CAS check and rename must not be overwritten",
+);
+
+const replacedSnapshot = await loadAdminConfigSnapshot(env);
+const unchangedSource = readFileSync(join(configDir, "config.json"), "utf8");
+let externalReplacementWritten = false;
+const replacedInput = new Proxy({
+  ...replacedSnapshot.config,
+  widgets: "changes" as const,
+}, {
+  get(target, property, receiver) {
+    if (property === "widgets" && !externalReplacementWritten) {
+      externalReplacementWritten = true;
+      const replacementPath = join(configDir, "config.external-replacement.json");
+      writeFileSync(replacementPath, unchangedSource);
+      renameSync(replacementPath, join(configDir, "config.json"));
+    }
+    return Reflect.get(target, property, receiver);
+  },
+});
+await assert.rejects(
+  saveAdminConfigIfMatch(replacedInput, replacedSnapshot.revision, env),
+  (error) => error instanceof AdminConfigConflictError,
+  "an atomic external replacement must conflict even when its content hash is unchanged",
+);
+assert.equal(externalReplacementWritten, true);
+
+const publishRaceConfigDir = join(testDir, "publish-race-config");
+mkdirSync(publishRaceConfigDir);
+const publishRaceEnv = { DEVSPACE_CONFIG_DIR: publishRaceConfigDir };
+const publishRacePath = join(publishRaceConfigDir, "config.json");
+const publishRaceOriginal = JSON.stringify({
+  schemaVersion: 2,
+  allowedRoots: [rootA],
+  widgets: "changes",
+}, null, 2) + "\n";
+const publishRaceExternal = JSON.stringify({
+  schemaVersion: 2,
+  allowedRoots: [rootA],
+  widgets: "off",
+  externalFinalWrite: true,
+}, null, 2) + "\n";
+writeFileSync(publishRacePath, publishRaceOriginal);
+const publishRaceVersion = readDevspaceConfigFileVersion(publishRaceEnv);
+let publishRaceHookCalled = false;
+let preservedConflictPath: string | undefined;
+assert.throws(
+  () => writeDevspaceConfig({ allowedRoots: [rootA], widgets: "full" }, publishRaceEnv, {
+    expectedVersion: publishRaceVersion,
+    beforePublish: () => {
+      publishRaceHookCalled = true;
+      writeFileSync(publishRacePath, publishRaceExternal);
+    },
+  }),
+  (error) => {
+    if (!(error instanceof DevspaceConfigConflictError)) return false;
+    preservedConflictPath = error.preservedConflictPath;
+    return true;
+  },
+  "an external write after final validation must make no-clobber publish fail",
+);
+assert.equal(publishRaceHookCalled, true);
+assert.equal(readFileSync(publishRacePath, "utf8"), publishRaceExternal);
+assert.ok(preservedConflictPath, "the displaced original must be retained as a named conflict copy");
+assert.equal(readFileSync(preservedConflictPath, "utf8"), publishRaceOriginal);
+
+const missingPublishRaceDir = join(testDir, "missing-publish-race-config");
+mkdirSync(missingPublishRaceDir);
+const missingPublishRaceEnv = { DEVSPACE_CONFIG_DIR: missingPublishRaceDir };
+const missingPublishRacePath = join(missingPublishRaceDir, "config.json");
+const missingPublishRaceVersion = readDevspaceConfigFileVersion(missingPublishRaceEnv);
+assert.equal(missingPublishRaceVersion.exists, false);
+assert.throws(
+  () => writeDevspaceConfig({ allowedRoots: [rootA], widgets: "full" }, missingPublishRaceEnv, {
+    expectedVersion: missingPublishRaceVersion,
+    beforePublish: () => writeFileSync(missingPublishRacePath, publishRaceExternal),
+  }),
+  (error) => error instanceof DevspaceConfigConflictError,
+  "a missing-file CAS must not overwrite a target created immediately before publish",
+);
+assert.equal(readFileSync(missingPublishRacePath, "utf8"), publishRaceExternal);
+
 const firstSaveConfigDir = join(testDir, "first-save-config");
 const firstSaveEnv = {
   DEVSPACE_CONFIG_DIR: firstSaveConfigDir,
@@ -187,7 +300,7 @@ writeFileSync(join(conflictConfigDir, "auth.json"), JSON.stringify({
 }));
 writeFileSync(join(conflictConfigDir, "config.json"), JSON.stringify({
   allowedRoots: [rootA],
-  resources: { maxProcessSessions: 4, maxProcessSessionsPerClient: 4, maxProcessSessionsPerWorkspace: 4 },
+  resources: { maxProcessSessions: 4, maxProcessSessionsPerWorkspace: 4 },
 }));
 const conflictEnv = {
   DEVSPACE_CONFIG_DIR: conflictConfigDir,

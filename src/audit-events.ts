@@ -27,6 +27,12 @@ export interface PersistedAuditEvent {
   details: Record<string, unknown>;
 }
 
+export interface AuditEventStoreHealth {
+  eventCount: number;
+  firstEventAt?: string;
+  lastEventAt?: string;
+}
+
 const DEFAULT_RETENTION_MS = 30 * 24 * 60 * 60_000;
 const DEFAULT_MAX_EVENTS = 100_000;
 const MAX_QUERY_LIMIT = 1_000;
@@ -164,6 +170,23 @@ export class AuditEventStore {
       ...(row.errorFingerprint ? { errorFingerprint: row.errorFingerprint } : {}),
       details: parseDetails(detailsJson),
     }));
+  }
+
+  health(): AuditEventStoreHealth {
+    this.assertOpen();
+    const row = this.database.sqlite.prepare(`
+      select count(*) as eventCount, min(ts) as firstEventAt, max(ts) as lastEventAt
+      from audit_events
+    `).get() as {
+      eventCount: number;
+      firstEventAt: string | null;
+      lastEventAt: string | null;
+    };
+    return {
+      eventCount: row.eventCount,
+      ...(row.firstEventAt ? { firstEventAt: row.firstEventAt } : {}),
+      ...(row.lastEventAt ? { lastEventAt: row.lastEventAt } : {}),
+    };
   }
 
   cleanup(now = Date.now()): number {

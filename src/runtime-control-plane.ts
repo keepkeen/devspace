@@ -8,6 +8,7 @@ import type { RuntimeDiagnostics } from "./runtime-diagnostics.js";
 import type { McpSessionUsageSnapshot } from "./mcp-sessions.js";
 import { DEVSPACE_VERSION } from "./version.js";
 import type { AuditWriteHealth } from "./logger.js";
+import type { AuditEventStoreHealth } from "./audit-events.js";
 
 interface ProcessUsage {
   sessions: number;
@@ -42,6 +43,15 @@ interface OAuthUsage {
   legacyWildcardGrants: number;
 }
 
+export interface ProjectExecutionUsage {
+  total: number;
+  provisioning: number;
+  active: number;
+  revoked: number;
+  quarantined: number;
+  closed: number;
+}
+
 interface RevocationCounts {
   clients: number;
   accessTokens: number;
@@ -59,6 +69,13 @@ interface AllowedRootsReloadResult {
   cleanupPending: number;
 }
 
+type GlobalRevocationRelease = () => void;
+
+export interface RuntimeAuditStatus extends AuditEventStoreHealth {
+  enabled: boolean;
+  stateDirRef: string;
+}
+
 export interface RuntimeControlPlaneOptions {
   internalAuth: {
     diagnostics: string | Uint8Array;
@@ -73,6 +90,9 @@ export interface RuntimeControlPlaneOptions {
   allowedRootsRevision(): string;
   allowedRootsCleanupPending(): number;
   isClosing(): boolean;
+  publicListenerBound?(): boolean;
+  controlListenerBound?(): boolean;
+  backendPid?(): number;
   workspaceDatabaseReady(): boolean;
   oauthDatabaseReady(): boolean;
   mcpUsage(): McpSessionUsageSnapshot;
@@ -80,9 +100,14 @@ export interface RuntimeControlPlaneOptions {
   processOutputUsage(): ProcessOutputUsage;
   workspaceUsage(): WorkspaceUsage;
   oauthUsage(): OAuthUsage;
+  projectExecutionUsage(): ProjectExecutionUsage;
   auditWriteHealth(): Readonly<AuditWriteHealth>;
+  auditStatus(): RuntimeAuditStatus;
   reloadAllowedRoots(): Promise<AllowedRootsReloadResult>;
-  beforeGlobalRevocation(): void | Promise<void>;
+  beforeGlobalRevocation():
+    | void
+    | GlobalRevocationRelease
+    | Promise<void | GlobalRevocationRelease>;
   revokeAll(): RevocationCounts;
   runtimeDiagnostics: RuntimeDiagnostics;
   onGlobalRevocation(counts: RevocationCounts): void | Promise<void>;
@@ -90,7 +115,12 @@ export interface RuntimeControlPlaneOptions {
 
 export type RuntimeReadinessOptions = Pick<
   RuntimeControlPlaneOptions,
-  "generation" | "isClosing" | "workspaceDatabaseReady" | "oauthDatabaseReady"
+  | "generation"
+  | "isClosing"
+  | "publicListenerBound"
+  | "controlListenerBound"
+  | "workspaceDatabaseReady"
+  | "oauthDatabaseReady"
 >;
 
 /** Public liveness/readiness endpoints. This router never exposes control actions. */
@@ -102,6 +132,8 @@ export function createRuntimeReadinessPlane(options: RuntimeReadinessOptions): R
   router.get("/readyz", (_req, res) => {
     const snapshot = readinessSnapshot({
       closing: options.isClosing(),
+      publicListenerBound: options.publicListenerBound?.(),
+      controlListenerBound: options.controlListenerBound?.(),
       workspaceDatabaseReady: options.workspaceDatabaseReady(),
       oauthDatabaseReady: options.oauthDatabaseReady(),
       generation: options.generation,
@@ -113,6 +145,29 @@ export function createRuntimeReadinessPlane(options: RuntimeReadinessOptions): R
 
 export function createRuntimeControlPlane(options: RuntimeControlPlaneOptions): Router {
   const router = Router();
+
+  router.get("/internal/readiness", (req, res) => {
+    if (!validInternalDiagnosticsToken(
+      options.internalAuth.diagnostics,
+      req.header("x-devspace-internal-token"),
+    )) {
+      res.status(404).json({ error: "not_found" });
+      return;
+    }
+    const snapshot = readinessSnapshot({
+      closing: options.isClosing(),
+      publicListenerBound: options.publicListenerBound?.(),
+      controlListenerBound: options.controlListenerBound?.(),
+      workspaceDatabaseReady: options.workspaceDatabaseReady(),
+      oauthDatabaseReady: options.oauthDatabaseReady(),
+      generation: options.generation,
+    });
+    res.setHeader("Cache-Control", "no-store");
+    res.status(snapshot.statusCode).json({
+      ...snapshot.body,
+      pid: options.backendPid?.() ?? process.pid,
+    });
+  });
 
   router.get("/internal/diagnostics", (req, res) => {
     if (!validInternalDiagnosticsToken(
@@ -127,11 +182,14 @@ export function createRuntimeControlPlane(options: RuntimeControlPlaneOptions): 
     const processOutputUsage = options.processOutputUsage();
     const workspaceUsage = options.workspaceUsage();
     const oauthUsage = options.oauthUsage();
+    const projectExecutionUsage = options.projectExecutionUsage();
     res.setHeader("Cache-Control", "no-store");
     res.json({
       generatedAt: new Date().toISOString(),
       version: DEVSPACE_VERSION,
+      pid: options.backendPid?.() ?? process.pid,
       generation: options.generation,
+      buildRevision: process.env.DEVSPACE_BUILD_REVISION || null,
       runtimeConfig: {
         ...options.runtimeConfig,
         allowedRootsRevision: options.allowedRootsRevision(),
@@ -176,9 +234,13 @@ export function createRuntimeControlPlane(options: RuntimeControlPlaneOptions): 
           expiredRecords: oauthUsage.expiredAccessTokens + oauthUsage.expiredRefreshTokens,
           legacyWildcardGrants: oauthUsage.legacyWildcardGrants,
         },
+        projectExecutions: projectExecutionUsage,
       },
       observability: {
-        audit: options.auditWriteHealth(),
+        audit: {
+          ...options.auditStatus(),
+          ...options.auditWriteHealth(),
+        },
       },
       recentFailures: options.runtimeDiagnostics.snapshot(),
     });
@@ -196,11 +258,15 @@ export function createRuntimeControlPlane(options: RuntimeControlPlaneOptions): 
       res.status(400).json({ error: "invalid_scope" });
       return;
     }
-    await options.beforeGlobalRevocation();
-    const revoked = options.revokeAll();
-    res.setHeader("Cache-Control", "no-store");
-    await options.onGlobalRevocation(revoked);
-    res.json({ ok: true, revoked });
+    const releaseGlobalRevocation = await options.beforeGlobalRevocation();
+    try {
+      const revoked = options.revokeAll();
+      res.setHeader("Cache-Control", "no-store");
+      await options.onGlobalRevocation(revoked);
+      res.json({ ok: true, revoked });
+    } finally {
+      releaseGlobalRevocation?.();
+    }
   });
 
   router.post("/internal/config/reload-roots", async (req, res) => {
@@ -229,12 +295,20 @@ export function createRuntimeControlPlane(options: RuntimeControlPlaneOptions): 
 
 export function readinessSnapshot(input: {
   closing: boolean;
+  publicListenerBound?: boolean;
+  controlListenerBound?: boolean;
   workspaceDatabaseReady: boolean;
   oauthDatabaseReady: boolean;
   generation?: string;
 }) {
   const checks = {
     lifecycle: !input.closing,
+    ...(input.publicListenerBound === undefined
+      ? {}
+      : { publicListener: input.publicListenerBound }),
+    ...(input.controlListenerBound === undefined
+      ? {}
+      : { controlListener: input.controlListenerBound }),
     workspaceDatabase: input.workspaceDatabaseReady,
     oauthDatabase: input.oauthDatabaseReady,
   };

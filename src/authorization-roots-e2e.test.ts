@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { authorizationRootId } from "./authorization-roots.js";
@@ -12,23 +14,35 @@ import { SqliteOAuthClientsStore, SqliteOAuthStore } from "./oauth-store.js";
 import { createServer } from "./server.js";
 import { SqliteWorkspaceStore } from "./workspace-store.js";
 
+const execFileAsync = promisify(execFile);
 const root = await mkdtemp(join(tmpdir(), "devspace-authorization-roots-e2e-"));
-const rootA = join(root, "account-a-root");
-const rootB = join(root, "account-b-root");
+const rootA = join(root, "authorized-root");
+const rootB = join(root, "ungranted-root");
 const stateDir = join(root, "state");
 const ownerToken = "authorization-roots-owner-token-long-enough";
 const publicBaseUrl = "http://127.0.0.1:7676";
-const accessTokenA = "authorization-root-token-a";
-const accessTokenB = "authorization-root-token-b";
+const accessToken = "authorization-root-token";
 
 await Promise.all([
   mkdir(rootA, { recursive: true }),
   mkdir(rootB, { recursive: true }),
 ]);
 await Promise.all([
-  writeFile(join(rootA, "payload.txt"), "account-a\n"),
-  writeFile(join(rootB, "payload.txt"), "account-b\n"),
+  writeFile(join(rootA, "payload.txt"), "authorized\n"),
+  writeFile(join(rootB, "payload.txt"), "ungranted\n"),
 ]);
+await execFileAsync("git", ["init", "-q"], { cwd: rootA });
+await execFileAsync("git", ["add", "."], { cwd: rootA });
+await execFileAsync(
+  "git",
+  [
+    "-c", "user.name=DevSpace Test",
+    "-c", "user.email=devspace@example.invalid",
+    "-c", "commit.gpgsign=false",
+    "commit", "-qm", "fixture",
+  ],
+  { cwd: rootA },
+);
 
 const config = loadConfig({
   DEVSPACE_CONFIG_DIR: join(root, "config"),
@@ -43,16 +57,14 @@ const config = loadConfig({
   PORT: "1",
 });
 
-const principalA = seedGrant(accessTokenA, rootA, "Account A");
-seedGrant(accessTokenB, rootB, "Account B");
+const principal = seedGrant(accessToken, rootA, "Owner");
 const workspaceStore = new SqliteWorkspaceStore(stateDir);
 try {
   workspaceStore.createSession({
     id: "account-a-hidden-root-b",
-    connectionPrincipalId: principalA,
+    connectionPrincipalId: principal,
     alias: "hidden-root-b",
     root: rootB,
-    mode: "checkout",
     writeAccess: "read_only",
   });
 } finally {
@@ -65,44 +77,51 @@ const origin = await listen(httpServer);
 const clients: Client[] = [];
 
 try {
-  const accountA = await connect("authorization-root-a", accessTokenA);
-  const initialListA = await accountA.callTool({ name: "list_workspaces", arguments: {} });
-  assertSucceeded(initialListA);
+  const client = await connect("authorization-root", accessToken);
+  const initialList = await client.callTool({ name: "list_projects", arguments: {} });
+  assertSucceeded(initialList);
   assert.equal(
-    JSON.stringify(initialListA.structuredContent).includes("hidden-root-b"),
+    JSON.stringify(initialList.structuredContent).includes("hidden-root-b"),
     false,
   );
-  const openA = await accountA.callTool({
-    name: "open_workspace",
-    arguments: { path: rootA, alias: "account-a", contextMode: "full" },
+  const projectRef = onlyProjectRef(initialList);
+  assert.equal(
+    JSON.stringify(initialList.structuredContent).includes("ungranted-root"),
+    false,
+  );
+  const selected = await client.callTool({
+    name: "project_control",
+    arguments: { action: "open", operationId: "authorization-root-execution" },
   });
-  assertSucceeded(openA);
-  assertSucceeded(await accountA.callTool({
-    name: "read",
-    arguments: { receipt: receipt(openA), path: "payload.txt" },
-  }));
-  assertRootDenied(await accountA.callTool({
-    name: "open_workspace",
-    arguments: { path: rootB, alias: "account-a-denied", contextMode: "full" },
-  }));
-  assertRootDenied(await accountA.callTool({
-    name: "resume_workspace",
-    arguments: { alias: "hidden-root-b", contextMode: "full" },
-  }));
-
-  const accountB = await connect("authorization-root-b", accessTokenB);
-  const openB = await accountB.callTool({
-    name: "open_workspace",
-    arguments: { path: rootB, alias: "account-b", contextMode: "full" },
+  assertSucceeded(selected);
+  assert.doesNotMatch(
+    JSON.stringify(selected.structuredContent),
+    /workspace|receipt|continuation|contextChanged|phase/iu,
+  );
+  const executionRef = String(
+    (selected.structuredContent as {
+      project?: { executionRef?: unknown };
+    } | undefined)?.project?.executionRef ?? "",
+  );
+  assert.match(executionRef, /^pex1_/u);
+  const read = await client.callTool({
+    name: "read_files",
+    arguments: { executionRef, files: [{ path: "payload.txt" }] },
   });
-  assertSucceeded(openB);
-  assertSucceeded(await accountB.callTool({
-    name: "read",
-    arguments: { receipt: receipt(openB), path: "payload.txt" },
-  }));
-  assertRootDenied(await accountB.callTool({
-    name: "open_workspace",
-    arguments: { path: rootA, alias: "account-b-denied", contextMode: "full" },
+  assertSucceeded(read);
+  assert.match(JSON.stringify(read.structuredContent), /authorized/u);
+  const ungrantedProjectRef = authorizationRootId(
+    rootB,
+    config.oauth.keys.authorizationRoot,
+  );
+  assert.notEqual(projectRef, ungrantedProjectRef);
+  assertProjectDenied(await client.callTool({
+    name: "project_control",
+    arguments: {
+      action: "open",
+      projectRef: ungrantedProjectRef,
+      operationId: "ungranted-root-execution",
+    },
   }));
 } finally {
   for (const client of clients.reverse()) await client.close().catch(() => undefined);
@@ -123,8 +142,8 @@ function seedGrant(accessToken: string, authorizedRoot: string, clientName: stri
     });
     const grant = store.createAuthorizationGrant({
       clientId: client.client_id,
-      scopes: ["workspace:read"],
-      allowedRootIds: [authorizationRootId(authorizedRoot, ownerToken)],
+      scopes: ["project:read"],
+      allowedRootIds: [authorizationRootId(authorizedRoot, config.oauth.keys.authorizationRoot)],
     });
     const expiresAt = Math.floor(Date.now() / 1_000) + 3_600;
     const resource = new URL("/mcp", publicBaseUrl).href;
@@ -165,29 +184,29 @@ async function connect(name: string, accessToken: string): Promise<Client> {
   return client;
 }
 
-function receipt(result: Awaited<ReturnType<Client["callTool"]>>): string {
-  const value = (result.structuredContent as {
-    continuation?: { receipt?: unknown };
-  } | undefined)?.continuation?.receipt;
-  assert.equal(typeof value, "string");
-  return String(value);
+function onlyProjectRef(result: Awaited<ReturnType<Client["callTool"]>>): string {
+  const projects = (result.structuredContent as {
+    projects?: Array<{ projectRef?: unknown }>;
+  } | undefined)?.projects;
+  assert.equal(projects?.length, 1);
+  assert.equal(typeof projects?.[0]?.projectRef, "string");
+  return String(projects?.[0]?.projectRef);
 }
 
 function assertSucceeded(result: Awaited<ReturnType<Client["callTool"]>>): void {
-  assert.notEqual(result.isError, true, JSON.stringify(result.content));
+  assert.notEqual(
+    result.isError,
+    true,
+    JSON.stringify({ content: result.content, structuredContent: result.structuredContent }),
+  );
 }
 
-function assertRootDenied(result: Awaited<ReturnType<Client["callTool"]>>): void {
+function assertProjectDenied(result: Awaited<ReturnType<Client["callTool"]>>): void {
   assert.equal(result.isError, true, JSON.stringify(result.content));
   const code = (result.structuredContent as {
     error?: { code?: unknown };
   } | undefined)?.error?.code;
-  assert.ok(
-    code === "path_not_allowed" ||
-      code === "path_denied" ||
-      code === "unknown_workspace_alias",
-    `unexpected root denial code: ${String(code)}`,
-  );
+  assert.equal(code, "project_not_authorized");
 }
 
 function hashToken(token: string): string {

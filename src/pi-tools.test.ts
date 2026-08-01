@@ -1,6 +1,16 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rename,
+  rm,
+  symlink,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
+import { platform, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   PI_TOOL_ERROR_MAX_CHARACTERS,
@@ -25,7 +35,7 @@ const pathError = sanitizePiToolError(
   new Error("ENOENT: no such file, open '/allowed/workspace/src/private.ts'"),
   context,
 );
-assert.equal(pathError, "ENOENT: no such file, open '[workspace]/src/private.ts'");
+assert.equal(pathError, "ENOENT: no such file, open '[project]/src/private.ts'");
 assert.doesNotMatch(pathError, /\/allowed\/workspace/);
 
 const readRootError = sanitizePiToolError(
@@ -65,6 +75,7 @@ assert.equal(
 assert.equal(sanitizePiToolError({}, context), "Tool operation failed.");
 
 const adapterRoot = await mkdtemp(join(tmpdir(), "devspace-pi-error-report-"));
+const adapterOutsideRoot = await mkdtemp(join(tmpdir(), "devspace-pi-outside-"));
 try {
   await mkdir(join(adapterRoot, "src", "nested"), { recursive: true });
   await mkdir(join(adapterRoot, "node_modules", "ignored"), { recursive: true });
@@ -72,6 +83,21 @@ try {
   await writeFile(join(adapterRoot, "src", "nested", "b.ts"), "nested MATCH\n");
   await writeFile(join(adapterRoot, "node_modules", "ignored", "hidden.ts"), "MATCH\n");
   await writeFile(join(adapterRoot, ".env"), "visible\n");
+  await symlink(join(adapterRoot, "src", "a.ts"), join(adapterRoot, "read-link.ts"));
+
+  const symlinkRead = await readFileTool(
+    { path: "read-link.ts" },
+    { cwd: adapterRoot, root: adapterRoot },
+  );
+  assert.equal(symlinkRead.isError, true);
+  assert.doesNotMatch(JSON.stringify(symlinkRead.content), /zero|MATCH|post/u);
+
+  const symlinkGrep = await grepFilesTool(
+    { pattern: "MATCH", path: "read-link.ts", literal: true },
+    { cwd: adapterRoot, root: adapterRoot },
+  );
+  assert.equal(symlinkGrep.isError, true);
+  assert.doesNotMatch(JSON.stringify(symlinkGrep.content), /read-link\.ts:2: MATCH/u);
 
   const readPage = await readFileTool(
     { path: "src/a.ts", offset: 2, limit: 1 },
@@ -131,6 +157,62 @@ try {
   const listedText = listed.content[0]?.type === "text" ? listed.content[0].text : "";
   assert.match(listedText, /^\.env/mu);
   assert.match(listedText, /^src\/$/mu);
+
+  if (platform() !== "win32") {
+    await writeFile(join(adapterOutsideRoot, "outside-secret.txt"), "outside secret\n");
+
+    const listRacePath = join(adapterRoot, "list-race");
+    const listRaceOriginal = join(adapterRoot, "list-race-original");
+    await mkdir(listRacePath);
+    await writeFile(join(listRacePath, "inside.txt"), "inside\n");
+    const canonicalListRacePath = await realpath(listRacePath);
+    let listRaceTriggered = false;
+    const listRaceContext = {
+      cwd: adapterRoot,
+      root: adapterRoot,
+      beforeDirectoryRead: async (path: string) => {
+        if (path !== canonicalListRacePath || listRaceTriggered) return;
+        listRaceTriggered = true;
+        await rename(listRacePath, listRaceOriginal);
+        await symlink(adapterOutsideRoot, listRacePath);
+      },
+    };
+    const racedList = await listDirectoryTool(
+      { path: "list-race" },
+      listRaceContext,
+    );
+    assert.equal(listRaceTriggered, true);
+    assert.equal(racedList.isError, true);
+    assert.doesNotMatch(JSON.stringify(racedList.content), /outside-secret/u);
+    await unlink(listRacePath);
+    await rename(listRaceOriginal, listRacePath);
+
+    const findRacePath = join(adapterRoot, "find-race");
+    const findRaceOriginal = join(adapterRoot, "find-race-original");
+    await mkdir(findRacePath);
+    await writeFile(join(findRacePath, "inside.ts"), "inside\n");
+    const canonicalFindRacePath = await realpath(findRacePath);
+    let findRaceTriggered = false;
+    const findRaceContext = {
+      cwd: adapterRoot,
+      root: adapterRoot,
+      beforeDirectoryRead: async (path: string) => {
+        if (path !== canonicalFindRacePath || findRaceTriggered) return;
+        findRaceTriggered = true;
+        await rename(findRacePath, findRaceOriginal);
+        await symlink(adapterOutsideRoot, findRacePath);
+      },
+    };
+    const racedFind = await findFilesTool(
+      { pattern: "*.txt", path: "find-race" },
+      findRaceContext,
+    );
+    assert.equal(findRaceTriggered, true);
+    assert.equal(racedFind.isError, true);
+    assert.doesNotMatch(JSON.stringify(racedFind.content), /outside-secret/u);
+    await unlink(findRacePath);
+    await rename(findRaceOriginal, findRacePath);
+  }
 
   const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00]);
   await writeFile(join(adapterRoot, "image.png"), png);
@@ -249,6 +331,7 @@ try {
   assert.match(reportedError.message, new RegExp(adapterRoot));
 } finally {
   await rm(adapterRoot, { recursive: true, force: true });
+  await rm(adapterOutsideRoot, { recursive: true, force: true });
 }
 
 console.log("pi-tools tests passed");

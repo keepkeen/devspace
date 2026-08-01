@@ -1,370 +1,377 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { promisify } from "node:util";
 import assert from "node:assert/strict";
-import { createReviewCheckpointManager } from "./review-checkpoints.js";
+import {
+  createReviewCheckpointManager,
+  UnsafeGitReviewConfigurationError,
+  type ReviewChangesResult,
+} from "./review-checkpoints.js";
 
 const execFileAsync = promisify(execFile);
 const root = await mkdtemp(join(tmpdir(), "devspace-review-checkpoints-test-"));
+const stateDir = await mkdtemp(join(tmpdir(), "devspace-review-state-test-"));
+const parentRoot = await mkdtemp(join(tmpdir(), "devspace-review-parent-test-"));
+const executableConfigRoot = await mkdtemp(join(tmpdir(), "devspace-review-executable-test-"));
+const unbornRoot = await mkdtemp(join(tmpdir(), "devspace-review-unborn-test-"));
 
 try {
-  await git(root, ["init"]);
-  await git(root, ["config", "user.email", "devspace@example.com"]);
-  await git(root, ["config", "user.name", "DevSpace Test"]);
+  await initializeRepository(root);
   await writeFile(join(root, "README.md"), "hello\n");
   await git(root, ["add", "README.md"]);
   await git(root, ["commit", "-m", "Initial commit"]);
 
-  const manager = createReviewCheckpointManager();
+  // Preserve an old DevSpace ref to prove the new manager never creates,
+  // updates, or deletes repository refs, including through the compatibility
+  // cleanup entry point.
+  await git(root, ["update-ref", "refs/devspace/review/legacy", "HEAD"]);
+
+  await writeFile(join(root, "README.md"), "hello\nunstaged\n");
+  await writeFile(join(root, "staged.txt"), "staged\n");
+  await git(root, ["add", "staged.txt"]);
+  await writeFile(join(root, "untracked.txt"), "untracked\n");
+
+  const gitStateBeforeReview = await gitStateSnapshot(root);
+  const statusBeforeReview = await gitOutput(root, ["status", "--porcelain=v1", "-z"]);
+  const manager = createReviewCheckpointManager({ stateDir });
   await Promise.all([
     manager.initializeWorkspace({ workspaceId: "ws_review", root }),
     manager.initializeWorkspace({ workspaceId: "ws_review", root }),
   ]);
-
-  const clean = await manager.reviewChanges({ workspaceId: "ws_review", root });
-  assert.equal(clean.summary.files, 0);
-  assert.equal(clean.patch, "");
-  assert.match(clean.result, /No changes/);
-
-  await writeFile(join(root, "README.md"), "hello\nworld\n");
-  await writeFile(join(root, "new.txt"), "new\n");
+  assert.equal(
+    await manager.reviewSource({ workspaceId: "ws_review", root }),
+    "repository",
+  );
+  assert.deepEqual(
+    await gitStateSnapshot(root),
+    gitStateBeforeReview,
+    "initialization must not write refs, the index, objects, or reflogs",
+  );
 
   const firstReview = await manager.reviewChanges({
     workspaceId: "ws_review",
     root,
-    markReviewed: false,
+    pagingScope: { principalRef: "principal", workspaceGeneration: 1 },
   });
-  assert.equal(firstReview.summary.files, 2);
-  assert.equal(firstReview.summary.additions, 2);
-  assert.equal(firstReview.summary.removals, 0);
-  assert.equal(firstReview.files.some((file) => file.path === "README.md"), true);
-  assert.equal(firstReview.files.some((file) => file.path === "new.txt"), true);
-  assert.match(firstReview.patch, /world/);
+  assert.deepEqual(
+    firstReview.files.map((file) => file.path).sort(),
+    ["README.md", "staged.txt", "untracked.txt"],
+    "the repository view includes staged, unstaged, and untracked files",
+  );
+  assert.equal(firstReview.summary.files, 3);
+  assert.match(firstReview.patch, /unstaged/u);
+  assert.match(firstReview.patch, /staged/u);
+  assert.match(firstReview.patch, /untracked/u);
   assert.match(firstReview.revision, /^review_[A-Za-z0-9_-]+$/u);
+  assert.equal(
+    await gitOutput(root, ["status", "--porcelain=v1", "-z"]),
+    statusBeforeReview,
+    "showing changes must preserve the user's dirty worktree and staging area",
+  );
+  assert.deepEqual(
+    await gitStateSnapshot(root),
+    gitStateBeforeReview,
+    "showing changes must not write Git state",
+  );
 
-  const restartedManager = createReviewCheckpointManager();
-  const afterRestart = await restartedManager.reviewChanges({
+  // Retained paging remains pinned even if the live repository changes.
+  await writeFile(join(root, "untracked.txt"), "untracked\nlater\n");
+  const continued = await manager.reviewChanges({
     workspaceId: "ws_review",
     root,
-    markReviewed: false,
+    continueRevision: firstReview.revision,
+    pagingScope: { principalRef: "principal", workspaceGeneration: 1 },
   });
-  assert.equal(afterRestart.summary.files, 2);
-  assert.match(afterRestart.patch, /world/);
+  assert.equal(continued.revision, firstReview.revision);
+  assert.equal(continued.patch, firstReview.patch);
+  assert.doesNotMatch(continued.patch, /later/u);
 
-  const stillUnreviewed = await manager.reviewChanges({
+  const restartedManager = createReviewCheckpointManager({ stateDir });
+  const continuedAfterRestart = await restartedManager.reviewChanges({
     workspaceId: "ws_review",
     root,
-    markReviewed: true,
-    expectedRevision: firstReview.revision,
+    continueRevision: firstReview.revision,
+    pagingScope: { principalRef: "principal", workspaceGeneration: 1 },
   });
-  assert.equal(stillUnreviewed.summary.files, 2);
+  assert.equal(continuedAfterRestart.patch, firstReview.patch);
 
-  const afterReviewed = await manager.reviewChanges({ workspaceId: "ws_review", root });
-  assert.equal(afterReviewed.summary.files, 0);
-
-  await writeFile(join(root, "README.md"), "hello\nworld\nserialized\n");
-  const serialized = await Promise.all([
-    manager.reviewChanges({ workspaceId: "ws_review", root }),
-    manager.reviewChanges({ workspaceId: "ws_review", root }),
-  ]);
-  assert.deepEqual(serialized.map((review) => review.summary.files), [1, 0]);
-
-  await manager.initializeWorkspace({ workspaceId: "ws_missing_ref", root });
-  await git(root, ["update-ref", "-d", "refs/devspace/review/ws_missing_ref/baseline"]);
-  const missingRefManager = createReviewCheckpointManager();
-  await assert.rejects(
-    missingRefManager.reviewChanges({ workspaceId: "ws_missing_ref", root }),
-    /Internal review checkpoint error.*open ref is valid and baseline ref is missing.*Refusing to reset review history/,
-  );
-  await missingRefManager.cleanupWorkspace({ workspaceId: "ws_missing_ref" });
-
-  await manager.initializeWorkspace({ workspaceId: "ws_corrupt_ref", root });
-  const tree = (await execFileAsync("git", ["rev-parse", "HEAD^{tree}"], { cwd: root })).stdout.trim();
-  await git(root, ["update-ref", "refs/devspace/review/ws_corrupt_ref/baseline", tree]);
-  const corruptRefManager = createReviewCheckpointManager();
-  await assert.rejects(
-    corruptRefManager.reviewChanges({ workspaceId: "ws_corrupt_ref", root }),
-    /Internal review checkpoint error.*open ref is valid and baseline ref is invalid.*Refusing to reset review history/,
-  );
-  await corruptRefManager.cleanupWorkspace({ workspaceId: "ws_corrupt_ref" });
-
-  // Paging must survive an edit landing between pages. The retained diff is
-  // what the cursor was issued against, so a sequence can always reach EOF;
-  // recomputing per page would change the revision and restart it at byte zero.
-  const pagingRoot = await mkdtemp(join(tmpdir(), "devspace-review-paging-"));
-  try {
-    await git(pagingRoot, ["init"]);
-    await git(pagingRoot, ["config", "user.email", "devspace@example.com"]);
-    await git(pagingRoot, ["config", "user.name", "DevSpace Test"]);
-    await writeFile(join(pagingRoot, "seed.txt"), "seed\n");
-    await git(pagingRoot, ["add", "-A"]);
-    await git(pagingRoot, ["commit", "-m", "seed"]);
-
-    const pagingManager = createReviewCheckpointManager();
-    await pagingManager.initializeWorkspace({ workspaceId: "ws_paging", root: pagingRoot });
-    await writeFile(join(pagingRoot, "reviewed.txt"), "under review\n");
-
-    const page1 = await pagingManager.reviewChanges({
-      workspaceId: "ws_paging",
-      root: pagingRoot,
-      markReviewed: false,
-    });
-    assert.match(page1.patch, /under review/u);
-
-    // Someone edits the workspace mid-review.
-    await writeFile(join(pagingRoot, "interfering.txt"), "written during paging\n");
-
-    const page2 = await pagingManager.reviewChanges({
-      workspaceId: "ws_paging",
-      root: pagingRoot,
-      markReviewed: false,
-      continueRevision: page1.revision,
-    });
-    assert.equal(page2.revision, page1.revision, "continuation must keep the reviewed revision");
-    assert.equal(page2.patch, page1.patch);
-    assert.doesNotMatch(page2.patch, /written during paging/u);
-
-    // A continuation for a revision that is not retained is reported as an
-    // expired page sequence. Recomputing instead would return a different
-    // revision, so the same caller behaviour would succeed or report the
-    // workspace as changed depending on retention state it cannot observe.
-    await assert.rejects(
-      pagingManager.reviewChanges({
-        workspaceId: "ws_paging",
-        root: pagingRoot,
-        markReviewed: false,
-        continueRevision: "review_not-retained",
-      }),
-      /no longer retained/iu,
-      "an unretained continuation must be reported, not silently recomputed",
-    );
-
-    // Serving from retention must hand out copies; a caller mutating the result
-    // would otherwise corrupt every later page.
-    const copy = await pagingManager.reviewChanges({
-      workspaceId: "ws_paging",
-      root: pagingRoot,
-      markReviewed: false,
-      continueRevision: page1.revision,
-    });
-    copy.summary.files = 999;
-    copy.files.length = 0;
-    const afterMutation = await pagingManager.reviewChanges({
-      workspaceId: "ws_paging",
-      root: pagingRoot,
-      markReviewed: false,
-      continueRevision: page1.revision,
-    });
-    assert.notEqual(afterMutation.summary.files, 999);
-
-    const uncached = await pagingManager.reviewChanges({
-      workspaceId: "ws_paging",
-      root: pagingRoot,
-      markReviewed: false,
-    });
-    assert.notEqual(uncached.revision, page1.revision);
-    assert.match(uncached.patch, /written during paging/u);
-    const oldSequenceStillRetained = await pagingManager.reviewChanges({
-      workspaceId: "ws_paging",
-      root: pagingRoot,
-      markReviewed: false,
-      continueRevision: page1.revision,
-    });
-    assert.equal(
-      oldSequenceStillRetained.revision,
-      page1.revision,
-      "a newer preview must not overwrite an older conversation's page sequence",
-    );
-
-    // Advancing never reads the retained diff: it has to observe the worktree
-    // as it is now, so reviewing one revision cannot advance a different one.
-    await assert.rejects(
-      pagingManager.reviewChanges({
-        workspaceId: "ws_paging",
-        root: pagingRoot,
-        markReviewed: true,
-        expectedRevision: page1.revision,
-      }),
-      /changed after the reviewed diff/iu,
-      "advancing with a stale revision must be refused",
-    );
-
-    const advanced = await pagingManager.reviewChanges({
-      workspaceId: "ws_paging",
-      root: pagingRoot,
-      markReviewed: true,
-      expectedRevision: uncached.revision,
-    });
-    assert.equal(advanced.revision, uncached.revision);
-    await assert.rejects(
-      pagingManager.reviewChanges({
-        workspaceId: "ws_paging",
-        root: pagingRoot,
-        markReviewed: false,
-        continueRevision: uncached.revision,
-      }),
-      /no longer retained/iu,
-      "advancing must discard the retained diff",
-    );
-    const afterAdvance = await pagingManager.reviewChanges({
-      workspaceId: "ws_paging",
-      root: pagingRoot,
-      markReviewed: false,
-    });
-    assert.equal(afterAdvance.summary.files, 0, "the advanced checkpoint has no remaining changes");
-
-    // Retention is bounded across workspaces. Once the bound is passed the
-    // oldest sessions report an expired sequence rather than silently drifting.
-    const largeStateDir = join(pagingRoot, "large-review-state");
-    const largeManager = createReviewCheckpointManager({ stateDir: largeStateDir });
-    const largeScope = { principalRef: "principal-large", workspaceGeneration: 7 };
-    await largeManager.initializeWorkspace({ workspaceId: "ws_large", root: pagingRoot });
-    await writeFile(
-      join(pagingRoot, "large-diff.txt"),
-      Array.from({ length: 28_000 }, (_unused, index) =>
-        `${String(index).padStart(6, "0")}:${"x".repeat(90)}`).join("\n") + "\n",
-    );
-    const largeFirst = await largeManager.reviewChanges({
-      workspaceId: "ws_large",
-      root: pagingRoot,
-      markReviewed: false,
-      pagingScope: largeScope,
-    });
-    assert.equal(Buffer.byteLength(largeFirst.patch, "utf8") > 2 * 1024 * 1024, true);
-    const largeContinuation = await largeManager.reviewChanges({
-      workspaceId: "ws_large",
-      root: pagingRoot,
-      markReviewed: false,
-      continueRevision: largeFirst.revision,
-      pagingScope: largeScope,
-    });
-    assert.equal(largeContinuation.patch, largeFirst.patch);
-    const spoolEntries = await readdir(join(largeStateDir, "review-diffs"));
-    assert.equal(spoolEntries.some((entry) => entry.endsWith(".patch")), true);
-    assert.equal(spoolEntries.some((entry) => entry.endsWith(".json")), true);
-
-    const restartedLargeManager = createReviewCheckpointManager({ stateDir: largeStateDir });
-    const afterManagerRestart = await restartedLargeManager.reviewChanges({
-      workspaceId: "ws_large",
-      root: pagingRoot,
-      markReviewed: false,
-      continueRevision: largeFirst.revision,
-      pagingScope: largeScope,
-    });
-    assert.equal(afterManagerRestart.patch, largeFirst.patch);
-    await assert.rejects(
-      restartedLargeManager.reviewChanges({
-        workspaceId: "ws_large",
-        root: pagingRoot,
-        markReviewed: false,
-        continueRevision: largeFirst.revision,
-        pagingScope: { ...largeScope, principalRef: "different-principal" },
-      }),
-      /no longer retained/iu,
-      "a retained diff must remain bound to its principal and generation",
-    );
-
-    const cleanupStateDir = join(pagingRoot, "cleanup-review-state");
-    let cleanupClock = 1_000;
-    const cleanupScope = { principalRef: "principal-cleanup", workspaceGeneration: 9 };
-    const cleanupManager = createReviewCheckpointManager({
-      stateDir: cleanupStateDir,
-      now: () => cleanupClock,
-      retainedPatchTtlMs: 10,
-    });
-    await cleanupManager.initializeWorkspace({ workspaceId: "ws_cleanup", root: pagingRoot });
-    await writeFile(join(pagingRoot, "cleanup-diff.txt"), "cleanup review\n");
-    const cleanupFirst = await cleanupManager.reviewChanges({
-      workspaceId: "ws_cleanup",
-      root: pagingRoot,
-      markReviewed: false,
-      pagingScope: cleanupScope,
-    });
-    const cleanupSpool = join(cleanupStateDir, "review-diffs");
-    await writeFile(join(cleanupSpool, ".abandoned.tmp"), "temporary");
-    await writeFile(join(cleanupSpool, `${"f".repeat(64)}.patch`), "orphan");
-    cleanupClock += 100;
-    const cleanupAfterRestart = createReviewCheckpointManager({
-      stateDir: cleanupStateDir,
-      now: () => cleanupClock,
-      retainedPatchTtlMs: 10,
-    });
-    await assert.rejects(
-      cleanupAfterRestart.reviewChanges({
-        workspaceId: "ws_cleanup",
-        root: pagingRoot,
-        markReviewed: false,
-        continueRevision: cleanupFirst.revision,
-        pagingScope: cleanupScope,
-      }),
-      /no longer retained/iu,
-    );
-    assert.deepEqual(
-      await readdir(cleanupSpool),
-      [],
-      "startup scan removes expired pairs, temporary files, and orphan halves",
-    );
-
-    const boundedManager = createReviewCheckpointManager({ maxRetainedPatches: 4 });
-    const sessions: Array<{ workspaceId: string; revision: string }> = [];
-    for (let index = 0; index < 6; index += 1) {
-      const workspaceId = `ws_bounded_${index}`;
-      await boundedManager.initializeWorkspace({ workspaceId, root: pagingRoot });
-      await writeFile(join(pagingRoot, `bounded-${index}.txt`), `change ${index}\n`);
-      const preview = await boundedManager.reviewChanges({
-        workspaceId,
-        root: pagingRoot,
-        markReviewed: false,
-      });
-      sessions.push({ workspaceId, revision: preview.revision });
-    }
-    const oldest = sessions[0]!;
-    const newest = sessions.at(-1)!;
-    await assert.rejects(
-      boundedManager.reviewChanges({
-        workspaceId: oldest.workspaceId,
-        root: pagingRoot,
-        markReviewed: false,
-        continueRevision: oldest.revision,
-      }),
-      /no longer retained/iu,
-      "the oldest retained diff must be evicted",
-    );
-    const stillRetained = await boundedManager.reviewChanges({
-      workspaceId: newest.workspaceId,
-      root: pagingRoot,
-      markReviewed: false,
-      continueRevision: newest.revision,
-    });
-    assert.equal(stillRetained.revision, newest.revision, "recent sessions keep their diff");
-  } finally {
-    await rm(pagingRoot, { recursive: true, force: true });
-  }
-
-  await manager.initializeWorkspace({ workspaceId: "ws_stale", root });
-  const removed = await manager.cleanupStaleRefs({
-    gitRoot: root,
-    activeWorkspaceIds: ["ws_review"],
-    olderThanMs: -1,
+  const currentReview = await manager.reviewChanges({
+    workspaceId: "ws_review",
+    root,
+    pagingScope: { principalRef: "principal", workspaceGeneration: 1 },
   });
-  assert.equal(removed, 2);
-  assert.deepEqual(await reviewRefNames(root), [
-    "refs/devspace/review/ws_review/baseline",
-    "refs/devspace/review/ws_review/open",
-  ]);
+  assert.notEqual(currentReview.revision, firstReview.revision);
+  assert.match(currentReview.patch, /later/u);
+  const stillCurrent = await manager.reviewChanges({
+    workspaceId: "ws_review",
+    root,
+  });
+  assert.equal(
+    stillCurrent.revision,
+    currentReview.revision,
+    "reviewing a diff must not hide still-present repository changes",
+  );
 
-  const cleanupAfterRestart = createReviewCheckpointManager();
-  await cleanupAfterRestart.cleanupWorkspace({ workspaceId: "ws_review", root });
-  assert.deepEqual(await reviewRefNames(root), []);
+  const statusAfterEdit = await gitOutput(root, ["status", "--porcelain=v1", "-z"]);
+  assert.deepEqual(
+    await gitStateSnapshot(root),
+    gitStateBeforeReview,
+    "previewing changes must remain Git-state read-only",
+  );
+
+  await manager.cleanupWorkspace({ workspaceId: "ws_review", root });
+  assert.deepEqual(
+    await gitStateSnapshot(root),
+    gitStateBeforeReview,
+    "cleanup must not delete refs or mutate any other Git state",
+  );
+  assert.equal(
+    await gitOutput(root, ["status", "--porcelain=v1", "-z"]),
+    statusAfterEdit,
+    "cleanup must preserve dirty user files",
+  );
+  assert.deepEqual(
+    await readdir(join(stateDir, "review-diffs")),
+    [],
+    "cleanup removes only the private retained-review files",
+  );
+  assert.deepEqual(
+    await reviewRefNames(root),
+    ["refs/devspace/review/legacy"],
+    "pre-existing DevSpace refs are left untouched",
+  );
+
+  // A Project nested inside a larger repository is not authorized to expose
+  // the parent repository. It uses only the server-observed apply_patch view.
+  await initializeRepository(parentRoot);
+  await mkdir(join(parentRoot, "approved-project"));
+  await writeFile(join(parentRoot, "outside.txt"), "outside\n");
+  await writeFile(join(parentRoot, "approved-project", "inside.txt"), "inside\n");
+  await git(parentRoot, ["add", "-A"]);
+  await git(parentRoot, ["commit", "-m", "Initial parent commit"]);
+  await writeFile(join(parentRoot, "outside.txt"), "outside\nsecret parent change\n");
+  await writeFile(
+    join(parentRoot, "approved-project", "inside.txt"),
+    "inside\napproved change\n",
+  );
+
+  const projectRoot = join(parentRoot, "approved-project");
+  const parentGitState = await gitStateSnapshot(parentRoot);
+  const nestedManager = createReviewCheckpointManager();
+  assert.equal(
+    await nestedManager.reviewSource({ workspaceId: "ws_nested", root: projectRoot }),
+    "apply_patch_history",
+  );
+  await assert.rejects(
+    nestedManager.reviewChanges({ workspaceId: "ws_nested", root: projectRoot }),
+    /server-observed apply_patch history/iu,
+  );
+
+  const observed = observedReview();
+  const nestedReview = await nestedManager.reviewChanges({
+    workspaceId: "ws_nested",
+    root: projectRoot,
+    observedChanges: observed,
+  });
+  assert.deepEqual(nestedReview.files.map((file) => file.path), ["inside.txt"]);
+  assert.equal(nestedReview.patch, observed.patch);
+  assert.doesNotMatch(nestedReview.patch, /outside|secret parent/iu);
+  await nestedManager.cleanupWorkspace({
+    workspaceId: "ws_nested",
+    root: projectRoot,
+  });
+  assert.deepEqual(
+    await gitStateSnapshot(parentRoot),
+    parentGitState,
+    "nested-Project review and cleanup must not touch the parent repository",
+  );
+
+  // Read-only review must not execute repository-configured fsmonitor or
+  // clean/process filter programs.
+  await initializeRepository(executableConfigRoot);
+  await writeFile(join(executableConfigRoot, ".gitattributes"), "filtered.txt filter=evil\n");
+  await writeFile(join(executableConfigRoot, "filtered.txt"), "committed\n");
+  await git(executableConfigRoot, ["add", "-A"]);
+  await git(executableConfigRoot, ["commit", "-m", "Executable config fixture"]);
+  const executableMarker = join(stateDir, "git-program-invoked");
+  const executableScript = join(executableConfigRoot, "git-program.cjs");
+  await writeFile(
+    executableScript,
+    "const fs = require('node:fs');\n" +
+      `fs.writeFileSync(${JSON.stringify(executableMarker)}, 'invoked\\n');\n` +
+      "process.stdin.pipe(process.stdout);\n",
+  );
+  await chmod(executableScript, 0o700);
+  const executableCommand =
+    `${JSON.stringify(process.execPath)} ${JSON.stringify(executableScript)}`;
+  await git(executableConfigRoot, ["config", "core.fsmonitor", executableCommand]);
+  await writeFile(join(executableConfigRoot, "filtered.txt"), "modified\n");
+
+  const safeGitManager = createReviewCheckpointManager();
+  assert.equal(
+    await safeGitManager.reviewSource({
+      workspaceId: "ws_executable",
+      root: executableConfigRoot,
+    }),
+    "repository",
+  );
+  const fsmonitorSafeReview = await safeGitManager.reviewChanges({
+    workspaceId: "ws_executable",
+    root: executableConfigRoot,
+  });
+  assert.match(fsmonitorSafeReview.patch, /modified/u);
+  assert.equal(await pathExists(executableMarker), false, "core.fsmonitor was not executed");
+
+  await git(executableConfigRoot, ["config", "filter.evil.clean", executableCommand]);
+  await git(executableConfigRoot, ["config", "filter.evil.process", executableCommand]);
+  await assert.rejects(
+    safeGitManager.reviewChanges({
+      workspaceId: "ws_executable",
+      root: executableConfigRoot,
+    }),
+    (error: unknown) =>
+      error instanceof UnsafeGitReviewConfigurationError &&
+      error.filterDrivers.includes("evil"),
+  );
+  assert.equal(
+    await pathExists(executableMarker),
+    false,
+    "executable clean/process filters were rejected before Git diff",
+  );
+
+  // A top-level repository with no HEAD is still a Git Project. Its staged,
+  // unstaged, and untracked state is reviewed without creating an empty-tree
+  // object or any other Git state.
+  await initializeRepository(unbornRoot);
+  await writeFile(join(unbornRoot, "staged.txt"), "staged version\n");
+  await git(unbornRoot, ["add", "staged.txt"]);
+  await writeFile(join(unbornRoot, "staged.txt"), "staged version\nunstaged version\n");
+  await writeFile(join(unbornRoot, "untracked.txt"), "untracked version\n");
+  const unbornStateBefore = await gitStateSnapshot(unbornRoot);
+  const unbornManager = createReviewCheckpointManager();
+  assert.equal(
+    await unbornManager.reviewSource({ workspaceId: "ws_unborn", root: unbornRoot }),
+    "repository",
+  );
+  const unbornReview = await unbornManager.reviewChanges({
+    workspaceId: "ws_unborn",
+    root: unbornRoot,
+  });
+  assert.deepEqual(
+    new Set(unbornReview.files.map((file) => file.path)),
+    new Set(["staged.txt", "untracked.txt"]),
+  );
+  assert.equal(unbornReview.summary.files, 2);
+  assert.match(unbornReview.patch, /staged version/u);
+  assert.match(unbornReview.patch, /unstaged version/u);
+  assert.match(unbornReview.patch, /untracked version/u);
+  assert.deepEqual(
+    await gitStateSnapshot(unbornRoot),
+    unbornStateBefore,
+    "unborn repository review must not write Git state",
+  );
 } finally {
-  await rm(root, { recursive: true, force: true });
+  await Promise.all([
+    rm(root, { recursive: true, force: true }),
+    rm(stateDir, { recursive: true, force: true }),
+    rm(parentRoot, { recursive: true, force: true }),
+    rm(executableConfigRoot, { recursive: true, force: true }),
+    rm(unbornRoot, { recursive: true, force: true }),
+  ]);
+}
+
+function observedReview(): ReviewChangesResult {
+  return {
+    result: "Recorded one successful DevSpace apply_patch operation.",
+    summary: { files: 1, additions: 1, removals: 0 },
+    files: [{
+      path: "inside.txt",
+      type: "change",
+      additions: 1,
+      removals: 0,
+    }],
+    patch: "--- a/inside.txt\n+++ b/inside.txt\n@@ -1 +1,2 @@\n inside\n+approved change\n",
+    revision: "review_observed",
+  };
+}
+
+async function initializeRepository(cwd: string): Promise<void> {
+  await git(cwd, ["init"]);
+  await git(cwd, ["config", "user.email", "devspace@example.com"]);
+  await git(cwd, ["config", "user.name", "DevSpace Test"]);
 }
 
 async function reviewRefNames(cwd: string): Promise<string[]> {
-  const result = await execFileAsync("git", ["for-each-ref", "--format=%(refname)", "refs/devspace/review"], { cwd });
-  return result.stdout.trim().split("\n").filter(Boolean).sort();
+  const output = await gitOutput(cwd, [
+    "for-each-ref",
+    "--format=%(refname)",
+    "refs/devspace/review",
+  ]);
+  return output.trim().split("\n").filter(Boolean).sort();
+}
+
+async function gitStateSnapshot(cwd: string): Promise<unknown> {
+  const gitDirOutput = (await gitOutput(cwd, ["rev-parse", "--git-dir"])).trim();
+  const gitDir = isAbsolute(gitDirOutput) ? gitDirOutput : join(cwd, gitDirOutput);
+  const indexPath = join(gitDir, "index");
+  const indexStats = await stat(indexPath, { bigint: true });
+  return {
+    refs: await gitOutput(cwd, ["for-each-ref", "--format=%(refname)%00%(objectname)"]),
+    index: (await readFile(indexPath)).toString("base64"),
+    indexMtimeNs: indexStats.mtimeNs,
+    objects: await snapshotTree(join(gitDir, "objects")),
+    logs: await snapshotTree(join(gitDir, "logs")),
+  };
+}
+
+async function snapshotTree(root: string): Promise<Array<[string, string]>> {
+  let entries: string[];
+  try {
+    entries = (await readdir(root, { recursive: true })).map(String).sort();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  }
+  const snapshot: Array<[string, string]> = [];
+  for (const entry of entries) {
+    const path = join(root, entry);
+    const stats = await lstat(path);
+    if (stats.isDirectory()) {
+      snapshot.push([entry, "directory"]);
+    } else if (stats.isFile()) {
+      snapshot.push([entry, (await readFile(path)).toString("base64")]);
+    }
+  }
+  return snapshot;
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await lstat(path);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+async function gitOutput(cwd: string, args: string[]): Promise<string> {
+  return (await execFileAsync("git", args, {
+    cwd,
+    env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
+  })).stdout;
 }
 
 async function git(cwd: string, args: string[]): Promise<void> {

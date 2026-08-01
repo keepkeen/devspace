@@ -17,7 +17,24 @@ function createTransport(closeError?: Error): FakeTransport {
 }
 
 let now = 0;
-const connectionPrincipalId = "client-a";
+const connectionPrincipalId = {
+  principalId: "principal-a",
+  grantId: "grant-a",
+  authorizationEpoch: 1,
+} as const;
+const otherPrincipalOwner = {
+  principalId: "principal-b",
+  grantId: "grant-b",
+  authorizationEpoch: 1,
+} as const;
+const otherGrantOwner = {
+  ...connectionPrincipalId,
+  grantId: "grant-a-2",
+} as const;
+const nextEpochOwner = {
+  ...connectionPrincipalId,
+  authorizationEpoch: 2,
+} as const;
 const registry = new McpSessionRegistry<FakeTransport>({ now: () => now });
 const staleTransport = createTransport();
 const activeTransport = createTransport();
@@ -27,7 +44,7 @@ now = 1_000;
 registry.register("active", connectionPrincipalId, activeTransport);
 now = 1_500;
 assert.equal(registry.get("active", connectionPrincipalId), activeTransport);
-assert.equal(registry.get("active", "client-b"), undefined);
+assert.equal(registry.get("active", otherPrincipalOwner), undefined);
 now = 2_000;
 
 const idleResults = await registry.closeIdle(1_500);
@@ -64,7 +81,7 @@ const first = createTransport();
 const second = createTransport();
 registry.register("first", connectionPrincipalId, first);
 registry.register("second", connectionPrincipalId, second);
-registry.remove("first");
+registry.remove("first", connectionPrincipalId);
 
 const shutdownResults = await registry.closeAll();
 assert.deepEqual(shutdownResults, [{ sessionId: "second" }]);
@@ -128,10 +145,13 @@ await activeCloseRegistry.closeAll();
 const transportCloseRegistry = new McpSessionRegistry<FakeTransport>();
 transportCloseRegistry.register("unexpected-close", connectionPrincipalId, createTransport());
 assert.equal(
-  transportCloseRegistry.removeOnTransportClose("unexpected-close"),
+  transportCloseRegistry.removeOnTransportClose("unexpected-close", connectionPrincipalId),
   "unexpected",
 );
-assert.equal(transportCloseRegistry.removeOnTransportClose("unexpected-close"), undefined);
+assert.equal(
+  transportCloseRegistry.removeOnTransportClose("unexpected-close", connectionPrincipalId),
+  undefined,
+);
 
 let finishIntentionalClose: (() => void) | undefined;
 const intentionalCloseTransport: FakeTransport = {
@@ -147,7 +167,7 @@ transportCloseRegistry.register("intentional-close", connectionPrincipalId, inte
 const intentionalClose = transportCloseRegistry.closeIdle(0);
 await Promise.resolve();
 assert.equal(
-  transportCloseRegistry.removeOnTransportClose("intentional-close"),
+  transportCloseRegistry.removeOnTransportClose("intentional-close", connectionPrincipalId),
   "intentional",
 );
 finishIntentionalClose?.();
@@ -155,18 +175,93 @@ assert.deepEqual(await intentionalClose, [{ sessionId: "intentional-close" }]);
 assert.equal(intentionalCloseTransport.closeCalls, 1);
 
 const limited = new McpSessionRegistry<FakeTransport>({ maxSessions: 1 });
-const limitedReservation = limited.tryReserve();
+const limitedReservation = limited.tryReserve(connectionPrincipalId);
 assert(limitedReservation);
-assert.equal(limited.tryReserve(), undefined);
+assert.equal(limited.tryReserve(connectionPrincipalId), undefined);
 const limitedTransport = createTransport();
 limited.register("limited", connectionPrincipalId, limitedTransport, limitedReservation);
 assert.equal(limited.get("limited", connectionPrincipalId), limitedTransport);
-assert.equal(limited.get("limited", "client-b"), undefined);
-assert.equal(limited.tryReserve(), undefined);
-assert.equal(limited.remove("limited"), true);
-const releasedSlotReservation = limited.tryReserve();
+assert.equal(limited.get("limited", otherPrincipalOwner), undefined);
+assert.equal(limited.tryReserve(connectionPrincipalId), undefined);
+assert.equal(limited.remove("limited", otherGrantOwner), false);
+assert.equal(limited.remove("limited", connectionPrincipalId), true);
+const releasedSlotReservation = limited.tryReserve(connectionPrincipalId);
 assert(releasedSlotReservation);
 limited.releaseReservation(releasedSlotReservation);
+
+const reconnectCapacity = new McpSessionRegistry<FakeTransport>({
+  maxSessions: 1,
+});
+const replacedGrantTransport = createTransport();
+reconnectCapacity.register(
+  "replaced-grant-session",
+  connectionPrincipalId,
+  replacedGrantTransport,
+);
+assert.deepEqual(
+  await reconnectCapacity.closeAuthorizationSessions(connectionPrincipalId),
+  [{ sessionId: "replaced-grant-session" }],
+);
+assert.equal(replacedGrantTransport.closeCalls, 1);
+const reconnectReservation = reconnectCapacity.tryReserve(nextEpochOwner);
+assert(
+  reconnectReservation,
+  "revoked authorization sessions must release maxSessions=1 capacity for reconnect",
+);
+reconnectCapacity.register(
+  "replacement-grant-session",
+  nextEpochOwner,
+  createTransport(),
+  reconnectReservation,
+);
+await reconnectCapacity.closeAll();
+
+const sharedGrantIsolation = new McpSessionRegistry<FakeTransport>({ maxSessions: 2 });
+const revokedSharedTransport = createTransport();
+const retainedSharedTransport = createTransport();
+sharedGrantIsolation.register("revoked-shared-grant", connectionPrincipalId, revokedSharedTransport);
+sharedGrantIsolation.register("retained-shared-grant", otherGrantOwner, retainedSharedTransport);
+assert.deepEqual(
+  await sharedGrantIsolation.closeAuthorizationSessions(connectionPrincipalId),
+  [{ sessionId: "revoked-shared-grant" }],
+);
+assert.equal(revokedSharedTransport.closeCalls, 1);
+assert.equal(retainedSharedTransport.closeCalls, 0);
+assert.equal(
+  sharedGrantIsolation.get("retained-shared-grant", otherGrantOwner),
+  retainedSharedTransport,
+  "revoking one grant must not close another active share grant on the same principal",
+);
+await sharedGrantIsolation.closeAll();
+
+let finishBoundaryClose: (() => void) | undefined;
+const boundaryCloseRace = new McpSessionRegistry<FakeTransport>({ maxSessions: 1 });
+const boundaryRaceTransport: FakeTransport = {
+  closeCalls: 0,
+  close() {
+    this.closeCalls += 1;
+    return new Promise<void>((resolve) => {
+      finishBoundaryClose = resolve;
+    });
+  },
+};
+boundaryCloseRace.register("boundary-close-race", connectionPrincipalId, boundaryRaceTransport);
+const idleBoundaryClose = boundaryCloseRace.closeIdle(0);
+await Promise.resolve();
+const authorizationBoundaryClose =
+  boundaryCloseRace.closeAuthorizationSessions(connectionPrincipalId);
+assert.equal(boundaryRaceTransport.closeCalls, 1, "authorization cleanup must reuse an in-flight close");
+assert.equal(
+  boundaryCloseRace.tryReserve(nextEpochOwner),
+  undefined,
+  "authorization cleanup must quarantine capacity until transport close succeeds",
+);
+finishBoundaryClose?.();
+assert.deepEqual(await idleBoundaryClose, [{ sessionId: "boundary-close-race" }]);
+assert.deepEqual(await authorizationBoundaryClose, [{ sessionId: "boundary-close-race" }]);
+const boundaryReplacement = boundaryCloseRace.tryReserve(nextEpochOwner);
+assert(boundaryReplacement, "successful authorization cleanup must release capacity");
+boundaryCloseRace.releaseReservation(boundaryReplacement);
 
 let reclaimNow = 0;
 const reclaiming = new McpSessionRegistry<FakeTransport>({
@@ -176,7 +271,7 @@ const reclaiming = new McpSessionRegistry<FakeTransport>({
 const otherOldest = createTransport();
 const ownerOlder = createTransport();
 const ownerNewest = createTransport();
-reclaiming.register("other-oldest", "client-b", otherOldest);
+reclaiming.register("other-oldest", otherPrincipalOwner, otherOldest);
 reclaimNow = 10;
 reclaiming.register("owner-older", connectionPrincipalId, ownerOlder);
 reclaimNow = 20;
@@ -184,36 +279,38 @@ reclaiming.register("owner-newest", connectionPrincipalId, ownerNewest);
 const reclaimedReservation = await reclaiming.reserveWithIdleReclaim(connectionPrincipalId);
 assert.deepEqual(reclaimedReservation, {
   reservation: reclaimedReservation.reservation,
-  reclaimed: { sessionId: "owner-older" },
+  reclaimed: { sessionId: "other-oldest" },
 });
 assert(reclaimedReservation.reservation);
-assert.equal(ownerOlder.closeCalls, 1);
-assert.equal(otherOldest.closeCalls, 0);
+assert.equal(ownerOlder.closeCalls, 0);
+assert.equal(otherOldest.closeCalls, 1);
 assert.equal(ownerNewest.closeCalls, 0);
 assert.equal(reclaiming.size, 2);
 reclaiming.releaseReservation(reclaimedReservation.reservation);
 
-const isolatedReclaim = new McpSessionRegistry<FakeTransport>({ maxSessions: 1 });
-const isolatedOther = createTransport();
-isolatedReclaim.register("other-only", "client-b", isolatedOther);
-assert.deepEqual(
-  await isolatedReclaim.reserveWithIdleReclaim(connectionPrincipalId),
-  {},
-  "default stateful reclaim must not evict another principal",
+const crossEpochReclaim = new McpSessionRegistry<FakeTransport>({ maxSessions: 1 });
+const epochScopedTransport = createTransport();
+crossEpochReclaim.register("epoch-scoped", connectionPrincipalId, epochScopedTransport);
+const epochReplacement = await crossEpochReclaim.reserveWithIdleReclaim(nextEpochOwner);
+assert.equal(epochReplacement.reclaimed?.sessionId, "epoch-scoped");
+assert(epochReplacement.reservation);
+assert.equal(
+  epochScopedTransport.closeCalls,
+  1,
+  "same-principal reclaim must cross authorization epochs",
 );
-assert.equal(isolatedOther.closeCalls, 0);
+crossEpochReclaim.releaseReservation(epochReplacement.reservation);
 
-const globalReclaim = new McpSessionRegistry<FakeTransport>({
+const globalActive = new McpSessionRegistry<FakeTransport>({
   maxSessions: 1,
-  allowGlobalIdleReclaim: true,
 });
-const globallyReclaimed = createTransport();
-globalReclaim.register("global-other", "client-b", globallyReclaimed);
-const globalReservation = await globalReclaim.reserveWithIdleReclaim(connectionPrincipalId);
-assert.equal(globalReservation.reclaimed?.sessionId, "global-other");
-assert(globalReservation.reservation);
-assert.equal(globallyReclaimed.closeCalls, 1);
-globalReclaim.releaseReservation(globalReservation.reservation);
+const globalActiveTransport = createTransport();
+globalActive.register("global-active", otherPrincipalOwner, globalActiveTransport);
+assert.equal(globalActive.acquire("global-active", otherPrincipalOwner), globalActiveTransport);
+assert.deepEqual(await globalActive.reserveWithIdleReclaim(connectionPrincipalId), {});
+assert.equal(globalActiveTransport.closeCalls, 0);
+globalActive.release("global-active", otherPrincipalOwner);
+await globalActive.closeAll();
 
 const allActive = new McpSessionRegistry<FakeTransport>({ maxSessions: 1 });
 const allActiveTransport = createTransport();
@@ -238,7 +335,7 @@ assert.equal(failedReservation.reclaimed?.sessionId, "failed-reclaim");
 assert.equal(failedReservation.reclaimed?.error, failedReclaimError);
 assert.equal(failedReclaim.size, 1);
 assert.equal(failedReclaim.get("failed-reclaim", connectionPrincipalId), undefined);
-assert.equal(failedReclaim.tryReserve(), undefined);
+assert.equal(failedReclaim.tryReserve(connectionPrincipalId), undefined);
 const retriedReclaim = await failedReclaim.reserveWithIdleReclaim(connectionPrincipalId);
 assert(retriedReclaim.reservation);
 assert.equal(retriedReclaim.reclaimed?.error, undefined);
@@ -302,6 +399,91 @@ activeRegistry.release("in-flight", connectionPrincipalId);
 activeNow = 2_000;
 assert.deepEqual(await activeRegistry.closeIdle(1), [{ sessionId: "in-flight" }]);
 
+let finishAuthorizationDrainClose: (() => void) | undefined;
+const authorizationDrain = new McpSessionRegistry<FakeTransport>({
+  maxSessions: 1,
+});
+const authorizationDrainTransport: FakeTransport = {
+  closeCalls: 0,
+  close() {
+    this.closeCalls += 1;
+    return new Promise<void>((resolve) => {
+      finishAuthorizationDrainClose = resolve;
+    });
+  },
+};
+authorizationDrain.register(
+  "authorization-drain",
+  connectionPrincipalId,
+  authorizationDrainTransport,
+);
+assert.equal(
+  authorizationDrain.acquire("authorization-drain", connectionPrincipalId),
+  authorizationDrainTransport,
+);
+const authorizationDrainClose =
+  authorizationDrain.closeAuthorizationSessions(connectionPrincipalId);
+await Promise.resolve();
+assert.equal(
+  authorizationDrainTransport.closeCalls,
+  0,
+  "exact revocation must not close a transport while an admitted request is active",
+);
+assert.equal(authorizationDrain.get("authorization-drain", connectionPrincipalId), undefined);
+assert.equal(authorizationDrain.tryReserve(nextEpochOwner), undefined);
+assert.equal(authorizationDrain.usageSnapshot().sessions, 1);
+authorizationDrain.release("authorization-drain", connectionPrincipalId);
+await Promise.resolve();
+await Promise.resolve();
+assert.equal(authorizationDrainTransport.closeCalls, 1);
+finishAuthorizationDrainClose?.();
+assert.deepEqual(
+  await authorizationDrainClose,
+  [{ sessionId: "authorization-drain" }],
+);
+const afterAuthorizationDrain = authorizationDrain.tryReserve(nextEpochOwner);
+assert(afterAuthorizationDrain);
+authorizationDrain.releaseReservation(afterAuthorizationDrain);
+
+let finishTimedOutDrainClose: (() => void) | undefined;
+const timedOutAuthorizationDrain = new McpSessionRegistry<FakeTransport>({
+  closeTimeoutMs: 10,
+  maxSessions: 1,
+});
+const timedOutDrainTransport: FakeTransport = {
+  closeCalls: 0,
+  close() {
+    this.closeCalls += 1;
+    return new Promise<void>((resolve) => {
+      finishTimedOutDrainClose = resolve;
+    });
+  },
+};
+timedOutAuthorizationDrain.register(
+  "timed-out-authorization-drain",
+  connectionPrincipalId,
+  timedOutDrainTransport,
+);
+assert(timedOutAuthorizationDrain.acquire(
+  "timed-out-authorization-drain",
+  connectionPrincipalId,
+));
+const timedOutDrainResults =
+  await timedOutAuthorizationDrain.closeAuthorizationSessions(connectionPrincipalId);
+assert.match(String(timedOutDrainResults[0]?.error), /Timed out closing MCP session/);
+assert.equal(timedOutDrainTransport.closeCalls, 0);
+assert.equal(timedOutAuthorizationDrain.size, 1);
+assert.equal(timedOutAuthorizationDrain.tryReserve(connectionPrincipalId), undefined);
+timedOutAuthorizationDrain.release(
+  "timed-out-authorization-drain",
+  connectionPrincipalId,
+);
+await new Promise<void>((resolve) => setImmediate(resolve));
+assert.equal(timedOutDrainTransport.closeCalls, 1);
+finishTimedOutDrainClose?.();
+await new Promise<void>((resolve) => setImmediate(resolve));
+assert.equal(timedOutAuthorizationDrain.size, 0);
+
 let finishConcurrentClose: (() => void) | undefined;
 const closeRaceRegistry = new McpSessionRegistry<FakeTransport>({ now: () => 1_000 });
 let closeRaceDisposition: "intentional" | "unexpected" | undefined;
@@ -309,7 +491,10 @@ const closeRaceTransport: FakeTransport = {
   closeCalls: 0,
   close() {
     this.closeCalls += 1;
-    closeRaceDisposition = closeRaceRegistry.removeOnTransportClose("close-race");
+    closeRaceDisposition = closeRaceRegistry.removeOnTransportClose(
+      "close-race",
+      connectionPrincipalId,
+    );
     return new Promise<void>((resolve) => {
       finishConcurrentClose = resolve;
     });
@@ -329,7 +514,11 @@ assert.equal(closeRaceTransport.closeCalls, 1);
 assert.equal(shutdownCloseResolved, false);
 finishConcurrentClose?.();
 assert.deepEqual(await idleClose, [{ sessionId: "close-race" }]);
-assert.deepEqual(await shutdownClose, []);
+assert.deepEqual(
+  await shutdownClose,
+  [{ sessionId: "close-race" }],
+  "shutdown must retain an intentional close attempt until its promise settles",
+);
 assert.equal(closeRaceRegistry.size, 0);
 
 const hungRegistry = new McpSessionRegistry<FakeTransport>({ closeTimeoutMs: 10 });
@@ -345,6 +534,70 @@ assert.equal(hungResults.length, 1);
 assert.match(String(hungResults[0]?.error), /Timed out closing MCP session/);
 assert.equal(hungRegistry.size, 1);
 assert.equal(hungRegistry.get("hung", connectionPrincipalId), undefined);
+
+const authorizationRejectError = new Error("authorization close rejected");
+const authorizationRejectTransport: FakeTransport = {
+  closeCalls: 0,
+  async close() {
+    this.closeCalls += 1;
+    if (this.closeCalls === 1) throw authorizationRejectError;
+  },
+};
+const authorizationRejectRegistry = new McpSessionRegistry<FakeTransport>({
+  maxSessions: 1,
+});
+authorizationRejectRegistry.register(
+  "authorization-reject",
+  connectionPrincipalId,
+  authorizationRejectTransport,
+);
+const authorizationRejectResults =
+  await authorizationRejectRegistry.closeAuthorizationSessions(connectionPrincipalId);
+assert.equal(authorizationRejectResults[0]?.error, authorizationRejectError);
+assert.equal(authorizationRejectRegistry.size, 1);
+assert.equal(authorizationRejectRegistry.usageSnapshot().sessions, 1);
+assert.equal(authorizationRejectRegistry.tryReserve(nextEpochOwner), undefined);
+assert.deepEqual(
+  await authorizationRejectRegistry.closeAll(),
+  [{ sessionId: "authorization-reject" }],
+  "shutdown must retry a rejected exact-authorization close",
+);
+assert.equal(authorizationRejectTransport.closeCalls, 2);
+assert.equal(authorizationRejectRegistry.size, 0);
+
+const authorizationHungTransport: FakeTransport = {
+  closeCalls: 0,
+  async close() {
+    this.closeCalls += 1;
+    await new Promise<void>(() => undefined);
+  },
+};
+const authorizationHungRegistry = new McpSessionRegistry<FakeTransport>({
+  closeTimeoutMs: 10,
+  maxSessions: 1,
+});
+authorizationHungRegistry.register(
+  "authorization-hung",
+  connectionPrincipalId,
+  authorizationHungTransport,
+);
+const authorizationHungResults =
+  await authorizationHungRegistry.closeAuthorizationSessions(connectionPrincipalId);
+assert.match(String(authorizationHungResults[0]?.error), /Timed out closing MCP session/);
+assert.equal(authorizationHungRegistry.size, 1);
+assert.equal(authorizationHungRegistry.usageSnapshot().sessions, 1);
+const authorizationHungShutdownResults = await authorizationHungRegistry.closeAll();
+assert.equal(authorizationHungShutdownResults.length, 1);
+assert.equal(authorizationHungShutdownResults[0]?.sessionId, "authorization-hung");
+assert.match(
+  String(authorizationHungShutdownResults[0]?.error),
+  /Timed out closing MCP session/,
+);
+assert.equal(
+  authorizationHungTransport.closeCalls,
+  1,
+  "shutdown must reuse the observable pending close instead of double-closing",
+);
 
 let finishHungIdle: (() => void) | undefined;
 const hungIdleRegistry = new McpSessionRegistry<FakeTransport>({
@@ -363,12 +616,11 @@ hungIdleRegistry.register("hung-idle", connectionPrincipalId, {
 const hungIdleResults = await hungIdleRegistry.closeIdle(0);
 assert.match(String(hungIdleResults[0]?.error), /Timed out closing MCP session/);
 assert.equal(hungIdleRegistry.size, 1);
-assert.equal(hungIdleRegistry.tryReserve(), undefined);
+assert.equal(hungIdleRegistry.tryReserve(connectionPrincipalId), undefined);
 finishHungIdle?.();
-await Promise.resolve();
-await Promise.resolve();
+await new Promise<void>((resolve) => setImmediate(resolve));
 assert.equal(hungIdleRegistry.size, 0);
-const afterHungIdle = hungIdleRegistry.tryReserve();
+const afterHungIdle = hungIdleRegistry.tryReserve(connectionPrincipalId);
 assert(afterHungIdle);
 hungIdleRegistry.releaseReservation(afterHungIdle);
 
@@ -381,106 +633,136 @@ detachedHungRegistry.register("detached-hung", connectionPrincipalId, {
   closeCalls: 0,
   close() {
     this.closeCalls += 1;
-    detachedHungDisposition = detachedHungRegistry.removeOnTransportClose("detached-hung");
+    detachedHungDisposition = detachedHungRegistry.removeOnTransportClose(
+      "detached-hung",
+      connectionPrincipalId,
+    );
     return new Promise<void>(() => undefined);
   },
 });
 const detachedHungResults = await detachedHungRegistry.closeIdle(0);
 assert.equal(detachedHungDisposition, "intentional");
 assert.match(String(detachedHungResults[0]?.error), /Timed out closing MCP session/);
-assert.equal(detachedHungRegistry.size, 0);
-const afterDetachedHung = detachedHungRegistry.tryReserve();
-assert(afterDetachedHung);
-detachedHungRegistry.releaseReservation(afterDetachedHung);
-
-const perClient = new McpSessionRegistry<FakeTransport>({
-  maxSessions: 3,
-  maxSessionsPerClient: 1,
-});
-const clientAReservation = perClient.tryReserve("client-a");
-assert(clientAReservation);
-assert.equal(perClient.tryReserve("client-a"), undefined);
-const clientBReservation = perClient.tryReserve("client-b");
-assert(clientBReservation);
-assert.throws(
-  () => perClient.register("wrong-owner", "client-b", createTransport(), clientAReservation),
-  /different OAuth client/,
+assert.equal(
+  detachedHungRegistry.size,
+  1,
+  "a close event must not hide a close promise that never settles",
 );
-perClient.register("client-a-session", "client-a", createTransport(), clientAReservation);
-perClient.register("client-b-session", "client-b", createTransport(), clientBReservation);
-assert.deepEqual(perClient.usageSnapshot("client-a"), {
-  sessions: 2,
+assert.equal(detachedHungRegistry.tryReserve(connectionPrincipalId), undefined);
+
+const reservationOwnership = new McpSessionRegistry<FakeTransport>({ maxSessions: 2 });
+const firstAuthorizationReservation = reservationOwnership.tryReserve(connectionPrincipalId);
+assert(firstAuthorizationReservation);
+assert.throws(
+  () => reservationOwnership.register(
+    "wrong-owner",
+    otherGrantOwner,
+    createTransport(),
+    firstAuthorizationReservation,
+  ),
+  /different authorization/,
+);
+reservationOwnership.register(
+  "owner-session",
+  connectionPrincipalId,
+  createTransport(),
+  firstAuthorizationReservation,
+);
+assert.deepEqual(reservationOwnership.usageSnapshot(), {
+  sessions: 1,
   reservations: 0,
   statelessRequests: 0,
-  statelessLeases: { agesMs: [], byOwner: [] },
-  limit: 3,
-  owner: { sessions: 1, reservations: 0, statelessRequests: 0, limit: 1 },
+  statelessLeases: { agesMs: [] },
+  limit: 2,
 });
-const clientAReplacement = await perClient.reserveWithIdleReclaim("client-a");
-assert.equal(clientAReplacement.reclaimed?.sessionId, "client-a-session");
-assert(clientAReplacement.reservation);
-perClient.register(
-  "client-a-replacement",
-  "client-a",
-  createTransport(),
-  clientAReplacement.reservation,
-);
-assert.equal(perClient.get("client-b-session", "client-b") !== undefined, true);
-assert.equal(perClient.usageSnapshot("client-a").owner?.sessions, 1);
-await perClient.closeAll();
-
-const perClientActive = new McpSessionRegistry<FakeTransport>({
-  maxSessions: 3,
-  maxSessionsPerClient: 1,
-});
-perClientActive.register("active-client-a", "client-a", createTransport());
-assert(perClientActive.acquire("active-client-a", "client-a"));
-assert.deepEqual(await perClientActive.reserveWithIdleReclaim("client-a"), {});
-await perClientActive.closeAll();
+assert.equal(reservationOwnership.get("owner-session", otherGrantOwner), undefined);
+await reservationOwnership.closeAll();
 
 let statelessNow = 1_000;
 const statelessLimited = new McpSessionRegistry<FakeTransport>({
   now: () => statelessNow,
   maxSessions: 2,
-  maxSessionsPerClient: 1,
 });
-const clientARequest = statelessLimited.tryAcquireStatelessRequest("client-a", {
-  principalRef: "conn_a",
-  clientRef: "oauth_a",
-});
-assert(clientARequest);
-assert.equal(statelessLimited.tryAcquireStatelessRequest("client-a", {
-  principalRef: "conn_a",
-  clientRef: "oauth_a",
-}), undefined);
+const firstStatelessRequest =
+  statelessLimited.tryAcquireStatelessRequest(connectionPrincipalId);
+assert(firstStatelessRequest);
+const globalReservation = statelessLimited.tryReserve(connectionPrincipalId);
+assert(globalReservation);
+const temporaryReservation = statelessLimited.tryReserve(connectionPrincipalId);
+assert.equal(
+  temporaryReservation,
+  undefined,
+  "stateless requests and reservations share the single global capacity",
+);
 statelessNow = 1_250;
-const clientBRequest = statelessLimited.tryAcquireStatelessRequest("client-b", {
-  principalRef: "conn_b",
-  clientRef: "oauth_b",
-});
+const secondStatelessRequest =
+  statelessLimited.tryAcquireStatelessRequest(otherGrantOwner);
+assert.equal(
+  secondStatelessRequest,
+  undefined,
+  "the outstanding reservation consumes the remaining global slot",
+);
+statelessLimited.releaseReservation(globalReservation);
+const clientBRequest = statelessLimited.tryAcquireStatelessRequest(otherGrantOwner);
 assert(clientBRequest);
-assert.equal(statelessLimited.tryReserve("client-c"), undefined);
+assert.equal(statelessLimited.tryReserve(otherGrantOwner), undefined);
 statelessNow = 2_000;
-assert.deepEqual(statelessLimited.usageSnapshot("client-a"), {
+assert.deepEqual(statelessLimited.usageSnapshot(), {
   sessions: 0,
   reservations: 0,
   statelessRequests: 2,
-  statelessLeases: {
-    agesMs: [1_000, 750],
-    byOwner: [
-      { principalRef: "conn_a", clientRef: "oauth_a", active: 1, oldestLeaseAgeMs: 1_000 },
-      { principalRef: "conn_b", clientRef: "oauth_b", active: 1, oldestLeaseAgeMs: 750 },
-    ],
-  },
+  statelessLeases: { agesMs: [1_000, 750] },
   limit: 2,
-  owner: { sessions: 0, reservations: 0, statelessRequests: 1, limit: 1 },
 });
-assert.equal(statelessLimited.releaseStatelessRequest(clientARequest), true);
-assert.equal(statelessLimited.releaseStatelessRequest(clientARequest), false);
-const clientAReservationAfterRelease = statelessLimited.tryReserve("client-a");
+assert.equal(statelessLimited.releaseStatelessRequest(firstStatelessRequest), true);
+assert.equal(statelessLimited.releaseStatelessRequest(firstStatelessRequest), false);
+const clientAReservationAfterRelease = statelessLimited.tryReserve(connectionPrincipalId);
 assert(clientAReservationAfterRelease);
 statelessLimited.releaseReservation(clientAReservationAfterRelease);
 assert.equal(statelessLimited.releaseStatelessRequest(clientBRequest), true);
-assert.deepEqual(statelessLimited.usageSnapshot().statelessLeases, { agesMs: [], byOwner: [] });
-assert.deepEqual(await detachedHungRegistry.closeAll(), []);
-assert.equal(detachedHungRegistry.size, 0);
+assert.deepEqual(statelessLimited.usageSnapshot().statelessLeases, { agesMs: [] });
+
+const exactStatelessDrain = new McpSessionRegistry<FakeTransport>({
+  maxSessions: 2,
+});
+const revokedStatelessLease = exactStatelessDrain.tryAcquireStatelessRequest(
+  connectionPrincipalId,
+);
+const retainedStatelessLease = exactStatelessDrain.tryAcquireStatelessRequest(
+  otherGrantOwner,
+);
+assert(revokedStatelessLease);
+assert(retainedStatelessLease);
+let exactStatelessCloseSettled = false;
+const exactStatelessClose =
+  exactStatelessDrain.closeAuthorizationSessions(connectionPrincipalId).then((results) => {
+    exactStatelessCloseSettled = true;
+    return results;
+  });
+await Promise.resolve();
+assert.equal(exactStatelessCloseSettled, false);
+assert.equal(
+  exactStatelessDrain.tryAcquireStatelessRequest(
+    connectionPrincipalId,
+  ),
+  undefined,
+  "exact revocation must quarantine new stateless leases for the revoked tuple",
+);
+assert.equal(exactStatelessDrain.tryReserve(connectionPrincipalId), undefined);
+assert.equal(exactStatelessDrain.usageSnapshot().statelessRequests, 2);
+assert.equal(exactStatelessDrain.releaseStatelessRequest(revokedStatelessLease), true);
+assert.deepEqual(await exactStatelessClose, []);
+assert.equal(
+  exactStatelessDrain.usageSnapshot().statelessRequests,
+  1,
+  "another grant on the same principal must remain independently tracked",
+);
+assert.equal(exactStatelessDrain.releaseStatelessRequest(retainedStatelessLease), true);
+const nextEpochAfterStatelessDrain = exactStatelessDrain.tryReserve(nextEpochOwner);
+assert(nextEpochAfterStatelessDrain);
+exactStatelessDrain.releaseReservation(nextEpochAfterStatelessDrain);
+
+const detachedHungShutdown = await detachedHungRegistry.closeAll();
+assert.equal(detachedHungShutdown.length, 1);
+assert.match(String(detachedHungShutdown[0]?.error), /Timed out closing MCP session/);
+assert.equal(detachedHungRegistry.size, 1);

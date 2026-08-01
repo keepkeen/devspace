@@ -1,596 +1,285 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { loadConfig } from "./config.js";
-import { internalDiagnosticsToken } from "./internal-auth.js";
-import { DEFAULT_DEVSPACE_OAUTH_SCOPES } from "./oauth-scopes.js";
+import { authorizationRootId } from "./authorization-roots.js";
+import { loadConfig, type McpHttpTransportMode } from "./config.js";
+import { DEVSPACE_CAPABILITY_SCOPES } from "./oauth-scopes.js";
 import { SqliteOAuthClientsStore, SqliteOAuthStore } from "./oauth-store.js";
 import { createServer } from "./server.js";
 
-const root = await mkdtemp(join(tmpdir(), "devspace-mcp-transport-mode-"));
-const workspaceRoot = join(root, "workspace");
-const stateDir = join(root, "state");
-const publicBaseUrl = "http://127.0.0.1:7676";
-const chatGptToken = "chatgpt-stateless-access-token";
-const statefulToken = "stateful-access-token";
-const clients: Client[] = [];
-await mkdir(workspaceRoot, { recursive: true });
-await mkdir(join(workspaceRoot, "nested"), { recursive: true });
-await writeFile(join(workspaceRoot, "AGENTS.md"), "# Transport test instructions\n\nKeep this fixture read-only.\n");
-await writeFile(
-  join(workspaceRoot, "nested", "AGENTS.md"),
-  "# Nested transport instructions\n\nAcknowledge this context before entering nested.\n",
-);
-await writeFile(join(workspaceRoot, "payload.txt"), "transport-mode-ok\n");
-
-const config = loadConfig({
-  DEVSPACE_CONFIG_DIR: join(root, "config"),
-  DEVSPACE_STATE_DIR: stateDir,
-  DEVSPACE_ALLOWED_ROOTS: workspaceRoot,
-  DEVSPACE_ALLOWED_HOSTS: "*",
-  DEVSPACE_PUBLIC_BASE_URL: publicBaseUrl,
-  DEVSPACE_OAUTH_OWNER_TOKEN: "mcp-transport-owner-token-long-enough",
-  DEVSPACE_SKILLS: "0",
-  DEVSPACE_WIDGETS: "off",
-  DEVSPACE_LOG_LEVEL: "warn",
-  DEVSPACE_LOG_FORMAT: "json",
-  DEVSPACE_MAX_MCP_SESSIONS: "2",
-  DEVSPACE_MAX_MCP_SESSIONS_PER_CLIENT: "1",
-  DEVSPACE_MCP_HTTP_TRANSPORT: "stateless",
-});
-seedClient(chatGptToken, "https://chatgpt.com/connector/oauth/transport-test", "chatgpt", stateDir, config);
-
-const running = createServer(config);
-const httpServer = createHttpServer(running.app);
-const controlHttpServer = createHttpServer(running.controlApp);
+const execFileAsync = promisify(execFile);
+const fixtureRoot = await mkdtemp(join(tmpdir(), "devspace-transport-mode-"));
 try {
-  const [origin, controlOrigin] = await Promise.all([
-    listen(httpServer),
-    listen(controlHttpServer),
-  ]);
-  assert.equal(
-    (await fetch(new URL("/internal/diagnostics", origin), {
-      headers: { "x-devspace-internal-token": internalDiagnosticsToken(config.oauth.keys.internalDiagnostics) },
-    })).status,
-    404,
-  );
-  const firstObserved: ObservedResponse[] = [];
-  const firstChatGpt = await connectClient("chatgpt-one", chatGptToken, origin, firstObserved);
-  clients.push(firstChatGpt);
-  assert.equal(firstObserved.some((entry) => entry.sessionId !== null), false);
-  await firstChatGpt.listTools();
-  const opened = await firstChatGpt.callTool({
-    name: "open_workspace",
-    arguments: {
-      path: workspaceRoot,
-      alias: "transport",
-      writeAccess: "read_write",
-      contextMode: "full",
-    },
-  });
-  const workspaceId = String(
-    (opened.structuredContent as { workspace?: { ref?: unknown } } | undefined)?.workspace?.ref ?? "",
-  );
-  assert.ok(workspaceId);
-  let receipt = String(
-    (opened.structuredContent as {
-      continuation?: { receipt?: unknown };
-    } | undefined)?.continuation?.receipt ?? "",
-  );
-  const firstContextReceipt = receipt;
-  assert.match(receipt, /^wctx5\./);
-  const instructionRevision = String(
-    (opened.structuredContent as {
-      instructionManifest?: { revision?: unknown };
-    } | undefined)?.instructionManifest?.revision ?? "",
-  );
-  assert.ok(instructionRevision);
-  const unverifiedRetainedOpen = await firstChatGpt.callTool({
-    name: "open_workspace",
-    arguments: {
-      path: workspaceRoot,
-      contextMode: "retained",
-      knownInstructionRevision: instructionRevision,
-    },
-  });
-  assert.equal(unverifiedRetainedOpen.isError, true);
-  assert.equal(
-    (unverifiedRetainedOpen.structuredContent as {
-      error?: { code?: unknown };
-    } | undefined)?.error?.code,
-    "retained_context_unverified",
-  );
-  const compactReopen = await firstChatGpt.callTool({
-    name: "get_workspace_context",
-    arguments: {
-      receipt,
-      contextMode: "retained",
-      knownInstructionRevision: instructionRevision,
-    },
-  });
-  const compactStructured = compactReopen.structuredContent as {
-    instructionManifest?: { files?: unknown };
-  } | undefined;
-  assert.deepEqual(compactStructured?.instructionManifest?.files, []);
-
-  const getResponse = await fetch(new URL("/mcp", origin), {
-    headers: { authorization: `Bearer ${chatGptToken}` },
-  });
-  assert.equal(getResponse.status, 405);
-  assert.equal(getResponse.headers.get("allow"), "POST");
-  const deleteResponse = await fetch(new URL("/mcp", origin), {
-    method: "DELETE",
-    headers: { authorization: `Bearer ${chatGptToken}` },
-  });
-  assert.equal(deleteResponse.status, 405);
-
-  const staleStatelessResponse = await rawMcpPost(origin, chatGptToken, "stale-chatgpt-session");
-  assert.equal(staleStatelessResponse.status, 200);
-
-  const loadedInstructions = await firstChatGpt.callTool({
-    name: "load_workspace_instructions",
-    arguments: { receipt, paths: ["."] },
-  });
-  const instructionToken = String(
-    (loadedInstructions.structuredContent as { instructionToken?: unknown } | undefined)?.instructionToken ?? "",
-  );
-  assert.match(instructionToken, /^instructions_/);
-  const nestedInstructions = await firstChatGpt.callTool({
-    name: "load_workspace_instructions",
-    arguments: { receipt, paths: ["nested"] },
-  });
-  const firstContextNestedToken = String(
-    (nestedInstructions.structuredContent as { instructionToken?: unknown } | undefined)
-      ?.instructionToken ?? "",
-  );
-  assert.match(firstContextNestedToken, /^instructions_/);
-
-  const heldCommand = firstChatGpt.callTool({
-    name: "exec_command",
-    arguments: {
-      receipt,
-      instructionToken,
-      shell: true,
-      command: "sleep 0.25",
-      yieldTimeMs: 1_000,
-    },
-  });
-  await delay(50);
-  const overCapacity = await rawMcpPost(origin, chatGptToken, "concurrent-chatgpt-session");
-  assert.equal(overCapacity.status, 503);
-  assert.match(await overCapacity.text(), /MCP request capacity reached/);
-  await heldCommand;
-  const afterCapacityRelease = await rawMcpPost(origin, chatGptToken, "released-chatgpt-session");
-  assert.equal(afterCapacityRelease.status, 200);
-
-  const disconnectProcess = await firstChatGpt.callTool({
-    name: "exec_command",
-    arguments: {
-      receipt,
-      program: process.execPath,
-      args: [
-        "-e",
-        "process.stdin.once('data', () => process.exit(0)); setInterval(() => {}, 1000);",
-      ],
-      closeStdin: false,
-      yieldTimeMs: 0,
-    },
-  });
-  const disconnectSessionId = (disconnectProcess.structuredContent as {
-    sessionId?: unknown;
-  } | undefined)?.sessionId;
-  assert.equal(typeof disconnectSessionId, "number");
-
-  await firstChatGpt.close();
-
-  for (let index = 0; index < 8; index += 1) {
-    await abortStatelessToolCallAfterLease({
-      origin,
-      controlOrigin,
-      accessToken: chatGptToken,
-      ownerToken: config.oauth.keys.internalDiagnostics,
-      requestId: 200 + index,
-      body: {
-        jsonrpc: "2.0",
-        id: 200 + index,
-        method: "tools/call",
-        params: {
-          name: "write_stdin",
-          _meta: {
-            "openai/subject": `subject-${chatGptToken}`,
-            "openai/session": "chatgpt-one",
-          },
-          arguments: {
-            receipt,
-            sessionId: disconnectSessionId,
-            yieldTimeMs: 5_000,
-          },
-        },
-      },
-    });
-  }
-
-  const listAfterEightDisconnects = await fetch(new URL("/mcp", origin), {
-    method: "POST",
-    headers: {
-      accept: "application/json, text/event-stream",
-      authorization: `Bearer ${chatGptToken}`,
-      "content-type": "application/json",
-      "mcp-protocol-version": "2025-06-18",
-    },
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      id: 300,
-      method: "tools/call",
-      params: {
-        name: "list_workspaces",
-        _meta: {
-          "openai/subject": `subject-${chatGptToken}`,
-          "openai/session": "chatgpt-one",
-        },
-        arguments: {},
-      },
-    }),
-  });
-  assert.equal(
-    listAfterEightDisconnects.status,
-    200,
-    "eight canceled stateless polls must not exhaust the client request limit",
-  );
-  assert.doesNotMatch(await listAfterEightDisconnects.text(), /MCP request capacity reached/);
-
-  const secondObserved: ObservedResponse[] = [];
-  const secondChatGpt = await connectClient("chatgpt-two", chatGptToken, origin, secondObserved);
-  clients.push(secondChatGpt);
-  assert.equal(secondObserved.some((entry) => entry.sessionId !== null), false);
-  const processAfterDisconnects = await secondChatGpt.callTool({
-    name: "write_stdin",
-    arguments: { receipt, sessionId: disconnectSessionId, yieldTimeMs: 0 },
-  });
-  assert.notEqual(
-    processAfterDisconnects.isError,
-    true,
-    "releasing a disconnected HTTP lease must not cancel the tracked process",
-  );
-  const stopDisconnectProcess = await secondChatGpt.callTool({
-    name: "write_stdin",
-    arguments: {
-      receipt,
-      sessionId: disconnectSessionId,
-      chars: "x",
-      yieldTimeMs: 1_000,
-    },
-  });
-  assert.notEqual(stopDisconnectProcess.isError, true);
-  const directReuseAfterTransportClose = await secondChatGpt.callTool({
-    name: "read",
-    arguments: { receipt, path: "payload.txt" },
-  });
-  assert.match(JSON.stringify(directReuseAfterTransportClose.content), /transport-mode-ok/);
-  const freshConversationOpen = await secondChatGpt.callTool({
-    name: "resume_workspace",
-    arguments: { alias: "transport", contextMode: "full" },
-  });
-  const freshStructured = freshConversationOpen.structuredContent as {
-    continuation?: { receipt?: unknown };
-    instructionManifest?: { files?: unknown[] };
-  } | undefined;
-  assert.ok((freshStructured?.instructionManifest?.files?.length ?? 0) > 0);
-  receipt = String(freshStructured?.continuation?.receipt ?? "");
-  assert.match(receipt, /^wctx5\./);
-  const resumedMutationWithoutReload = await secondChatGpt.callTool({
-    name: "exec_command",
-    arguments: { receipt, shell: true, command: "pwd" },
-  });
-  assert.equal(resumedMutationWithoutReload.isError, true);
-  assert.equal(
-    (resumedMutationWithoutReload.structuredContent as {
-      error?: { code?: unknown };
-    } | undefined)?.error?.code,
-    "instructions_required",
-  );
-  const freshRootInstructions = await secondChatGpt.callTool({
-    name: "load_workspace_instructions",
-    arguments: { receipt, paths: ["."] },
-  });
-  const freshRootToken = String(
-    (freshRootInstructions.structuredContent as { instructionToken?: unknown } | undefined)
-      ?.instructionToken ?? "",
-  );
-  assert.match(freshRootToken, /^instructions_/);
-  const resumedMutationAfterLoad = await secondChatGpt.callTool({
-    name: "exec_command",
-    arguments: { receipt, instructionToken: freshRootToken, shell: true, command: "pwd" },
-  });
-  assert.notEqual(resumedMutationAfterLoad.isError, true);
-  const originalContextStillAcknowledged = await secondChatGpt.callTool({
-    name: "exec_command",
-    arguments: { receipt: firstContextReceipt, shell: true, command: "pwd" },
-  });
-  assert.notEqual(
-    originalContextStillAcknowledged.isError,
-    true,
-    "resuming a new context must not clear acknowledgement state owned by an older receipt",
-  );
-  const crossContextInstructionToken = await secondChatGpt.callTool({
-    name: "exec_command",
-    arguments: {
-      receipt,
-      instructionToken: firstContextNestedToken,
-      shell: true, command: "pwd",
-      workingDirectory: "nested",
-    },
-  });
-  assert.equal(
-    (crossContextInstructionToken.structuredContent as {
-      error?: { code?: unknown };
-    } | undefined)?.error?.code,
-    "instruction_token_invalid",
-  );
-  const originalContextConsumesItsToken = await secondChatGpt.callTool({
-    name: "exec_command",
-    arguments: {
-      receipt: firstContextReceipt,
-      instructionToken: firstContextNestedToken,
-      shell: true, command: "pwd",
-      workingDirectory: "nested",
-    },
-  });
-  assert.notEqual(originalContextConsumesItsToken.isError, true);
-  const reusedRead = await secondChatGpt.callTool({
-    name: "read",
-    arguments: { receipt, path: "payload.txt" },
-  });
-  assert.match(JSON.stringify(reusedRead.content), /transport-mode-ok/);
-
+  await runMode("stateless", 0);
+  await runMode("stateful", 1);
 } finally {
-  for (const client of clients.reverse()) await client.close().catch(() => undefined);
-  await closeHttpServer(httpServer);
-  await closeHttpServer(controlHttpServer);
-  await running.close();
+  await rm(fixtureRoot, { recursive: true, force: true });
 }
 
-const statefulStateDir = join(root, "stateful-state");
-const statefulConfig = loadConfig({
-  DEVSPACE_CONFIG_DIR: join(root, "stateful-config"),
-  DEVSPACE_STATE_DIR: statefulStateDir,
-  DEVSPACE_ALLOWED_ROOTS: workspaceRoot,
-  DEVSPACE_ALLOWED_HOSTS: "*",
-  DEVSPACE_PUBLIC_BASE_URL: publicBaseUrl,
-  DEVSPACE_OAUTH_OWNER_TOKEN: "mcp-transport-owner-token-long-enough",
-  DEVSPACE_SKILLS: "0",
-  DEVSPACE_WIDGETS: "off",
-  DEVSPACE_LOG_LEVEL: "warn",
-  DEVSPACE_LOG_FORMAT: "json",
-  DEVSPACE_MCP_HTTP_TRANSPORT: "stateful",
-});
-seedClient(
-  statefulToken,
-  "http://127.0.0.1/stateful-callback",
-  "stateful",
-  statefulStateDir,
-  statefulConfig,
-);
-const statefulRunning = createServer(statefulConfig);
-const statefulHttpServer = createHttpServer(statefulRunning.app);
-try {
-  const statefulOrigin = await listen(statefulHttpServer);
-  const statefulObserved: ObservedResponse[] = [];
-  const stateful = await connectClient(
-    "stateful-client",
-    statefulToken,
-    statefulOrigin,
-    statefulObserved,
+async function runMode(mode: McpHttpTransportMode, index: number): Promise<void> {
+  const modeRoot = join(fixtureRoot, mode);
+  const projectRoot = join(modeRoot, "project");
+  const stateDir = join(modeRoot, "state");
+  const publicBaseUrl = `http://127.0.0.1:${7676 + index}`;
+  const accessToken = `transport-${mode}-access-token`;
+  await mkdir(projectRoot, { recursive: true });
+  await writeFile(
+    join(projectRoot, "AGENTS.md"),
+    `# ${mode} Project\n\nExercise the ${mode} MCP transport.\n`,
   );
-  const statefulSessionId = statefulObserved.find((entry) => entry.sessionId)?.sessionId;
-  assert.equal(typeof statefulSessionId, "string");
-  await stateful.listTools();
+  await writeFile(join(projectRoot, "payload.txt"), `${mode}-ready\n`);
+  await execFileAsync("git", ["init", "-q"], { cwd: projectRoot });
+  await execFileAsync("git", ["add", "."], { cwd: projectRoot });
+  await execFileAsync(
+    "git",
+    [
+      "-c", "user.name=DevSpace Test",
+      "-c", "user.email=devspace@example.invalid",
+      "-c", "commit.gpgsign=false",
+      "commit", "-qm", "fixture",
+    ],
+    { cwd: projectRoot },
+  );
 
-  const warningLines: string[] = [];
-  const originalWarn = console.warn;
-  let staleStatefulResponse: Response;
-  console.warn = (...values: unknown[]) => {
-    warningLines.push(values.map(String).join(" "));
-  };
+  const config = loadConfig({
+    DEVSPACE_CONFIG_DIR: join(modeRoot, "config"),
+    DEVSPACE_STATE_DIR: stateDir,
+    DEVSPACE_ALLOWED_ROOTS: projectRoot,
+    DEVSPACE_ALLOWED_HOSTS: "*",
+    DEVSPACE_PUBLIC_BASE_URL: publicBaseUrl,
+    DEVSPACE_OAUTH_OWNER_TOKEN: `transport-${mode}-owner-token-long-enough`,
+    DEVSPACE_OAUTH_SCOPES: DEVSPACE_CAPABILITY_SCOPES.join(","),
+    DEVSPACE_WIDGETS: "off",
+    DEVSPACE_LOG_LEVEL: "silent",
+    DEVSPACE_MCP_HTTP_TRANSPORT: mode,
+  });
+  seedAccessToken(config, stateDir, projectRoot, publicBaseUrl, accessToken, mode);
+  const running = createServer(config);
+  const httpServer = createHttpServer(running.app);
+  const clients: Client[] = [];
   try {
-    staleStatefulResponse = await rawMcpPost(
-      statefulOrigin,
-      statefulToken,
-      "stale-stateful-session",
+    const origin = await listen(httpServer);
+    const first = await connect(
+      origin,
+      accessToken,
+      `${mode}-first`,
+      clients,
+    );
+    const tools = await first.listTools();
+    assert.deepEqual(
+      tools.tools.map((tool) => tool.name).sort(),
+      [
+        "apply_patch",
+        "exec_command",
+        "inspect",
+        "list_projects",
+        "project_control",
+        "read_files",
+        "read_process_output",
+        "save_progress",
+        "show_changes",
+        "skills",
+        "write_stdin",
+      ].sort(),
+    );
+    assert.doesNotMatch(
+      JSON.stringify(tools),
+      /open_workspace|list_workspaces|resume_workspace|receipt|workspaceId|workspaceGeneration/iu,
+    );
+
+    const selected = await first.callTool({
+      name: "project_control",
+      arguments: { action: "open", operationId: `${mode}-first-execution` },
+    });
+    assertSucceeded(selected);
+    assert.match(JSON.stringify(selected.structuredContent), new RegExp(`${mode} Project`, "u"));
+    assertProjectOnly(selected);
+    const executionRef = projectExecutionRef(selected);
+    assertReadText(
+      await first.callTool({
+        name: "read_files",
+        arguments: { executionRef, files: [{ path: "payload.txt" }] },
+      }),
+      `${mode}-ready`,
+    );
+
+    await closeClient(first, clients);
+    const reconnected = await connect(
+      origin,
+      accessToken,
+      `${mode}-reconnected`,
+      clients,
+    );
+    assertReadText(
+      await reconnected.callTool({
+        name: "read_files",
+        arguments: { executionRef, files: [{ path: "payload.txt" }] },
+      }),
+      `${mode}-ready`,
+    );
+
+    const otherConversation = await connect(
+      origin,
+      accessToken,
+      `${mode}-other`,
+      clients,
+    );
+    assertErrorCode(
+      await otherConversation.callTool({
+        name: "read_files",
+        arguments: { files: [{ path: "payload.txt" }] },
+      }),
+      "invalid_tool_input",
+    );
+    const otherSelected = await otherConversation.callTool({
+      name: "project_control",
+      arguments: { action: "open", operationId: `${mode}-other-execution` },
+    });
+    assertSucceeded(otherSelected);
+    const otherExecutionRef = projectExecutionRef(otherSelected);
+    assert.notEqual(otherExecutionRef, executionRef);
+    assertReadText(
+      await otherConversation.callTool({
+        name: "read_files",
+        arguments: { executionRef: otherExecutionRef, files: [{ path: "payload.txt" }] },
+      }),
+      `${mode}-ready`,
     );
   } finally {
-    console.warn = originalWarn;
-  }
-  assert.equal(staleStatefulResponse.status, 404);
-  assert.match(await staleStatefulResponse.text(), /Unknown MCP session/);
-  const unknownSessionLog = warningLines
-    .map((line) => JSON.parse(line) as Record<string, unknown>)
-    .find((entry) => entry.event === "unknown_mcp_session");
-  assert.ok(unknownSessionLog);
-  assert.equal(unknownSessionLog.sessionIdPrefix, "stale-st");
-  assert.equal(unknownSessionLog.reason, "not_found_or_not_owned");
-  const serializedLog = JSON.stringify(unknownSessionLog);
-  assert.doesNotMatch(serializedLog, /stale-stateful-session/);
-  assert.doesNotMatch(serializedLog, new RegExp(statefulToken));
-  await stateful.close();
-} finally {
-  await closeHttpServer(statefulHttpServer);
-  await statefulRunning.close();
-  await rm(root, { recursive: true, force: true });
-}
-
-interface ObservedResponse {
-  method: string;
-  status: number;
-  sessionId: string | null;
-}
-
-async function connectClient(
-  name: string,
-  accessToken: string,
-  origin: URL,
-  observed: ObservedResponse[],
-): Promise<Client> {
-  const client = new Client({ name, version: "1.0.0" });
-  await client.connect(new StreamableHTTPClientTransport(new URL("/mcp", origin), {
-    requestInit: { headers: { authorization: `Bearer ${accessToken}` } },
-    fetch: async (input, init) => {
-      const response = await fetch(input, init);
-      observed.push({
-        method: init?.method ?? "GET",
-        status: response.status,
-        sessionId: response.headers.get("mcp-session-id"),
-      });
-      return response;
-    },
-  }));
-  let operationSequence = 0;
-  const originalCallTool = client.callTool.bind(client);
-  client.callTool = (async (...callArgs: Parameters<Client["callTool"]>) => {
-    const request = callArgs[0];
-    const requestArguments = {
-      ...(request.arguments as Record<string, unknown> | undefined ?? {}),
-    };
-    const mutatingWriteStdin = request.name === "write_stdin" && (
-      requestArguments.chars !== undefined ||
-      requestArguments.closeStdin === true ||
-      requestArguments.columns !== undefined ||
-      requestArguments.rows !== undefined
-    );
-    if (
-      requestArguments.operationId === undefined &&
-      (new Set([
-        "exec_command", "apply_patch", "close_workspace", "revoke_workspace", "show_changes",
-      ]).has(request.name) || mutatingWriteStdin)
-    ) {
-      operationSequence += 1;
-      requestArguments.operationId = `${name}-auto-${operationSequence}`;
+    while (clients.length > 0) {
+      await closeClient(clients[clients.length - 1]!, clients);
     }
-    callArgs[0] = {
-      ...request,
-      _meta: {
-        ...(request._meta ?? {}),
-        "openai/subject": `subject-${accessToken}`,
-        "openai/session": name,
-      },
-      arguments: requestArguments,
-    };
-    return originalCallTool(...callArgs);
-  }) as Client["callTool"];
-  return client;
-}
-
-function rawMcpPost(origin: URL, accessToken: string, sessionId: string): Promise<Response> {
-  return fetch(new URL("/mcp", origin), {
-    method: "POST",
-    headers: {
-      accept: "application/json, text/event-stream",
-      authorization: `Bearer ${accessToken}`,
-      "content-type": "application/json",
-      "mcp-protocol-version": "2025-06-18",
-      "mcp-session-id": sessionId,
-    },
-    body: JSON.stringify({ jsonrpc: "2.0", id: 99, method: "tools/list", params: {} }),
-  });
-}
-
-async function abortStatelessToolCallAfterLease(options: {
-  origin: URL;
-  controlOrigin: URL;
-  accessToken: string;
-  ownerToken: string | Uint8Array;
-  requestId: number;
-  body: Record<string, unknown>;
-}): Promise<void> {
-  await waitForStatelessRequestCount(options.controlOrigin, options.ownerToken, 0);
-  const controller = new AbortController();
-  const request = fetch(new URL("/mcp", options.origin), {
-    method: "POST",
-    headers: {
-      accept: "application/json, text/event-stream",
-      authorization: `Bearer ${options.accessToken}`,
-      "content-type": "application/json",
-      "mcp-protocol-version": "2025-06-18",
-    },
-    body: JSON.stringify(options.body),
-    signal: controller.signal,
-  });
-
-  await waitForStatelessRequestCount(options.controlOrigin, options.ownerToken, 1);
-  controller.abort();
-  const abortError = await request.then(
-    async (response) => {
-      try {
-        await response.text();
-        return undefined;
-      } catch (error) {
-        return error;
-      }
-    },
-    (error: unknown) => error,
-  );
-  assert.equal(
-    abortError instanceof Error ? abortError.name : undefined,
-    "AbortError",
-    `request ${options.requestId} must observe the client abort`,
-  );
-  await waitForStatelessRequestCount(options.controlOrigin, options.ownerToken, 0);
-}
-
-async function waitForStatelessRequestCount(
-  origin: URL,
-  ownerToken: string | Uint8Array,
-  expected: number,
-): Promise<void> {
-  const deadline = Date.now() + 2_000;
-  while (Date.now() < deadline) {
-    const response = await fetch(new URL("/internal/diagnostics", origin), {
-      headers: { "x-devspace-internal-token": internalDiagnosticsToken(ownerToken) },
-    });
-    assert.equal(response.status, 200);
-    const body = await response.json() as {
-      usage?: { mcpSessions?: { statelessRequests?: unknown } };
-    };
-    if (body.usage?.mcpSessions?.statelessRequests === expected) return;
-    await delay(10);
+    await closeHttpServer(httpServer);
+    await running.close();
   }
-  assert.fail(`stateless request count did not reach ${expected}`);
 }
 
-function seedClient(
+function seedAccessToken(
+  config: ReturnType<typeof loadConfig>,
+  stateDir: string,
+  projectRoot: string,
+  publicBaseUrl: string,
   accessToken: string,
-  redirectUri: string,
-  name: string,
-  targetStateDir: string,
-  targetConfig: ReturnType<typeof loadConfig>,
+  mode: McpHttpTransportMode,
 ): void {
-  const store = new SqliteOAuthStore(targetStateDir);
+  const store = new SqliteOAuthStore(stateDir);
   try {
-    const clientsStore = new SqliteOAuthClientsStore(
+    const client = new SqliteOAuthClientsStore(
       store,
-      targetConfig.oauth.allowedRedirectHosts,
-    );
-    const client = clientsStore.registerClient({
-      redirect_uris: [redirectUri],
-      client_name: name,
+      config.oauth.allowedRedirectHosts,
+    ).registerClient({
+      redirect_uris: ["https://chatgpt.com/connector_platform_oauth_redirect"],
+      client_name: `transport-${mode}`,
     });
-    store.ensurePrincipalForClient(client.client_id);
-    const resource = new URL("/mcp", publicBaseUrl).href;
+    const grant = store.createAuthorizationGrant({
+      clientId: client.client_id,
+      scopes: [...DEVSPACE_CAPABILITY_SCOPES],
+      allowedRootIds: [
+        authorizationRootId(projectRoot, config.oauth.keys.authorizationRoot),
+      ],
+    });
     const expiresAt = Math.floor(Date.now() / 1_000) + 3_600;
+    const resource = new URL("/mcp", publicBaseUrl).href;
     store.saveTokenPair({
       accessTokenHash: hashToken(accessToken),
-      accessToken: { clientId: client.client_id, scopes: [...DEFAULT_DEVSPACE_OAUTH_SCOPES], expiresAt, resource },
+      accessToken: {
+        grantId: grant.grantId,
+        clientId: client.client_id,
+        principalId: grant.principalId,
+        authorizationEpoch: grant.authorizationEpoch,
+        scopes: [...grant.grantedScopes],
+        expiresAt,
+        resource,
+      },
       refreshTokenHash: hashToken(`${accessToken}-refresh`),
-      refreshToken: { clientId: client.client_id, scopes: [...DEFAULT_DEVSPACE_OAUTH_SCOPES], expiresAt, resource },
+      refreshToken: {
+        grantId: grant.grantId,
+        clientId: client.client_id,
+        principalId: grant.principalId,
+        authorizationEpoch: grant.authorizationEpoch,
+        scopes: [...grant.grantedScopes],
+        expiresAt: expiresAt + 3_600,
+        resource,
+      },
     });
   } finally {
     store.close();
   }
+}
+
+async function connect(
+  origin: URL,
+  accessToken: string,
+  name: string,
+  clients: Client[],
+): Promise<Client> {
+  const client = new Client({ name, version: "1.0.0" });
+  await client.connect(new StreamableHTTPClientTransport(new URL("/mcp", origin), {
+    requestInit: { headers: { authorization: `Bearer ${accessToken}` } },
+  }));
+  clients.push(client);
+  return client;
+}
+
+async function closeClient(client: Client, clients: Client[]): Promise<void> {
+  const index = clients.indexOf(client);
+  if (index >= 0) clients.splice(index, 1);
+  await client.close().catch(() => undefined);
+}
+
+function assertProjectOnly(
+  result: Awaited<ReturnType<Client["callTool"]>>,
+): void {
+  const serialized = JSON.stringify(result.structuredContent ?? {});
+  assert.match(serialized, /"project"/u);
+  assert.doesNotMatch(
+    serialized,
+    /"(?:workspace|receipt|continuation|contextChanged|state|phase|instructionToken)"\s*:/iu,
+  );
+}
+
+function projectExecutionRef(
+  result: Awaited<ReturnType<Client["callTool"]>>,
+): string {
+  const executionRef = String(
+    (result.structuredContent as {
+      project?: { executionRef?: unknown };
+    } | undefined)?.project?.executionRef ?? "",
+  );
+  assert.match(executionRef, /^pex1_/u);
+  return executionRef;
+}
+
+function assertReadText(
+  result: Awaited<ReturnType<Client["callTool"]>>,
+  expected: string,
+): void {
+  assertSucceeded(result);
+  assert.match(JSON.stringify(result.structuredContent), new RegExp(expected, "u"));
+}
+
+function assertSucceeded(result: Awaited<ReturnType<Client["callTool"]>>): void {
+  assert.notEqual(result.isError, true, JSON.stringify(result.content));
+}
+
+function assertErrorCode(
+  result: Awaited<ReturnType<Client["callTool"]>>,
+  code: string,
+): void {
+  assert.equal(result.isError, true, JSON.stringify(result.content));
+  assert.equal(
+    (result.structuredContent as {
+      error?: { code?: unknown };
+    } | undefined)?.error?.code,
+    code,
+  );
 }
 
 function hashToken(token: string): string {
@@ -614,8 +303,4 @@ function closeHttpServer(server: HttpServer): Promise<void> {
   return new Promise((resolve, reject) => {
     server.close((error) => error ? reject(error) : resolve());
   });
-}
-
-function delay(milliseconds: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }

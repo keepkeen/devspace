@@ -132,7 +132,7 @@ await assert.rejects(
 +no
 *** End Patch`,
   ),
-  /path escapes the workspace/,
+  /path escapes the Project/,
 );
 
 const outside = await mkdtemp(join(tmpdir(), "devspace-apply-patch-outside-"));
@@ -145,7 +145,7 @@ await assert.rejects(
 +no
 *** End Patch`,
   ),
-  /path resolves outside the workspace/,
+  /path resolves outside the Project/,
 );
 
 await assert.rejects(

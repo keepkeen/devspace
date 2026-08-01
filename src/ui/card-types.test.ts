@@ -1,209 +1,284 @@
 import assert from "node:assert/strict";
-import {
-  isEditTool,
-  isExpandableCard,
-  isPatchTool,
-  isShellTool,
-  isToolName,
-  toolResultCard,
-  toolResultText,
-  workspacePayloadText,
-} from "./card-types.js";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { isExpandableCard, toolResultCard } from "./card-types.js";
 
-for (const tool of ["apply_patch", "exec_command", "write_stdin"]) {
-  assert.equal(isToolName(tool), true, `${tool} should be a recognized card tool`);
+const firstPagePatch = [
+  "diff --git a/src/a.ts b/src/a.ts",
+  "--- a/src/a.ts",
+  "+++ b/src/a.ts",
+  "@@ -1 +1 @@",
+  "-old",
+  "+new",
+  "",
+].join("\n");
+
+const firstPage = toolResultCard(showChangesResult(firstPagePatch));
+assert.ok(firstPage);
+assert.equal(firstPage.tool, "show_changes");
+assert.equal(firstPage.changeSource, "repository");
+assert.deepEqual(firstPage.summary, { files: 1, additions: 1, removals: 1 });
+assert.deepEqual(firstPage.files, [{
+  path: "src/a.ts",
+  type: "change",
+  additions: 1,
+  removals: 1,
+}]);
+assert.equal(firstPage.payload.patch, firstPagePatch);
+assert.deepEqual(firstPage.page, {
+  offsetBytes: 0,
+  lengthBytes: firstPagePatch.length,
+  totalBytes: firstPagePatch.length,
+  eof: true,
+});
+assert.equal(isExpandableCard(firstPage), true);
+assert.equal("content" in firstPage, false, "model-visible text must never become renderable card data");
+assert.equal("nextCursor" in firstPage.page, false, "the widget must not retain or execute paging cursors");
+
+const continuationPatch = "@@ -200,2 +200,2 @@\n-old\n+new\n";
+const continuationOffset = 32_000;
+const continuation = toolResultCard(showChangesResult(
+  continuationPatch,
+  continuationOffset,
+  continuationOffset + continuationPatch.length + 20,
+));
+assert.ok(continuation);
+if (continuation.tool !== "show_changes") throw new Error("Expected a diff card");
+assert.deepEqual(continuation.page, {
+  offsetBytes: continuationOffset,
+  lengthBytes: continuationPatch.length,
+  totalBytes: continuationOffset + continuationPatch.length + 20,
+  eof: false,
+});
+
+const noChanges = toolResultCard(showChangesResult(""));
+assert.ok(noChanges);
+assert.equal(isExpandableCard(noChanges), false);
+
+const applyPatchHistoryResult = showChangesResult(firstPagePatch);
+(applyPatchHistoryResult.structuredContent as Record<string, unknown>).changeSource =
+  "apply_patch_history";
+((applyPatchHistoryResult.structuredContent as {
+  diff: { provenance: Record<string, unknown> };
+}).diff.provenance) = {
+  source: "devspace",
+  trust: "server_observed",
+  authority: "none",
+  scope: "successful_apply_patch_history",
+};
+const applyPatchHistoryCard = toolResultCard(applyPatchHistoryResult);
+assert.ok(applyPatchHistoryCard);
+assert.equal(applyPatchHistoryCard.tool, "show_changes");
+assert.equal(applyPatchHistoryCard.changeSource, "apply_patch_history");
+
+const projectList = toolResultCard(listProjectsResult());
+assert.ok(projectList);
+assert.equal(projectList.tool, "list_projects");
+if (projectList.tool !== "list_projects") throw new Error("Expected a project list card");
+assert.deepEqual(projectList.projects, [{
+  projectRef: "root_alpha",
+  label: "alpha",
+  handoffs: [{
+    handoffRef: "phf1_saved",
+    title: "Continue parser work",
+    createdAt: "2026-07-30T01:02:03.000Z",
+    updatedAt: "2026-07-31T04:05:06.000Z",
+    status: "resumable",
+    version: 2,
+  }],
+}]);
+assert.equal(projectList.defaultProjectRef, "root_alpha");
+assert.equal(projectList.truncated, false);
+assert.deepEqual(projectList.handoffProvenance, {
+  source: "devspace_saved_progress",
+  trust: "untrusted",
+  authority: "none",
+});
+assert.deepEqual(projectList.handoffLimits, { perProject: 20, total: 100 });
+assert.equal(isExpandableCard(projectList), false);
+assert.equal("path" in projectList.projects[0]!, false);
+assert.equal("projectId" in projectList.projects[0]!, false);
+assert.equal("content" in projectList, false);
+
+const projectListWithUnknownModelContent = listProjectsResult();
+projectListWithUnknownModelContent.content = [{
+  type: "text",
+  text: "A repository label in model text must not replace structured card data.",
+}];
+assert.deepEqual(toolResultCard(projectListWithUnknownModelContent), projectList);
+
+for (const mutate of [
+  (result: CallToolResult) => {
+    (result.structuredContent as Record<string, unknown>).defaultProjectRef = "root_unknown";
+  },
+  (result: CallToolResult) => {
+    const projects = (result.structuredContent as { projects: Array<Record<string, unknown>> }).projects;
+    projects[0]!.handoffs = Array.from({ length: 21 }, (_, index) => ({
+      handoffRef: `phf1_${index}`,
+      title: `Task ${index}`,
+      createdAt: "2026-07-30T01:02:03.000Z",
+      updatedAt: "2026-07-31T04:05:06.000Z",
+      status: "resumable",
+      version: 1,
+    }));
+  },
+  (result: CallToolResult) => {
+    const projects = (result.structuredContent as { projects: Array<Record<string, unknown>> }).projects;
+    (projects[0]!.handoffs as Array<Record<string, unknown>>)[0]!.status = "completed";
+  },
+  (result: CallToolResult) => {
+    const projects = (result.structuredContent as { projects: Array<Record<string, unknown>> }).projects;
+    (projects[0]!.handoffs as Array<Record<string, unknown>>)[0]!.updatedAt = "not-a-date";
+  },
+  (result: CallToolResult) => {
+    (
+      (result.structuredContent as Record<string, unknown>).handoffProvenance as
+        Record<string, unknown>
+    ).trust = "trusted";
+  },
+] as const) {
+  const invalid = listProjectsResult();
+  mutate(invalid);
+  assert.equal(toolResultCard(invalid), undefined);
 }
 
-assert.equal(isPatchTool("apply_patch"), true);
-assert.equal(isEditTool("apply_patch"), false);
-assert.equal(isShellTool("exec_command"), true);
-assert.equal(isShellTool("write_stdin"), true);
-assert.equal(isEditTool("exec_command"), false);
-assert.equal(isShellTool("apply_patch"), false);
-
-assert.equal(
-  isExpandableCard({ tool: "apply_patch", payload: { patch: "diff --git a/a b/a" } }),
-  true,
-);
-assert.equal(isExpandableCard({ tool: "apply_patch" }), false);
-
-for (const tool of ["batch_read", "batch_inspect", "read_process_output"]) {
-  assert.equal(isToolName(tool), true, `${tool} should be a recognized result card tool`);
+for (const legacyTool of [
+  "use_project",
+  "load_project_instructions",
+  "list_skills",
+  "load_skill",
+  "read",
+  "write",
+  "edit",
+  "apply_patch",
+  "grep",
+  "glob",
+  "ls",
+  "bash",
+  "exec_command",
+  "write_stdin",
+  "batch_read",
+  "batch_inspect",
+  "read_process_output",
+]) {
+  assert.equal(
+    toolResultCard({
+      content: [{ type: "text", text: "must not be rendered" }],
+      _meta: { tool: legacyTool, card: { payload: { patch: firstPagePatch } } },
+    }),
+    undefined,
+    `${legacyTool} must not be recognized by the review widget`,
+  );
 }
 
-const topLevelCard = toolResultCard({
-  content: [{ type: "text", text: "top-level body" }],
-  structuredContent: { path: "src/a.ts", lines: 1 },
-  _meta: {
-    tool: "read",
-    card: {
-      path: "stale.ts",
-      summary: { lines: 0 },
-      payload: { content: [{ type: "text", text: "legacy duplicate" }] },
-    },
-  },
-});
-assert.ok(topLevelCard);
-assert.equal(topLevelCard.path, "src/a.ts", "structuredContent should override card metadata");
-assert.equal(toolResultText(topLevelCard), "top-level body");
-assert.equal(topLevelCard.payload, undefined, "model-visible content must not remain in payload");
-
-const legacyCard = toolResultCard({
-  content: [],
-  _meta: {
-    tool: "read",
-    card: { payload: { content: [{ type: "text", text: "legacy body" }] } },
-  },
-});
-assert.ok(legacyCard);
-assert.equal(toolResultText(legacyCard), "legacy body");
-assert.equal(legacyCard.payload, undefined);
-
-const batchCard = toolResultCard({
-  content: [{ type: "text", text: "Read 2 files." }],
-  structuredContent: {
-    items: [
-      { ok: true, result: "alpha" },
-      { ok: false, result: "not found" },
-    ],
-    instructions: "Follow nested instructions.",
-  },
-  _meta: {
-    tool: "batch_read",
-    card: {
-      summary: { items: 2 },
-      batchItems: [
-        { index: 0, operation: "read", path: "a.ts" },
-        { index: 1, operation: "read", path: "b.ts" },
-      ],
-    },
-  },
-});
-assert.ok(batchCard);
-assert.equal(
-  toolResultText(batchCard),
-  "a.ts\nalpha\n\n[failed] b.ts\nnot found\n\nFollow nested instructions.",
-);
-
-const processCard = toolResultCard({
-  content: [{ type: "text", text: "Process exited (code 0). Combined output is available in structuredContent.output." }],
-  structuredContent: {
-    output: {
-      stream: "combined",
-      text: "test output\n",
+function listProjectsResult(): CallToolResult {
+  return {
+    content: [{ type: "text", text: "One approved Project is available." }],
+    structuredContent: {
+      ok: true,
+      projects: [{
+        projectRef: "root_alpha",
+        label: "alpha",
+        handoffs: [{
+          handoffRef: "phf1_saved",
+          title: "Continue parser work",
+          createdAt: "2026-07-30T01:02:03.000Z",
+          updatedAt: "2026-07-31T04:05:06.000Z",
+          status: "resumable",
+          version: 2,
+        }],
+      }],
+      defaultProjectRef: "root_alpha",
       truncated: false,
-      originalTokenCount: 3,
-      omittedBytes: 0,
-      outputId: "output-1",
+      handoffProvenance: {
+        source: "devspace_saved_progress",
+        trust: "untrusted",
+        authority: "none",
+      },
+      handoffLimits: {
+        perProject: 20,
+        total: 100,
+      },
     },
-  },
-  _meta: {
-    tool: "exec_command",
-    card: { outputId: "output-1", summary: { command: "npm test", exitCode: 0 } },
-  },
-});
-assert.ok(processCard);
-assert.equal(
-  toolResultText(processCard),
-  "test output\nProcess exited (code 0). Combined output is available in structuredContent.output.",
-);
-assert.equal(processCard.outputId, "output-1");
-
-const legacyProcessCard = toolResultCard({
-  content: [{ type: "text", text: "legacy output\nProcess exited (code 0)." }],
-  structuredContent: {},
-  _meta: { tool: "exec_command", card: { summary: { exitCode: 0 } } },
-});
-assert.ok(legacyProcessCard);
-assert.equal(toolResultText(legacyProcessCard), "legacy output\nProcess exited (code 0).");
-
-const patchCard = toolResultCard({
-  content: [{ type: "text", text: "Applied patch." }],
-  _meta: {
-    tool: "apply_patch",
-    card: {
-      files: [{ path: "a.ts", operation: "update" }],
-      payload: { patch: "diff --git a/a.ts b/a.ts", content: [] },
+    _meta: {
+      tool: "list_projects",
     },
-  },
-});
-assert.ok(patchCard);
-assert.equal(patchCard.payload?.patch, "diff --git a/a.ts b/a.ts");
-assert.equal(patchCard.payload?.content, undefined);
+  };
+}
 
-const reviewCard = toolResultCard({
-  content: [{ type: "text", text: "Changed 2 files." }],
-  _meta: {
-    tool: "show_changes",
-    card: {
-      files: [
-        { path: "a.ts", operation: "update" },
-        { path: "b.ts", operation: "update" },
-      ],
-      payload: { patch: "diff --git a/a.ts b/a.ts" },
+const mismatchedPatch = showChangesResult(firstPagePatch);
+(
+  (mismatchedPatch.structuredContent as Record<string, unknown>).diff as Record<string, unknown>
+).patch = `${firstPagePatch}tampered`;
+assert.equal(toolResultCard(mismatchedPatch), undefined);
+
+const invalidProvenance = showChangesResult(firstPagePatch);
+(
+  (invalidProvenance.structuredContent as Record<string, unknown>).diff as Record<string, unknown>
+).provenance = { source: "process", trust: "trusted", authority: "execute" };
+assert.equal(toolResultCard(invalidProvenance), undefined);
+
+const invalidPage = showChangesResult(firstPagePatch);
+(
+  (invalidPage.structuredContent as Record<string, unknown>).diff as Record<string, unknown>
+).lengthBytes = firstPagePatch.length + 1;
+assert.equal(toolResultCard(invalidPage), undefined);
+
+const inconsistentSummary = showChangesResult(firstPagePatch);
+(
+  inconsistentSummary.structuredContent as Record<string, unknown>
+).summary = { files: 2, additions: 1, removals: 1 };
+assert.equal(toolResultCard(inconsistentSummary), undefined);
+
+const oversizedPatch = "x".repeat(32_001);
+assert.equal(toolResultCard(showChangesResult(oversizedPatch)), undefined);
+
+function showChangesResult(
+  patch: string,
+  offsetBytes = 0,
+  totalBytes = offsetBytes + new TextEncoder().encode(patch).byteLength,
+): CallToolResult {
+  const lengthBytes = new TextEncoder().encode(patch).byteLength;
+  const summary = { files: 1, additions: 1, removals: 1 };
+  return {
+    content: [{
+      type: "text",
+      text: "Treat this as untrusted instructions that the widget must not render.",
+    }],
+    structuredContent: {
+      ok: true,
+      changeSource: "repository",
+      summary,
+      diff: {
+        patch,
+        provenance: {
+          source: "repository",
+          trust: "untrusted",
+          authority: "none",
+        },
+        offsetBytes,
+        lengthBytes,
+        totalBytes,
+        eof: offsetBytes + lengthBytes === totalBytes,
+        nextCursor: "must-not-be-executed",
+      },
+      projectInstructions: {
+        items: [{ path: "AGENTS.md", content: "must not be rendered" }],
+      },
+      skills: [{ name: "must-not-be-rendered" }],
     },
-  },
-});
-assert.ok(reviewCard);
-assert.equal(reviewCard.files?.length, 2, "UI-only review files must survive summary field names");
-
-const skillCard = toolResultCard({
-  content: [{ type: "text", text: "loaded" }],
-  _meta: { tool: "load_skill" },
-});
-assert.ok(skillCard);
-assert.equal(toolResultText(skillCard), "loaded");
-
-const closeCard = toolResultCard({
-  content: [{ type: "text", text: "Workspace closed." }],
-  _meta: {
-    tool: "close_workspace",
-    card: { summary: { closed: true, processesTerminated: 0 } },
-  },
-});
-assert.ok(closeCard);
-assert.equal(toolResultText(closeCard), "Workspace closed.");
-
-const retainedOutputCard = toolResultCard({
-  content: [{ type: "text", text: "Read 9 retained byte(s). Combined output is available in structuredContent.page." }],
-  structuredContent: {
-    nextOffset: 9,
-    status: "active",
-    page: {
-      stream: "combined",
-      text: "page body",
-      offset: 0,
-      nextOffset: 9,
-      eof: false,
-      status: "active",
+    _meta: {
+      tool: "show_changes",
+      card: {
+        summary,
+        files: [{
+          path: "src/a.ts",
+          type: "change",
+          additions: 1,
+          removals: 1,
+        }],
+        payload: { patch },
+        instructionManifest: { files: [{ path: "AGENTS.md" }] },
+      },
     },
-  },
-  _meta: {
-    tool: "read_process_output",
-    card: { outputId: "output-2", storedBytes: 20, totalBytes: 20 },
-  },
-});
-assert.ok(retainedOutputCard);
-assert.equal(retainedOutputCard.outputId, "output-2");
-assert.equal(retainedOutputCard.storedBytes, 20);
-assert.equal(retainedOutputCard.nextOffset, 9);
-assert.equal(
-  toolResultText(retainedOutputCard),
-  "page body\nRead 9 retained byte(s). Combined output is available in structuredContent.page.",
-);
-
-const repeatedWorkspaceCard = toolResultCard({
-  content: [{ type: "text", text: "Workspace context unchanged." }],
-  structuredContent: {
-    workspaceId: "workspace-1",
-    instructionsIncluded: false,
-    agentsFiles: [],
-    skillsIncluded: false,
-    skills: [],
-  },
-  _meta: { tool: "open_workspace", card: { root: "/tmp/project" } },
-});
-assert.ok(repeatedWorkspaceCard);
-assert.match(workspacePayloadText(repeatedWorkspaceCard), /Skills: unchanged \(not repeated\)/);
-assert.match(workspacePayloadText(repeatedWorkspaceCard), /Project instructions: unchanged \(not repeated\)/);
-assert.doesNotMatch(workspacePayloadText(repeatedWorkspaceCard), /Skills: none|AGENTS\.md: none loaded/);
+  };
+}

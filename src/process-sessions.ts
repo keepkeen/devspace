@@ -1,5 +1,7 @@
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { resolve } from "node:path";
+import type { Writable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import {
   isProcessTreeAlive,
@@ -9,12 +11,6 @@ import {
   type ShellCommand,
 } from "./process-platform.js";
 import { ProcessOutputQuotaError, type ProcessOutputStore } from "./process-output-store.js";
-import { tokenizeSegment, unwrapCommandWrappers } from "./command-policy.js";
-import {
-  delegatedCommandPayloads,
-  isShellAnalysisLimitError,
-  splitShellSegments,
-} from "./shell-command-analysis.js";
 import type { WorkspaceRootLease } from "./workspace-root-locks.js";
 
 const DEFAULT_EXEC_YIELD_MS = 10_000;
@@ -40,7 +36,6 @@ export interface StartCommandInput {
   workspaceId: string;
   command: ProcessCommand;
   cwd: string;
-  workspaceRoot?: string;
   environment?: Record<string, string>;
   tty?: boolean;
   columns?: number;
@@ -53,6 +48,27 @@ export interface StartCommandInput {
   /** Initial standard input. When provided, stdin is closed by default after writing. */
   stdin?: string;
   closeStdin?: boolean;
+  /** Retain the operation's workspace-root lease immediately after child spawn. */
+  retainWorkspaceRootLease?: () => WorkspaceRootLease;
+  activity?: {
+    threadId: string;
+    operationId: string;
+    summary: string;
+  };
+}
+
+export interface ProcessActivityEvent {
+  threadId: string;
+  operationId: string;
+  itemId: string;
+  type:
+    | "command.started"
+    | "command.output_available"
+    | "command.completed"
+    | "command.failed"
+    | "command.interrupted";
+  eventKey: string;
+  payload: Record<string, unknown>;
 }
 
 export interface PreparedProcessInput {
@@ -139,6 +155,11 @@ interface ManagedProcess {
   resize?(columns: number, rows: number): void;
 }
 
+interface ProcessLaunchGate {
+  release(): Promise<void>;
+  abort(): void;
+}
+
 interface ProcessSession {
   id: number;
   connectionPrincipalId: string;
@@ -177,13 +198,13 @@ interface ProcessSession {
   durableFlushTimer?: NodeJS.Timeout;
   outputStorageError?: string;
   releaseWorkspaceRootLease?: () => void;
+  activity?: StartCommandInput["activity"];
 }
 
 export interface ProcessSessionManagerOptions {
   maxBufferBytes?: number;
   completedSessionTtlMs?: number;
   maxSessions?: number;
-  maxSessionsPerClient?: number;
   maxSessionsPerWorkspace?: number;
   maxRuntimeMs?: number;
   terminationGraceMs?: number;
@@ -194,17 +215,13 @@ export interface ProcessSessionManagerOptions {
     error: unknown,
     context: { connectionPrincipalId: string; workspaceId: string; outputId?: string },
   ) => void;
+  onActivity?: (event: ProcessActivityEvent) => void;
 }
 
 export interface ProcessSessionUsageSnapshot {
   sessions: number;
   running: number;
   limit: number;
-  principal?: {
-    sessions: number;
-    running: number;
-    limit: number;
-  };
 }
 
 function boundedInteger(value: number | undefined, fallback: number, maximum: number): number {
@@ -239,126 +256,11 @@ function workspaceKey(connectionPrincipalId: string, workspaceId: string): strin
   return `${connectionPrincipalId}\u0000${workspaceId}`;
 }
 
-export function isInteractiveShellCommand(command: string, depth = 0): boolean {
-  if (depth > 8) return true;
-  try {
-    for (const segment of splitShellSegments(command)) {
-      const tokens = tokenizeSegment(segment);
-      if (directShellReadsStdin(tokens)) return true;
-      for (const payload of delegatedCommandPayloads(tokens)) {
-        if (isInteractiveShellCommand(payload, depth + 1)) return true;
-      }
-    }
-    return false;
-  } catch (error) {
-    if (isShellAnalysisLimitError(error)) return true;
-    throw error;
-  }
-}
-
-function directShellReadsStdin(tokens: string[]): boolean {
-  const words = unwrapCommandWrappers(tokens);
-  const executable = words.shift()?.split("/").at(-1);
-  if (!executable || !["sh", "bash", "zsh", "dash", "ksh", "fish"].includes(executable)) {
-    return false;
-  }
-
-  let readsStdin = false;
-  for (let index = 0; index < words.length; index += 1) {
-    const word = words[index]!;
-    if (word === "--" || (executable === "zsh" && word === "-b")) {
-      return readsStdin || index + 1 === words.length;
-    }
-    if (word === "-") {
-      readsStdin = true;
-      continue;
-    }
-    if (!word.startsWith("-") && !word.startsWith("+")) return readsStdin;
-
-    const option = shellInvocationOption(executable, word);
-    if (option === "command") {
-      // A missing command operand is malformed and therefore ambiguous. Treat
-      // it as shell input so any supplied stdin still receives shell checks.
-      return words[index + 1] === undefined;
-    }
-    if (option === "command-inline") return false;
-    if (option === "stdin") {
-      readsStdin = true;
-      continue;
-    }
-    if (option === "value") {
-      if (words[index + 1] === undefined) return true;
-      index += 1;
-      continue;
-    }
-    if (option === "flag") continue;
-
-    // Unknown invocation options may consume the following word. Fail closed
-    // instead of mistaking that operand for a script file.
-    return true;
-  }
-  return true;
-}
-
-type ShellInvocationOption = "command" | "command-inline" | "stdin" | "value" | "flag" | "unknown";
-
-function shellInvocationOption(shell: string, option: string): ShellInvocationOption {
-  if (option.startsWith("--command=")) return "command-inline";
-  if (option === "-c" || option === "--command") return "command";
-  if (option === "-s" || option === "--stdin") return "stdin";
-
-  if (shell === "fish") {
-    if (["-C", "--init-command", "-d", "--debug", "-D", "--debug-output", "--features", "--profile", "--profile-startup"].includes(option)) {
-      return "value";
-    }
-    if (/^--(?:init-command|debug|debug-output|features|profile|profile-startup)=/u.test(option)) {
-      return "flag";
-    }
-    if (["-i", "-l", "-N", "-n", "-P", "--interactive", "--login", "--no-config", "--no-execute", "--private", "--version", "--help"].includes(option)) {
-      return "flag";
-    }
-    return "unknown";
-  }
-
-  if (option === "-o" || option === "+o" || (shell === "bash" && (option === "-O" || option === "+O"))) {
-    return "value";
-  }
-  if (shell === "bash" && ["--init-file", "--rcfile"].includes(option)) return "value";
-  if (shell === "bash" && /^--(?:init-file|rcfile)=/u.test(option)) return "flag";
-  if (shell === "ksh" && option === "-R") return "value";
-
-  if (option.startsWith("--")) {
-    if (shell === "zsh") return "flag";
-    if ([
-      "--debug", "--debugger", "--dump-po-strings", "--dump-strings", "--help", "--login",
-      "--noediting", "--noprofile", "--norc", "--posix", "--pretty-print", "--protected",
-      "--restricted", "--verbose", "--version", "--wordexp",
-    ].includes(option)) return "flag";
-    return "unknown";
-  }
-
-  if (/^-[^-]+/u.test(option)) {
-    const flags = option.slice(1);
-    if (flags.includes("c")) return "command";
-    if (flags.includes("s")) return "stdin";
-    const knownFlags = shell === "bash"
-      ? /^[abefhiklmnprtuvxBCHPD]+$/u
-      : shell === "zsh"
-        ? /^[dfilnrsuvx]+$/u
-        : shell === "ksh"
-          ? /^[abefhiklmnprstuvxBCEG]+$/u
-          : /^[abCefhimnuvx]+$/u;
-    return knownFlags.test(flags) ? "flag" : "unknown";
-  }
-  if (/^\+[^+]+/u.test(option)) return "flag";
-  return "unknown";
-}
-
 function processEnvironment(input?: {
-  workspaceId?: string;
-  workspaceRoot?: string;
   overrides?: Record<string, string>;
+  inheritedEnvironment?: NodeJS.ProcessEnv;
 }): Record<string, string> {
+  const inheritedEnvironment = input?.inheritedEnvironment ?? process.env;
   const inheritedKeys = [
     "PATH",
     "HOME",
@@ -410,7 +312,7 @@ function processEnvironment(input?: {
   const environment: Record<string, string> = {
     ...Object.fromEntries(
       inheritedKeys.flatMap((name) => {
-        const value = process.env[name];
+        const value = inheritedEnvironment[name];
         return value === undefined ? [] : [[name, value] as const];
       }),
     ),
@@ -420,15 +322,43 @@ function processEnvironment(input?: {
     GIT_PAGER: "cat",
     GH_PAGER: "cat",
     CODEX_CI: "1",
-    LANG: process.env.LANG ?? "C.UTF-8",
-    LC_ALL: process.env.LC_ALL ?? "C.UTF-8",
-    ...(input?.workspaceId ? { DEVSPACE_WORKSPACE_ID: input.workspaceId } : {}),
-    ...(input?.workspaceRoot ? { DEVSPACE_WORKSPACE_ROOT: input.workspaceRoot } : {}),
+    LANG: inheritedEnvironment.LANG ?? "C.UTF-8",
+    LC_ALL: inheritedEnvironment.LC_ALL ?? "C.UTF-8",
     ...(input?.overrides ?? {}),
   };
   // CDPATH changes the destination of an otherwise literal relative `cd`,
   // which would invalidate the instruction-scope check performed before spawn.
   delete environment.CDPATH;
+  return environment;
+}
+
+export function processLauncherEnvironment(
+  inheritedEnvironment: NodeJS.ProcessEnv = process.env,
+): Record<string, string> {
+  const environment = processEnvironment({ inheritedEnvironment });
+  for (const name of Object.keys(environment)) {
+    const normalized = name.toUpperCase();
+    if (
+      normalized.startsWith("LD_") ||
+      normalized.startsWith("DYLD_") ||
+      [
+        "BASH_ENV",
+        "ENV",
+        "GCONV_PATH",
+        "NODE_OPTIONS",
+        "NODE_PATH",
+        "PERL5LIB",
+        "PERL5OPT",
+        "PYTHONHOME",
+        "PYTHONPATH",
+        "RUBYLIB",
+        "RUBYOPT",
+        "SHELLOPTS",
+      ].includes(normalized)
+    ) {
+      delete environment[name];
+    }
+  }
   return environment;
 }
 
@@ -567,7 +497,6 @@ export class ProcessSessionManager {
   private readonly maxBufferBytes: number;
   private readonly completedSessionTtlMs: number;
   private readonly maxSessions: number;
-  private readonly maxSessionsPerClient: number;
   private readonly maxSessionsPerWorkspace: number;
   private readonly maxRuntimeMs: number;
   private readonly terminationGraceMs: number;
@@ -575,6 +504,7 @@ export class ProcessSessionManager {
   private readonly durableOutputFlushMs: number;
   private readonly outputStore?: ProcessOutputStore;
   private readonly onOutputStorageError?: ProcessSessionManagerOptions["onOutputStorageError"];
+  private readonly onActivity?: ProcessSessionManagerOptions["onActivity"];
   private nextSessionId = 1;
   private shuttingDown = false;
   private shutdownPromise?: Promise<void>;
@@ -584,7 +514,6 @@ export class ProcessSessionManager {
     this.maxBufferBytes = options.maxBufferBytes ?? DEFAULT_BUFFER_BYTES;
     this.completedSessionTtlMs = options.completedSessionTtlMs ?? COMPLETED_SESSION_TTL_MS;
     this.maxSessions = options.maxSessions ?? Number.POSITIVE_INFINITY;
-    this.maxSessionsPerClient = options.maxSessionsPerClient ?? Number.POSITIVE_INFINITY;
     this.maxSessionsPerWorkspace = options.maxSessionsPerWorkspace ?? Number.POSITIVE_INFINITY;
     this.maxRuntimeMs = options.maxRuntimeMs ?? 60 * 60 * 1_000;
     this.terminationGraceMs = options.terminationGraceMs ?? 5_000;
@@ -602,27 +531,22 @@ export class ProcessSessionManager {
     );
     this.outputStore = options.outputStore;
     this.onOutputStorageError = options.onOutputStorageError;
+    this.onActivity = options.onActivity;
   }
 
   async start(input: StartCommandInput): Promise<ProcessSnapshot> {
     if (this.shuttingDown) throw new Error("Process manager is shutting down.");
     if (this.closingWorkspaces.has(workspaceKey(input.connectionPrincipalId, input.workspaceId))) {
-      throw new Error("Workspace is closing and cannot start new processes.");
+      throw new Error("Project execution runtime is closing and cannot start new processes.");
     }
     if (this.sessions.size >= this.maxSessions) {
       throw new Error(`Process session limit reached (${this.maxSessions}).`);
-    }
-    const clientSessions = Array.from(this.sessions.values()).filter(
-      (session) => session.connectionPrincipalId === input.connectionPrincipalId,
-    ).length;
-    if (clientSessions >= this.maxSessionsPerClient) {
-      throw new Error(`Process session limit reached for this OAuth client (${this.maxSessionsPerClient}).`);
     }
     const workspaceSessions = Array.from(this.sessions.values()).filter(
       (session) => session.connectionPrincipalId === input.connectionPrincipalId && session.workspaceId === input.workspaceId,
     ).length;
     if (workspaceSessions >= this.maxSessionsPerWorkspace) {
-      throw new Error(`Process session limit reached for this workspace (${this.maxSessionsPerWorkspace}).`);
+      throw new Error(`Process session limit reached for this Project (${this.maxSessionsPerWorkspace}).`);
     }
     const runtimeLimitMs = this.resolveRuntimeLimitMs(input.runtimeLimitMs);
     assertProcessInputSize(input.stdin);
@@ -633,28 +557,47 @@ export class ProcessSessionManager {
     const session = this.createSession(input);
     this.sessions.set(session.id, session);
 
+    let launchGate: ProcessLaunchGate | undefined;
     try {
       const command = resolveProcessCommand(input.command);
-      if (input.tty && process.platform !== "win32") await this.startPty(session, input, command);
-      else this.startPipe(session, input, command);
+      if (input.tty && process.platform !== "win32") {
+        launchGate = await this.startPty(
+          session,
+          input,
+          command,
+          Boolean(input.retainWorkspaceRootLease),
+        );
+      } else {
+        launchGate = await this.startPipe(
+          session,
+          input,
+          command,
+          Boolean(input.retainWorkspaceRootLease),
+        );
+      }
+      if (input.retainWorkspaceRootLease) {
+        await this.attachWorkspaceRootLease(
+          input.connectionPrincipalId,
+          input.workspaceId,
+          session.id,
+          input.retainWorkspaceRootLease(),
+          false,
+        );
+      }
+      await launchGate?.release();
+      launchGate = undefined;
+      this.emitActivity(session, "command.started", `command:${session.id}:started`, {
+        summary: input.activity?.summary ?? "Command started.",
+        sessionId: session.id,
+        cwd: input.cwd,
+      });
       this.startRuntimeTimer(session, runtimeLimitMs);
       if (input.stdin) session.process?.write(input.stdin);
       if (closeStdin) this.closeProcessStdin(session);
     } catch (error) {
+      launchGate?.abort();
       if (session.process) {
-        session.cancelRequested = true;
-        const terminationError = this.killSession(session, "SIGTERM");
-        if (terminationError) {
-          this.append(session, `\nFailed to terminate process after startup error: ${String(terminationError)}\n`);
-        }
-        session.escalationTimer = setTimeout(() => {
-          if (!session.running) return;
-          const escalationError = this.killSession(session, "SIGKILL");
-          if (escalationError) {
-            this.append(session, `\nFailed to force-kill process after startup error: ${String(escalationError)}\n`);
-          }
-        }, this.terminationGraceMs);
-        session.escalationTimer.unref();
+        await this.terminateFailedStartup(session);
       } else {
         this.finalizeDurableOutput(session);
         this.sessions.delete(session.id);
@@ -683,13 +626,13 @@ export class ProcessSessionManager {
     assertProcessInputSize(chars);
     assertProcessInputSize(input.preparedInput?.pendingInput);
     if (input.closeStdin && chars.includes("\u0003")) {
-      throw new Error("Send Ctrl-C and closeStdin in separate write_stdin calls.");
+      throw new Error("Send Ctrl-C and close_stdin in separate write_stdin calls.");
     }
     const ordinaryInteractionRequested =
       (input.chars ?? "").length > 0 || input.closeStdin === true ||
       input.columns !== undefined || input.rows !== undefined;
     if (input.detachRootLease && ordinaryInteractionRequested) {
-      throw new Error("Detach the daemon root lease in a separate write_stdin call without input, resize, or closeStdin.");
+      throw new Error("Detach the daemon root lease in a separate write_stdin call without input, resize, or close_stdin.");
     }
     if (session.rootExited && ordinaryInteractionRequested) {
       throw new Error(`Process session ${session.id} root process exited; only polling, termination, or confirmed root-lease detach is available.`);
@@ -710,7 +653,7 @@ export class ProcessSessionManager {
         throw new Error("The managed daemon root lease is already detached.");
       }
       if (!session.releaseWorkspaceRootLease) {
-        throw new Error("The managed daemon does not currently own a workspace root lease.");
+        throw new Error("The managed daemon does not currently own a Project root lease.");
       }
       this.releaseWorkspaceRootLease(session);
       session.rootLeaseDetached = true;
@@ -727,6 +670,7 @@ export class ProcessSessionManager {
 
     const interruptRequested = chars.includes("\u0003") && session.running;
     if (interruptRequested) {
+      session.cancelRequested = true;
       session.process?.interrupt();
     }
     const writableChars = chars.replaceAll("\u0003", "");
@@ -765,8 +709,9 @@ export class ProcessSessionManager {
     workspaceId: string,
     sessionId: number,
     lease: WorkspaceRootLease | (() => void),
+    releaseOnAttachmentFailure = true,
   ): Promise<boolean> {
-    const release = () => lease();
+    const release = releaseOnce(() => lease());
     const session = this.sessions.get(sessionId);
     if (
       !session ||
@@ -779,8 +724,9 @@ export class ProcessSessionManager {
     }
     if (session.releaseWorkspaceRootLease) {
       release();
-      throw new Error(`Process session ${sessionId} already owns a workspace root lease.`);
+      throw new Error(`Process session ${sessionId} already owns a Project root lease.`);
     }
+    session.releaseWorkspaceRootLease = release;
     const richLease = workspaceRootLease(lease);
     if (richLease && session.process?.pid !== undefined) {
       try {
@@ -791,15 +737,14 @@ export class ProcessSessionManager {
             : { processGroupId: session.process.processGroupId }),
         });
       } catch (error) {
-        release();
+        if (releaseOnAttachmentFailure) this.releaseWorkspaceRootLease(session);
         throw error;
       }
       if (!session.running) {
-        release();
+        this.releaseWorkspaceRootLease(session);
         return false;
       }
     }
-    session.releaseWorkspaceRootLease = releaseOnce(release);
     // A newly attached lease has not been detached, whatever happened to the
     // previous one. Leaving the flag set would make the next detach request
     // fail as "already detached" and pin the lease until the tree exits.
@@ -825,7 +770,23 @@ export class ProcessSessionManager {
 
   terminate(connectionPrincipalId: string, workspaceId: string, sessionId: number): void {
     const session = this.getOwnedSession(connectionPrincipalId, workspaceId, sessionId);
-    if (session.running) session.process?.kill("SIGTERM");
+    if (session.running) {
+      session.cancelRequested = true;
+      session.process?.kill("SIGTERM");
+    }
+  }
+
+  interruptWorkspace(connectionPrincipalId: string, workspaceId: string): number[] {
+    const sessions = Array.from(this.sessions.values()).filter(
+      (session) => session.running &&
+        session.connectionPrincipalId === connectionPrincipalId &&
+        session.workspaceId === workspaceId,
+    );
+    for (const session of sessions) {
+      session.cancelRequested = true;
+      session.process?.interrupt();
+    }
+    return sessions.map((session) => session.id);
   }
 
   async terminateWorkspace(connectionPrincipalId: string, workspaceId: string): Promise<number> {
@@ -853,7 +814,7 @@ export class ProcessSessionManager {
     if (survivors.length > 0) {
       this.reopenWorkspace(connectionPrincipalId, workspaceId);
       errors.push(new Error(`Failed to terminate ${survivors.length} process session(s).`));
-      throw new AggregateError(errors, "Workspace processes could not be terminated");
+      throw new AggregateError(errors, "Project processes could not be terminated");
     }
     return sessions.length;
   }
@@ -868,21 +829,12 @@ export class ProcessSessionManager {
     );
   }
 
-  usageSnapshot(connectionPrincipalId?: string): ProcessSessionUsageSnapshot {
+  usageSnapshot(): ProcessSessionUsageSnapshot {
     const sessions = Array.from(this.sessions.values());
     return {
       sessions: sessions.length,
       running: sessions.filter((session) => session.running).length,
       limit: this.maxSessions,
-      ...(connectionPrincipalId === undefined ? {} : {
-        principal: {
-          sessions: sessions.filter((session) => session.connectionPrincipalId === connectionPrincipalId).length,
-          running: sessions.filter(
-            (session) => session.connectionPrincipalId === connectionPrincipalId && session.running,
-          ).length,
-          limit: this.maxSessionsPerClient,
-        },
-      }),
     };
   }
 
@@ -952,24 +904,35 @@ export class ProcessSessionManager {
       rootExited: false,
       treeExitPollMs: INITIAL_TREE_EXIT_POLL_MS,
       rootLeaseDetached: false,
+      ...(input.activity ? { activity: input.activity } : {}),
       exitPromise,
       resolveExit,
     };
   }
 
-  private startPipe(session: ProcessSession, input: StartCommandInput, command: ShellCommand): void {
+  private async startPipe(
+    session: ProcessSession,
+    input: StartCommandInput,
+    command: ShellCommand,
+    gated: boolean,
+  ): Promise<ProcessLaunchGate | undefined> {
     const detached = process.platform !== "win32";
+    const targetEnvironment = processEnvironment({
+      overrides: input.environment,
+    });
+    // The supervisor receives neither the target command nor its environment
+    // until this private descriptor is released after durable attachment.
+    const gateToken = gated ? randomBytes(24).toString("base64url") : undefined;
+    const launchCommand = gateToken
+      ? gatedSupervisorCommand("pipe", gateToken)
+      : command;
     // Spawn the resolved process with its args directly. Using Node's
     // `shell: executable` form drops custom args (e.g. -c) and re-wraps the
     // command inconsistently with the PTY path.
-    const child = spawn(command.executable, command.args, {
+    const child = spawn(launchCommand.executable, launchCommand.args, {
       cwd: input.cwd,
-      env: processEnvironment({
-        workspaceId: input.workspaceId,
-        workspaceRoot: input.workspaceRoot,
-        overrides: input.environment,
-      }),
-      stdio: "pipe",
+      env: gated ? processLauncherEnvironment() : targetEnvironment,
+      stdio: gated ? ["pipe", "pipe", "pipe", "pipe"] : "pipe",
       windowsHide: true,
       detached,
     });
@@ -983,7 +946,7 @@ export class ProcessSessionManager {
       session.stdinClosed = true;
     });
 
-    session.process = {
+    const managedProcess: ManagedProcess = {
       ...(child.pid === undefined ? {} : { pid: child.pid }),
       ...(detached && child.pid !== undefined ? { processGroupId: child.pid } : {}),
       write: (data) => {
@@ -1005,14 +968,47 @@ export class ProcessSessionManager {
     child.stderr?.on("end", () => this.append(session, stderrDecoder.end()));
     child.on("error", (error) => this.append(session, `${error.message}\n`));
     child.on("close", (code, signal) => this.finish(session, code ?? undefined, signal ?? undefined));
+    await childSpawned(child);
+    session.process = managedProcess;
     if (session.cancelRequested) session.process.kill("SIGTERM");
+    if (!gateToken) return undefined;
+    const gate = child.stdio[3] as Writable | null;
+    if (!gate) throw new Error("Process launch gate was not created.");
+    let settled = false;
+    let gateError: Error | undefined;
+    let rejectRelease: ((error: Error) => void) | undefined;
+    gate.on("error", (error) => {
+      gateError = error;
+      rejectRelease?.(error);
+    });
+    return {
+      release: () => {
+        if (settled) return Promise.resolve();
+        settled = true;
+        if (gateError) return Promise.reject(gateError);
+        return new Promise<void>((resolve, reject) => {
+          rejectRelease = reject;
+          gate.end(launchPayload(gateToken, command, targetEnvironment), () => {
+            rejectRelease = undefined;
+            if (gateError) reject(gateError);
+            else resolve();
+          });
+        });
+      },
+      abort: () => {
+        if (settled) return;
+        settled = true;
+        gate.destroy();
+      },
+    };
   }
 
   private async startPty(
     session: ProcessSession,
     input: StartCommandInput,
     command: ShellCommand,
-  ): Promise<void> {
+    gated: boolean,
+  ): Promise<ProcessLaunchGate | undefined> {
     let nodePty: typeof import("node-pty");
     try {
       nodePty = await import("node-pty");
@@ -1024,15 +1020,20 @@ export class ProcessSessionManager {
       this.finish(session, undefined, "SIGTERM");
       return;
     }
+    const targetEnvironment = processEnvironment({
+      overrides: input.environment,
+    });
+    const gateToken = gated ? randomBytes(24).toString("base64url") : undefined;
+    const readyToken = gateToken ? `devspace-ready-${randomBytes(24).toString("base64url")}` : undefined;
+    const launchedToken = gateToken ? `devspace-launched-${randomBytes(24).toString("base64url")}` : undefined;
+    const launchCommand = gateToken && readyToken && launchedToken
+      ? gatedSupervisorCommand("pty", gateToken, readyToken, launchedToken)
+      : command;
     let pty: import("node-pty").IPty;
     try {
-      pty = nodePty.spawn(command.executable, command.args, {
+      pty = nodePty.spawn(launchCommand.executable, launchCommand.args, {
         cwd: input.cwd,
-        env: processEnvironment({
-          workspaceId: input.workspaceId,
-          workspaceRoot: input.workspaceRoot,
-          overrides: input.environment,
-        }),
+        env: gated ? processLauncherEnvironment() : targetEnvironment,
         name: "xterm-256color",
         cols: session.columns,
         rows: session.rows,
@@ -1051,11 +1052,67 @@ export class ProcessSessionManager {
       treeAlive: () => isProcessTreeAlive(pty, true),
       resize: (columns, rows) => pty.resize(columns, rows),
     };
-    pty.onData((data) => this.append(session, data));
+    let pendingOutput = "";
+    let expectedHandshake = readyToken;
+    let resolveHandshake = (): void => undefined;
+    let rejectHandshake = (_error: Error): void => undefined;
+    const handshakePromise = (): Promise<void> => new Promise<void>((resolve, reject) => {
+      resolveHandshake = resolve;
+      rejectHandshake = reject;
+    });
+    const ready = readyToken ? handshakePromise() : undefined;
+    pty.onData((data) => {
+      if (!expectedHandshake) {
+        this.append(session, data);
+        return;
+      }
+      pendingOutput += data;
+      const markerOffset = pendingOutput.indexOf(expectedHandshake);
+      if (markerOffset < 0) {
+        const safeLength = Math.max(0, pendingOutput.length - expectedHandshake.length + 1);
+        if (safeLength > 0) {
+          this.append(session, pendingOutput.slice(0, safeLength));
+          pendingOutput = pendingOutput.slice(safeLength);
+        }
+        return;
+      }
+      this.append(session, pendingOutput.slice(0, markerOffset));
+      const trailing = pendingOutput.slice(markerOffset + expectedHandshake.length);
+      pendingOutput = "";
+      expectedHandshake = undefined;
+      resolveHandshake();
+      if (trailing) this.append(session, trailing);
+    });
     pty.onExit(({ exitCode, signal }) => {
+      if (expectedHandshake) {
+        if (pendingOutput) this.append(session, pendingOutput);
+        rejectHandshake(new Error("PTY launch gate exited before completing its handshake."));
+      }
       this.finish(session, exitCode, signal === 0 ? undefined : String(signal));
     });
     if (session.cancelRequested) session.process.kill("SIGTERM");
+    if (!gateToken || !launchedToken || !ready) return undefined;
+    await ready;
+    let settled = false;
+    return {
+      release: async () => {
+        if (settled) return;
+        settled = true;
+        expectedHandshake = launchedToken;
+        const launched = handshakePromise();
+        const payload = Buffer.from(
+          launchPayload(gateToken, command, targetEnvironment),
+          "utf8",
+        ).toString("base64");
+        pty.write(`${payload}\n`);
+        await launched;
+      },
+      abort: () => {
+        if (settled) return;
+        settled = true;
+        pty.kill();
+      },
+    };
   }
 
   private closeProcessStdin(session: ProcessSession): void {
@@ -1089,6 +1146,25 @@ export class ProcessSessionManager {
     session.running = false;
     this.releaseWorkspaceRootLease(session);
     this.finalizeDurableOutput(session);
+    const terminalType = session.cancelRequested
+      ? "command.interrupted"
+      : session.exitCode === 0 && !session.signal && !session.timedOut
+        ? "command.completed"
+        : "command.failed";
+    this.emitActivity(session, terminalType, `command:${session.id}:terminal`, {
+      summary: terminalType === "command.completed"
+        ? "Command completed."
+        : terminalType === "command.interrupted"
+          ? "Command interrupted."
+          : "Command failed.",
+      sessionId: session.id,
+      exitCode: session.exitCode,
+      ...(session.signal ? { signal: session.signal } : {}),
+      timedOut: session.timedOut,
+      wallTimeMs: Date.now() - session.startedAt,
+      outputId: session.outputId,
+      ...this.durableMetadata(session),
+    });
     session.resolveExit();
     if (session.runtimeTimer) clearTimeout(session.runtimeTimer);
     if (session.escalationTimer) clearTimeout(session.escalationTimer);
@@ -1188,6 +1264,21 @@ export class ProcessSessionManager {
         session.outputId,
       );
       if (metadata.droppedBytes > 0) session.durableQuotaReached = true;
+      this.emitActivity(
+        session,
+        "command.output_available",
+        `command:${session.id}:output:${metadata.totalBytes}`,
+        {
+          summary: "Command output updated.",
+          sessionId: session.id,
+          outputId: session.outputId,
+          nextOffset: metadata.storedBytes,
+          totalBytes: metadata.totalBytes,
+          storedBytes: metadata.storedBytes,
+          droppedBytes: metadata.droppedBytes + session.quotaDroppedBytes,
+          status: metadata.status,
+        },
+      );
     } catch (error) {
       if (error instanceof ProcessOutputQuotaError) {
         session.durableQuotaReached = true;
@@ -1200,6 +1291,27 @@ export class ProcessSessionManager {
           outputId: session.outputId,
         });
       }
+    }
+  }
+
+  private emitActivity(
+    session: ProcessSession,
+    type: ProcessActivityEvent["type"],
+    eventKeySuffix: string,
+    payload: Record<string, unknown>,
+  ): void {
+    if (!session.activity || !this.onActivity) return;
+    try {
+      this.onActivity({
+        threadId: session.activity.threadId,
+        operationId: session.activity.operationId,
+        itemId: `command:${session.id}`,
+        type,
+        eventKey: `${session.activity.operationId}:${eventKeySuffix}`,
+        payload,
+      });
+    } catch {
+      // Activity reporting must never change process execution semantics.
     }
   }
 
@@ -1353,6 +1465,37 @@ export class ProcessSessionManager {
     }
   }
 
+  private async terminateFailedStartup(session: ProcessSession): Promise<void> {
+    session.cancelRequested = true;
+    const terminationError = this.killSession(session, "SIGTERM");
+    if (terminationError) {
+      this.append(session, `\nFailed to terminate process after startup error: ${String(terminationError)}\n`);
+    }
+    await this.waitForSessions([session], this.terminationGraceMs);
+    if (session.running) {
+      const escalationError = this.killSession(session, "SIGKILL");
+      if (escalationError) {
+        this.append(session, `\nFailed to force-kill process after startup error: ${String(escalationError)}\n`);
+      }
+      await this.waitForSessions([session], this.terminationGraceMs);
+    }
+    if (session.running) {
+      // The launch gate has already been aborted, so this can only be an inert
+      // supervisor. Do not retain an undiscoverable session/root lease if the
+      // OS refuses both termination attempts.
+      this.append(
+        session,
+        "\nGated process launcher survived startup cleanup; hidden session state was released.\n",
+      );
+      session.running = false;
+      session.stdinClosed = true;
+      session.rootExited = true;
+      this.finalizeDurableOutput(session);
+      session.resolveExit();
+    }
+    this.removeSession(session.id);
+  }
+
   private async waitForSessions(sessions: ProcessSession[], timeoutMs: number): Promise<void> {
     if (sessions.length === 0) return;
     let timer: NodeJS.Timeout | undefined;
@@ -1405,3 +1548,98 @@ function workspaceRootLease(
     ? lease as WorkspaceRootLease
     : undefined;
 }
+
+function childSpawned(child: ReturnType<typeof spawn>): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const spawned = (): void => {
+      child.off("error", failed);
+      resolve();
+    };
+    const failed = (error: Error): void => {
+      child.off("spawn", spawned);
+      reject(error);
+    };
+    child.once("spawn", spawned);
+    child.once("error", failed);
+  });
+}
+
+function gatedSupervisorCommand(
+  mode: "pipe" | "pty",
+  gateToken: string,
+  readyToken?: string,
+  launchedToken?: string,
+): ShellCommand {
+  return {
+    executable: process.execPath,
+    args: [
+      "-e",
+      GATED_PROCESS_SUPERVISOR_SOURCE,
+      mode,
+      gateToken,
+      ...(readyToken ? [readyToken] : []),
+      ...(launchedToken ? [launchedToken] : []),
+    ],
+  };
+}
+
+function launchPayload(
+  token: string,
+  command: ShellCommand,
+  environment: Record<string, string>,
+): string {
+  return JSON.stringify({
+    token,
+    executable: command.executable,
+    args: command.args,
+    environment,
+  });
+}
+
+const GATED_PROCESS_SUPERVISOR_SOURCE = [
+  "\"use strict\";",
+  "const fs=require('node:fs');",
+  "const {spawn}=require('node:child_process');",
+  "const mode=process.argv[1];",
+  "const expectedToken=process.argv[2];",
+  "const readyToken=process.argv[3];",
+  "const launchedToken=process.argv[4];",
+  "function fail(message){if(message)process.stderr.write(message+'\\n');process.exit(125);}",
+  "function start(source){",
+  " let spec;",
+  " try{spec=JSON.parse(source);}catch{fail('Invalid process launch payload.');}",
+  " if(!spec||spec.token!==expectedToken||typeof spec.executable!=='string'||",
+  "    !Array.isArray(spec.args)||!spec.args.every(value=>typeof value==='string')||",
+  "    !spec.environment||typeof spec.environment!=='object'){fail('Invalid process launch payload.');}",
+  " if(mode==='pty'&&process.stdin.setRawMode)process.stdin.setRawMode(false);",
+  " const child=spawn(spec.executable,spec.args,{stdio:'inherit',env:spec.environment,windowsHide:true});",
+  " child.once('spawn',()=>{if(mode==='pty')process.stdout.write(launchedToken);});",
+  " child.once('error',error=>{process.stderr.write(error.message+'\\n');process.exit(127);});",
+  " child.once('exit',(code,signal)=>{",
+  "  if(signal){try{process.kill(process.pid,signal);}catch{process.exit(1);}}",
+  "  else process.exit(code??1);",
+  " });",
+  "}",
+  "if(mode==='pipe'){",
+  " let source;",
+  " try{source=fs.readFileSync(3,'utf8');}catch{process.exit(125);}",
+  " if(!source)process.exit(125);",
+  " start(source);",
+  "}else if(mode==='pty'){",
+  " if(process.stdin.setRawMode)process.stdin.setRawMode(true);",
+  " process.stdin.setEncoding('utf8');",
+  " let source='';",
+  " const receive=chunk=>{",
+  "  source+=chunk;",
+  "  const newline=source.indexOf('\\n');",
+  "  if(newline<0)return;",
+  "  process.stdin.off('data',receive);process.stdin.pause();",
+  "  let decoded;",
+  "  try{decoded=Buffer.from(source.slice(0,newline),'base64').toString('utf8');}",
+  "  catch{fail('Invalid process launch payload.');}",
+  "  start(decoded);",
+  " };",
+  " process.stdin.on('data',receive);",
+  " process.stdout.write(readyToken);",
+  "}else fail('Invalid process launch mode.');",
+].join("");

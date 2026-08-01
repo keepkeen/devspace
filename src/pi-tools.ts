@@ -1,16 +1,21 @@
-import { constants } from "node:fs";
+import { constants, type Dirent, type Stats } from "node:fs";
 import {
-  access,
+  lstat,
   mkdir,
+  open,
   readFile,
   readdir,
-  stat,
+  realpath,
   writeFile,
 } from "node:fs/promises";
 import { dirname, relative, sep } from "node:path";
 import { TextDecoder } from "node:util";
 import { minimatch } from "minimatch";
-import { resolveAllowedPath } from "./roots.js";
+import {
+  AccessDeniedError,
+  isPathInsideRoot,
+  resolveAllowedPath,
+} from "./roots.js";
 
 type McpContent =
   | { type: "text"; text: string }
@@ -178,6 +183,12 @@ const MAX_WALK_ENTRIES = 100_000;
 const MAX_IMAGE_BYTES = 10 * 1_024 * 1_024;
 export const MAX_TEXT_READ_FILE_BYTES = 16 * 1_024 * 1_024;
 const IGNORED_DIRECTORIES = new Set([".git", "node_modules"]);
+const READ_ONLY_NOFOLLOW_FLAGS =
+  constants.O_RDONLY |
+  (typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0);
+const READ_ONLY_DIRECTORY_NOFOLLOW_FLAGS =
+  READ_ONLY_NOFOLLOW_FLAGS |
+  (typeof constants.O_DIRECTORY === "number" ? constants.O_DIRECTORY : 0);
 
 export type ToolResponse<TDetails = unknown> = {
   content: McpContent[];
@@ -192,6 +203,10 @@ interface ToolContext {
   readRoots?: string[];
   onError?: (error: unknown) => void;
 }
+
+type ToolContextWithDirectoryReadTestHook = ToolContext & {
+  beforeDirectoryRead?: (path: string) => void | Promise<void>;
+};
 
 export function sanitizePiToolError(error: unknown, context: ToolContext): string {
   const rawMessage = extractErrorMessage(error);
@@ -216,8 +231,8 @@ function extractErrorMessage(error: unknown): string {
 
 function redactContextPaths(message: string, context: ToolContext): string {
   const replacements = new Map<string, string>();
-  replacements.set(context.root, "__DEVSPACE_WORKSPACE__");
-  replacements.set(context.cwd, "__DEVSPACE_WORKSPACE__");
+  replacements.set(context.root, "__DEVSPACE_PROJECT__");
+  replacements.set(context.cwd, "__DEVSPACE_PROJECT__");
   for (const root of context.readRoots ?? []) {
     if (!replacements.has(root)) replacements.set(root, "__DEVSPACE_READ_ROOT__");
   }
@@ -232,7 +247,7 @@ function redactContextPaths(message: string, context: ToolContext): string {
   return redacted
     .replace(/(?<![A-Za-z0-9_])\/(?:[^\s'"]+)/gu, "[path]")
     .replace(/\b[A-Za-z]:[\\/][^\s'"]+/gu, "[path]")
-    .replaceAll("__DEVSPACE_WORKSPACE__", "[workspace]")
+    .replaceAll("__DEVSPACE_PROJECT__", "[project]")
     .replaceAll("__DEVSPACE_READ_ROOT__", "[read root]");
 }
 
@@ -278,16 +293,17 @@ export async function readFileTool(
 ): Promise<ToolResponse<ReadToolDetails | undefined>> {
   return runLocalTool(context, async () => {
     const path = resolveAllowedPath(input.path, context.cwd, context.readRoots ?? [context.root]);
-    await access(path, constants.R_OK);
-    const metadata = await stat(path);
-    if (!metadata.isFile()) throw new Error(`Not a file: ${path}`);
+    const { buffer, metadata } = await readValidatedFile(
+      path,
+      context.readRoots ?? [context.root],
+      MAX_TEXT_READ_FILE_BYTES,
+    );
     if (metadata.size > MAX_TEXT_READ_FILE_BYTES) {
       throw new UnsupportedTextFileError(
         "file_too_large",
-        `The file is ${formatSize(metadata.size)}, above the ${formatSize(MAX_TEXT_READ_FILE_BYTES)} text-read limit. Use a bounded search, tail, or workspace command instead.`,
+        `The file is ${formatSize(metadata.size)}, above the ${formatSize(MAX_TEXT_READ_FILE_BYTES)} text-read limit. Use a bounded search, tail, or Project command instead.`,
       );
     }
-    const buffer = await readFile(path);
     const imageMimeType = supportedImageMimeType(path, buffer);
     if (imageMimeType) {
       if (buffer.length > MAX_IMAGE_BYTES) {
@@ -447,7 +463,7 @@ export async function grepFilesTool(
       if (matches >= effectiveLimit) break;
       const relativePath = displayRelative(searchPath, file.path, file.singleFile);
       if (input.glob && !globMatches(relativePath, input.glob)) continue;
-      const buffer = await readFile(file.path);
+      const { buffer } = await readValidatedFile(file.path, [context.root]);
       if (probablyBinary(buffer)) continue;
       let text: string;
       try {
@@ -476,7 +492,9 @@ export async function grepFilesTool(
     const notices: string[] = [];
     if (matches >= effectiveLimit) notices.push(`${effectiveLimit} matches limit reached. Use limit=${effectiveLimit * 2} for more, or refine pattern`);
     if (truncated.details.truncated) notices.push(`${formatSize(DEFAULT_MAX_BYTES)} limit reached`);
-    if (linesTruncated) notices.push(`Some lines truncated to ${GREP_MAX_LINE_LENGTH} chars. Use read tool to see full lines`);
+    if (linesTruncated) notices.push(
+      `Some lines truncated to ${GREP_MAX_LINE_LENGTH} chars. Use read_files to see full lines`,
+    );
     return {
       content: [{
         type: "text",
@@ -494,7 +512,7 @@ export async function findFilesTool(
   return runLocalTool(context, async () => {
     const searchPath = resolveAllowedPath(input.path ?? ".", context.cwd, [context.root]);
     const effectiveLimit = Math.max(1, input.limit ?? DEFAULT_FIND_LIMIT);
-    const entries = await collectEntries(searchPath);
+    const entries = await collectEntries(searchPath, context.root, directoryReadTestHook(context));
     const patternHasPath = input.pattern.includes("/") || input.pattern.includes("\\");
     const matches = entries
       .filter((entry) => globMatches(patternHasPath ? entry.relativePath : entry.name, input.pattern))
@@ -524,10 +542,14 @@ export async function listDirectoryTool(
 ): Promise<ToolResponse> {
   return runLocalTool(context, async () => {
     const path = resolveAllowedPath(input.path ?? ".", context.cwd, [context.root]);
-    const metadata = await stat(path);
-    if (!metadata.isDirectory()) throw new Error(`Not a directory: ${path}`);
     const effectiveLimit = Math.max(1, input.limit ?? DEFAULT_LS_LIMIT);
-    const entries = await readdir(path, { withFileTypes: true });
+    const boundary = await createDirectoryBoundary(context.root);
+    const { entries, snapshot } = await readValidatedDirectory(
+      path,
+      boundary,
+      directoryReadTestHook(context),
+    );
+    await validateDirectorySnapshots(boundary, [snapshot]);
     const formatted = entries
       .filter((entry) => !entry.isSymbolicLink())
       .map((entry) => `${entry.name}${entry.isDirectory() ? "/" : ""}`)
@@ -555,34 +577,46 @@ interface WalkEntry {
   directory: boolean;
 }
 
-async function collectEntries(root: string): Promise<WalkEntry[]> {
-  const metadata = await stat(root);
-  if (!metadata.isDirectory()) throw new Error(`Not a directory: ${root}`);
+async function collectEntries(
+  root: string,
+  allowedRoot: string,
+  beforeDirectoryRead?: (path: string) => void | Promise<void>,
+): Promise<WalkEntry[]> {
+  const boundary = await createDirectoryBoundary(allowedRoot);
+  const canonicalTraversalRoot = await realpath(root);
+  assertCanonicalPathAllowed(canonicalTraversalRoot, [boundary.canonicalRoot]);
   const results: WalkEntry[] = [];
-  const pending = [root];
+  const snapshots: DirectorySnapshot[] = [];
+  const pending = [canonicalTraversalRoot];
   let visited = 0;
   while (pending.length > 0) {
     const directory = pending.pop()!;
-    const entries = await readdir(directory, { withFileTypes: true });
+    const { entries, snapshot } = await readValidatedDirectory(
+      directory,
+      boundary,
+      beforeDirectoryRead,
+    );
+    snapshots.push(snapshot);
     for (const entry of entries) {
       visited += 1;
       if (visited > MAX_WALK_ENTRIES) throw new Error(`Directory traversal exceeded ${MAX_WALK_ENTRIES} entries.`);
       if (entry.isSymbolicLink()) continue;
       if (entry.isDirectory() && IGNORED_DIRECTORIES.has(entry.name)) continue;
       const path = `${directory}${sep}${entry.name}`;
-      const relativePath = toPosix(relative(root, path)) + (entry.isDirectory() ? "/" : "");
+      const relativePath = toPosix(relative(canonicalTraversalRoot, path)) + (entry.isDirectory() ? "/" : "");
       results.push({ path, relativePath, name: entry.name, directory: entry.isDirectory() });
       if (entry.isDirectory()) pending.push(path);
     }
   }
+  await validateDirectorySnapshots(boundary, snapshots);
   return results;
 }
 
 async function collectFiles(path: string): Promise<Array<{ path: string; singleFile: boolean }>> {
-  const metadata = await stat(path);
+  const metadata = await lstat(path);
   if (metadata.isFile()) return [{ path, singleFile: true }];
   if (!metadata.isDirectory()) throw new Error(`Not a file or directory: ${path}`);
-  return (await collectEntries(path))
+  return (await collectEntries(path, path))
     .filter((entry) => !entry.directory)
     .map((entry) => ({ path: entry.path, singleFile: false }))
     .sort((left, right) => left.path.localeCompare(right.path));
@@ -590,6 +624,176 @@ async function collectFiles(path: string): Promise<Array<{ path: string; singleF
 
 function displayRelative(root: string, path: string, singleFile: boolean): string {
   return singleFile ? path.split(sep).at(-1) ?? "[file]" : toPosix(relative(root, path));
+}
+
+interface DirectoryBoundary {
+  requestedRoot: string;
+  canonicalRoot: string;
+  rootSnapshot: Stats;
+}
+
+function directoryReadTestHook(
+  context: ToolContext,
+): ToolContextWithDirectoryReadTestHook["beforeDirectoryRead"] {
+  return (context as ToolContextWithDirectoryReadTestHook).beforeDirectoryRead;
+}
+
+interface DirectorySnapshot {
+  path: string;
+  metadata: Stats;
+}
+
+async function createDirectoryBoundary(root: string): Promise<DirectoryBoundary> {
+  const canonicalRoot = await realpath(root);
+  const rootSnapshot = await lstat(canonicalRoot);
+  if (!rootSnapshot.isDirectory()) throw new Error(`Not a directory: ${root}`);
+  return { requestedRoot: root, canonicalRoot, rootSnapshot };
+}
+
+async function readValidatedDirectory(
+  path: string,
+  boundary: DirectoryBoundary,
+  beforeDirectoryRead?: (path: string) => void | Promise<void>,
+): Promise<{ entries: Dirent[]; snapshot: DirectorySnapshot }> {
+  const canonicalPathBefore = await realpath(path);
+  assertCanonicalPathAllowed(canonicalPathBefore, [boundary.canonicalRoot]);
+  const pathBefore = await lstat(canonicalPathBefore);
+  if (!pathBefore.isDirectory()) throw new Error(`Not a directory: ${path}`);
+
+  const handle = await open(canonicalPathBefore, READ_ONLY_DIRECTORY_NOFOLLOW_FLAGS);
+  try {
+    const descriptorBefore = await handle.stat();
+    if (!descriptorBefore.isDirectory()) throw new Error(`Not a directory: ${path}`);
+    assertSameFileIdentity(pathBefore, descriptorBefore, canonicalPathBefore);
+
+    await beforeDirectoryRead?.(canonicalPathBefore);
+    const entries = await readdir(canonicalPathBefore, { withFileTypes: true });
+
+    const descriptorAfter = await handle.stat();
+    if (!sameFileSnapshot(descriptorBefore, descriptorAfter)) {
+      throw new Error(`Directory changed during read: ${canonicalPathBefore}`);
+    }
+    await validateDirectorySnapshot({
+      path: canonicalPathBefore,
+      metadata: descriptorAfter,
+    }, boundary);
+    return {
+      entries,
+      snapshot: { path: canonicalPathBefore, metadata: descriptorAfter },
+    };
+  } finally {
+    await handle.close();
+  }
+}
+
+async function validateDirectorySnapshots(
+  boundary: DirectoryBoundary,
+  snapshots: DirectorySnapshot[],
+): Promise<void> {
+  const canonicalRootAfter = await realpath(boundary.requestedRoot);
+  if (canonicalRootAfter !== boundary.canonicalRoot) {
+    throw new Error(`Directory changed during read: ${boundary.requestedRoot}`);
+  }
+  const rootAfter = await lstat(boundary.canonicalRoot);
+  if (!sameFileSnapshot(boundary.rootSnapshot, rootAfter) || !rootAfter.isDirectory()) {
+    throw new Error(`Directory changed during read: ${boundary.requestedRoot}`);
+  }
+  for (const snapshot of snapshots) {
+    await validateDirectorySnapshot(snapshot, boundary);
+  }
+}
+
+async function validateDirectorySnapshot(
+  snapshot: DirectorySnapshot,
+  boundary: DirectoryBoundary,
+): Promise<void> {
+  const pathAfter = await lstat(snapshot.path);
+  if (!pathAfter.isDirectory() || !sameFileSnapshot(snapshot.metadata, pathAfter)) {
+    throw new Error(`Directory changed during read: ${snapshot.path}`);
+  }
+  const canonicalPathAfter = await realpath(snapshot.path);
+  assertCanonicalPathAllowed(canonicalPathAfter, [boundary.canonicalRoot]);
+  if (canonicalPathAfter !== snapshot.path) {
+    throw new Error(`Directory changed during read: ${snapshot.path}`);
+  }
+}
+
+async function readValidatedFile(
+  path: string,
+  allowedRoots: string[],
+  maximumBytes?: number,
+): Promise<{ buffer: Buffer; metadata: Stats }> {
+  const canonicalRoots = await Promise.all(allowedRoots.map((root) => realpath(root)));
+  const canonicalPathBefore = await realpath(path);
+  assertCanonicalPathAllowed(canonicalPathBefore, canonicalRoots);
+
+  const pathBefore = await lstat(path);
+  if (!pathBefore.isFile()) {
+    if (pathBefore.isSymbolicLink()) {
+      throw new Error(`Refusing to read symbolic link: ${path}`);
+    }
+    throw new Error(`Not a file: ${path}`);
+  }
+  if (maximumBytes !== undefined && pathBefore.size > maximumBytes) {
+    return {
+      buffer: Buffer.alloc(0),
+      metadata: pathBefore,
+    };
+  }
+
+  const handle = await open(path, READ_ONLY_NOFOLLOW_FLAGS);
+  try {
+    const descriptorBefore = await handle.stat();
+    if (!descriptorBefore.isFile()) throw new Error(`Not a file: ${path}`);
+    assertSameFileIdentity(pathBefore, descriptorBefore, path);
+    if (maximumBytes !== undefined && descriptorBefore.size > maximumBytes) {
+      return {
+        buffer: Buffer.alloc(0),
+        metadata: descriptorBefore,
+      };
+    }
+
+    const buffer = await handle.readFile();
+    const descriptorAfter = await handle.stat();
+    if (!sameFileSnapshot(descriptorBefore, descriptorAfter)) {
+      throw new Error(`File changed during read: ${path}`);
+    }
+
+    const pathAfter = await lstat(path);
+    if (!pathAfter.isFile()) throw new Error(`File was replaced during read: ${path}`);
+    assertSameFileIdentity(descriptorAfter, pathAfter, path);
+    const canonicalPathAfter = await realpath(path);
+    assertCanonicalPathAllowed(canonicalPathAfter, canonicalRoots);
+    if (canonicalPathAfter !== canonicalPathBefore) {
+      throw new Error(`File was replaced during read: ${path}`);
+    }
+
+    return { buffer, metadata: descriptorAfter };
+  } finally {
+    await handle.close();
+  }
+}
+
+function assertCanonicalPathAllowed(path: string, allowedRoots: string[]): void {
+  if (!allowedRoots.some((root) => isPathInsideRoot(path, root))) {
+    throw new AccessDeniedError(`Path is outside allowed roots: ${path}`);
+  }
+}
+
+function assertSameFileIdentity(left: Stats, right: Stats, path: string): void {
+  if (left.dev !== right.dev || left.ino !== right.ino) {
+    throw new Error(`File was replaced during read: ${path}`);
+  }
+}
+
+function sameFileSnapshot(left: Stats, right: Stats): boolean {
+  return (
+    left.dev === right.dev &&
+    left.ino === right.ino &&
+    left.size === right.size &&
+    left.mtimeMs === right.mtimeMs &&
+    left.ctimeMs === right.ctimeMs
+  );
 }
 
 function globMatches(path: string, pattern: string): boolean {

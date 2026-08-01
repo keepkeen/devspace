@@ -1,4 +1,5 @@
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
+import type { AppliedPatchFile } from "./apply-patch.js";
 
 export interface MutationOperationKey {
   connectionPrincipalId: string;
@@ -42,6 +43,7 @@ export interface MutationOperationStatus {
 
 export interface MutationOperationResolutionInput {
   connectionPrincipalId: string;
+  workspaceId: string;
   operationId: string;
   resolution: MutationOperationResolution;
   method: string;
@@ -70,10 +72,61 @@ export type MutationOperationUnknownOutcome =
   | { status: "conflict" }
   | { status: "not_pending" };
 
+export interface ApplyPatchChangeSummary {
+  files: number;
+  additions: number;
+  removals: number;
+}
+
+export interface ApplyPatchChangeSettlement {
+  patch: string;
+  files: readonly AppliedPatchFile[];
+  summary: ApplyPatchChangeSummary;
+}
+
+export interface MutationOperationSettlementOptions {
+  applyPatchChange?: ApplyPatchChangeSettlement;
+}
+
+export interface ApplyPatchChangeRecord {
+  operationId: string;
+  workspaceGeneration: number;
+  appliedAt: string;
+  patch: string;
+  files: ApplyPatchChangeFile[];
+  summary: ApplyPatchChangeSummary;
+}
+
+export interface ApplyPatchChangeFile {
+  path: string;
+  previousPath?: string;
+  operation: AppliedPatchFile["operation"];
+}
+
+export interface ListApplyPatchChangesInput {
+  connectionPrincipalId: string;
+  workspaceId: string;
+}
+
+export interface ApplyPatchHistoryCapacityInput extends ListApplyPatchChangesInput {
+  additionalBytes: number;
+}
+
+export interface ApplyPatchHistoryCapacity {
+  allowed: boolean;
+  operations: number;
+  storedBytes: number;
+  maxOperations: number;
+  maxBytes: number;
+  limitingFactor?: "operations" | "bytes";
+}
+
 export interface MutationOperationStoreOptions {
   ttlMs?: number;
   maxResultBytes?: number;
   cleanupLimit?: number;
+  maxApplyPatchHistoryBytes?: number;
+  maxApplyPatchHistoryOperations?: number;
   now?: () => number;
 }
 
@@ -95,6 +148,17 @@ const MAX_TOOL_LENGTH = 256;
 const MAX_REQUEST_HASH_LENGTH = 512;
 const MAX_RESOLUTION_LABEL_LENGTH = 128;
 const MAX_EVIDENCE_BYTES = 64 * 1024;
+export const DEFAULT_MAX_APPLY_PATCH_HISTORY_BYTES = 64 * 1024 * 1024;
+export const DEFAULT_MAX_APPLY_PATCH_HISTORY_OPERATIONS = 1_000;
+
+export class ApplyPatchHistoryLimitError extends Error {
+  readonly code = "apply_patch_history_limit";
+
+  constructor(readonly limitingFactor: "operations" | "bytes") {
+    super(`apply_patch history ${limitingFactor} limit reached`);
+    this.name = "ApplyPatchHistoryLimitError";
+  }
+}
 
 /**
  * Durable idempotency records for mutating tool calls. The store persists only
@@ -108,6 +172,8 @@ export class MutationOperationStore {
   private readonly ttlMs: number;
   private readonly maxResultBytes: number;
   private readonly cleanupLimit: number;
+  private readonly maxApplyPatchHistoryBytes: number;
+  private readonly maxApplyPatchHistoryOperations: number;
   private readonly clock: () => number;
   private closed = false;
 
@@ -121,6 +187,14 @@ export class MutationOperationStore {
       options.cleanupLimit ?? DEFAULT_CLEANUP_LIMIT,
       "cleanupLimit",
       MAX_CLEANUP_LIMIT,
+    );
+    this.maxApplyPatchHistoryBytes = positiveSafeInteger(
+      options.maxApplyPatchHistoryBytes ?? DEFAULT_MAX_APPLY_PATCH_HISTORY_BYTES,
+      "maxApplyPatchHistoryBytes",
+    );
+    this.maxApplyPatchHistoryOperations = positiveSafeInteger(
+      options.maxApplyPatchHistoryOperations ?? DEFAULT_MAX_APPLY_PATCH_HISTORY_OPERATIONS,
+      "maxApplyPatchHistoryOperations",
     );
     this.clock = options.now ?? Date.now;
     this.database = openDatabase(stateDir);
@@ -154,10 +228,16 @@ export class MutationOperationStore {
         .prepare(
           `update mutation_operations
            set result_json = null
-           where connection_principal_id = ? and operation_id = ? and expires_at <= ?
+           where connection_principal_id = ? and workspace_id = ?
+             and operation_id = ? and expires_at <= ?
              and result_json is not null`,
         )
-        .run(normalizedKey.connectionPrincipalId, normalizedKey.operationId, nowTimestamp);
+        .run(
+          normalizedKey.connectionPrincipalId,
+          normalizedKey.workspaceId,
+          normalizedKey.operationId,
+          nowTimestamp,
+        );
 
       const row = this.getRow(normalizedKey);
       if (row && !rowMatchesKey(row, normalizedKey)) return { status: "conflict" };
@@ -192,7 +272,7 @@ export class MutationOperationStore {
 
       const currentGeneration = this.getWorkspaceGeneration(normalizedKey);
       if (currentGeneration === undefined) {
-        throw new Error("Mutation operation workspace does not belong to the OAuth client");
+        throw new Error("Mutation operation Project runtime does not belong to the active authorization");
       }
       if (expectedGeneration !== undefined && expectedGeneration !== currentGeneration) {
         return { status: "stale_generation", currentGeneration };
@@ -225,10 +305,14 @@ export class MutationOperationStore {
     key: MutationOperationKey,
     requestHash: string,
     result: unknown,
+    options: MutationOperationSettlementOptions = {},
   ): MutationOperationSettlement {
     this.assertOpen();
     const normalizedKey = validateKey(key);
     const normalizedHash = boundedNonEmptyString(requestHash, "requestHash", MAX_REQUEST_HASH_LENGTH);
+    const applyPatchChange = options.applyPatchChange === undefined
+      ? undefined
+      : validateApplyPatchChange(normalizedKey, options.applyPatchChange);
     const resultJson = serializeJson(result);
     const resultAvailable = Buffer.byteLength(resultJson, "utf8") <= this.maxResultBytes;
     const now = this.currentTime();
@@ -241,6 +325,20 @@ export class MutationOperationStore {
       if (!rowMatchesKey(row, normalizedKey)) return { status: "conflict" };
       if (row.request_hash !== normalizedHash) return { status: "conflict" };
       if (row.state !== "pending") return { status: "not_pending" };
+
+      if (applyPatchChange) {
+        const recordBytes = Buffer.byteLength(applyPatchChange.patch, "utf8") +
+          Buffer.byteLength(applyPatchChange.filesJson, "utf8") +
+          Buffer.byteLength(applyPatchChange.summaryJson, "utf8");
+        const capacity = this.applyPatchHistoryCapacity(
+          normalizedKey.connectionPrincipalId,
+          normalizedKey.workspaceId,
+          recordBytes,
+        );
+        if (!capacity.allowed) {
+          throw new ApplyPatchHistoryLimitError(capacity.limitingFactor ?? "bytes");
+        }
+      }
 
       this.database.sqlite
         .prepare(
@@ -256,6 +354,26 @@ export class MutationOperationStore {
           ...keyValues(normalizedKey),
           normalizedHash,
         );
+
+      if (applyPatchChange) {
+        this.database.sqlite
+          .prepare(
+            `insert into apply_patch_changes (
+              connection_principal_id, workspace_id, operation_id, workspace_generation,
+              applied_at, patch, files_json, summary_json
+            ) values (?, ?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            normalizedKey.connectionPrincipalId,
+            normalizedKey.workspaceId,
+            normalizedKey.operationId,
+            row.workspace_generation,
+            nowTimestamp,
+            applyPatchChange.patch,
+            applyPatchChange.filesJson,
+            applyPatchChange.summaryJson,
+          );
+      }
 
       return { status: resultAvailable ? "settled" : "result_unavailable" };
     });
@@ -311,6 +429,7 @@ export class MutationOperationStore {
 
   getOperationStatus(
     connectionPrincipalId: string,
+    workspaceId: string,
     operationId: string,
   ): MutationOperationStatus | undefined {
     this.assertOpen();
@@ -324,12 +443,23 @@ export class MutationOperationStore {
       "operationId",
       MAX_KEY_PART_LENGTH,
     );
+    const normalizedWorkspaceId = boundedNonEmptyString(
+      workspaceId,
+      "workspaceId",
+      MAX_KEY_PART_LENGTH,
+    );
     this.database.sqlite.prepare(`
       update mutation_operations
       set result_json = null
-      where connection_principal_id = ? and operation_id = ? and expires_at <= ?
+      where connection_principal_id = ? and workspace_id = ?
+        and operation_id = ? and expires_at <= ?
         and result_json is not null
-    `).run(normalizedConnectionPrincipalId, normalizedOperationId, timestampFromMs(this.currentTime()));
+    `).run(
+      normalizedConnectionPrincipalId,
+      normalizedWorkspaceId,
+      normalizedOperationId,
+      timestampFromMs(this.currentTime()),
+    );
     const row = this.database.sqlite.prepare(`
       select
         operation_id as operationId,
@@ -347,8 +477,12 @@ export class MutationOperationStore {
         operator_ref as operatorRef,
         case when state = 'settled' and result_json is not null then 1 else 0 end as resultAvailable
       from mutation_operations
-      where connection_principal_id = ? and operation_id = ?
-    `).get(normalizedConnectionPrincipalId, normalizedOperationId) as
+      where connection_principal_id = ? and workspace_id = ? and operation_id = ?
+    `).get(
+      normalizedConnectionPrincipalId,
+      normalizedWorkspaceId,
+      normalizedOperationId,
+    ) as
       | Omit<MutationOperationStatus, "resultAvailable" | "resolution"> & {
           resultAvailable: 0 | 1;
           resolutionMethod: string | null;
@@ -398,6 +532,11 @@ export class MutationOperationStore {
       "operationId",
       MAX_KEY_PART_LENGTH,
     );
+    const workspaceId = boundedNonEmptyString(
+      input.workspaceId,
+      "workspaceId",
+      MAX_KEY_PART_LENGTH,
+    );
     if (!isResolutionState(input.resolution)) throw new TypeError("Unknown operation resolution.");
     const method = boundedNonEmptyString(input.method, "method", MAX_RESOLUTION_LABEL_LENGTH);
     const evidenceType = boundedNonEmptyString(
@@ -419,7 +558,7 @@ export class MutationOperationStore {
       update mutation_operations
       set state = ?, resolution_method = ?, evidence_type = ?, evidence_json = ?,
           resolved_at = ?, operator_ref = ?, updated_at = ?
-      where connection_principal_id = ? and operation_id = ?
+      where connection_principal_id = ? and workspace_id = ? and operation_id = ?
         and state = 'outcome_unknown'
     `).run(
       input.resolution,
@@ -430,10 +569,125 @@ export class MutationOperationStore {
       operatorRef,
       now,
       connectionPrincipalId,
+      workspaceId,
       operationId,
     );
     if (result.changes === 0) return undefined;
-    return this.getOperationStatus(connectionPrincipalId, operationId);
+    return this.getOperationStatus(connectionPrincipalId, workspaceId, operationId);
+  }
+
+  listApplyPatchChanges(input: ListApplyPatchChangesInput): ApplyPatchChangeRecord[] {
+    this.assertOpen();
+    const connectionPrincipalId = boundedNonEmptyString(
+      input.connectionPrincipalId,
+      "connectionPrincipalId",
+      MAX_KEY_PART_LENGTH,
+    );
+    const workspaceId = boundedNonEmptyString(
+      input.workspaceId,
+      "workspaceId",
+      MAX_KEY_PART_LENGTH,
+    );
+    const usage = this.applyPatchHistoryUsage(connectionPrincipalId, workspaceId);
+    if (usage.operations > this.maxApplyPatchHistoryOperations) {
+      throw new ApplyPatchHistoryLimitError("operations");
+    }
+    if (usage.storedBytes > this.maxApplyPatchHistoryBytes) {
+      throw new ApplyPatchHistoryLimitError("bytes");
+    }
+    const rows = this.database.sqlite.prepare(`
+      select
+        operation_id as operationId,
+        workspace_generation as workspaceGeneration,
+        applied_at as appliedAt,
+        patch,
+        files_json as filesJson,
+        summary_json as summaryJson
+      from apply_patch_changes
+      where connection_principal_id = ? and workspace_id = ?
+      order by sequence
+    `).all(connectionPrincipalId, workspaceId) as Array<{
+      operationId: string;
+      workspaceGeneration: number;
+      appliedAt: string;
+      patch: string;
+      filesJson: string;
+      summaryJson: string;
+    }>;
+    return rows.map((row) => ({
+      operationId: row.operationId,
+      workspaceGeneration: row.workspaceGeneration,
+      appliedAt: row.appliedAt,
+      patch: row.patch,
+      files: parseStoredJson(row.filesJson, "files_json") as ApplyPatchChangeFile[],
+      summary: parseStoredJson(row.summaryJson, "summary_json") as ApplyPatchChangeSummary,
+    }));
+  }
+
+  checkApplyPatchHistoryCapacity(
+    input: ApplyPatchHistoryCapacityInput,
+  ): ApplyPatchHistoryCapacity {
+    this.assertOpen();
+    const connectionPrincipalId = boundedNonEmptyString(
+      input.connectionPrincipalId,
+      "connectionPrincipalId",
+      MAX_KEY_PART_LENGTH,
+    );
+    const workspaceId = boundedNonEmptyString(
+      input.workspaceId,
+      "workspaceId",
+      MAX_KEY_PART_LENGTH,
+    );
+    const additionalBytes = nonNegativeSafeInteger(
+      input.additionalBytes,
+      "additionalBytes",
+    );
+    return this.applyPatchHistoryCapacity(
+      connectionPrincipalId,
+      workspaceId,
+      additionalBytes,
+    );
+  }
+
+  private applyPatchHistoryCapacity(
+    connectionPrincipalId: string,
+    workspaceId: string,
+    additionalBytes: number,
+  ): ApplyPatchHistoryCapacity {
+    const usage = this.applyPatchHistoryUsage(connectionPrincipalId, workspaceId);
+    const operationLimited = usage.operations + 1 > this.maxApplyPatchHistoryOperations;
+    const byteLimited = usage.storedBytes + additionalBytes > this.maxApplyPatchHistoryBytes;
+    return {
+      allowed: !operationLimited && !byteLimited,
+      ...usage,
+      maxOperations: this.maxApplyPatchHistoryOperations,
+      maxBytes: this.maxApplyPatchHistoryBytes,
+      ...(operationLimited
+        ? { limitingFactor: "operations" as const }
+        : byteLimited
+          ? { limitingFactor: "bytes" as const }
+          : {}),
+    };
+  }
+
+  private applyPatchHistoryUsage(
+    connectionPrincipalId: string,
+    workspaceId: string,
+  ): { operations: number; storedBytes: number } {
+    return this.database.sqlite.prepare(`
+      select
+        count(*) as operations,
+        coalesce(sum(
+          length(cast(patch as blob)) +
+          length(cast(files_json as blob)) +
+          length(cast(summary_json as blob))
+        ), 0) as storedBytes
+      from apply_patch_changes
+      where connection_principal_id = ? and workspace_id = ?
+    `).get(connectionPrincipalId, workspaceId) as {
+      operations: number;
+      storedBytes: number;
+    };
   }
 
   cleanupExpired(limit = this.cleanupLimit): number {
@@ -479,11 +733,15 @@ export class MutationOperationStore {
   private getRow(key: MutationOperationKey): MutationOperationRow | undefined {
     return this.database.sqlite
       .prepare(
-        `select workspace_id, workspace_generation, tool, request_hash, state, result_json
+         `select workspace_id, workspace_generation, tool, request_hash, state, result_json
          from mutation_operations
-         where connection_principal_id = ? and operation_id = ?`,
+         where connection_principal_id = ? and workspace_id = ? and operation_id = ?`,
       )
-      .get(key.connectionPrincipalId, key.operationId) as MutationOperationRow | undefined;
+      .get(
+        key.connectionPrincipalId,
+        key.workspaceId,
+        key.operationId,
+      ) as MutationOperationRow | undefined;
   }
 
   private getWorkspaceGeneration(key: MutationOperationKey): number | undefined {
@@ -539,6 +797,75 @@ function keyValues(key: MutationOperationKey): [string, string, string, string] 
 
 function rowMatchesKey(row: MutationOperationRow, key: MutationOperationKey): boolean {
   return row.workspace_id === key.workspaceId && row.tool === key.tool;
+}
+
+function validateApplyPatchChange(
+  key: MutationOperationKey,
+  value: ApplyPatchChangeSettlement,
+): ApplyPatchChangeSettlement & { filesJson: string; summaryJson: string } {
+  if (key.tool !== "apply_patch") {
+    throw new TypeError("applyPatchChange may only be recorded for the apply_patch tool");
+  }
+  if (!value || typeof value !== "object") {
+    throw new TypeError("applyPatchChange must be an object");
+  }
+  if (typeof value.patch !== "string") {
+    throw new TypeError("applyPatchChange.patch must be a string");
+  }
+  if (!Array.isArray(value.files)) {
+    throw new TypeError("applyPatchChange.files must be an array");
+  }
+  if (!value.summary || typeof value.summary !== "object") {
+    throw new TypeError("applyPatchChange.summary must be an object");
+  }
+  const summary = value.summary as ApplyPatchChangeSummary;
+  const files = nonNegativeSafeInteger(summary.files, "applyPatchChange.summary.files");
+  const additions = nonNegativeSafeInteger(
+    summary.additions,
+    "applyPatchChange.summary.additions",
+  );
+  const removals = nonNegativeSafeInteger(
+    summary.removals,
+    "applyPatchChange.summary.removals",
+  );
+  if (files !== value.files.length) {
+    throw new TypeError("applyPatchChange.summary.files must match applyPatchChange.files.length");
+  }
+  const journalFiles = value.files.map((file, index): ApplyPatchChangeFile => {
+    const path = boundedNonEmptyString(
+      file.path,
+      `applyPatchChange.files[${index}].path`,
+      MAX_KEY_PART_LENGTH,
+    );
+    const previousPath = file.previousPath === undefined
+      ? undefined
+      : boundedNonEmptyString(
+          file.previousPath,
+          `applyPatchChange.files[${index}].previousPath`,
+          MAX_KEY_PART_LENGTH,
+        );
+    if (
+      file.operation !== "add" &&
+      file.operation !== "update" &&
+      file.operation !== "delete" &&
+      file.operation !== "move"
+    ) {
+      throw new TypeError(`applyPatchChange.files[${index}].operation is invalid`);
+    }
+    return {
+      path,
+      ...(previousPath ? { previousPath } : {}),
+      operation: file.operation,
+    };
+  });
+  const normalizedSummary = { files, additions, removals };
+  return {
+    patch: value.patch,
+    files: value.files,
+    summary: normalizedSummary,
+    filesJson: serializeJson(journalFiles),
+    summaryJson: serializeJson(normalizedSummary),
+  };
 }
 
 function boundedNonEmptyString(value: unknown, name: string, maxLength: number): string {
@@ -597,6 +924,14 @@ function parseJson(value: string): unknown {
     return JSON.parse(value) as unknown;
   } catch {
     return undefined;
+  }
+}
+
+function parseStoredJson(value: string, column: string): unknown {
+  try {
+    return JSON.parse(value) as unknown;
+  } catch {
+    throw new Error(`Stored apply_patch change ${column} is invalid JSON`);
   }
 }
 

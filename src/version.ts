@@ -24,5 +24,5 @@ export const DEVSPACE_SERVER_INFO = {
   title: "DevSpace",
   version: DEVSPACE_VERSION,
   description:
-    "Secure local coding workspace for MCP clients. Provides workspace-scoped file, search, edit, write, and shell tools.",
+    "Local Project coding tools, AGENTS.md instructions, and Skills for ChatGPT.",
 } as const;

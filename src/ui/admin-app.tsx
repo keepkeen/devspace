@@ -76,17 +76,13 @@ const resourceFields: Array<{
   unit?: string;
 }> = [
   { key: "maxMcpSessions", label: "MCP 会话上限", description: "同时保持的 MCP 客户端连接数。" },
-  { key: "maxMcpSessionsPerClient", label: "单连接主体 MCP 上限", description: "单个本机连接主体可占用的 MCP 会话数。" },
-  { key: "maxProcessSessions", label: "进程会话总上限", description: "所有 workspace 合计可运行的终端进程数。" },
-  { key: "maxProcessSessionsPerClient", label: "单连接主体进程上限", description: "单个本机连接主体跨 workspace 可占用的进程会话数。" },
-  { key: "maxProcessSessionsPerWorkspace", label: "单 workspace 进程上限", description: "单个 workspace 可同时占用的终端进程数。" },
+  { key: "maxProcessSessions", label: "进程会话总上限", description: "所有 Project 合计可运行的终端进程数。" },
+  { key: "maxProcessSessionsPerWorkspace", label: "单 Project 进程上限", description: "单个 Project 可同时占用的终端进程数。" },
   { key: "maxProcessOutputFileBytes", label: "单份进程输出上限", description: "单个进程可持久化的完整输出字节数。", unit: "字节" },
   { key: "maxProcessOutputStorageBytes", label: "进程输出存储总上限", description: "所有持久化进程输出合计可占用的字节数。", unit: "字节" },
   { key: "completedProcessOutputTtlMs", label: "已完成输出保留时间", description: "进程结束后完整输出继续保留的时间。", displaySeconds: true, unit: "秒" },
   { key: "maxCommandRuntimeMs", label: "命令最长运行时间", description: "命令达到此时间后会被终止。", displaySeconds: true, unit: "秒" },
-  { key: "maxResidentWorkspaces", label: "驻留 workspace 上限", description: "内存中保留的 workspace 会话数量。" },
-  { key: "maxActiveWorkspacesPerClient", label: "单连接主体 workspace 上限", description: "单个本机连接主体可保持的活跃 workspace 数。" },
-  { key: "maxManagedWorktrees", label: "托管 worktree 上限", description: "DevSpace 同时维护的 Git worktree 数量。" },
+  { key: "maxResidentWorkspaces", label: "驻留 Project 运行时上限", description: "内存中保留的 Project 运行时数量。" },
   { key: "maxRequestBodyBytes", label: "MCP 请求体上限", description: "单个 MCP JSON 请求的最大字节数；必须容纳转义后的最大 patch。", unit: "字节" },
 ];
 
@@ -350,7 +346,9 @@ function AdminForm({
   async function refreshDiagnostics(): Promise<void> {
     setDiagnosticsState("loading");
     try {
-      setDiagnostics(await requestJson<AdminDiagnosticsResponse>("/api/diagnostics"));
+      const nextDiagnostics =
+        await requestJson<AdminDiagnosticsResponse>("/api/diagnostics");
+      setDiagnostics(nextDiagnostics);
       setDiagnosticsState("ready");
     } catch {
       setDiagnosticsState("error");
@@ -541,21 +539,21 @@ function AdminForm({
         </section>
 
         <section className="panel" id="runtime" aria-labelledby="runtime-heading">
-          <SectionHeading kicker="RUNTIME" title="运行情况" description="当前会话、workspace、进程、授权记录与最近失败。">
+          <SectionHeading kicker="RUNTIME" title="运行情况" description="当前 Project、进程、授权记录与最近失败。">
             <button type="button" className="quiet-button" onClick={() => void refreshDiagnostics()} disabled={diagnosticsState === "loading"}>
               {diagnosticsState === "loading" ? "刷新中…" : "刷新数据"}
             </button>
           </SectionHeading>
           {diagnosticsState === "error" && <div className="inline-banner error" role="alert">后端尚未提供内部诊断端点，或当前网络不可用。</div>}
           {diagnostics && <>
-            {(diagnostics.diagnostics.usage?.oauth?.legacyWildcardGrants ?? 0) > 0 && <div className="inline-banner warning" role="alert">检测到 {diagnostics.diagnostics.usage?.oauth?.legacyWildcardGrants} 个遗留通配根授权。新增 allowed root 会扩大这些授权的访问范围；请重新执行 OAuth 审批并选择明确项目根。</div>}
+            {(diagnostics.diagnostics.usage?.oauth?.legacyWildcardGrants ?? 0) > 0 && <div className="inline-banner warning" role="alert">检测到 {diagnostics.diagnostics.usage?.oauth?.legacyWildcardGrants} 个遗留通配根授权。请重新执行 OAuth 授权并选择明确的项目根。</div>}
             {(diagnostics.diagnostics.observability?.audit?.auditWriteFailures ?? 0) > 0 && <div className="inline-banner warning" role="alert">安全审计持久化已失败 {diagnostics.diagnostics.observability?.audit?.auditWriteFailures} 次；最近一次为 {diagnostics.diagnostics.observability?.audit?.lastAuditWriteFailureAt ? formatTimestamp(diagnostics.diagnostics.observability.audit.lastAuditWriteFailureAt) : "未知时间"}。工具结果未受影响，但请检查本地 SQLite 状态和磁盘。</div>}
             <div className="usage-grid">
               <UsageCard label="MCP 会话" metric={diagnostics.diagnostics.usage?.mcpSessions} />
               <UsageCard label="进程会话" metric={diagnostics.diagnostics.usage?.processSessions} />
               <UsageCard label="进程输出字节" metric={diagnostics.diagnostics.usage?.processOutput} />
-              <UsageCard label="驻留 workspace" metric={diagnostics.diagnostics.usage?.workspaces} activeKey="resident" />
-              <UsageCard label="连接主体" metric={{ active: diagnostics.diagnostics.usage?.oauth?.principals ?? undefined }} />
+              <UsageCard label="驻留 Project 运行时" metric={diagnostics.diagnostics.usage?.workspaces} activeKey="resident" />
+              <UsageCard label="Project 执行记录" metric={{ active: diagnostics.diagnostics.usage?.projectExecutions?.total ?? undefined }} />
               <UsageCard label="OAuth 注册" metric={{ active: diagnostics.diagnostics.usage?.oauth?.clients ?? undefined }} />
             </div>
             <div className="runtime-columns">
@@ -568,9 +566,9 @@ function AdminForm({
               <div className="subsection security-actions">
                 <h3>诊断与安全</h3>
                 <p>诊断包仅包含汇总信息，不含路径、客户端 ID、令牌或错误详情。</p>
-                <div className="row-actions"><a className="secondary-button" href="/api/diagnostics/bundle" download>下载脱敏诊断包</a>{!revokeArmed && <button type="button" className="danger-button" onClick={() => { setRevokeArmed(true); setRevokeState("idle"); }}>撤销全部客户端与令牌</button>}</div>
-                {revokeArmed && <div className="danger-confirm" role="alert"><strong>所有远程客户端都会立即失效。</strong><div className="row-actions"><button type="button" className="quiet-button" onClick={() => setRevokeArmed(false)} disabled={revokeState === "working"}>取消</button><button type="button" className="danger-button" onClick={() => void revokeAllClientsAndTokens()} disabled={revokeState === "working"}>{revokeState === "working" ? "正在撤销…" : "确认全部撤销"}</button></div></div>}
-                {revokeState === "success" && <p className="field-help success" role="status">全部客户端和令牌已撤销。</p>}
+                <div className="row-actions"><a className="secondary-button" href="/api/diagnostics/bundle" download>下载脱敏诊断包</a>{!revokeArmed && <button type="button" className="danger-button" onClick={() => { setRevokeArmed(true); setRevokeState("idle"); }}>撤销当前 ChatGPT 授权</button>}</div>
+                {revokeArmed && <div className="danger-confirm" role="alert"><strong>当前 ChatGPT 授权及其令牌会立即失效。</strong><div className="row-actions"><button type="button" className="quiet-button" onClick={() => setRevokeArmed(false)} disabled={revokeState === "working"}>取消</button><button type="button" className="danger-button" onClick={() => void revokeAllClientsAndTokens()} disabled={revokeState === "working"}>{revokeState === "working" ? "正在撤销…" : "确认撤销"}</button></div></div>}
+                {revokeState === "success" && <p className="field-help success" role="status">当前 ChatGPT 授权已撤销。</p>}
                 {revokeState === "error" && <p className="field-error" role="alert">撤销失败；确认可能已过期，请刷新运行数据后重试。</p>}
               </div>
             </div>
@@ -586,12 +584,13 @@ function AdminForm({
         <section className="panel" id="access" aria-labelledby="access-heading">
           <SectionHeading kicker="ACCESS" title="访问" description="限制远程客户端可见的本机目录与项目说明文件。"><span className="count-badge">{config.allowedRoots.length}</span></SectionHeading>
           <div className="subsection">
-            <div className="subsection-heading"><div><h3>允许访问的目录</h3><p>仅列表中的目录及其子目录可被读取和修改；保存后立即生效，无需重启。移除目录会终止其运行命令并使已有 workspace 失效。</p></div><FieldMeta path="allowedRoots" overrides={overrides} warnings={warnings} issues={issuesByPath} /></div>
+            <div className="subsection-heading"><div><h3>允许访问的目录</h3><p>这是服务端的全局目录上限，不是单个 OAuth 授权。保存后会热加载，无需重启；授权能力还同时受 OAuth 根目录 ID 和 scopes 限制。</p></div><FieldMeta path="allowedRoots" overrides={overrides} warnings={warnings} issues={issuesByPath} /></div>
             {(rootsPolicyMismatch || rootsCleanupPending) && <div className="inline-banner warning" role="status"><strong>{rootsCleanupPending ? "目录权限已收紧，但后台清理尚未完成。" : "保存的目录权限尚未与运行中的后端一致。"}</strong> 后台会持续重试；在提示消失前，请勿依赖刚新增的目录，必要时可重启后端。</div>}
             <div className="item-list">
-              {config.allowedRoots.map((root, index) => <div className="item-row" key={`${root}-${index}`}><div className="item-value"><code title={root}>{root}</code><FieldMeta path={`allowedRoots.${index}`} overrides={overrides} warnings={warnings} issues={issuesByPath} /></div><button type="button" className="remove-button" onClick={() => removeRoot(index)} aria-label={`移除目录 ${root}`} title={config.allowedRoots.length <= 1 ? "至少保留一个目录" : undefined} disabled={overrides.includes("allowedRoots") || config.allowedRoots.length <= 1}>移除</button></div>)}
+              {config.allowedRoots.map((root, index) => <div className="item-row" key={`${root}-${index}`}><div className="item-value"><code title={root}>{root}</code><FieldMeta path={`allowedRoots.${index}`} overrides={overrides} warnings={warnings} issues={issuesByPath} /></div><button type="button" className="remove-button" onClick={() => removeRoot(index)} aria-label={`移除目录 ${root}`} title={config.allowedRoots.length <= 1 ? "至少保留一个目录" : "会终止相关命令并清除受影响的 Project 绑定；不会删除任何项目文件"} disabled={overrides.includes("allowedRoots") || config.allowedRoots.length <= 1}>移除</button></div>)}
             </div>
-            <AddField id="new-root" label="添加目录" value={newRoot} onChange={(value) => { setNewRoot(value); setRootError(null); }} onAdd={addRoot} placeholder="/Users/you/code/project" help="请输入本机目录的绝对路径。" error={rootError} disabled={overrides.includes("allowedRoots")} />
+            <AddField id="new-root" label="添加目录" value={newRoot} onChange={(value) => { setNewRoot(value); setRootError(null); }} onAdd={addRoot} placeholder="/Users/you/code/project" help={overrides.includes("allowedRoots") ? "DEVSPACE_ALLOWED_ROOTS 已锁定此项；请修改启动环境并重启后端。" : "请输入本机绝对路径。保存会立即扩大全局上限；现有授权仍需重新审批才能选择新增项目根。"} error={rootError} disabled={overrides.includes("allowedRoots")} />
+            <p className="field-help">移除目录会终止相关命令并清除受影响的 Project 绑定，但绝不会删除项目文件。</p>
           </div>
           <div className="subsection divided">
             <div className="subsection-heading"><div><h3>用户级说明文件</h3><p>可选的单个本机说明文件，会先于项目 AGENTS.md 加载；留空不会读取 ~/.codex/AGENTS.md。保存后需重启后端。</p></div></div>
@@ -613,12 +612,12 @@ function AdminForm({
           <SectionHeading kicker="TOOLS & INSTRUCTIONS" title="工具与说明" description="控制 ChatGPT 中的结果卡片。" />
           {activeRuntimeConfig && <div className={`inline-banner ${widgetConfigMismatch ? "warning" : "neutral"}`} role="status">{widgetConfigMismatch ? <><strong>后端仍运行：结果卡片 {widgetModeLabels[activeRuntimeConfig.widgets]}；需重启。</strong></> : <>后端已运行当前保存的结果卡片配置。</>}</div>}
           <div className="field-grid">
-            <SelectField<WidgetMode> id="widget-mode" label="结果卡片" value={config.widgets} description="控制工具调用详情和文件变更的展示。" options={[["full", "完整显示"], ["changes", "仅文件变更"], ["off", "关闭"]]} onChange={(value) => { setConfig((current) => ({ ...current, widgets: value })); beginEdit(["widgets"]); }} disabled={overrides.includes("widgets")} meta={<FieldMeta path="widgets" overrides={overrides} warnings={warnings} issues={issuesByPath} />} />
+            <SelectField<WidgetMode> id="widget-mode" label="结果卡片" value={config.widgets} description="完整显示包含 Project 选择卡和文件变更卡；仅文件变更不会显示 Project 选择卡。" options={[["full", "完整显示"], ["changes", "仅文件变更"], ["off", "关闭"]]} onChange={(value) => { setConfig((current) => ({ ...current, widgets: value })); beginEdit(["widgets"]); }} disabled={overrides.includes("widgets")} meta={<FieldMeta path="widgets" overrides={overrides} warnings={warnings} issues={issuesByPath} />} />
           </div>
         </section>
 
         <section className="panel" id="limits" aria-labelledby="limits-heading">
-          <SectionHeading kicker="LIMITS" title="限制" description="为连接、进程和 workspace 设置本机资源边界。" />
+          <SectionHeading kicker="LIMITS" title="限制" description="为连接、进程和 Project 运行时设置本机资源边界。" />
           <div className="field-grid limits-grid">{resourceFields.map((field) => { const path = `resources.${field.key}`; const value = config.resources[field.key]; const invalid = (issuesByPath.get(path)?.length ?? 0) > 0; const errorId = `${field.key}-errors`; return <div className="field" key={field.key}><label htmlFor={field.key}>{field.label}</label><div className="number-input-wrap"><input id={field.key} type="number" min="1" step="1" required disabled={overrides.includes(path)} value={field.displaySeconds ? value / 1_000 : value} onChange={(event) => updateResource(field.key, event.target.value, Boolean(field.displaySeconds))} aria-invalid={invalid} aria-describedby={`${field.key}-help${invalid ? ` ${errorId}` : ""}`} />{field.unit && <span>{field.unit}</span>}</div><p id={`${field.key}-help`} className="field-help">{field.description}</p><FieldMeta id={invalid ? errorId : undefined} path={path} overrides={overrides} warnings={warnings} issues={issuesByPath} /></div>; })}</div>
         </section>
         </fieldset>
@@ -635,7 +634,7 @@ function AdminForm({
           <section ref={restartDialogRef} className="confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="restart-dialog-title" aria-describedby="restart-dialog-description">
             <p className="section-kicker">RUNTIME ACTION</p>
             <h2 id="restart-dialog-title">确认重启 DevSpace？</h2>
-            <p id="restart-dialog-description">重启会断开当前 MCP 会话并终止正在运行的命令。管理面板会保持打开，并在服务恢复后自动更新状态。</p>
+            <p id="restart-dialog-description">重启会断开当前 MCP 会话。若仍有 DevSpace 管理的命令在运行，后端会拒绝重启；请先等待命令结束或主动停止。管理面板会保持打开，并在服务恢复后自动更新状态。</p>
             {dirty && <div className="dialog-note">尚未保存的设置会先安全写入配置，再执行重启。</div>}
             <div className="dialog-actions">
               <button type="button" className="secondary-button" autoFocus onClick={() => setRestartConfirmationOpen(false)}>取消</button>

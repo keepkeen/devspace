@@ -1,413 +1,310 @@
 # Security Model
 
-DevSpace exposes local coding capabilities over MCP. Treat it as remote access
-to your development machine.
+DevSpace is a single-owner bridge between ChatGPT web and approved local
+Projects. Its primary controls are narrow Project approval, OAuth capabilities,
+grant-bound execution references, path and version validation, effect replay
+protection, bounded Project handoffs, bounded output, and root locking.
 
-The security model is simple:
+It is not an operating-system security boundary.
 
-- you choose a narrow filesystem allowlist
-- the MCP endpoint requires OAuth approval with your Owner password
-- OAuth authorization grants bind local principals, capabilities, and epochs
-- granular OAuth capabilities are checked again for every tool
-- Host headers are allowlisted from the configured public URL
-- every coding action happens through explicit MCP tool calls
+## Trust model
 
-## Filesystem Allowlist
+The trusted operator is the person who:
 
-DevSpace only opens workspaces under configured roots.
+- runs DevSpace under a local OS account;
+- chooses the approved Project roots;
+- controls the Owner password and persistent state;
+- reviews and approves the ChatGPT OAuth grant;
+- decides which commands ChatGPT may run.
 
-Good examples:
+Repository files, `AGENTS.md`, Skills, build scripts, command output, saved
+handoff text, and model text are untrusted input. They cannot grant capabilities
+or expand an approved root.
 
-```text
-~/work
-~/personal/open-source
-```
+## Approved roots and Projects
 
-Avoid broad roots:
+Configure the narrowest roots that contain the checkouts ChatGPT needs. Avoid
+approving:
 
-```text
-~
-/
-C:\
-```
+- `/` or a full home directory;
+- a cloud-drive root;
+- a secrets directory;
+- a parent containing unrelated work and personal data.
 
-The narrower the root, the easier it is to reason about what the MCP client can
-reach.
+`list_projects` exposes only Projects selected for the active OAuth grant and
+does not need to reveal absolute local paths. `use_project` validates the
+returned Project reference, binds a logical context to that approved directory,
+and returns an opaque `executionRef`. Git is not required.
 
-## Owner Password
+File tools resolve Project-relative paths and verify that canonical targets
+remain inside the approved root. Command `workdir` receives the same containment
+check. These checks prevent accidental or model-supplied path traversal through
+the DevSpace tool arguments.
 
-`devspace init` generates an Owner password. It displays that password once and
-stores only an Argon2id verifier in:
+They do not constrain what an already-started local process can access.
 
-```text
-~/.devspace/auth.json
-```
+## Project execution binding
 
-When an MCP client connects, DevSpace shows an approval page. Enter the Owner
-password only when you intentionally want that client to access this server.
-Only after the password succeeds does DevSpace show the local principal list
-and approved filesystem roots. That second step uses a short-lived one-time
-selection token and never resubmits the Owner password.
+The OAuth bearer grant is the request identity. DevSpace does not consume or
+persist ChatGPT account or conversation identifiers.
 
-For env-driven deployments, set a long random value:
+Creating an execution requires a caller-chosen `operationId` and, when more than
+one Project is approved, a `projectRef`. The result is an HMAC-authenticated
+`executionRef`. Every Project-scoped tool requires that reference explicitly.
+Before the tool handler runs, DevSpace verifies that the execution still belongs
+to the active principal, OAuth client, grant, authorization epoch, approved
+Project, and expected shared directory.
 
-```bash
-DEVSPACE_OAUTH_OWNER_TOKEN="$(openssl rand -base64 32)"
-```
+The reference is durable across MCP transports, ChatGPT conversations, and
+service restarts. It is not reusable under any different grant, including a
+second grant issued to the same OAuth client. Removing the
+source Project from authorization closes the execution before a new effect can
+start.
 
-DevSpace keeps authentication and identity-key material separate:
+Each new operation creates a different logical context on the same approved
+directory. Retrying the identical `use_project` request replays the same
+execution, which makes a lost response safe without creating another context.
+DevSpace never selects an execution by recency and has no process-global
+“current Project.”
 
-```text
-Owner password
-  -> Argon2id verifier (local approval only)
+Logical contexts isolate references, instruction state, idempotency records,
+process handles, patch journals, and grant authorization—not files. Any two
+contexts or grants approved for the same Project see the same filesystem and
+can observe one another's writes. DevSpace root locks coordinate tracked
+DevSpace writers, but cannot serialize external programs or edits outside
+DevSpace.
 
-random persistent master key
-  -> HKDF host-identity key
-  -> HKDF authorization-root key
-  -> HKDF project-fingerprint key
-  -> HKDF cursor and receipt keys
-  -> HKDF audit-reference and internal-control keys
-```
+## Project handoffs
 
-Changing the Owner password revokes access and refresh tokens but preserves the
-master key, authorized-root IDs, project fingerprints, anonymous audit
-references, and retained Workspace continuity. Rotating the master key is a
-separate deliberate global security reset: stop DevSpace, replace the key, and
-reauthorize every connector because HMAC identities, cursors, receipts, and
-internal control tokens change.
+A Project handoff is a bounded semantic progress snapshot for continuing work
+in a later ChatGPT conversation. It is not a ChatGPT account/session record,
+chat transcript, command log, diff, file snapshot, or source of authorization.
 
-For a fully environment-driven deployment, provide both values. The master key
-must be persistent base64url text generated from cryptographically random bytes:
+Handoffs are keyed by the approved Project's stable fingerprint rather than by
+an OAuth grant. Any active grant that currently authorizes that same Project
+may list and continue its resumable handoffs. Continuing one always creates a
+new execution bound to the calling grant; it never transfers or reuses another
+grant's `executionRef`, process handles, instruction acknowledgement, mutation
+replay records, or non-Git patch journal. Knowing a `handoffRef` alone cannot
+bypass Project authorization.
 
-```bash
-DEVSPACE_OAUTH_OWNER_TOKEN="$(openssl rand -base64 32)"
-DEVSPACE_MASTER_KEY="$(node -e 'console.log(require("node:crypto").randomBytes(32).toString("base64url"))')"
-```
+Each handoff has a title of at most 256 UTF-8 bytes and progress text of at most
+8 KiB. Their JSON-serialized model text must also fit 12,000 bytes. A Project
+may have at most 20 resumable handoffs and retains at most the newest 80
+completed records; selection output is also bounded. `save_progress` uses a
+caller-stable `operationId` and an integer `ifMatch` revision for replay-safe,
+optimistic updates. Save responses and Project lists omit the progress body to
+avoid duplicating it in model context.
 
-When upgrading an older `auth.json`, DevSpace rewrites it to schema version 2,
-hashes the former Owner token with Argon2id, and temporarily uses that token as
-legacy-compatible master-key material so existing local HMAC identifiers do not
-change. `devspace doctor` reports this `legacy-direct` state; move to a new HKDF
-master key only during a planned global reauthorization.
+Do not place secrets, credentials, hidden reasoning, complete file contents,
+full diffs, transcripts, or raw logs in a handoff. Handoff text is durable state
+and should be treated as sensitive. On resume, DevSpace returns it only on the
+first Project-context page with explicit `untrusted` historical provenance and
+`mustRevalidate: true`; the model must reread relevant files and Git state
+before acting on it. A completed handoff is removed from resume selection but
+its bounded record remains until it ages out of the per-Project completed
+retention set. Pruning replaces obsolete execution links with a terminal marker
+so those executions cannot create a new handoff; it removes metadata only,
+never Project files.
 
-An interrupted upgrade can leave `auth.json` on schema version 2 while the
-SQLite Owner verifier is still the pre-v2 scrypt value. On the next startup,
-DevSpace uses the `legacy-direct` master-key bytes only as an ephemeral migration
-proof. It preserves OAuth tokens only when those bytes match both the old scrypt
-verifier and the new Argon2id verifier. A successful upgrade emits
-`oauth_owner_credential_upgraded` with `tokensPreserved=true`; either mismatch is
-treated as a real credential change and follows the normal token-revocation
-path. The compatibility proof is never persisted as a second password.
+## Owner and OAuth
 
-Failed approval attempts are not tracked in one global in-memory counter.
-DevSpace persists bounded token-bucket state for the exact authorization
-session, dynamic client registration, source IP, and a global fallback. This
-prevents one attacker from consuming every legitimate client's allowance and
-keeps backoff consistent across process restarts. A successful approval clears
-only that exact authorization-session key.
+DevSpace has one hidden local Owner. The Owner password gates the OAuth approval
+page and is stored as a verifier rather than recoverable plaintext. Keep the
+password and `auth.json` out of repositories, chats, screenshots, and logs.
 
-Owner-password verification uses the asynchronous Argon2 implementation behind
-a small FIFO concurrency gate. Expensive verification therefore does not block
-the Node event loop, and excess queued attempts receive bounded backpressure
-instead of unbounded memory growth.
+Multiple OAuth grants may remain active concurrently, including grants sharing
+the same OAuth client ID. Each access token resolves an exact
+principal/client/grant/authorization-epoch boundary with its own scopes and
+approved Projects. Issuing a new grant does not invalidate another grant's
+tokens, executions, transports, or Project selection.
 
-When proxy trust is enabled, forwarded IP information is accepted only from a
-loopback direct peer. Do not expose the backend directly while also trusting
-arbitrary forwarding headers.
+Revoking or expiring one grant affects only that grant. Its tracked executions
+and processes are closed through the durable cleanup path, retained process
+output and review state are retired, and Project files and Git state are left
+untouched. Refresh-token replay revokes only the replayed grant.
+Owner-password rotation and the authenticated `revokeAll` operation remain
+intentional global emergency actions.
 
-## Authorization Grants, Principals, And Host Identity
+DevSpace does not claim to identify a ChatGPT account: it stores no ChatGPT
+account or conversation key. Independent OAuth grants are the multi-user
+security boundaries, even when the host reuses one OAuth client ID.
+Executions and processes remain grant-local. Project handoffs are the deliberate
+exception: they are shared only among grants that currently authorize the same
+Project, as described above.
 
-OAuth `client_id` identifies a dynamic connector registration. It is not a
-verified account identity and does not own Workspace state. Every successful
-Owner approval creates an authorization grant with a fixed local principal,
-granted scope set, authorized root-ID set, and authorization epoch.
-Authorization codes, access tokens, and refresh tokens reference that grant
-directly. Refresh rotation preserves the original grant and never derives a
-principal from `clientId`.
+The public OAuth scopes are fixed:
 
-Refresh tokens also belong to a random family. Rotation consumes the presented
-token and stores only a short-lived hash tombstone. Presenting a consumed token
-again is treated as replay: DevSpace records
-`oauth_refresh_token_replay_detected`, revokes the grant and family, increments
-the authorization boundary, deletes issued access/refresh tokens, and clears
-affected in-memory Workspace authority. An optional absolute grant expiry caps
-all token lifetimes and cannot be extended by refresh.
+| Scope | Authority |
+| --- | --- |
+| `project:read` | Select approved Projects; load and save Project handoffs; load instructions and Skills; read, inspect, and review changes. |
+| `project:write` | Apply file patches. |
+| `process:execute` | Explicit high-trust opt-in for process I/O and, together with `project:write`, command creation. |
 
-A fresh grant and principal are isolated by default. After Owner verification,
-the local approval page may explicitly reuse an existing principal. Reuse
-revokes the same client's old tokens and grants and bumps Workspace generations,
-so stale receipts cannot survive an authorization-boundary change. A client
-cannot silently jump away from another principal that still owns retained
-Workspaces; transfer or close those records locally first.
+Every tool call rechecks the active grant and the capability required by that
+tool. A `projectRef` is a selector, not a credential.
 
-Legacy clients may still use a one-time reconnect code:
+Access and refresh tokens are bearer credentials. Protect them in transit with
+HTTPS, never log them, and do not place them in shell history or repository
+content.
 
-```bash
-devspace auth principals
-devspace auth reconnect-code <principal-id>
-```
+## Public and local listeners
 
-Treat this code as a short-lived credential. It is stored hashed, expires, is
-consumed once, and must not be sent through ChatGPT or repository content.
-Tokens issued before a successful relink are revoked.
+`DEVSPACE_PUBLIC_BASE_URL` is the public HTTPS origin, without `/mcp`. The MCP
+endpoint is that origin plus `/mcp`.
 
-Historical orphan state can be managed locally with dry-run-first commands:
+The public listener serves the MCP and OAuth routes plus health endpoints.
+Administrative and internal control routes remain on loopback-only listeners.
+Tunnel or reverse-proxy only the public DevSpace service port. Never expose the
+admin/control listener.
 
-```bash
-devspace auth transfer-workspaces <source> <target> [--apply]
-devspace auth close-orphan <principal-id> [--apply]
-devspace auth relink-client <oauth-client-id> <target> [--apply]
-```
+Host-header and OAuth redirect-host validation reduce endpoint confusion and
+redirect abuse. They are configuration checks, not a replacement for TLS or
+OAuth.
 
-Applying these operations requires the backend to be stopped so persisted
-ownership cannot diverge from live in-memory bindings.
+Temporary tunnel URLs change. When one changes, update the public origin,
+restart the server, update the ChatGPT app endpoint, and authorize again.
 
-Tool calls may carry `openai/subject`, `openai/organization`, and
-`openai/session`. DevSpace stores only purpose-separated HMAC values under a
-derived host-identity key. Subject and organization provide grant consistency,
-anonymous audit/rate-limit dimensions, and protection against using one token
-under another host subject. They are not credentials and never replace the OAuth
-bearer token. Raw values are not persisted.
+## File mutation safety
 
-For ChatGPT-style hosts, the session HMAC participates in a bounded server-side
-binding from the authorized principal/grant to one Workspace context. Generic
-MCP clients use an explicit `wctx5` receipt. An explicitly invalid receipt is
-never allowed to fall back to session state. Server restart clears these
-in-process bindings while retained aliases remain resumable.
+DevSpace file writes preserve several invariants:
 
-Conversation bindings have no fixed wall-clock expiry. They remain bounded by
-LRU limits and are invalidated by grant/epoch changes, Workspace lifecycle
-changes, global revocation, or process restart. This avoids breaking a long,
-actively used ChatGPT conversation after an arbitrary fixed deadline.
+- Project-relative and canonical-path containment;
+- `ifMatch` file-version preconditions;
+- `operationId` replay protection where required by the tool contract;
+- per-root coordination for conflicting writes;
+- bounded request, response, and diff data.
 
-DevSpace still receives no trusted human account or conversation identity.
-Aliases are the durable local continuity key. New conversations and restarted
-servers must list and resume retained Workspaces rather than reopen remembered
-paths. Missing managed worktrees remain recoverable records; physically lost
-uncommitted files cannot be guaranteed.
+An `ifMatch` failure means the file changed after it was read. The caller must
+reread and reconcile the edit.
 
-## OAuth Capabilities
+Reusing the same operation identifier for the same request after a lost
+response replays the stored result rather than repeating the effect. A
+different intended effect requires a new identifier.
 
-Version 2.0 uses only these explicit scopes:
+Root locks coordinate DevSpace writers that target the same checkout. A running
+process may retain its root lease until the tracked process tree exits or is
+cleaned up. Locks prevent cooperating DevSpace operations from racing; they do
+not stop unrelated local programs from editing the same files.
+`save_progress` updates only DevSpace metadata and does not acquire the Project
+root lock, so a checkpoint can be recorded while a tracked command still holds
+the filesystem lease.
 
-- `workspace:read`
-- `workspace:write`
-- `process:execute`
-- `network:access`
-- `worktree:create`
-- `workspace:revoke`
+Signed continuation cursors bind the grant, authorization epoch, execution,
+resource, revision, query, and paging parameters. Continue with the same
+`executionRef` plus the cursor and omit the initial paging fields. A cursor is
+not Project authority and cannot be transferred to another grant or execution.
 
-If an authorization request omits `scope`, only `workspace:read` is granted.
-Elevated capabilities must be explicit. tools/list is filtered by the grant, and
-tool handlers enforce the actual combination immediately before execution,
-including conditional checks for writable checkouts, worktree creation, network
-inheritance, and mutating process input. A cached schema cannot turn a read token
-into process, write, or revoke authority.
+## Command execution
 
-Scopes answer **what** a connection may do. Authorized root IDs answer **where**
-it may do it. `open_workspace`, `list_workspaces`, `resume_workspace`, and every
-receipt/session-bound Workspace call recheck the current grant's root set. Two
-accounts with identical scopes can therefore receive non-overlapping project
-roots. Legacy grants migrate with the compatibility wildcard `*` and retain the
-configured global roots until they are reauthorized more narrowly. Local
-Admin diagnostics and `devspace doctor` identify these grants because adding a
-global root expands their authority; existing grants are never silently
-rewritten.
-
-## Public URL And Host Allowlist
-
-DevSpace needs `DEVSPACE_PUBLIC_BASE_URL` so MCP clients can discover OAuth
-metadata and connect to the correct resource.
-
-The value should be the origin only:
+`exec_command` is intentionally a full local command facility. It accepts:
 
 ```text
-https://your-tunnel-host.example.com
+executionRef, operationId, cmd, workdir, env, yield_time_ms,
+max_output_tokens, tty
 ```
 
-Do not include `/mcp` in `DEVSPACE_PUBLIC_BASE_URL`.
+DevSpace validates that `workdir` is inside the Project bound to the execution and bounds
+returned output. `write_stdin` is mutation-only and requires `operationId` to
+send input, close stdin, interrupt, or resize a terminal.
+`read_process_output` performs live polling and retained-output reads without
+mutating process input. Process count, retention, and cleanup limits prevent
+unbounded server-side accumulation.
 
-By default, DevSpace derives allowed Host headers from the local host and public
-URL. Use `DEVSPACE_ALLOWED_HOSTS=*` only for intentional local debugging.
+After process creation, the OS is the enforcement boundary. The command runs
+with the privileges of the OS user running DevSpace and can:
 
-The public listener contains OAuth, MCP, app assets, `/healthz`, and `/readyz`.
-All `/internal/*` diagnostics and destructive control routes are mounted only on
-a separate loopback listener at `DEVSPACE_CONTROL_PORT`. A public request to an
-internal path receives 404 even if it somehow carries a valid internal token.
+- access any file that OS user can access, including paths outside the Project;
+- use the network according to the host OS and environment;
+- spawn subprocesses and execute repository-provided scripts;
+- make changes that DevSpace file-version checks cannot observe in advance.
 
-## Tunnels
+DevSpace provides no process sandbox, command allow/deny list, risk
+classification, child-process protected-path policy, or network egress policy.
+Project and `workdir` validation must not be described as shell isolation.
 
-DevSpace does not manage tunnels. Your tunnel or reverse proxy should point to:
+Shutdown and interrupt cover only process groups that DevSpace started and
+still tracks, and termination is best effort. Detached, daemonized,
+re-parented, or otherwise untracked descendants may outlive DevSpace.
 
-```text
-http://127.0.0.1:7676
-```
+For stronger isolation, run DevSpace with a dedicated low-privilege OS user or
+inside a suitably configured container or VM. Treat `process:execute` as
+high-trust authority.
 
-Prefer adding Cloudflare Access, Tailscale identity controls, or equivalent
-protection in front of public tunnels. DevSpace OAuth still protects the MCP
-endpoint, but the tunnel URL should not be treated as a secret.
+## Instructions and Skills
 
-## Local Admin Panel
+`use_project` returns a compact bounded root instruction delta without an eager
+Skill catalog. `read_files` and `inspect` return newly applicable nested
+`instructionsDelta` only when target paths require it. The `skills` tool
+searches bounded metadata and lazily loads one selected Skill.
 
-The management panel runs as a separate `devspace admin` process bound to
-`127.0.0.1` on its own port. Never proxy that port through Cloudflare or another
-tunnel. Each launch uses a one-time URL-fragment capability, an HttpOnly local
-session cookie, strict Host/Origin checks, and CSRF protection. The panel does
-not expose OAuth owner tokens or tunnel credentials. Both the Admin UI and OAuth
-approval page deny iframe embedding with CSP `frame-ancestors 'none'` and
-`X-Frame-Options: DENY`.
+Default repository instruction discovery uses `AGENTS.override.md` and
+`AGENTS.md` (including supported case variants). `CLAUDE.md` is not loaded
+unless the operator explicitly configures it as a fallback filename.
 
-The panel talks to the backend's loopback control listener; neither the panel
-port nor `DEVSPACE_CONTROL_PORT` belongs behind the public tunnel.
+These sources may describe how to work, but they cannot:
 
-Runtime restart is available only for an explicitly enrolled user-level
-launchd service. It requires the authenticated local session, CSRF, a short-lived
-one-time confirmation token, and a fixed service label. DevSpace calls
-`/bin/launchctl` directly with fixed arguments; it does not invoke a shell,
-accept executable paths, or control root/system services. Restart completion is
-verified using the enrolled launchd process PID plus a fresh backend readiness
-generation before the UI reports success.
-Tunnel management remains status-only, and public diagnostics issue only a
-credential-free `/readyz` request without following redirects.
+- alter OAuth capabilities or approved roots;
+- authorize another local path;
+- disable file-version or replay checks;
+- disclose server credentials that were not already present in accessible
+  content.
 
-The model-facing `exec_command` path separately rejects attempts to terminate
-the current DevSpace PID or control the enrolled DevSpace service through
-`launchctl`, `systemctl`, `service`, `pkill`, or `killall`. Runtime lifecycle
-changes belong to the local Admin control plane so the initiating MCP request
-cannot kill itself before returning a durable result.
+Review repository-provided instructions and Skills with the same care as build
+scripts.
 
-## Shell Access
+## Shared Project directories and change review
 
-The shell tool is powerful by design. It is meant for tests, builds, git, and
-package scripts.
+The approved Project root is the mutable execution directory. `use_project`
+accepts any existing approved directory and never creates, switches, removes,
+or validates Git branches or worktrees. Users may ask the model to manage Git
+through ordinary commands, subject to the full command-security boundary above.
 
-Filesystem path containment applies to DevSpace file tools. Shell commands run
-as local commands and can do what your user account can do. This is why the MCP
-client must be trusted and the Owner password must stay private.
+When the approved Project root is exactly the Git top level, `show_changes`
+reads the current staged, unstaged, and untracked repository diff without
+writing the index, objects, or refs. A Project nested inside a larger repository
+uses the non-Git source so review cannot expose paths above the approved root.
+This includes repositories with no first commit. DevSpace disables Git
+fsmonitor for review and rejects executable clean/process filters that apply to
+Project files, because a `project:read` tool must not run repository-configured
+programs.
+The non-Git source is a bounded durable journal containing the exact successful
+DevSpace `apply_patch` requests for the current logical execution. It is not a
+filesystem monitor or net diff: command writes, external edits, failed or
+unknown-outcome patches, and patches from another execution are excluded. A
+full journal requires starting a new logical context; shared files are not
+reset or copied.
 
-For that reason, new checkout workspaces are read-only by default and do not
-permit shell execution. Use a managed worktree for writable model work. Direct
-writes to the user's current checkout require an explicit
-`writeAccess: "read_write"`; this is an authority choice, not a claim that the
-shell has been sandboxed.
+Closing or revoking an authorization retires its logical and retained runtime
+state without deleting Project files or changing Git state. There is no
+worktree inventory or cleanup API.
 
-Direct `program` + `args` execution removes shell expansion and quoting
-ambiguity, but it is not an OS sandbox. Runtime capabilities explicitly report
-that the default implementation has no process sandbox, no per-process network
-isolation, and only guardrail-level filesystem confinement. Unsupported
-`network: "deny"` is removed from the tool schema rather than presented as a
-control that always fails. Workspace generations and file versions do not
-replace OS isolation.
+## Output and process retention
 
-DevSpace intentionally does not try to infer filesystem intent from inline
-interpreter programs such as `python -c`, `node -e`, `ruby -e`, or equivalent
-forms. Once `exec_command` is granted, these programs are full-trust local code:
-they can access anything available to the DevSpace OS user, create subprocesses,
-use the inherited network, and deliberately detach into another process group.
-Literal path checks and Workspace locks remain accident-prevention and
-coordination mechanisms; they are not a security boundary against such code.
+Read results, diffs, command output, and retained process output are bounded.
+Truncation is expected for large data; callers should narrow their request.
 
-Spawned commands do not inherit the server's complete environment. DevSpace
-passes only basic executable-path, home/user, temporary-directory, locale, and
-platform variables, then adds its Workspace markers and any variables supplied
-explicitly in the tool call. OAuth secrets, CI tokens, proxy credentials,
-`NODE_OPTIONS`, SSH-agent sockets, and unrelated service credentials are not
-forwarded implicitly. Explicit environment values are still capabilities and
-should be provided only when the command actually needs them.
+Running and completed process records are subject to configured limits and
+cleanup. Do not use retained output as permanent storage.
+Project handoffs are also bounded but intentionally durable; they are continuity
+metadata, not a backup of Project files or chat history.
 
-Repository files, repository instructions, and Skill content are untrusted
-workspace-scoped data. They may guide work inside their scope, but their text
-cannot grant OAuth capability, alter the filesystem allowlist, disclose
-secrets, bypass file preconditions, or authorize operations outside the Workspace.
-Repository reads, grep results, diffs, and process output carry a structured
-provenance marker with `trust="untrusted"` and `authority="none"`. DevSpace does
-not modify or filter the underlying bytes merely to make them look safer.
-Structured tool results are the source of truth for execution and retry state.
-Do not retry a mutation unless `safeToRetry` is explicitly true.
+## Logs and secrets
 
-An unknown mutation outcome can later be resolved as `verified_committed`,
-`verified_not_started`, or `acknowledged_unknown`. Resolution records the method,
-evidence type, bounded evidence, time, and anonymous operator reference. The old
-operation ID remains a tombstone and is never reused for a new effect.
+Keep the following out of logs and repositories:
 
-## Concurrent Workspace Access
+- Owner passwords and OAuth tokens;
+- `auth.json` and master-key material;
+- internal control tokens;
+- tunnel credentials;
+- command text or output that contains secrets.
 
-Workspace operations first use a fair process-local read/write queue keyed by
-the canonical physical root. Write operations additionally acquire a
-cross-process lock under `<stateDir>/locks/workspace-roots`, using hashed root keys so
-absolute paths are not disclosed. Reader markers, writer intent, and writer
-markers prevent writer starvation. Versioned lock markers record the server PID,
-process start identity, boot identity, random lease token, heartbeat, and
-Workspace generation. This prevents a recycled PID from making a stale lock
-look live. Every startup/acquisition validates directory type, symlink status,
-owner UID, and mode. Process-local and cross-process waiters share a deadline;
-timing out a waiter does not release the real holder. Lock timeouts return
-`workspace_root_busy` before effects.
+Use `DEVSPACE_LOG_SHELL_COMMANDS=1` only when command previews are intentionally
+acceptable. Audit and diagnostic output should remain bounded and sanitized,
+but operators must still review it before sharing.
 
-Reads and default change previews may overlap. Patches, commands, mutating
-process input, checkpoint advancement, close, and revoke serialize even when
-different principals or DevSpace state directories point at the same checkout.
+`GET /healthz` is a liveness check. `GET /readyz` is a readiness check and
+should not expose credentials or local file contents.
 
-If `exec_command` returns a running background or interactive process, the
-write lease transfers to that process session and remains held until the entire
-process tree exits, is terminated, the Workspace closes or revokes, or the
-server shuts down. The marker owner changes to the child PID and process group.
-If the DevSpace server crashes while descendants remain alive, a replacement
-server still sees the child-owned lease and cannot write the same physical root;
-the lock is reclaimed only after both the owner process and process group exit.
-Polling and stdin tools operate on the existing lease rather than deadlocking by
-reacquiring it.
-
-Workers created by `devspace agents run` stay in the launching command's process
-group, so the process session and root lease remain live after the short CLI
-launcher exits. Provider children normally inherit that group as well. This
-cannot constrain a trusted command or provider that deliberately calls
-`setsid`, registers an OS service, or otherwise creates an independently managed
-daemon. Preventing that requires a sandbox, container/VM, dedicated OS account,
-cgroup, launchd job, or Windows Job Object rather than more command parsing.
-
-After a root process exits, descendant polling backs off from 25 ms to 2 seconds
-and the session is labeled a managed daemon. Serialization remains held by
-default. The user may explicitly detach it through a separate, idempotent
-`write_stdin` mutation with `confirmUnserializedWrites=true`; the daemon remains
-tracked, but its future writes can race other Workspace writers.
-
-This coordination covers DevSpace instances, not arbitrary external editors.
-Every patch therefore still requires strict `ifMatch` versions. Use separate
-managed worktrees, a dedicated OS account, container, or VM when stronger
-isolation is required.
-
-## Worktrees
-
-Managed worktrees reduce accidental edits to your active checkout, but they are
-not a security boundary. They are a workflow boundary for isolated coding
-sessions.
-
-## Logs
-
-By default, DevSpace logs requests and tool calls. Principal, client, grant,
-subject, organization, and session dimensions use opaque or HMAC-derived
-identifiers; raw host identity claims and bearer tokens are not logged. Shell
-command previews are disabled unless `DEVSPACE_LOG_SHELL_COMMANDS=1`.
-
-At `info`, request logs retain only bounded Host and Origin values, a Referer
-with credentials/query/fragment removed, and numeric Content-Length. Full IP
-and User-Agent values are emitted only at `debug`, and every header is length
-bounded before formatting. Anonymous OAuth, connection, Workspace-activity, and
-operation references use the dedicated audit-reference HMAC key.
-
-DevSpace also persists a bounded safe audit index in SQLite. It records event,
-request/tool, anonymous connection and Workspace activity references, operation
-reference, error code/category/fingerprint, and a small allowlisted details map.
-It does not persist command text, absolute paths, bearer tokens, raw host claims,
-or error stacks. Query it locally with `devspace audit`; human-readable output is
-rendered in `Asia/Shanghai`, while stored timestamps remain canonical UTC ISO.
-Console log level does not suppress this index; set `DEVSPACE_AUDIT_EVENTS=0`
-only when intentionally disabling persistent audit records.
-
-Audit persistence remains best-effort so a logging failure cannot change an
-authorization decision or tool result. Such failures are nevertheless visible
-through in-memory `auditWriteFailures` and `lastAuditWriteFailureAt` diagnostics;
-the counters are not recursively written back into the failing audit store.
-
-Do not enable shell command logging if commands may contain secrets.
+The canonical public surface and examples are in
+[ChatGPT Tool Contract](./chatgpt-tool-contract.md).

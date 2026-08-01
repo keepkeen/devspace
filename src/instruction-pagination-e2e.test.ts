@@ -1,17 +1,25 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { authorizationRootId } from "./authorization-roots.js";
 import { loadConfig } from "./config.js";
 import { SqliteOAuthClientsStore, SqliteOAuthStore } from "./oauth-store.js";
+import {
+  MAX_PROJECT_HANDOFF_MODEL_TEXT_JSON_BYTES,
+  MAX_PROJECT_HANDOFF_PROGRESS_UTF8_BYTES,
+  projectHandoffModelTextJsonBytes,
+} from "./project-handoff-store.js";
+import { PROJECT_CONTEXT_SCHEMA_VERSION } from "./project-context-protocol.js";
 import { createServer } from "./server.js";
 
-const root = await mkdtemp(join(tmpdir(), "devspace-instruction-pagination-e2e-"));
+const root = await realpath(await mkdtemp(join(tmpdir(), "devspace-instruction-pagination-e2e-")));
 const workspaceRoot = join(root, "workspace");
 const nested = join(workspaceRoot, "nested");
 const deep = join(nested, "deep");
@@ -19,12 +27,13 @@ const stateDir = join(root, "state");
 const publicBaseUrl = "http://127.0.0.1:7676";
 const ownerToken = "instruction-pagination-owner-token-long-enough";
 const accessToken = "instruction-pagination-access-token";
+const execFileAsync = promisify(execFile);
 
 await mkdir(deep, { recursive: true });
 const expectedInstructions = new Map([
-  ["AGENTS.md", instruction("ROOT_PAGE", 7_000)],
-  ["nested/AGENTS.md", instruction("NESTED_PAGE", 7_000)],
-  ["nested/deep/AGENTS.md", instruction("DEEP_PAGE_中文🙂", 12_000)],
+  ["AGENTS.md", instruction("ROOT_PAGE", 40_000)],
+  ["nested/AGENTS.md", instruction("NESTED_PAGE", 4_000)],
+  ["nested/deep/AGENTS.md", instruction("DEEP_PAGE_中文🙂", 4_000)],
 ]);
 await Promise.all([
   writeFile(join(workspaceRoot, "AGENTS.md"), expectedInstructions.get("AGENTS.md")!),
@@ -32,6 +41,14 @@ await Promise.all([
   writeFile(join(deep, "AGENTS.md"), expectedInstructions.get("nested/deep/AGENTS.md")!),
   writeFile(join(deep, "payload.txt"), "before\n"),
 ]);
+await execFileAsync("git", ["init", "-q"], { cwd: workspaceRoot });
+await execFileAsync("git", ["add", "."], { cwd: workspaceRoot });
+await execFileAsync("git", [
+  "-c", "user.name=DevSpace Test",
+  "-c", "user.email=devspace@example.invalid",
+  "-c", "commit.gpgsign=false",
+  "commit", "-qm", "fixture",
+], { cwd: workspaceRoot });
 
 const config = loadConfig({
   DEVSPACE_CONFIG_DIR: join(root, "config"),
@@ -50,108 +67,196 @@ seedGrant();
 const running = createServer(config);
 const httpServer = createHttpServer(running.app);
 const origin = await listen(httpServer);
+const clients: Client[] = [];
 const client = new Client({ name: "instruction-pagination", version: "1.0.0" });
+clients.push(client);
 
 try {
   await client.connect(new StreamableHTTPClientTransport(new URL("/mcp", origin), {
     requestInit: { headers: { authorization: `Bearer ${accessToken}` } },
   }));
-  const opened = await client.callTool({
-    name: "open_workspace",
-    arguments: {
-      path: workspaceRoot,
-      alias: "instruction-pagination",
-      writeAccess: "read_write",
-      contextMode: "full",
-    },
+  const projects = await client.callTool({
+    name: "list_projects",
+    arguments: {},
   });
-  assertSucceeded(opened);
-  let currentReceipt = receipt(opened);
-
-  const first = await client.callTool({
-    name: "load_workspace_instructions",
-    arguments: { receipt: currentReceipt, paths: ["nested/deep/payload.txt"] },
+  assertSucceeded(projects);
+  const projectRef = (projects.structuredContent as {
+    projects?: Array<{ projectRef?: unknown }>;
+  } | undefined)?.projects?.[0]?.projectRef;
+  assert.equal(typeof projectRef, "string");
+  const selected = await client.callTool({
+    name: "project_control",
+    arguments: { action: "open", projectRef, operationId: "instruction-read-execution" },
   });
-  assertSucceeded(first);
-  const reconstructed = new Map<string, Buffer>();
-  assertInstructionPage(first, reconstructed);
-  assert.equal(instructionToken(first), undefined);
-  assert.equal(statePhase(first), "context_loaded");
-  const firstCursor = nextCursor(first);
-  assert.equal(typeof firstCursor, "string");
-  currentReceipt = receipt(first);
-
-  const tamperedCursor = `${firstCursor!.slice(0, -1)}${firstCursor!.endsWith("a") ? "b" : "a"}`;
-  const tampered = await client.callTool({
-    name: "load_workspace_instructions",
-    arguments: {
-      receipt: currentReceipt,
-      paths: ["nested/deep/payload.txt"],
-      cursor: tamperedCursor,
-    },
-  });
-  assert.equal(tampered.isError, true);
+  assertSucceeded(selected);
+  assert.match(JSON.stringify(selected.structuredContent), /ROOT_PAGE/u);
   assert.equal(
-    (tampered.structuredContent as { error?: { code?: unknown } } | undefined)?.error?.code,
-    "invalid_instruction_cursor",
+    (selected.structuredContent as { schemaVersion?: unknown } | undefined)?.schemaVersion,
+    PROJECT_CONTEXT_SCHEMA_VERSION,
   );
+  const executionRef = String(
+    (selected.structuredContent as {
+      project?: { executionRef?: unknown };
+    } | undefined)?.project?.executionRef ?? "",
+  );
+  assert.match(executionRef, /^pex1_/u);
+  assertNoLegacyContextProtocol(selected);
+  assert.equal(rootInstructionsComplete(selected), false);
+  assert.equal(typeof rootInstructionCursor(selected), "string");
+  assert.ok(serializedBytes(selected) < 16_000);
 
-  let cursor: string | undefined = firstCursor;
-  let finalPage = first;
-  let pages = 1;
-  while (cursor) {
-    const page = await client.callTool({
-      name: "load_workspace_instructions",
-      arguments: {
-        receipt: currentReceipt,
-        paths: ["nested/deep/payload.txt"],
-        cursor,
-      },
-    });
-    assertSucceeded(page);
-    assertInstructionPage(page, reconstructed);
-    pages += 1;
-    cursor = nextCursor(page);
-    currentReceipt = receipt(page);
-    finalPage = page;
-    if (cursor) {
-      assert.equal(instructionToken(page), undefined);
-      assert.equal(statePhase(page), "context_loaded");
-    }
-  }
-  assert.ok(pages >= 4, "the oversized instruction chain must require multiple 8 KiB pages");
-  assert.equal(statePhase(finalPage), "target_scoped");
-  const finalToken = instructionToken(finalPage);
-  assert.match(finalToken ?? "", /^instructions_/u);
-  for (const [path, expected] of expectedInstructions) {
-    assert.equal(
-      reconstructed.get(path)?.toString("utf8"),
-      expected,
-      `${path} must be reassembled without missing, duplicate, or broken UTF-8 bytes`,
-    );
-  }
+  const gatedRead = await client.callTool({
+    name: "read_files",
+    arguments: { executionRef, files: [{ path: "nested/deep/payload.txt" }] },
+  });
+  assert.equal(gatedRead.isError, true);
+  assert.equal(errorCode(gatedRead), "root_instructions_required");
+  assert.deepEqual(errorSemantics(gatedRead), {
+    retryable: true,
+    safeToRetry: true,
+    recovery: "continue_or_restart_root_instructions",
+  });
+
+  const restarted = await client.callTool({
+    name: "project_control",
+    arguments: { action: "hydrate", executionRef },
+  });
+  assertSucceeded(restarted);
+  assert.equal(rootInstructionsComplete(restarted), false);
+  assert.equal(typeof rootInstructionCursor(restarted), "string");
+  const rootContent = await finishRootInstructions(client, executionRef, restarted);
+  assert.equal(rootContent, expectedInstructions.get("AGENTS.md"));
 
   const read = await client.callTool({
-    name: "read",
-    arguments: { receipt: currentReceipt, path: "nested/deep/payload.txt" },
+    name: "read_files",
+    arguments: { executionRef, files: [{ path: "nested/deep/payload.txt" }] },
   });
   assertSucceeded(read);
-  const contentHash = String(
-    (read.structuredContent as { contentHash?: unknown } | undefined)?.contentHash,
-  );
-  const patched = await client.callTool({
-    name: "apply_patch",
+  assertInstructionDelta(read);
+  assert.doesNotMatch(JSON.stringify(read.content), /NESTED_PAGE|DEEP_PAGE/u);
+  const readItems = (read.structuredContent as {
+    items?: Array<{ path?: unknown; contentHash?: unknown; content?: unknown }>;
+  } | undefined)?.items ?? [];
+  const payload = readItems.find((item) => item.path === "nested/deep/payload.txt");
+  assert.equal(payload?.content, "before\n");
+  assert.equal(typeof payload?.contentHash, "string");
+  const escapeHeavyProgress = "\\".repeat(MAX_PROJECT_HANDOFF_PROGRESS_UTF8_BYTES);
+  const rejectedProgress = await client.callTool({
+    name: "save_progress",
     arguments: {
-      receipt: currentReceipt,
-      operationId: "instruction-pagination-patch",
-      instructionToken: finalToken,
-      ifMatch: { "nested/deep/payload.txt": contentHash },
-      patch: "*** Begin Patch\n*** Update File: nested/deep/payload.txt\n@@\n-before\n+after\n*** End Patch",
+      executionRef,
+      operationId: "instruction-save-progress",
+      title: "Paged instruction task",
+      progress: escapeHeavyProgress,
     },
+  });
+  assert.equal(rejectedProgress.isError, true);
+  assert.equal(
+    (rejectedProgress.structuredContent as {
+      error?: { code?: unknown };
+    } | undefined)?.error?.code,
+    "handoff_context_too_large",
+  );
+
+  const escapedPrefix = "\\".repeat(3_750);
+  const maximumHandoffProgress =
+    escapedPrefix +
+    "H".repeat(MAX_PROJECT_HANDOFF_PROGRESS_UTF8_BYTES - escapedPrefix.length);
+  assert.equal(
+    Buffer.byteLength(maximumHandoffProgress, "utf8"),
+    MAX_PROJECT_HANDOFF_PROGRESS_UTF8_BYTES,
+  );
+  assert.ok(
+    projectHandoffModelTextJsonBytes(
+      "Paged instruction task",
+      maximumHandoffProgress,
+    ) <= MAX_PROJECT_HANDOFF_MODEL_TEXT_JSON_BYTES,
+  );
+  const savedProgress = await client.callTool({
+    name: "save_progress",
+    arguments: {
+      executionRef,
+      operationId: "instruction-save-progress",
+      title: "Paged instruction task",
+      progress: maximumHandoffProgress,
+    },
+  });
+  assertSucceeded(savedProgress);
+  const savedThreadRef = String(
+    (savedProgress.structuredContent as {
+      thread?: { ref?: unknown };
+    } | undefined)?.thread?.ref ?? "",
+  );
+  assert.match(savedThreadRef, /^pth1_/u);
+
+  const mutationClient = new Client({
+    name: "instruction-mutation-gate",
+    version: "1.0.0",
+  });
+  clients.push(mutationClient);
+  await mutationClient.connect(new StreamableHTTPClientTransport(new URL("/mcp", origin), {
+    requestInit: { headers: { authorization: `Bearer ${accessToken}` } },
+  }));
+  const mutationSelection = await mutationClient.callTool({
+    name: "project_control",
+    arguments: {
+      action: "resume",
+      projectRef,
+      threadRef: savedThreadRef,
+      operationId: "instruction-mutation-execution",
+    },
+  });
+  assertSucceeded(mutationSelection);
+  assert.ok(
+    serializedBytes(mutationSelection) < 16_000,
+    "a maximum-size handoff plus root instructions must remain inside the Project-context response budget",
+  );
+  assert.equal(
+    (mutationSelection.structuredContent as {
+      thread?: { checkpoint?: { modelSummary?: unknown } };
+    }).thread?.checkpoint?.modelSummary,
+    maximumHandoffProgress,
+  );
+  assert.equal(
+    (mutationSelection.structuredContent as {
+      thread?: { checkpoint?: { modelSummaryTrust?: unknown } };
+    }).thread?.checkpoint?.modelSummaryTrust,
+    "untrusted",
+  );
+  const mutationExecutionRef = String(
+    (mutationSelection.structuredContent as {
+      project?: { executionRef?: unknown };
+    } | undefined)?.project?.executionRef ?? "",
+  );
+  assert.match(mutationExecutionRef, /^pex1_/u);
+  await finishRootInstructions(mutationClient, mutationExecutionRef, mutationSelection);
+  const patchArguments = {
+    executionRef: mutationExecutionRef,
+    operationId: "instruction-delta-patch",
+    ifMatch: { "nested/deep/payload.txt": String(payload?.contentHash) },
+    patch: "*** Begin Patch\n*** Update File: nested/deep/payload.txt\n@@\n-before\n+after\n*** End Patch",
+  };
+  const gated = await mutationClient.callTool({
+    name: "apply_patch",
+    arguments: patchArguments,
+  });
+  assert.equal(gated.isError, true);
+  assert.equal(
+    (gated.structuredContent as { error?: { code?: unknown } } | undefined)?.error?.code,
+    "instructions_required",
+  );
+  assertInstructionDelta(gated);
+  assertNoLegacyContextProtocol(gated);
+
+  const patched = await mutationClient.callTool({
+    name: "apply_patch",
+    arguments: patchArguments,
   });
   assertSucceeded(patched);
 } finally {
-  await client.close().catch(() => undefined);
+  for (const activeClient of clients.reverse()) {
+    await activeClient.close().catch(() => undefined);
+  }
   await closeHttpServer(httpServer);
   await running.close();
   await rm(root, { recursive: true, force: true });
@@ -174,8 +279,8 @@ function seedGrant(): void {
     });
     const grant = store.createAuthorizationGrant({
       clientId: clientInfo.client_id,
-      scopes: ["workspace:read", "workspace:write"],
-      allowedRootIds: [authorizationRootId(workspaceRoot, ownerToken)],
+      scopes: ["project:read", "project:write"],
+      allowedRootIds: [authorizationRootId(workspaceRoot, config.oauth.keys.authorizationRoot)],
     });
     const expiresAt = Math.floor(Date.now() / 1_000) + 3_600;
     const resource = new URL("/mcp", publicBaseUrl).href;
@@ -206,88 +311,140 @@ function seedGrant(): void {
   }
 }
 
-function assertInstructionPage(
+function assertInstructionDelta(
   result: Awaited<ReturnType<Client["callTool"]>>,
-  reconstructed: Map<string, Buffer>,
 ): void {
-  const pagination = (result.structuredContent as {
-    pagination?: {
-      returnedFiles?: unknown;
-      returnedFragments?: unknown;
-      returnedBytes?: unknown;
-      totalBytes?: unknown;
-    };
-  } | undefined)?.pagination;
-  assert.equal(typeof pagination?.returnedFiles, "number");
-  assert.equal(typeof pagination?.returnedFragments, "number");
-  assert.equal(typeof pagination?.returnedBytes, "number");
-  assert.equal(typeof pagination?.totalBytes, "number");
-  assert.ok(Number(pagination?.returnedBytes) > 0);
-  assert.ok(Number(pagination?.returnedBytes) <= 8 * 1024);
-  assert.ok(modelVisibleBytes(result) < 12_500, "one instruction page must remain context-bounded");
-
-  const items = (result.structuredContent as {
-    workspaceInstructions?: {
-      items?: Array<{
-        path?: unknown;
-        content?: unknown;
-        bytes?: unknown;
-        fragment?: {
-          offsetBytes?: unknown;
-          lengthBytes?: unknown;
-          totalBytes?: unknown;
-          complete?: unknown;
-          lineBoundary?: unknown;
-        };
-      }>;
-    };
-  } | undefined)?.workspaceInstructions?.items ?? [];
-  assert.equal(items.length, pagination?.returnedFragments);
-  for (const item of items) {
-    assert.equal(typeof item.path, "string");
-    assert.equal(typeof item.content, "string");
-    const path = String(item.path);
-    const content = Buffer.from(String(item.content), "utf8");
-    const existing = reconstructed.get(path) ?? Buffer.alloc(0);
-    assert.equal(item.fragment?.offsetBytes, existing.byteLength);
-    assert.equal(item.fragment?.lengthBytes, content.byteLength);
-    assert.equal(item.fragment?.totalBytes, item.bytes);
-    assert.equal(typeof item.fragment?.complete, "boolean");
-    assert.equal(typeof item.fragment?.lineBoundary, "boolean");
-    reconstructed.set(path, Buffer.concat([existing, content]));
+  const instructions = (result.structuredContent as {
+    instructionsDelta?: Array<{
+      source?: unknown;
+      trust?: unknown;
+      scope?: unknown;
+      path?: unknown;
+      content?: unknown;
+    }>;
+  } | undefined)?.instructionsDelta ?? [];
+  assert.equal(instructions.length, 2);
+  const byPath = new Map(instructions.map((item) => [String(item.path), item]));
+  for (const [path, expected] of expectedInstructions) {
+    if (path === "AGENTS.md") continue;
+    const item = byPath.get(path);
+    assert.equal(item?.source, "repository");
+    assert.equal(item?.trust, "repository_untrusted");
+    assert.equal(item?.content, expected);
   }
+  assert.doesNotMatch(
+    JSON.stringify(instructions),
+    /fragment|cursor|hash|bytes|manifest|token|revision/iu,
+  );
 }
 
-function modelVisibleBytes(result: Awaited<ReturnType<Client["callTool"]>>): number {
-  return Buffer.byteLength(JSON.stringify({
-    content: result.content,
-    structuredContent: result.structuredContent,
-  }), "utf8");
+function assertNoLegacyContextProtocol(
+  result: Awaited<ReturnType<Client["callTool"]>>,
+): void {
+  assert.doesNotMatch(
+    JSON.stringify(result.structuredContent ?? {}),
+    /"(?:workspace|receipt|continuation|contextChanged|state|instructionToken)"\s*:/iu,
+  );
 }
 
-function receipt(result: Awaited<ReturnType<Client["callTool"]>>): string {
-  const value = (result.structuredContent as {
-    continuation?: { receipt?: unknown };
-  } | undefined)?.continuation?.receipt;
-  assert.equal(typeof value, "string");
-  return String(value);
+async function finishRootInstructions(
+  activeClient: Client,
+  executionRef: string,
+  firstPage: Awaited<ReturnType<Client["callTool"]>>,
+): Promise<string> {
+  let page = firstPage;
+  let combined = "";
+  let pages = 0;
+  while (true) {
+    pages += 1;
+    assert.ok(pages < 20, "root instruction paging must make bounded progress");
+    assert.ok(serializedBytes(page) < 16_000, "project_control pages must remain below 16 KiB");
+    if (pages > 1) {
+      assert.equal(
+        (page.structuredContent as {
+          thread?: { checkpoint?: unknown };
+        } | undefined)?.thread?.checkpoint,
+        undefined,
+        "saved Thread summary must appear only on the first Project-context page",
+      );
+    }
+    const items = (page.structuredContent as {
+      contextDelta?: {
+        instructions?: Array<{
+          path?: unknown;
+          content?: unknown;
+          fragment?: {
+            offsetBytes?: unknown;
+            lengthBytes?: unknown;
+            totalBytes?: unknown;
+            complete?: unknown;
+          };
+        }>;
+      };
+    } | undefined)?.contextDelta?.instructions ?? [];
+    for (const item of items) {
+      assert.equal(item.path, "AGENTS.md");
+      assert.equal(typeof item.fragment?.offsetBytes, "number");
+      assert.equal(typeof item.fragment?.lengthBytes, "number");
+      assert.equal(item.fragment?.totalBytes, Buffer.byteLength(expectedInstructions.get("AGENTS.md")!, "utf8"));
+      combined += String(item.content ?? "");
+    }
+    const cursor = rootInstructionCursor(page);
+    if (!cursor) {
+      assert.equal(rootInstructionsComplete(page), true);
+      break;
+    }
+    assert.equal(rootInstructionsComplete(page), false);
+    page = await activeClient.callTool({
+      name: "project_control",
+      arguments: { action: "hydrate", executionRef, cursor },
+    });
+    assertSucceeded(page);
+  }
+  assert.ok(pages > 1, "the >32 KiB root must require continuation");
+  return combined;
 }
 
-function nextCursor(result: Awaited<ReturnType<Client["callTool"]>>): string | undefined {
-  const value = (result.structuredContent as {
-    pagination?: { nextCursor?: unknown };
-  } | undefined)?.pagination?.nextCursor;
-  return typeof value === "string" ? value : undefined;
+function rootInstructionCursor(
+  result: Awaited<ReturnType<Client["callTool"]>>,
+): string | undefined {
+  const cursor = (result.structuredContent as {
+    contextDelta?: { nextCursor?: unknown };
+  } | undefined)?.contextDelta?.nextCursor;
+  return typeof cursor === "string" ? cursor : undefined;
 }
 
-function instructionToken(result: Awaited<ReturnType<Client["callTool"]>>): string | undefined {
-  const value = (result.structuredContent as { instructionToken?: unknown } | undefined)
-    ?.instructionToken;
-  return typeof value === "string" ? value : undefined;
+function rootInstructionsComplete(
+  result: Awaited<ReturnType<Client["callTool"]>>,
+): unknown {
+  return (result.structuredContent as {
+    contextDelta?: { rootInstructionsComplete?: unknown };
+  } | undefined)?.contextDelta?.rootInstructionsComplete;
 }
 
-function statePhase(result: Awaited<ReturnType<Client["callTool"]>>): unknown {
-  return (result.structuredContent as { state?: { phase?: unknown } } | undefined)?.state?.phase;
+function errorCode(
+  result: Awaited<ReturnType<Client["callTool"]>>,
+): unknown {
+  return (result.structuredContent as {
+    error?: { code?: unknown };
+  } | undefined)?.error?.code;
+}
+
+function errorSemantics(
+  result: Awaited<ReturnType<Client["callTool"]>>,
+): Record<string, unknown> {
+  const error = (result.structuredContent as {
+    error?: Record<string, unknown>;
+  } | undefined)?.error ?? {};
+  return {
+    retryable: error.retryable,
+    safeToRetry: error.safeToRetry,
+    recovery: error.recovery,
+  };
+}
+
+function serializedBytes(value: unknown): number {
+  return Buffer.byteLength(JSON.stringify(value), "utf8");
 }
 
 function assertSucceeded(result: Awaited<ReturnType<Client["callTool"]>>): void {

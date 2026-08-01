@@ -1,7 +1,7 @@
 # Setup Guide
 
-This guide is for users who want ChatGPT or another MCP host to work in local
-projects through DevSpace.
+This guide is for users who want ChatGPT to work in local projects through
+DevSpace. Other MCP hosts are not supported.
 
 ## Requirements
 
@@ -81,7 +81,7 @@ Enter the public origin without `/mcp`:
 https://your-tunnel-host.example.com
 ```
 
-Configure the MCP client with the full MCP endpoint:
+Configure the ChatGPT Connector with the full MCP endpoint:
 
 ```text
 https://your-tunnel-host.example.com/mcp
@@ -110,8 +110,8 @@ node dist/cli.js serve
 
 ## Approve The Client
 
-When ChatGPT, Claude, or another MCP client connects, DevSpace shows an Owner
-password approval page. Enter the Owner password printed during setup.
+When ChatGPT connects, DevSpace shows an Owner password approval page. Enter
+the Owner password printed during setup.
 
 The default config files are:
 

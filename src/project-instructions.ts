@@ -9,8 +9,6 @@ const BUILTIN_PROJECT_INSTRUCTION_FILENAMES = [
   "AGENTS.override.MD",
   "AGENTS.md",
   "AGENTS.MD",
-  "CLAUDE.md",
-  "CLAUDE.MD",
 ] as const;
 
 export function isValidProjectDocFallbackFilename(value: string): boolean {

@@ -1,10 +1,11 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { get as httpGet } from "node:http";
+import { internalDiagnosticsToken } from "./internal-auth.js";
 
 const LAUNCHCTL_PATH = "/bin/launchctl";
 const RUNTIME_COMMAND_TIMEOUT_MS = 10_000;
-const RUNTIME_RECOVERY_TIMEOUT_MS = 30_000;
+const RUNTIME_RECOVERY_TIMEOUT_MS = 45_000;
 const SERVICE_LABEL_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
 export type BackendRuntimeState =
@@ -29,6 +30,8 @@ export interface BackendRuntimeOperation {
     currentPid: number;
     previousGeneration: string;
     currentGeneration: string;
+    preflightIdentity: "pid_correlated" | "legacy_authenticated";
+    restartSignal: "SIGTERM";
   };
 }
 
@@ -45,6 +48,10 @@ export interface BackendRuntimeStatus {
 export interface BackendReadiness {
   ready: boolean;
   generation?: string;
+  pid?: number;
+  identity?: "pid_correlated" | "legacy_authenticated";
+  /** Running DevSpace-managed command/process sessions observed by authenticated diagnostics. */
+  runningProcesses?: number;
 }
 
 export class AdminRuntimeError extends Error {
@@ -171,6 +178,7 @@ export class AdminRuntimeManager {
     let enrollment: { target: string; label: string };
     let previousPid: number;
     let previousGeneration: string;
+    let preflightIdentity: "pid_correlated" | "legacy_authenticated";
     try {
       const resolvedEnrollment = this.enrollment();
       if (!("target" in resolvedEnrollment)) {
@@ -208,6 +216,28 @@ export class AdminRuntimeManager {
           "The backend readiness generation is unavailable; restart verification cannot proceed.",
         );
       }
+      preflightIdentity = readinessBefore.pid === previousPid
+        ? "pid_correlated"
+        : readinessBefore.identity === "legacy_authenticated" && readinessBefore.pid === undefined
+          ? "legacy_authenticated"
+          : "pid_correlated";
+      if (
+        preflightIdentity === "pid_correlated" &&
+        readinessBefore.pid !== previousPid
+      ) {
+        throw new AdminRuntimeError(
+          409,
+          "runtime_pid_mismatch",
+          "The authenticated backend PID does not match the enrolled launchd service; restart was refused.",
+        );
+      }
+      if ((readinessBefore.runningProcesses ?? 0) > 0) {
+        throw new AdminRuntimeError(
+          409,
+          "runtime_active_processes",
+          `Backend restart was refused because ${readinessBefore.runningProcesses} managed process session(s) are still running.`,
+        );
+      }
     } finally {
       this.restartPending = false;
     }
@@ -223,7 +253,12 @@ export class AdminRuntimeManager {
     this.lastOperation = operation;
     this.onEvent("admin_runtime_operation_requested", { ...operation });
 
-    void this.verifyRestart(enrollment, previousPid, previousGeneration).then((verification) => {
+    void this.verifyRestart(
+      enrollment,
+      previousPid,
+      previousGeneration,
+      preflightIdentity,
+    ).then((verification) => {
       operation.state = "completed";
       operation.completedAt = new Date().toISOString();
       operation.verification = verification;
@@ -246,27 +281,35 @@ export class AdminRuntimeManager {
     enrollment: { target: string; label: string },
     previousPid: number,
     previousGeneration: string,
+    preflightIdentity: "pid_correlated" | "legacy_authenticated",
   ): Promise<NonNullable<BackendRuntimeOperation["verification"]>> {
     try {
       await this.runCommand(
         LAUNCHCTL_PATH,
-        ["kickstart", "-k", enrollment.target],
+        ["kill", "SIGTERM", enrollment.target],
         RUNTIME_COMMAND_TIMEOUT_MS,
       );
     } catch {
-      throw new AdminRuntimeError(502, "runtime_restart_failed", "launchd could not restart the enrolled backend service.");
+      throw new AdminRuntimeError(
+        502,
+        "runtime_restart_failed",
+        "launchd could not send SIGTERM to the enrolled backend service.",
+      );
     }
 
     const deadline = Date.now() + this.recoveryTimeoutMs;
+    let startRequested = false;
     do {
       let currentPid: number | undefined;
+      let currentState: BackendRuntimeState | undefined;
       try {
         const launchd = await this.runCommand(
           LAUNCHCTL_PATH,
           ["print", enrollment.target],
           RUNTIME_COMMAND_TIMEOUT_MS,
         );
-        if (launchdState(launchd.stdout) === "running") currentPid = launchdPid(launchd.stdout);
+        currentState = launchdState(launchd.stdout);
+        if (currentState === "running") currentPid = launchdPid(launchd.stdout);
       } catch {
         // launchd may briefly report the job as unavailable while replacing it.
       }
@@ -275,14 +318,33 @@ export class AdminRuntimeManager {
         if (
           readiness.ready &&
           readiness.generation &&
-          readiness.generation !== previousGeneration
+          readiness.generation !== previousGeneration &&
+          readiness.pid === currentPid
         ) {
           return {
             previousPid,
             currentPid,
             previousGeneration,
             currentGeneration: readiness.generation,
+            preflightIdentity,
+            restartSignal: "SIGTERM",
           };
+        }
+      }
+      if (
+        !startRequested &&
+        currentPid === undefined &&
+        (currentState === "stopped" || currentState === "starting" || currentState === "unknown")
+      ) {
+        try {
+          await this.runCommand(
+            LAUNCHCTL_PATH,
+            ["kickstart", enrollment.target],
+            RUNTIME_COMMAND_TIMEOUT_MS,
+          );
+          startRequested = true;
+        } catch {
+          // Keep polling: KeepAlive may already be scheduling a replacement.
         }
       }
       if (Date.now() < deadline) await this.wait(250);
@@ -291,7 +353,7 @@ export class AdminRuntimeManager {
     throw new AdminRuntimeError(
       504,
       "runtime_recovery_timeout",
-      "The backend did not prove a new launchd PID and readiness generation before the recovery deadline.",
+      "The backend did not drain after SIGTERM and prove matching new launchd/backend PIDs plus a new readiness generation before the recovery deadline.",
     );
   }
 
@@ -329,10 +391,105 @@ function launchdPid(stdout: string): number | undefined {
   return Number.isSafeInteger(pid) && pid > 0 ? pid : undefined;
 }
 
-export function probeBackendReadiness(host: string, port: number): Promise<BackendReadiness> {
+export function probeBackendReadiness(
+  host: string,
+  port: number,
+  diagnosticsKey?: string | Uint8Array,
+): Promise<BackendReadiness> {
+  const authenticated = diagnosticsKey !== undefined;
+  return probeJsonEndpoint({
+    host: authenticated ? "127.0.0.1" : loopbackHost(host),
+    port,
+    path: authenticated ? "/internal/readiness" : "/readyz",
+    ...(authenticated && diagnosticsKey !== undefined
+      ? { diagnosticsKey }
+      : {}),
+  }).then((probe) => readinessFromProbe(probe));
+}
+
+/**
+ * One-release upgrade bridge for backends that predate authenticated
+ * `/internal/readiness`. The fallback is accepted only when that endpoint is
+ * absent (404) and authenticated diagnostics agree exactly with `/readyz` on
+ * the same loopback control listener. Post-restart verification still uses the
+ * strict PID-bearing endpoint through `probeBackendReadiness`.
+ */
+export async function probeBackendRestartPreflight(
+  host: string,
+  port: number,
+  diagnosticsKey: string | Uint8Array,
+): Promise<BackendReadiness> {
+  const diagnosticsRequest = probeJsonEndpoint({
+    host: "127.0.0.1",
+    port,
+    path: "/internal/diagnostics",
+    diagnosticsKey,
+  });
+  const strictProbe = await probeJsonEndpoint({
+    host: "127.0.0.1",
+    port,
+    path: "/internal/readiness",
+    diagnosticsKey,
+  });
+  const diagnosticsProbe = await diagnosticsRequest;
+  if (diagnosticsProbe.statusCode !== 200 || !validDiagnosticsShape(diagnosticsProbe.body)) {
+    return { ready: false };
+  }
+  const diagnosticsGeneration = generationFromBody(diagnosticsProbe.body);
+  const runningProcesses = runningProcessesFromDiagnostics(diagnosticsProbe.body);
+  if (!diagnosticsGeneration || runningProcesses === undefined) return { ready: false };
+
+  const strict = readinessFromProbe(strictProbe);
+  if (strict.ready) {
+    return strict.pid && strict.generation && strict.generation === diagnosticsGeneration
+      ? { ...strict, identity: "pid_correlated", runningProcesses }
+      : { ready: false };
+  }
+  if (strictProbe.statusCode !== 404) return { ready: false };
+
+  const readinessProbe = await probeJsonEndpoint({
+    host: loopbackHost(host),
+    port,
+    path: "/readyz",
+  });
+  if (readinessProbe.statusCode !== 200) return { ready: false };
+  const readinessGeneration = generationFromBody(readinessProbe.body);
+  const readinessOk = readinessProbe.body?.ok === true &&
+    readinessProbe.body?.status === "ready";
+  if (
+    diagnosticsGeneration !== readinessGeneration ||
+    !readinessOk
+  ) return { ready: false };
+  return {
+    ready: true,
+    generation: diagnosticsGeneration,
+    identity: "legacy_authenticated",
+    runningProcesses,
+  };
+}
+
+interface JsonEndpointProbe {
+  statusCode?: number;
+  body?: Record<string, unknown>;
+}
+
+function probeJsonEndpoint(options: {
+  host: string;
+  port: number;
+  path: string;
+  diagnosticsKey?: string | Uint8Array;
+}): Promise<JsonEndpointProbe> {
   return new Promise((resolveProbe) => {
     const request = httpGet(
-      { hostname: host === "0.0.0.0" ? "127.0.0.1" : host === "::" ? "::1" : host, port, path: "/readyz", timeout: 1_500 },
+      {
+        hostname: options.host,
+        port: options.port,
+        path: options.path,
+        timeout: 1_500,
+        ...(options.diagnosticsKey !== undefined
+          ? { headers: { "x-devspace-internal-token": internalDiagnosticsToken(options.diagnosticsKey) } }
+          : {}),
+      },
       (response) => {
         const chunks: Buffer[] = [];
         let size = 0;
@@ -342,22 +499,66 @@ export function probeBackendReadiness(host: string, port: number): Promise<Backe
           else request.destroy();
         });
         response.on("end", () => {
-          let generation: string | undefined;
+          let body: Record<string, unknown> | undefined;
           try {
-            const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { generation?: unknown };
-            if (typeof body.generation === "string" || typeof body.generation === "number") {
-              generation = String(body.generation);
+            const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown;
+            if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+              body = parsed as Record<string, unknown>;
             }
           } catch {
-            // A valid readiness response without JSON still reports readiness, but cannot verify restart.
+            // Invalid JSON cannot establish restart identity.
           }
-          resolveProbe({ ready: response.statusCode === 200, ...(generation ? { generation } : {}) });
+          resolveProbe({ statusCode: response.statusCode, ...(body ? { body } : {}) });
         });
       },
     );
     request.on("timeout", () => request.destroy());
-    request.on("error", () => resolveProbe({ ready: false }));
+    request.on("error", () => resolveProbe({}));
   });
+}
+
+function readinessFromProbe(probe: JsonEndpointProbe): BackendReadiness {
+  const generation = generationFromBody(probe.body);
+  const rawPid = probe.body?.pid;
+  const pid = Number.isSafeInteger(rawPid) && Number(rawPid) > 0
+    ? Number(rawPid)
+    : undefined;
+  return {
+    ready: probe.statusCode === 200,
+    ...(generation ? { generation } : {}),
+    ...(pid ? { pid } : {}),
+  };
+}
+
+function generationFromBody(body: Record<string, unknown> | undefined): string | undefined {
+  const value = body?.generation;
+  if (typeof value !== "string" && typeof value !== "number") return undefined;
+  const generation = String(value);
+  return generation || undefined;
+}
+
+function validDiagnosticsShape(body: Record<string, unknown> | undefined): boolean {
+  return typeof body?.version === "string" && Boolean(body.version) &&
+    body.runtimeConfig !== null && typeof body.runtimeConfig === "object";
+}
+
+function runningProcessesFromDiagnostics(
+  body: Record<string, unknown> | undefined,
+): number | undefined {
+  const usage = body?.usage;
+  if (!usage || typeof usage !== "object" || Array.isArray(usage)) return undefined;
+  const processSessions = (usage as Record<string, unknown>).processSessions;
+  if (!processSessions || typeof processSessions !== "object" || Array.isArray(processSessions)) {
+    return undefined;
+  }
+  const running = (processSessions as Record<string, unknown>).running;
+  return Number.isSafeInteger(running) && Number(running) >= 0 ? Number(running) : undefined;
+}
+
+function loopbackHost(host: string): string {
+  if (host === "0.0.0.0" || host === "localhost") return "127.0.0.1";
+  if (host === "::") return "::1";
+  return host;
 }
 
 function runCommand(

@@ -341,6 +341,24 @@ try {
   assert.equal(revoke.status, 200);
   assert.equal(revokeCount, 1);
 
+  const projectWorktrees = await request(url, {
+    path: "/api/project-worktrees",
+    headers: { cookie },
+  });
+  assert.equal(projectWorktrees.status, 404);
+  const cleanup = await request(url, {
+    method: "POST",
+    path: "/api/project-worktrees/cleanup",
+    headers: {
+      cookie,
+      origin,
+      "content-type": "application/json",
+      "x-devspace-admin-csrf": sessionBody.csrfToken,
+    },
+    body: JSON.stringify({}),
+  });
+  assert.equal(cleanup.status, 404);
+
   const privateProbeConfig = JSON.parse(readFileSync(join(configDir, "config.json"), "utf8"));
   privateProbeConfig.publicBaseUrl = `http://127.0.0.1:${mcpAddress.port + 1}`;
   writeFileSync(join(configDir, "config.json"), JSON.stringify(privateProbeConfig));

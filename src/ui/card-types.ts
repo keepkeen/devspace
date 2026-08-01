@@ -1,384 +1,382 @@
 import type { App } from "@modelcontextprotocol/ext-apps";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 
-export type DisplayToolName =
-  | "open_workspace"
-  | "close_workspace"
-  | "load_skill"
-  | "show_changes"
-  | "apply_patch"
-  | "exec_command"
-  | "write_stdin"
-  | "read"
-  | "write"
-  | "edit"
-  | "grep"
-  | "glob"
-  | "ls"
-  | "bash";
-
-export type ToolName =
-  | DisplayToolName
-  | "batch_read"
-  | "batch_inspect"
-  | "read_process_output";
-
 export type HostContext = NonNullable<ReturnType<App["getHostContext"]>>;
 
-export type PatchOperation = "add" | "update" | "delete" | "move";
-
-export interface ToolResultCard<TTool extends ToolName = DisplayToolName> {
-  tool: TTool;
-  workspaceId?: string;
-  path?: string;
-  root?: string;
-  status?: string;
-  summary?: Record<string, unknown>;
-  files?: Array<{
-    path?: string;
-    previousPath?: string;
-    operation?: PatchOperation;
-    type?: string;
-    additions?: number;
-    removals?: number;
-  }>;
-  payload?: ToolPayload;
-  agentsFiles?: Array<{
-    path?: string;
-    content?: string;
-  }>;
-  availableAgentsFiles?: Array<{
-    path?: string;
-  }>;
-  skills?: Array<{
-    name?: string;
-    description?: string;
-    path?: string;
-  }>;
-  skillDiagnostics?: unknown[];
-  instructionsIncluded?: boolean;
-  skillsIncluded?: boolean;
-  instruction?: string;
-  content?: ToolContent[];
-  items?: BatchResultItem[];
-  truncated?: boolean;
-  instructions?: string;
-  outputId?: string;
-  output?: ProcessOutput;
-  page?: ProcessOutputPage;
-  offset?: number;
-  nextOffset?: number;
-  eof?: boolean;
-  totalBytes?: number;
-  storedBytes?: number;
-  droppedBytes?: number;
+export interface ReviewSummary {
+  files: number;
+  additions: number;
+  removals: number;
 }
 
-export interface ProcessOutput {
-  stream?: "combined";
-  text?: string;
-  truncated?: boolean;
-  originalTokenCount?: number;
-  omittedBytes?: number;
-  outputId?: string;
-  droppedBytes?: number;
+export interface ReviewFile {
+  path: string;
+  previousPath?: string;
+  type: "change" | "rename-pure" | "rename-changed" | "new" | "deleted";
+  additions: number;
+  removals: number;
 }
 
-export interface ProcessOutputPage {
-  stream?: "combined";
-  text?: string;
-  offset?: number;
-  nextOffset?: number;
-  eof?: boolean;
-  status?: "active" | "unknown";
-  droppedBytes?: number;
+export interface DiffPage {
+  offsetBytes: number;
+  lengthBytes: number;
+  totalBytes: number;
+  eof: boolean;
 }
 
-export type AnyToolResultCard = ToolResultCard<ToolName>;
-
-export interface ToolContent {
-  type: "text" | "image";
-  text?: string;
-  data?: string;
-  mimeType?: string;
+export interface ToolResultCard {
+  tool: "show_changes";
+  changeSource: "repository" | "apply_patch_history";
+  summary: ReviewSummary;
+  files: ReviewFile[];
+  payload: {
+    patch: string;
+  };
+  page: DiffPage;
 }
 
-export interface ToolPayload {
-  /** Compatibility-only input. New results carry model-visible content at top level. */
-  content?: ToolContent[];
-  diff?: string;
-  patch?: string;
+export interface ResumableHandoffCard {
+  handoffRef: string;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+  status: "resumable";
+  version: number;
 }
 
-export interface BatchResultItem {
-  index?: number;
-  operation?: string;
-  path?: string;
-  ok?: boolean;
-  result?: string;
+export interface ProjectCardEntry {
+  projectRef: string;
+  label: string;
+  handoffs: ResumableHandoffCard[];
 }
 
-export function isToolName(value: unknown): value is ToolName {
-  return (
-    value === "open_workspace" ||
-    value === "close_workspace" ||
-    value === "load_skill" ||
-    value === "show_changes" ||
-    value === "apply_patch" ||
-    value === "exec_command" ||
-    value === "write_stdin" ||
-    value === "read" ||
-    value === "write" ||
-    value === "edit" ||
-    value === "grep" ||
-    value === "glob" ||
-    value === "ls" ||
-    value === "bash" ||
-    value === "batch_read" ||
-    value === "batch_inspect" ||
-    value === "read_process_output"
-  );
+export interface ProjectListCard {
+  tool: "list_projects";
+  projects: ProjectCardEntry[];
+  defaultProjectRef?: string;
+  truncated: boolean;
+  handoffProvenance: {
+    source: "devspace_saved_progress";
+    trust: "untrusted";
+    authority: "none";
+  };
+  handoffLimits: {
+    perProject: number;
+    total: number;
+  };
 }
 
-export function isDisplayToolName(value: ToolName): value is DisplayToolName {
-  return value !== "batch_read" && value !== "batch_inspect" && value !== "read_process_output";
-}
+export type ProjectAppCard = ToolResultCard | ProjectListCard;
 
-export function isReadTool(tool: ToolName): boolean {
-  return tool === "read";
-}
+const MAX_DIFF_PAGE_BYTES = 32_000;
+const MAX_REVIEW_FILES = 50;
+const MAX_PATH_LENGTH = 4_096;
+const MAX_PROJECTS = 100;
+const MAX_PROJECT_LABEL_LENGTH = 512;
+const MAX_PROJECT_REF_LENGTH = 128;
+const MAX_HANDOFF_REF_LENGTH = 512;
+const MAX_HANDOFF_TITLE_LENGTH = 256;
+const MAX_HANDOFFS_PER_PROJECT = 20;
+const MAX_TOTAL_HANDOFFS = 100;
 
-export function isWriteTool(tool: ToolName): boolean {
-  return tool === "write";
-}
-
-export function isEditTool(tool: ToolName): boolean {
-  return tool === "edit";
-}
-
-export function isPatchTool(tool: ToolName): boolean {
-  return tool === "apply_patch";
-}
-
-export function isSearchTool(tool: ToolName): boolean {
-  return tool === "grep" || tool === "glob";
-}
-
-export function isShellTool(tool: ToolName): boolean {
-  return tool === "bash" || tool === "exec_command" || tool === "write_stdin";
-}
-
-export function isReviewTool(tool: ToolName): boolean {
-  return tool === "show_changes";
-}
-
-export function isBatchTool(tool: ToolName): boolean {
-  return tool === "batch_read" || tool === "batch_inspect";
-}
-
-export function isToolResultCard(value: unknown): value is Omit<ToolResultCard, "tool"> {
-  return Boolean(value && typeof value === "object");
-}
-
-export function payloadText(payload: ToolPayload | undefined): string {
-  return contentText(payload?.content);
-}
-
-export function contentText(content: ToolContent[] | undefined): string {
-  return (
-    content
-      ?.map((item) => {
-        if (item.type === "text") return item.text ?? "";
-        return `[${item.mimeType ?? "image"} image payload]`;
-      })
-      .filter(Boolean)
-      .join("\n\n") ?? ""
-  );
-}
-
-export function toolResultText(card: AnyToolResultCard): string {
-  if (isBatchTool(card.tool)) {
-    const itemText = batchItemsText(card.items);
-    const structuredText = [itemText, card.instructions]
-      .filter((value): value is string => Boolean(value))
-      .join("\n\n");
-    if (structuredText) return structuredText;
-  }
-
-  const fallbackText = contentText(card.content) || payloadText(card.payload);
-  if (isShellTool(card.tool) && typeof card.output?.text === "string") {
-    if (!card.output.text) return fallbackText;
-    return fallbackText
-      ? `${card.output.text.replace(/\n$/u, "")}\n${fallbackText}`
-      : card.output.text;
-  }
-
-  if (card.tool === "read_process_output" && typeof card.page?.text === "string") {
-    if (!card.page.text) return fallbackText;
-    return fallbackText
-      ? `${card.page.text.replace(/\n$/u, "")}\n${fallbackText}`
-      : card.page.text;
-  }
-
-  return fallbackText;
-}
-
-export function workspacePayloadText(card: AnyToolResultCard): string {
-  const agentsFiles = card.agentsFiles ?? [];
-  const availableAgentsFiles = card.availableAgentsFiles ?? [];
-  const skills = card.skills ?? [];
-  const lines = [
-    card.workspaceId ? `Workspace: ${card.workspaceId}` : undefined,
-    card.root ? `Root: ${card.root}` : undefined,
-    card.skillsIncluded === false
-      ? "Skills: unchanged (not repeated)"
-      : skills.length > 0
-        ? `Skills: ${skills.map((skill) => skill.name ?? skill.path ?? "unnamed").join(", ")}`
-        : "Skills: none",
-    availableAgentsFiles.length > 0
-      ? `Nested instructions: ${availableAgentsFiles.map((file) => file.path ?? "unknown").join(", ")}`
-      : undefined,
-    card.instructionsIncluded === false
-      ? "\nProject instructions: unchanged (not repeated)"
-      : agentsFiles.length > 0
-        ? `\n${formatAgentsFilesForPayload(agentsFiles)}`
-        : "\nAGENTS.md: none loaded",
-  ].filter((line): line is string => typeof line === "string");
-
-  return lines.join("\n");
-}
-
-function formatAgentsFilesForPayload(
-  agentsFiles: NonNullable<AnyToolResultCard["agentsFiles"]>,
-): string {
-  return agentsFiles
-    .map((file) => {
-      const path = file.path ?? "AGENTS.md";
-      const content = file.content?.trim();
-      return content ? `${path}\n\n${content}` : `${path}\n\nNo content loaded.`;
-    })
-    .join("\n\n");
-}
-
-export function toolResultCard(result: CallToolResult): AnyToolResultCard | undefined {
+export function toolResultCard(result: CallToolResult): ProjectAppCard | undefined {
   const meta = objectRecord(result._meta);
-  const tool = meta?.tool;
-  if (!isToolName(tool)) return undefined;
+  if (meta?.tool === "list_projects") return projectListCard(result);
+  if (meta?.tool !== "show_changes") return undefined;
+  return showChangesCard(result);
+}
 
-  const metaCard = objectRecord(meta?.card) ?? {};
-  const structuredContent = objectRecord(result.structuredContent) ?? {};
-  const metaPayload = objectRecord(metaCard.payload);
-  const topLevelContent = normalizeContent(result.content);
-  const legacyContent = topLevelContent.length === 0
-    ? normalizeContent(metaPayload?.content)
-    : [];
-  const payload = uiOnlyPayload(metaPayload);
-  const structuredItems = Array.isArray(structuredContent.items)
-    ? structuredContent.items
-    : undefined;
-  const metadataItems = Array.isArray(metaCard.batchItems)
-    ? metaCard.batchItems
-    : undefined;
-  const items = structuredItems?.map((item, index) => ({
-    ...(objectRecord(metadataItems?.[index]) ?? {}),
-    ...(objectRecord(item) ?? {}),
-  })) as BatchResultItem[] | undefined;
-  const files = Array.isArray(structuredContent.files)
-    ? structuredContent.files
-    : Array.isArray(metaCard.files)
-      ? metaCard.files
-      : undefined;
-  const { payload: _legacyPayload, batchItems: _batchItems, ...cardMetadata } = metaCard;
+function showChangesCard(result: CallToolResult): ToolResultCard | undefined {
+  const meta = objectRecord(result._meta);
+  const metaCard = objectRecord(meta?.card);
+  const structured = objectRecord(result.structuredContent);
+  const structuredDiff = objectRecord(structured?.diff);
+  const metaPayload = objectRecord(metaCard?.payload);
+  const provenance = objectRecord(structuredDiff?.provenance);
+  const changeSource = structured?.changeSource;
+  const validRepositoryProvenance =
+    changeSource === "repository" &&
+    provenance?.source === "repository" &&
+    provenance.trust === "untrusted" &&
+    provenance.authority === "none";
+  const validApplyPatchProvenance =
+    changeSource === "apply_patch_history" &&
+    provenance?.source === "devspace" &&
+    provenance.trust === "server_observed" &&
+    provenance.authority === "none" &&
+    provenance.scope === "successful_apply_patch_history";
+  if (
+    !metaCard ||
+    !structured ||
+    !structuredDiff ||
+    structured?.ok !== true ||
+    (!validRepositoryProvenance && !validApplyPatchProvenance)
+  ) {
+    return undefined;
+  }
+
+  const metaPatch = metaPayload?.patch;
+  const structuredPatch = structuredDiff?.patch;
+  if (
+    typeof metaPatch !== "string" ||
+    typeof structuredPatch !== "string" ||
+    metaPatch !== structuredPatch
+  ) {
+    return undefined;
+  }
+
+  const patchBytes = new TextEncoder().encode(metaPatch).byteLength;
+  if (patchBytes > MAX_DIFF_PAGE_BYTES) return undefined;
+
+  const summary = reviewSummary(metaCard?.summary);
+  const structuredSummary = reviewSummary(structured.summary);
+  const files = reviewFiles(metaCard?.files);
+  const page = diffPage(structuredDiff, patchBytes);
+  if (
+    !summary ||
+    !structuredSummary ||
+    !sameSummary(summary, structuredSummary) ||
+    !files ||
+    !page
+  ) {
+    return undefined;
+  }
 
   return {
-    ...cardMetadata,
-    ...structuredContent,
-    tool,
-    ...(topLevelContent.length > 0 || legacyContent.length > 0
-      ? { content: topLevelContent.length > 0 ? topLevelContent : legacyContent }
-      : {}),
-    ...(payload ? { payload } : {}),
-    ...(files ? { files } : {}),
-    ...(items ? { items } : {}),
-  } as AnyToolResultCard;
+    tool: "show_changes",
+    changeSource,
+    summary,
+    files,
+    payload: { patch: metaPatch },
+    page,
+  };
 }
 
-export function summaryNumber(
-  summary: Record<string, unknown> | undefined,
-  key: string,
-): number | undefined {
-  const value = summary?.[key];
-  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+export function isExpandableCard(card: ProjectAppCard): boolean {
+  return card.tool === "show_changes" && card.payload.patch.length > 0;
 }
 
-export function isExpandableCard(card: AnyToolResultCard): boolean {
-  if (card.tool === "open_workspace") {
-    return (
-      Number(card.summary?.agentsFiles ?? 0) > 0 ||
-      Number(card.summary?.skills ?? 0) > 0 ||
-      Number(card.summary?.skillDiagnostics ?? 0) > 0 ||
-      Boolean(card.agentsFiles?.length) ||
-      Boolean(card.availableAgentsFiles?.length) ||
-      Boolean(card.skills?.length) ||
-      Boolean(card.skillDiagnostics?.length)
-    );
+function projectListCard(result: CallToolResult): ProjectListCard | undefined {
+  const structured = objectRecord(result.structuredContent);
+  const limits = objectRecord(structured?.handoffLimits);
+  const provenance = objectRecord(structured?.handoffProvenance);
+  const perProject = safePositiveInteger(limits?.perProject);
+  const total = safePositiveInteger(limits?.total);
+  if (
+    structured?.ok !== true ||
+    typeof structured.truncated !== "boolean" ||
+    provenance?.source !== "devspace_saved_progress" ||
+    provenance.trust !== "untrusted" ||
+    provenance.authority !== "none" ||
+    perProject === undefined ||
+    total === undefined ||
+    perProject > MAX_HANDOFFS_PER_PROJECT ||
+    total > MAX_TOTAL_HANDOFFS ||
+    !Array.isArray(structured.projects) ||
+    structured.projects.length > MAX_PROJECTS
+  ) {
+    return undefined;
   }
 
-  if (isReviewTool(card.tool)) return Boolean(card.files?.length || card.payload?.patch);
-  if (isPatchTool(card.tool)) return Boolean(card.payload?.patch);
+  const projects: ProjectCardEntry[] = [];
+  const projectRefs = new Set<string>();
+  const handoffRefs = new Set<string>();
+  let handoffCount = 0;
+  for (const value of structured.projects) {
+    const project = objectRecord(value);
+    const projectRef = boundedString(project?.projectRef, MAX_PROJECT_REF_LENGTH);
+    const label = boundedString(project?.label, MAX_PROJECT_LABEL_LENGTH);
+    if (
+      !projectRef ||
+      !label ||
+      projectRefs.has(projectRef) ||
+      !Array.isArray(project?.handoffs) ||
+      project.handoffs.length > perProject
+    ) {
+      return undefined;
+    }
+    projectRefs.add(projectRef);
 
-  return Boolean(card.payload || toolResultText(card));
+    const handoffs: ResumableHandoffCard[] = [];
+    for (const handoffValue of project.handoffs) {
+      const handoff = objectRecord(handoffValue);
+      const handoffRef = boundedString(
+        handoff?.handoffRef,
+        MAX_HANDOFF_REF_LENGTH,
+      );
+      const title = boundedString(handoff?.title, MAX_HANDOFF_TITLE_LENGTH);
+      const createdAt = isoTimestamp(handoff?.createdAt);
+      const updatedAt = isoTimestamp(handoff?.updatedAt);
+      const version = safePositiveInteger(handoff?.version);
+      if (
+        !handoffRef ||
+        handoffRefs.has(handoffRef) ||
+        !title ||
+        !createdAt ||
+        !updatedAt ||
+        version === undefined ||
+        handoff?.status !== "resumable"
+      ) {
+        return undefined;
+      }
+      handoffRefs.add(handoffRef);
+      handoffs.push({
+        handoffRef,
+        title,
+        createdAt,
+        updatedAt,
+        status: "resumable",
+        version,
+      });
+    }
+    handoffCount += handoffs.length;
+    if (handoffCount > total) return undefined;
+    projects.push({ projectRef, label, handoffs });
+  }
+
+  const defaultProjectRef = structured.defaultProjectRef === undefined
+    ? undefined
+    : boundedString(structured.defaultProjectRef, MAX_PROJECT_REF_LENGTH);
+  if (
+    (structured.defaultProjectRef !== undefined && !defaultProjectRef) ||
+    (defaultProjectRef !== undefined && !projectRefs.has(defaultProjectRef))
+  ) {
+    return undefined;
+  }
+
+  return {
+    tool: "list_projects",
+    projects,
+    ...(defaultProjectRef ? { defaultProjectRef } : {}),
+    truncated: structured.truncated,
+    handoffProvenance: {
+      source: "devspace_saved_progress",
+      trust: "untrusted",
+      authority: "none",
+    },
+    handoffLimits: { perProject, total },
+  };
 }
 
-function batchItemsText(items: BatchResultItem[] | undefined): string {
-  return (
-    items
-      ?.map((item, itemIndex) => {
-        if (typeof item.result !== "string" || !item.result) return "";
-        const label = item.path
-          ? item.path
-          : item.operation
-            ? `${item.operation} ${itemIndex + 1}`
-            : `Item ${itemIndex + 1}`;
-        return `${item.ok === false ? "[failed] " : ""}${label}\n${item.result}`;
-      })
-      .filter(Boolean)
-      .join("\n\n") ?? ""
-  );
+function reviewSummary(value: unknown): ReviewSummary | undefined {
+  const summary = objectRecord(value);
+  const files = safeNonNegativeInteger(summary?.files);
+  const additions = safeNonNegativeInteger(summary?.additions);
+  const removals = safeNonNegativeInteger(summary?.removals);
+  if (files === undefined || additions === undefined || removals === undefined) return undefined;
+  return { files, additions, removals };
+}
+
+function reviewFiles(value: unknown): ReviewFile[] | undefined {
+  if (!Array.isArray(value) || value.length > MAX_REVIEW_FILES) return undefined;
+
+  const files: ReviewFile[] = [];
+  for (const valueItem of value) {
+    const item = objectRecord(valueItem);
+    const path = boundedPath(item?.path);
+    const previousPath = item?.previousPath === undefined
+      ? undefined
+      : boundedPath(item.previousPath);
+    const additions = safeNonNegativeInteger(item?.additions);
+    const removals = safeNonNegativeInteger(item?.removals);
+    const type = reviewFileType(item?.type);
+    if (
+      !path ||
+      (item?.previousPath !== undefined && !previousPath) ||
+      additions === undefined ||
+      removals === undefined ||
+      !type
+    ) {
+      return undefined;
+    }
+
+    files.push({
+      path,
+      ...(previousPath ? { previousPath } : {}),
+      type,
+      additions,
+      removals,
+    });
+  }
+  return files;
+}
+
+function diffPage(
+  value: Record<string, unknown>,
+  actualLengthBytes: number,
+): DiffPage | undefined {
+  const offsetBytes = safeNonNegativeInteger(value.offsetBytes);
+  const lengthBytes = safeNonNegativeInteger(value.lengthBytes);
+  const totalBytes = safeNonNegativeInteger(value.totalBytes);
+  const eof = value.eof;
+  if (
+    offsetBytes === undefined ||
+    lengthBytes === undefined ||
+    totalBytes === undefined ||
+    typeof eof !== "boolean" ||
+    lengthBytes !== actualLengthBytes ||
+    offsetBytes + lengthBytes > totalBytes ||
+    eof !== (offsetBytes + lengthBytes === totalBytes)
+  ) {
+    return undefined;
+  }
+  return { offsetBytes, lengthBytes, totalBytes, eof };
+}
+
+function sameSummary(left: ReviewSummary, right: ReviewSummary): boolean {
+  return left.files === right.files &&
+    left.additions === right.additions &&
+    left.removals === right.removals;
+}
+
+function boundedPath(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 && value.length <= MAX_PATH_LENGTH
+    ? value
+    : undefined;
+}
+
+function boundedString(value: unknown, maximum: number): string | undefined {
+  return typeof value === "string" && value.length > 0 && value.length <= maximum
+    ? value
+    : undefined;
+}
+
+function isoTimestamp(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) && new Date(timestamp).toISOString() === value
+    ? value
+    : undefined;
+}
+
+function reviewFileType(value: unknown): ReviewFile["type"] | undefined {
+  if (
+    value === "change" ||
+    value === "rename-pure" ||
+    value === "rename-changed" ||
+    value === "new" ||
+    value === "deleted"
+  ) {
+    return value;
+  }
+  return undefined;
+}
+
+function safeNonNegativeInteger(value: unknown): number | undefined {
+  return typeof value === "number" &&
+      Number.isSafeInteger(value) &&
+      value >= 0
+    ? value
+    : undefined;
+}
+
+function safePositiveInteger(value: unknown): number | undefined {
+  const parsed = safeNonNegativeInteger(value);
+  return parsed !== undefined && parsed > 0 ? parsed : undefined;
 }
 
 function objectRecord(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>
     : undefined;
-}
-
-function normalizeContent(value: unknown): ToolContent[] {
-  if (!Array.isArray(value)) return [];
-  const content: ToolContent[] = [];
-  for (const item of value) {
-    const block = objectRecord(item);
-    if (block?.type === "text" && typeof block.text === "string") {
-      content.push({ type: "text", text: block.text });
-      continue;
-    }
-    if (
-      block?.type === "image" &&
-      typeof block.data === "string" &&
-      typeof block.mimeType === "string"
-    ) {
-      content.push({
-        type: "image",
-        data: block.data,
-        mimeType: block.mimeType,
-      });
-    }
-  }
-  return content;
-}
-
-function uiOnlyPayload(value: Record<string, unknown> | undefined): ToolPayload | undefined {
-  const diff = typeof value?.diff === "string" ? value.diff : undefined;
-  const patch = typeof value?.patch === "string" ? value.patch : undefined;
-  return diff || patch ? { diff, patch } : undefined;
 }

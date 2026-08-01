@@ -6,7 +6,6 @@ import type { OAuthConfig } from "./oauth-provider.js";
 import {
   DEFAULT_DEVSPACE_OAUTH_SCOPES,
   DEVSPACE_CAPABILITY_SCOPES,
-  FULL_DEVSPACE_OAUTH_SCOPES,
 } from "./oauth-scopes.js";
 import {
   DEFAULT_MAX_REQUEST_BODY_BYTES,
@@ -15,7 +14,6 @@ import {
 } from "./resource-limits.js";
 import { normalizeProjectDocFallbackFilenames } from "./project-instructions.js";
 import {
-  devspaceAgentsDir,
   devspaceSkillsDir,
   loadDevspaceFiles,
   type DevspaceUserConfig,
@@ -28,7 +26,6 @@ import {
 
 export type WidgetMode = "off" | "changes" | "full";
 export type McpHttpTransportMode = "stateless" | "stateful";
-export type ToolProfile = "browse" | "coding";
 const DEFAULT_OAUTH_ACCESS_TOKEN_TTL_SECONDS = 60 * 60;
 const DEFAULT_OAUTH_REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
 
@@ -37,9 +34,7 @@ export interface ResourceLimitsConfig {
   mcpSessionCloseTimeoutMs: number;
   cleanupIntervalMs: number;
   maxMcpSessions: number;
-  maxMcpSessionsPerClient: number;
   maxProcessSessions: number;
-  maxProcessSessionsPerClient: number;
   maxProcessSessionsPerWorkspace: number;
   maxProcessOutputFileBytes: number;
   maxProcessOutputStorageBytes: number;
@@ -49,8 +44,6 @@ export interface ResourceLimitsConfig {
   httpDrainTimeoutMs: number;
   workspaceIdleTtlMs: number;
   maxResidentWorkspaces: number;
-  maxActiveWorkspacesPerClient: number;
-  maxManagedWorktrees: number;
   /** Ceiling for an inbound MCP request body, which bounds patch and stdin size. */
   maxRequestBodyBytes: number;
 }
@@ -66,17 +59,12 @@ export interface ServerConfig {
   publicBaseUrl: string;
   mcpHttpTransport: McpHttpTransportMode;
   mcpGlobalIdleReclaim: boolean;
-  toolProfile: ToolProfile;
   widgets: WidgetMode;
   stateDir: string;
-  worktreeRoot: string;
-  skillsEnabled: boolean;
   skillPaths: string[];
   disabledSkillPaths: string[];
   adminSkillsDir: string;
   devspaceSkillsDir: string;
-  devspaceAgentsDir: string;
-  subagents: boolean;
   userInstructionsPath: string | null;
   projectDocFallbackFilenames: string[];
   logging: LoggingConfig;
@@ -195,7 +183,7 @@ function parseStringList(value: string | undefined, fallback: string[]): string[
 }
 
 function parseOAuthScopes(value: string | undefined): string[] {
-  const scopes = [...new Set(parseStringList(value, [...FULL_DEVSPACE_OAUTH_SCOPES]))];
+  const scopes = [...new Set(parseStringList(value, [...DEFAULT_DEVSPACE_OAUTH_SCOPES]))];
   const invalid = scopes.filter(
     (scope) => !DEVSPACE_CAPABILITY_SCOPES.includes(scope as never),
   );
@@ -275,19 +263,7 @@ function parseResourceLimits(
     mcpSessionCloseTimeoutMs: seconds(env.DEVSPACE_MCP_SESSION_CLOSE_TIMEOUT_SECONDS, 5, "DEVSPACE_MCP_SESSION_CLOSE_TIMEOUT_SECONDS"),
     cleanupIntervalMs: seconds(env.DEVSPACE_RESOURCE_CLEANUP_INTERVAL_SECONDS, 5 * 60, "DEVSPACE_RESOURCE_CLEANUP_INTERVAL_SECONDS"),
     maxMcpSessions,
-    maxMcpSessionsPerClient: parsePositiveInteger(
-      env.DEVSPACE_MAX_MCP_SESSIONS_PER_CLIENT,
-      configured?.maxMcpSessionsPerClient ?? Math.min(8, maxMcpSessions),
-      "DEVSPACE_MAX_MCP_SESSIONS_PER_CLIENT",
-      RESOURCE_LIMIT_MAXIMUMS.maxMcpSessionsPerClient,
-    ),
     maxProcessSessions,
-    maxProcessSessionsPerClient: parsePositiveInteger(
-      env.DEVSPACE_MAX_PROCESS_SESSIONS_PER_CLIENT,
-      configured?.maxProcessSessionsPerClient ?? Math.min(16, maxProcessSessions),
-      "DEVSPACE_MAX_PROCESS_SESSIONS_PER_CLIENT",
-      RESOURCE_LIMIT_MAXIMUMS.maxProcessSessionsPerClient,
-    ),
     maxProcessSessionsPerWorkspace: parsePositiveInteger(
       env.DEVSPACE_MAX_PROCESS_SESSIONS_PER_WORKSPACE,
       configured?.maxProcessSessionsPerWorkspace ?? 8,
@@ -325,18 +301,6 @@ function parseResourceLimits(
       "DEVSPACE_MAX_RESIDENT_WORKSPACES",
       RESOURCE_LIMIT_MAXIMUMS.maxResidentWorkspaces,
     ),
-    maxActiveWorkspacesPerClient: parsePositiveInteger(
-      env.DEVSPACE_MAX_ACTIVE_WORKSPACES_PER_CLIENT,
-      configured?.maxActiveWorkspacesPerClient ?? 32,
-      "DEVSPACE_MAX_ACTIVE_WORKSPACES_PER_CLIENT",
-      RESOURCE_LIMIT_MAXIMUMS.maxActiveWorkspacesPerClient,
-    ),
-    maxManagedWorktrees: parsePositiveInteger(
-      env.DEVSPACE_MAX_MANAGED_WORKTREES,
-      configured?.maxManagedWorktrees ?? 64,
-      "DEVSPACE_MAX_MANAGED_WORKTREES",
-      RESOURCE_LIMIT_MAXIMUMS.maxManagedWorktrees,
-    ),
     // The 4 MiB patch field is the largest and JSON escaping can expand one byte
     // to six wire bytes. The default leaves room for that plus the envelope.
     maxRequestBodyBytes: parsePositiveInteger(
@@ -350,20 +314,9 @@ function parseResourceLimits(
 }
 
 function assertResourceLimits(resources: ResourceLimitsConfig): void {
-  if (resources.maxMcpSessionsPerClient > resources.maxMcpSessions) {
-    throw new Error("DEVSPACE_MAX_MCP_SESSIONS_PER_CLIENT cannot exceed DEVSPACE_MAX_MCP_SESSIONS");
-  }
-  if (resources.maxProcessSessionsPerClient > resources.maxProcessSessions) {
-    throw new Error("DEVSPACE_MAX_PROCESS_SESSIONS_PER_CLIENT cannot exceed DEVSPACE_MAX_PROCESS_SESSIONS");
-  }
   if (resources.maxProcessSessionsPerWorkspace > resources.maxProcessSessions) {
     throw new Error(
       "DEVSPACE_MAX_PROCESS_SESSIONS_PER_WORKSPACE cannot exceed DEVSPACE_MAX_PROCESS_SESSIONS",
-    );
-  }
-  if (resources.maxProcessSessionsPerWorkspace > resources.maxProcessSessionsPerClient) {
-    throw new Error(
-      "DEVSPACE_MAX_PROCESS_SESSIONS_PER_WORKSPACE cannot exceed DEVSPACE_MAX_PROCESS_SESSIONS_PER_CLIENT",
     );
   }
   if (resources.maxProcessOutputFileBytes > resources.maxProcessOutputStorageBytes) {
@@ -379,18 +332,6 @@ function parseWidgetMode(value: string | undefined, configuredMode?: WidgetMode)
   if (value === "off" || value === "changes") return value;
 
   throw new Error(`Invalid DEVSPACE_WIDGETS: ${value}`);
-}
-
-function parseToolProfile(
-  value: string | undefined,
-  configuredProfile?: ToolProfile,
-): ToolProfile {
-  const profile = value?.trim().toLowerCase();
-  if (!profile) return configuredProfile ?? "coding";
-  if (profile === "browse" || profile === "coding") return profile;
-  throw new Error(
-    `Invalid DEVSPACE_TOOL_PROFILE: ${value} (expected browse or coding)`,
-  );
 }
 
 function parseMcpHttpTransport(
@@ -486,10 +427,6 @@ function defaultStateDir(): string {
   return join(homedir(), ".local", "share", "devspace");
 }
 
-function defaultWorktreeRoot(): string {
-  return join(homedir(), ".devspace", "worktrees");
-}
-
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
   const config = loadConfigForAdmin(env);
   assertResourceLimits(config.resources);
@@ -532,14 +469,8 @@ export function loadConfigForAdmin(env: NodeJS.ProcessEnv = process.env): Server
     mcpGlobalIdleReclaim: env.DEVSPACE_MCP_GLOBAL_IDLE_RECLAIM === undefined
       ? files.config.mcpGlobalIdleReclaim ?? false
       : parseBoolean(env.DEVSPACE_MCP_GLOBAL_IDLE_RECLAIM, "DEVSPACE_MCP_GLOBAL_IDLE_RECLAIM"),
-    toolProfile: parseToolProfile(
-      env.DEVSPACE_TOOL_PROFILE,
-      files.config.toolProfile,
-    ),
     widgets: parseWidgetMode(env.DEVSPACE_WIDGETS, files.config.widgets),
     stateDir: resolve(expandHomePath(env.DEVSPACE_STATE_DIR ?? files.config.stateDir ?? defaultStateDir())),
-    worktreeRoot: resolve(expandHomePath(env.DEVSPACE_WORKTREE_ROOT ?? files.config.worktreeRoot ?? defaultWorktreeRoot())),
-    skillsEnabled: env.DEVSPACE_SKILLS === undefined ? true : parseBoolean(env.DEVSPACE_SKILLS, "DEVSPACE_SKILLS"),
     skillPaths:
       env.DEVSPACE_SKILL_PATHS === undefined
         ? files.config.skillPaths ?? []
@@ -550,11 +481,6 @@ export function loadConfigForAdmin(env: NodeJS.ProcessEnv = process.env): Server
         : parsePathList(env.DEVSPACE_DISABLED_SKILL_PATHS),
     adminSkillsDir: env.DEVSPACE_ADMIN_SKILLS_DIR ?? files.config.adminSkillsDir ?? "/etc/codex/skills",
     devspaceSkillsDir: devspaceSkillsDir(env),
-    devspaceAgentsDir: devspaceAgentsDir(env),
-    subagents:
-      env.DEVSPACE_SUBAGENTS === undefined
-        ? files.config.subagents === true
-        : parseBoolean(env.DEVSPACE_SUBAGENTS, "DEVSPACE_SUBAGENTS"),
     userInstructionsPath: parseOptionalPath(
       env.DEVSPACE_USER_INSTRUCTIONS_PATH ?? files.config.userInstructionsPath,
     ),

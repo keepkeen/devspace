@@ -262,11 +262,6 @@ try {
     loadWorkspaceSkills(disabledDirectoryConfig, workspaceRoot).skills.some((skill) => skill.name === "explicit-only"),
     false,
   );
-  assert.deepEqual(
-    loadWorkspaceSkills(makeConfig(workspaceRoot, { DEVSPACE_SKILLS: "0" }), workspaceRoot),
-    { skills: [], diagnostics: [] },
-  );
-
   const invalidRoot = join(workspaceRoot, "invalid-skills");
   await writeSkill(join(invalidRoot, "empty-name"), "''", "Has no usable name.");
   await writeFile(
@@ -384,14 +379,6 @@ try {
   assert.equal(noisy.diagnostics.length, SKILL_DISCOVERY_LIMITS.maxDiagnostics);
   assert.equal(noisy.diagnostics.at(-1)?.message.includes("omitted"), true);
 
-  const bundled = loadWorkspaceSkills(
-    makeConfig(workspaceRoot, { DEVSPACE_SUBAGENTS: "1" }),
-    workspaceRoot,
-  );
-  const bundledSubagent = bundled.skills.find(
-    (skill) => skill.name === "subagent-delegation" && skill.source === "bundled",
-  );
-  assert.ok(bundledSubagent);
 } finally {
   if (originalHome === undefined) delete process.env.HOME;
   else process.env.HOME = originalHome;

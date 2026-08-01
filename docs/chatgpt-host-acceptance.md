@@ -1,90 +1,73 @@
-# Real ChatGPT Host Acceptance Matrix
+# Real ChatGPT Host Acceptance
 
-Automated SDK tests verify the server contract. A real-host acceptance run is
-still required after changing OAuth grants, host metadata, Workspace context,
-tool schemas, or result envelopes.
-
-`src/host-conversation-simulation.test.ts` covers the server-side journey with
-stable `openai/subject` and `openai/session` metadata. It intentionally does not
-auto-convert `workspaceId` into receipt authority.
-
-Record the ChatGPT build/date, DevSpace commit, operating system, tunnel, OAuth
-scope set, and structured results. Never record bearer tokens, host identity
-claims, receipt values, Owner passwords, or absolute paths outside the disposable
-fixture.
+Run these checks only against disposable Projects. Backend restart, service
+replacement, publication, and process termination require a separate explicit
+user command and are not part of ordinary acceptance.
 
 ## Preconditions
 
-1. Use a disposable Git project under an approved root.
-2. Add distinct root and nested instruction files.
-3. Keep one checkout and at least one managed worktree available.
-4. Record `devspace auth principals` before connector changes.
-5. Use unique `operationId` values for new effects.
-6. Refresh the ChatGPT app tools after schema changes.
+1. Use a disposable OAuth client and narrowly approved test Projects.
+2. Keep admin/control listeners off the public tunnel.
+3. Include one non-Git Project and one Git top-level Project.
+4. Ensure all commands and worktrees are disposable.
+5. Rescan the ChatGPT App after schema changes before collecting evidence.
 
-## Matrix
+## Acceptance matrix
 
-| Scenario | Procedure | Required result |
+| Area | Exercise | Expected result |
 | --- | --- | --- |
-| First selection | Ask only to select a project and call `open_workspace` without a context mode, then attempt a read. | Open returns `state.phase=selected`; read is rejected with `workspace_context_incomplete` before file access. |
-| One-call first load | Ask for immediate analysis/editing and open the user-named project with `contextMode="full"`. | The call succeeds in `context_loaded` and returns a v5 instruction manifest without instruction or Skill bodies. |
-| Manifest-first instructions | Inspect full context, then call `load_workspace_instructions` for target paths. | Full context contains only manifest metadata; scoped load returns applicable bodies and a reviewed revision. Long files/chains use signed UTF-8-safe byte fragments of at most 8 KiB, reassemble without gaps or duplicates, and return an acknowledgement token only on the final page. |
-| Unified cursor binding | Page Workspace, Skill, instruction, and process-output results; tamper with one cursor and reuse another under a different query/session. | Every continuation uses `dcur1`; tampered, expired, cross-principal, stale-generation, changed-query, and changed-revision cursors fail closed without effects. |
-| Stable Workspace pagination | Fetch a one-item Workspace page, access one listed Workspace so `lastUsedAt` changes, then continue with the signed cursor. | The cursor remains valid because stable ordering/revision fields did not change; no item is duplicated or skipped. |
-| Session-bound ordinary tools | In one ChatGPT conversation, read several files without sending receipt arguments. | Tools resolve the server-side `openai/session` binding and return only `workspaceAlias` plus `contextChanged=false`, not repeated continuation data. |
-| Long conversation continuity | Keep the same authorized `openai/session` active beyond the old six-hour boundary. | The binding remains valid; only grant/epoch changes, Workspace lifecycle, LRU eviction, revocation, or server restart invalidate it. |
-| Generic receipt mode | Use a client without `openai/session` and pass the current `wctx5` receipt. | The same Workspace is authorized. Missing/expired receipt is rejected before the handler. |
-| Explicit invalid receipt | Supply an invalid receipt while a valid host session binding exists. | The call is rejected; DevSpace never falls back to host state after explicit invalid authority. |
-| New conversation recovery | Start a different `openai/session`, call `list_workspaces`, then resume by alias and by `workspaceRef`. | Both recovery paths work without resending the host path and establish a new session binding. |
-| Backend restart | Restart only for this row and keep the state directory. | Old in-process receipt/session bindings fail; retained aliases survive; `list_workspaces → resume_workspace` recovers. |
-| Structured recovery | Trigger a context-required error with and without retained Workspaces. | Results distinguish `list_then_resume`/`hasRetainedWorkspaces=true` from `open_workspace_full`/false. |
-| Grant refresh | Refresh an access token. | New tokens retain the original `grantId`, principal, scopes, and authorization epoch. |
-| Refresh replay | Rotate a refresh token, then present the consumed token again. | Replay is audited, the grant/family is revoked, current access and refresh tokens fail, and Workspace authority generations/bindings are invalidated. |
-| Absolute grant lifetime | Approve with a short configured absolute grant lifetime and refresh near the deadline. | Access and refresh expiry never exceed the grant deadline, and refresh cannot extend it. |
-| New isolated authorization | After Owner verification choose **new local connection** for the same client. | A new grant/principal is isolated from old Workspace state and old receipts. |
-| Explicit principal reuse | Reauthorize the same client, choose an existing principal locally, and select roots. | Old client tokens/grants are revoked, the selected principal's aliases remain visible, Workspace generations advance, and old receipts fail safely. |
-| Explicit reconnect | Authorize a fresh grant with a valid one-time reconnect code. | The grant joins the selected old principal; the code cannot be reused. |
-| Per-grant roots | Give account A only root A and account B only root B, with identical capability scopes. | Each account can open/list/resume only its own roots; guessing the other path or alias is rejected. |
-| Host subject consistency | Bind a grant using `openai/subject`, then send a different subject. | The later tool call is rejected. Logs and state contain only HMAC identifiers. |
-| Host organization consistency | Repeat with `openai/organization`. | A conflicting organization is rejected; omission is handled according to the established grant binding. |
-| Least-privilege default | Authorize without a `scope` parameter. | The grant receives only `workspace:read`; its lifecycle/read/inspection tools/list remains below 12 KB. |
-| Static browse profile | Start with `DEVSPACE_TOOL_PROFILE=browse` and authorize every capability. | tools/list contains only the nine lifecycle/read/inspection tools, remains below 12 KB, and cached calls to mutation/process tools are unavailable. |
-| Static coding profile | Start with `DEVSPACE_TOOL_PROFILE=coding` and authorize every capability. | The full 19-tool surface remains below 19 KB and is stable for the connection lifetime. |
-| Scope-filtered change review | Inspect tools/list under a default read-only grant, then under an elevated read/write grant. | Read-only `show_changes` may preview without advancing; checkpoint advancement requires write scope plus an operation ID. |
-| Scope-filtered process tools | Use a grant with `process:execute` but no network capability. | `write_stdin`/`read_process_output` remain available for an owned process; `exec_command` is not advertised. |
-| Runtime capability schema | Inspect lifecycle output and `exec_command` schema. | Capabilities accurately report no process/network sandbox; unsupported `network="deny"` is absent. |
-| Process tool annotations | Inspect `exec_command` and `write_stdin` definitions. | Both explicitly declare non-read-only, destructive, non-idempotent, open-world behavior. |
-| Public/internal listener split | Send `/internal/diagnostics` to the public listener and then to the loopback control listener with the proper local token. | Public returns 404; only loopback control serves the protected route. |
-| Structured text-read rejection | Read a binary file, invalid UTF-8, and an oversized text file. | Results fail before text decoding with `binary_file`, `invalid_utf8`, and `file_too_large`; source bytes are not rewritten. |
-| Same-root cross-process writes | Run two DevSpace processes against the same checkout and overlap writes. | Reads may overlap; writer intent blocks later readers; writes serialize; stale `ifMatch` fails. |
-| Background process lease | Start a background process and attempt a second same-root write from another process. | The second write waits or returns `workspace_root_busy` until the complete process tree exits. |
-| Managed daemon detach | Let the root exit while a descendant survives, then try detach with and without explicit confirmation. | The session reports `managedDaemon`; the lease stays held by default; detach requires a new operation ID plus `confirmUnserializedWrites=true` and warns that future writes are unserialized. |
-| Server crash with surviving child | Start a detached same-root process, kill the DevSpace server without cleanup, then start a replacement server. | The child PID/process-group marker keeps the physical-root write lease; the replacement cannot write until the orphan process tree exits. PID start/boot identity prevents reuse from preserving a stale lease. |
-| External editor race | Read a file, modify it outside DevSpace, then apply the old version. | `file_version_conflict` prevents overwrite despite any OS lock state. |
-| Patch byte preservation | Patch fixtures with BOM, mixed LF/CRLF/CR, no final newline, and an empty file; also create an ambiguous fuzzy target. | Untouched bytes and final-newline state remain exact, empty files work, unique fuzzy use is reported, and ambiguity is rejected. |
-| Paged change review | Generate a diff larger than one model page and attempt to advance before EOF. | Preview returns bounded signed pages and summaries; advance requires the EOF `reviewToken` or explicit truncated acknowledgement and rejects a stale revision. |
-| Retained-output modes | Produce normal and error log lines, then call page, tail, search, and errors modes. | Default remains small; tail/search/error matches are bounded, cursor-bound, UTF-8-safe, and process provenance is untrusted. |
-| Batch fairness | Run several large batch items with a small aggregate budget. | Every item receives a fair reservation; omitted items say `aggregate_budget_exhausted`; reads retain `nextOffset`. |
-| Lost mutation response | Drop a response, then retry the identical request with the same `operationId`. | The result replays once without executing again. Ordinary replay remains compact and does not attach stale continuation state. |
-| Lifecycle replay | Repeat close/revoke with the same operation ID. | Cleanup effects are not repeated and the stored operation envelope is returned. |
-| Unknown outcome resolution | Produce or seed an `outcome_unknown`, verify external evidence, then call `resolve_operation`. | The durable state becomes `verified_committed`, `verified_not_started`, or `acknowledged_unknown`; method/evidence/operator metadata is retained and the old ID remains a tombstone. |
-| Self-management denial | Attempt to kill the current PID or restart the enrolled DevSpace service through `exec_command`. | The command is rejected before effects with recovery pointing to local Admin runtime control. |
-| Persistent audit correlation | Trigger a tool failure, query `devspace audit`, and inspect runtime diagnostics. | Both show request/tool and anonymous connection/Workspace activity correlation plus error code/fingerprint, without paths, command text, host claims, tokens, or stacks. Human output uses China time. |
-| Audit-store failure visibility | Inject an audit-store write failure. | The authorization/tool result is unchanged, while loopback diagnostics increment `auditWriteFailures` and record the last failure time without recursive audit writes. |
-| Dirty worktree close/revoke | Modify a managed worktree and close/revoke it. | Tracked processes stop, the dirty worktree is retained, and structured effects describe what committed. |
-| Transport configuration | Test default stateless and explicit stateful modes with identical OAuth registrations. | Behavior follows server configuration, not redirect host, User-Agent, location, or host hints. |
-| Stateful reclaim isolation | Fill stateful capacity with idle sessions from two principals. | The requester reclaims its own oldest idle session first; another principal is considered only when global idle reclaim was explicitly enabled. |
-| Partial v1 Owner migration | Seed issued access/refresh tokens, a schema-v2 `auth.json` using `legacy-direct`, and a still-legacy SQLite scrypt verifier, then restart an isolated server. | Startup requires the legacy key to match both old scrypt and new Argon2id verifiers, upgrades SQLite in place, emits `oauth_owner_credential_upgraded`, preserves token counts, rejects the old process receipt, and permits `list_workspaces → resume_workspace` with the old access token. |
-| Owner-password rotation | Rotate only the Owner password and restart only for this row. | Existing clients remain registered, old access/refresh tokens are unusable, and fresh authorization is required; root IDs, project fingerprints, aliases, and other master-key-derived continuity remain stable. |
-| Master-key rotation | Stop the backend, replace only the persistent master key, then restart and reauthorize. | All purpose-derived HMAC identities, internal tokens, receipts, and cursors change; old grants/cursors fail safely and retained local state requires deliberate global recovery. |
+| OAuth identity | Call tools under two concurrent grants. | Each bearer sees only its scopes, approved Projects, executions, private Threads, and processes. |
+| Exact surface | Inspect `tools/list` with all scopes. | The names are `list_projects`, `project_control`, `save_progress`, `read_files`, `inspect`, `skills`, `apply_patch`, `show_changes`, `exec_command`, `write_stdin`, and `read_process_output`. |
+| Scope filtering | Compare read, read/write, read/process, and full grants. | Tools outside the grant are omitted; `exec_command` needs all three scopes. |
+| Project discovery | Call `list_projects`. | Only approved opaque Project references and labels appear; no local paths leak. |
+| Explicit lifecycle | Exercise every `project_control` action. | `list`, `open`, `resume`, `hydrate`, `status`, and `close` accept only their documented fields. |
+| No recency guess | Open several Threads and omit selection during resume. | DevSpace requires an explicit `threadRef`; it never selects the newest or sole Thread implicitly. |
+| Thread privacy | Save under grant A, list/resume under grant B for the same Project. | B cannot see or resume A's Thread. Shared checkout files may still be visible if both grants approve the Project. |
+| Execution isolation | Try A's `executionRef` under B. | The reference is rejected across the grant boundary. |
+| Open replay | Retry identical open with the same operation ID. | The same execution is returned; no second checkout or worktree is created. |
+| Root paging | Use an oversized root `AGENTS.md`. | Every page remains bounded; other Project tools stay gated until the final page. |
+| Lost cursor | Hydrate without a lost cursor. | Root paging restarts safely without creating another execution. |
+| Nested instructions | Read, inspect, patch, or command under nested instructions. | Newly applicable deltas are returned; guarded effects start only after acknowledgement. |
+| Lazy Skill | Search and load one Skill. | Only bounded metadata or the selected manifest appears; authority does not expand. |
+| Batch read | Read one to eight files. | Per-item versions and bounded continuations are returned in input order. |
+| Batch inspect | Run one to eight mixed grep/glob/list operations. | Items run as a bounded batch with per-item status, `ref`, and aggregate truncation. |
+| File containment | Try absolute, parent, and escaping-symlink paths. | Access outside the bound checkout/worktree is rejected. |
+| Patch preconditions | Patch with current, missing, and stale `ifMatch`. | Current succeeds; missing/stale fails before any write. |
+| Automatic patch checkpoint | Apply a successful patch, then read Thread status. | A server-observed checkpoint records bounded file effects without file bodies. |
+| Thread CAS | Save, update with current version, then update with a stale version. | Version increments; stale update receives `thread_revision_conflict`. |
+| Summary minimization | Save a distinctive summary and inspect results/logs/listing. | Save result and Thread listing do not echo the summary; status/resume returns it as untrusted checkpoint context. |
+| Grant-private checkpoint | Read another grant's Thread status. | The request returns `project_thread_not_found`. |
+| Checkout mode | Open two checkout Threads for one Project. | They use distinct executions over the intentionally shared approved directory. |
+| Worktree eligibility | Request worktree mode for a non-Git or nested Project. | Open fails before workspace activation with a clear recovery path. |
+| Worktree isolation | Open two writable worktree Threads. | Each has a separate managed root and branch; writes do not appear in the other worktree. |
+| Worktree replay | Retry the same worktree open. | The original managed Thread/worktree is reused. |
+| Worktree authorization | Inspect retained state and tool results. | Authorization remains anchored to the approved source Project; managed roots stay under the private state directory and are never model-visible. |
+| Dirty close | Modify a managed worktree and close its Thread. | Close returns `project_worktree_dirty`; files, branch, and Thread remain recoverable. |
+| Clean close | Close a clean managed worktree Thread. | Active operations are checked, the clean worktree/managed branch are removed, and the Thread becomes closed. |
+| Busy close | Hold a tracked process and close its Thread. | Close returns busy and does not terminate the task. |
+| Direct command | Run a harmless program with `program` and `args`. | No shell is involved; working directory and environment are applied. |
+| Shell command | Use `shell:true` with a pipeline and `approvalReason`. | The command runs only with the complete explicit shell form. |
+| Invalid command mode | Mix direct and shell fields or omit the reason. | The command is rejected before process creation. |
+| CamelCase process fields | Inspect and call process tools. | Only `sessionId`, `closeStdin`, `expectedRevision`, `yieldTimeMs`, `timeoutMs`, and `maxOutputTokens` are accepted. |
+| Process polling | Start a live process, poll, write input, and await exit. | Polling is read-only; input uses a fresh operation ID. |
+| Command checkpoint | Complete a foreground command, then read Thread status. | A bounded server-observed checkpoint records mode, outcome, duration, and retained-output availability, not raw output. |
+| Process authority disclosure | Run harmless OS-user/network checks. | Behavior follows the local OS user and inherited network; no sandbox claim is made. |
+| Change review | Review Git and non-Git Projects. | Git top-level review is read-only; non-Git review uses the execution patch journal. |
+| Cross-execution journal | Patch under execution A and review under B. | A's patch journal does not appear in B, even if checkout files are shared. |
+| Revocation | Revoke A while B is active. | A's executions/processes are cleaned according to policy; B remains usable. |
+| Removed root | Remove Project authorization and reuse an execution. | Access is rejected without deleting Project or worktree files. |
+| Bounded output | Request large reads, inspection, diffs, and process output. | Results remain bounded and expose safe continuation/narrowing. |
+| Public/local split | Request a local management route through the public origin. | It is unavailable publicly. |
 
-## Pass Criteria
+## Pass criteria
 
-A release passes only when every applicable row has structured evidence and no
-row relies on prose to infer whether an effect occurred. The server contract must
-remain safe when the host loses a response, opens a new transport, starts a new
-conversation, or presents stale cached tool definitions.
+Acceptance passes only when applicable rows have real-host evidence, the public
+surface matches this document, guarded effects fail before starting, Thread and
+grant boundaries are preserved, dirty worktrees survive, and no secret or
+unrelated local path appears in evidence.
 
-A host interoperability issue is not a reason to weaken grant ownership,
-subject consistency, Workspace phase, scope checks, file versions, root locks,
-or operation idempotency.
+Unit, integration, context-budget, and typecheck validation remain required in
+addition to this host matrix.
+
+See [ChatGPT Tool Contract](./chatgpt-tool-contract.md) for the normative
+contract.

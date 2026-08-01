@@ -1,10 +1,9 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "./config.js";
 import { DEFAULT_DEVSPACE_OAUTH_SCOPES } from "./oauth-scopes.js";
-import { ensureDevspaceDefaultSkills, resolveSubagentsFlag } from "./user-config.js";
 
 const emptyConfigDir = mkdtempSync(join(tmpdir(), "devspace-empty-config-test-"));
 const baseEnv = {
@@ -16,6 +15,8 @@ const baseEnv = {
 assert.equal(loadConfig(baseEnv).widgets, "full");
 assert.equal(loadConfig(baseEnv).port, 7676);
 assert.equal(loadConfig(baseEnv).controlPort, 7677);
+assert.equal("worktreeRoot" in loadConfig(baseEnv), false);
+assert.equal("maxManagedWorktrees" in loadConfig(baseEnv).resources, false);
 assert.equal(loadConfig({ ...baseEnv, PORT: "9000" }).controlPort, 9001);
 assert.equal(
   loadConfig({ ...baseEnv, PORT: "9000", DEVSPACE_CONTROL_PORT: "9100" }).controlPort,
@@ -24,13 +25,6 @@ assert.equal(
 assert.throws(
   () => loadConfig({ ...baseEnv, PORT: "9000", DEVSPACE_CONTROL_PORT: "9000" }),
   /must differ from PORT/,
-);
-assert.equal(loadConfig(baseEnv).toolProfile, "coding");
-assert.equal(loadConfig({ ...baseEnv, DEVSPACE_TOOL_PROFILE: "browse" }).toolProfile, "browse");
-assert.equal(loadConfig({ ...baseEnv, DEVSPACE_TOOL_PROFILE: "coding" }).toolProfile, "coding");
-assert.throws(
-  () => loadConfig({ ...baseEnv, DEVSPACE_TOOL_PROFILE: "dynamic" }),
-  /Invalid DEVSPACE_TOOL_PROFILE: dynamic/,
 );
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_WIDGETS: "changes" }).widgets, "changes");
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_WIDGETS: "full" }).widgets, "full");
@@ -51,13 +45,10 @@ assert.equal(
     .oauth.grantMaxLifetimeSeconds,
   undefined,
 );
-assert.equal(loadConfig(baseEnv).skillsEnabled, true);
 assert.deepEqual(loadConfig(baseEnv).skillPaths, []);
 assert.deepEqual(loadConfig(baseEnv).disabledSkillPaths, []);
 assert.equal(loadConfig(baseEnv).adminSkillsDir, "/etc/codex/skills");
 assert.equal(loadConfig(baseEnv).devspaceSkillsDir, join(emptyConfigDir, "skills"));
-assert.equal(loadConfig(baseEnv).devspaceAgentsDir, join(emptyConfigDir, "agents"));
-assert.equal(loadConfig(baseEnv).subagents, false);
 assert.equal(loadConfig(baseEnv).userInstructionsPath, null);
 assert.equal(
   loadConfig({ ...baseEnv, DEVSPACE_USER_INSTRUCTIONS_PATH: "/tmp/devspace-user-instructions.md" })
@@ -86,8 +77,6 @@ assert.throws(
   () => loadConfig({ ...baseEnv, DEVSPACE_PROJECT_DOC_FALLBACK_FILENAMES: "../AGENTS.md" }),
   /Invalid project document fallback filename/,
 );
-assert.equal(loadConfig({ ...baseEnv, DEVSPACE_SKILLS: "0" }).skillsEnabled, false);
-assert.equal(loadConfig({ ...baseEnv, DEVSPACE_SKILLS: "1" }).skillsEnabled, true);
 assert.deepEqual(
   loadConfig({ ...baseEnv, DEVSPACE_SKILL_PATHS: "repo-skills,../shared-skills" }).skillPaths,
   ["repo-skills", "../shared-skills"],
@@ -101,25 +90,6 @@ assert.equal(
   loadConfig({ ...baseEnv, DEVSPACE_ADMIN_SKILLS_DIR: "admin-skills" }).adminSkillsDir,
   "admin-skills",
 );
-assert.equal(
-  loadConfig({ ...baseEnv, DEVSPACE_SUBAGENTS: "1" }).subagents,
-  true,
-);
-assert.equal(resolveSubagentsFlag({}, {}), undefined);
-assert.equal(resolveSubagentsFlag({ subagents: true }, {}), true);
-assert.equal(resolveSubagentsFlag({ subagents: true }, { DEVSPACE_SUBAGENTS: "0" }), false);
-assert.equal(resolveSubagentsFlag({}, { DEVSPACE_SUBAGENTS: "1" }), true);
-assert.throws(
-  () => resolveSubagentsFlag({}, { DEVSPACE_SUBAGENTS: "treu" }),
-  /Invalid DEVSPACE_SUBAGENTS: treu \(expected boolean\)/,
-);
-
-const seededConfigDir = mkdtempSync(join(tmpdir(), "devspace-seeded-skills-test-"));
-const seededSkillPaths = ensureDevspaceDefaultSkills({ DEVSPACE_CONFIG_DIR: seededConfigDir });
-assert.deepEqual(seededSkillPaths, [join(seededConfigDir, "skills", "subagent-delegation", "SKILL.md")]);
-assert.equal(existsSync(seededSkillPaths[0]), true);
-assert.match(readFileSync(seededSkillPaths[0], "utf8"), /name: subagent-delegation/);
-assert.deepEqual(ensureDevspaceDefaultSkills({ DEVSPACE_CONFIG_DIR: seededConfigDir }), []);
 
 assert.throws(
   () => loadConfig({ ...baseEnv, DEVSPACE_WIDGETS: "invalid" }),
@@ -149,9 +119,7 @@ assert.deepEqual(loadConfig(baseEnv).resources, {
   mcpSessionCloseTimeoutMs: 5_000,
   cleanupIntervalMs: 300_000,
   maxMcpSessions: 64,
-  maxMcpSessionsPerClient: 8,
   maxProcessSessions: 32,
-  maxProcessSessionsPerClient: 16,
   maxProcessSessionsPerWorkspace: 8,
   maxProcessOutputFileBytes: 64 * 1024 * 1024,
   maxProcessOutputStorageBytes: 1024 * 1024 * 1024,
@@ -161,39 +129,29 @@ assert.deepEqual(loadConfig(baseEnv).resources, {
   httpDrainTimeoutMs: 30_000,
   workspaceIdleTtlMs: 604_800_000,
   maxResidentWorkspaces: 256,
-  maxActiveWorkspacesPerClient: 32,
-  maxManagedWorktrees: 64,
   // Allows the maximum 4 MiB UTF-8 patch even under worst-case JSON escaping.
   maxRequestBodyBytes: 32 * 1024 * 1024,
 });
 const limitedConfig = loadConfig({
   ...baseEnv,
   DEVSPACE_MAX_MCP_SESSIONS: "4",
-  DEVSPACE_MAX_MCP_SESSIONS_PER_CLIENT: "3",
   DEVSPACE_MAX_PROCESS_SESSIONS: "5",
-  DEVSPACE_MAX_PROCESS_SESSIONS_PER_CLIENT: "4",
   DEVSPACE_MAX_PROCESS_SESSIONS_PER_WORKSPACE: "2",
   DEVSPACE_MAX_PROCESS_OUTPUT_FILE_BYTES: "1048576",
   DEVSPACE_MAX_PROCESS_OUTPUT_STORAGE_BYTES: "2097152",
   DEVSPACE_COMPLETED_PROCESS_OUTPUT_TTL_SECONDS: "90",
   DEVSPACE_MAX_COMMAND_RUNTIME_SECONDS: "30",
   DEVSPACE_WORKSPACE_IDLE_TTL_SECONDS: "60",
-  DEVSPACE_MAX_MANAGED_WORKTREES: "3",
-  DEVSPACE_MAX_ACTIVE_WORKSPACES_PER_CLIENT: "2",
   DEVSPACE_MAX_REQUEST_BODY_BYTES: "41943040",
 });
 assert.equal(limitedConfig.resources.maxMcpSessions, 4);
-assert.equal(limitedConfig.resources.maxMcpSessionsPerClient, 3);
 assert.equal(limitedConfig.resources.maxProcessSessions, 5);
-assert.equal(limitedConfig.resources.maxProcessSessionsPerClient, 4);
 assert.equal(limitedConfig.resources.maxProcessSessionsPerWorkspace, 2);
 assert.equal(limitedConfig.resources.maxProcessOutputFileBytes, 1_048_576);
 assert.equal(limitedConfig.resources.maxProcessOutputStorageBytes, 2_097_152);
 assert.equal(limitedConfig.resources.completedProcessOutputTtlMs, 90_000);
 assert.equal(limitedConfig.resources.maxCommandRuntimeMs, 30_000);
 assert.equal(limitedConfig.resources.workspaceIdleTtlMs, 60_000);
-assert.equal(limitedConfig.resources.maxManagedWorktrees, 3);
-assert.equal(limitedConfig.resources.maxActiveWorkspacesPerClient, 2);
 assert.equal(limitedConfig.resources.maxRequestBodyBytes, 40 * 1024 * 1024);
 
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_LOG_LEVEL: "silent" }).logging.level, "silent");
@@ -220,23 +178,10 @@ assert.throws(
 assert.throws(
   () => loadConfig({
     ...baseEnv,
-    DEVSPACE_MAX_MCP_SESSIONS: "2",
-    DEVSPACE_MAX_MCP_SESSIONS_PER_CLIENT: "3",
-  }),
-  /DEVSPACE_MAX_MCP_SESSIONS_PER_CLIENT cannot exceed DEVSPACE_MAX_MCP_SESSIONS/,
-);
-assert.throws(
-  () => loadConfig({
-    ...baseEnv,
-    DEVSPACE_MAX_PROCESS_SESSIONS: "4",
-    DEVSPACE_MAX_PROCESS_SESSIONS_PER_CLIENT: "3",
+    DEVSPACE_MAX_PROCESS_SESSIONS: "3",
     DEVSPACE_MAX_PROCESS_SESSIONS_PER_WORKSPACE: "4",
   }),
-  /DEVSPACE_MAX_PROCESS_SESSIONS_PER_WORKSPACE cannot exceed DEVSPACE_MAX_PROCESS_SESSIONS_PER_CLIENT/,
-);
-assert.throws(
-  () => loadConfig({ ...baseEnv, DEVSPACE_SKILLS: "" }),
-  /Invalid DEVSPACE_SKILLS:  \(expected boolean\)/,
+  /DEVSPACE_MAX_PROCESS_SESSIONS_PER_WORKSPACE cannot exceed DEVSPACE_MAX_PROCESS_SESSIONS/,
 );
 assert.throws(
   () => loadConfig({ ...baseEnv, DEVSPACE_MAX_PROCESS_SESSIONS: "0" }),
@@ -292,6 +237,14 @@ assert.equal(environmentOAuth.keys.derivation, "legacy-direct");
 assert.equal(environmentOAuth.keys.source, "legacy_environment");
 assert.equal(environmentOAuth.keys.legacyCompatibility, true);
 assert.deepEqual(loadConfig(baseEnv).oauth.scopes, [...DEFAULT_DEVSPACE_OAUTH_SCOPES]);
+assert.equal(loadConfig(baseEnv).oauth.scopes.includes("process:execute"), false);
+assert.deepEqual(
+  loadConfig({
+    ...baseEnv,
+    DEVSPACE_OAUTH_SCOPES: "project:read,project:write,process:execute",
+  }).oauth.scopes,
+  ["project:read", "project:write", "process:execute"],
+);
 assert.deepEqual(loadConfig(baseEnv).oauth.allowedRedirectHosts, [
   "chatgpt.com",
   "localhost",
@@ -361,7 +314,6 @@ writeFileSync(
     controlPort: 8790,
     allowedRoots: [process.cwd()],
     publicBaseUrl: "https://devspace.example.com",
-    subagents: true,
     mcpGlobalIdleReclaim: true,
     oauthGrantMaxLifetimeSeconds: 604_800,
     widgets: "changes",
@@ -379,7 +331,6 @@ writeFileSync(
       completedProcessOutputTtlMs: 120_000,
       maxCommandRuntimeMs: 45_000,
       maxResidentWorkspaces: 22,
-      maxManagedWorktrees: 7,
     },
   }),
 );
@@ -413,7 +364,6 @@ assert.deepEqual(fileConfig.projectDocFallbackFilenames, ["TEAM_GUIDE.md", ".age
 assert.deepEqual(fileConfig.skillPaths, ["workspace-skills"]);
 assert.deepEqual(fileConfig.disabledSkillPaths, ["workspace-skills/disabled/SKILL.md"]);
 assert.equal(fileConfig.adminSkillsDir, "/opt/devspace/admin-skills");
-assert.equal(fileConfig.subagents, true);
 assert.equal(fileConfig.mcpGlobalIdleReclaim, true);
 assert.equal(fileConfig.oauth.grantMaxLifetimeSeconds, 604_800);
 assert.equal(fileConfig.widgets, "changes");
@@ -426,7 +376,6 @@ assert.equal(fileConfig.resources.maxProcessOutputStorageBytes, 4_194_304);
 assert.equal(fileConfig.resources.completedProcessOutputTtlMs, 120_000);
 assert.equal(fileConfig.resources.maxCommandRuntimeMs, 45_000);
 assert.equal(fileConfig.resources.maxResidentWorkspaces, 22);
-assert.equal(fileConfig.resources.maxManagedWorktrees, 7);
 assert.equal(
   loadConfig({ DEVSPACE_CONFIG_DIR: configDir, DEVSPACE_WIDGETS: "off" }).widgets,
   "off",

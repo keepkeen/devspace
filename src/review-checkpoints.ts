@@ -3,19 +3,16 @@ import {
   chmod,
   lstat,
   mkdir,
-  mkdtemp,
   readFile,
   readdir,
+  realpath,
   rename,
   rm,
   unlink,
   writeFile,
 } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { git, getGitEligibility, safeWorkspaceRefSegment } from "./git.js";
-
-export type ReviewSince = "last_shown" | "last_review" | "workspace_open";
+import { git, type GitCommandResult } from "./git.js";
 
 export interface ReviewSummary {
   files: number;
@@ -39,13 +36,6 @@ export interface ReviewChangesResult {
   revision: string;
 }
 
-export class ReviewRevisionChangedError extends Error {
-  constructor() {
-    super("Workspace changes changed after the reviewed diff was generated.");
-    this.name = "ReviewRevisionChangedError";
-  }
-}
-
 /**
  * A page sequence asked to continue a diff that is no longer retained.
  *
@@ -60,11 +50,25 @@ export class ReviewPagingExpiredError extends Error {
   }
 }
 
+export class UnsafeGitReviewConfigurationError extends Error {
+  readonly code = "git_review_unsafe_configuration";
+  readonly filterDrivers: readonly string[];
+
+  constructor(filterDrivers: readonly string[]) {
+    super(
+      "Repository review is disabled because executable Git clean/process filters are active.",
+    );
+    this.name = "UnsafeGitReviewConfigurationError";
+    this.filterDrivers = filterDrivers
+      .slice(0, 8)
+      .map((driver) => driver.length <= 128 ? driver : "(oversized driver name)");
+  }
+}
+
 interface RetainedReviewPatch {
   key: string;
   workspaceId: string;
   pagingScope: ReviewPagingScope;
-  since: ReviewSince;
   revision: string;
   result: Omit<ReviewChangesResult, "patch">;
   patch?: string;
@@ -76,11 +80,10 @@ interface RetainedReviewPatch {
 }
 
 interface RetainedReviewMetadata {
-  schemaVersion: 1;
+  schemaVersion: 2;
   key: string;
   workspaceId: string;
   pagingScope: ReviewPagingScope;
-  since: ReviewSince;
   revision: string;
   result: Omit<ReviewChangesResult, "patch">;
   patchBytes: number;
@@ -105,8 +108,6 @@ export interface ReviewCheckpointManagerOptions {
 interface WorkspaceReviewState {
   root: string;
   gitRoot?: string;
-  openRef: string;
-  baselineRef: string;
   diagnostic?: string;
   initialization?: Promise<void>;
   operationTail: Promise<void>;
@@ -116,33 +117,30 @@ interface WorkspaceReviewState {
 export interface ReviewCheckpointManager {
   activeWorkspaceIds(): string[];
   initializeWorkspace(input: { workspaceId: string; root: string }): Promise<void>;
+  reviewSource(input: {
+    workspaceId: string;
+    root: string;
+  }): Promise<"repository" | "apply_patch_history">;
   reviewChanges(input: {
     workspaceId: string;
     root: string;
-    since?: ReviewSince;
-    markReviewed?: boolean;
-    expectedRevision?: string;
     pagingScope?: ReviewPagingScope;
     /**
      * Continue an established paging session: serve the retained diff for this
-     * exact revision instead of snapshotting the worktree again. Ignored when
-     * the revision is not retained, and never honored while advancing.
+     * exact revision instead of snapshotting the repository again. Ignored when
+     * the revision is not retained.
      */
     continueRevision?: string;
+    /**
+     * Successful DevSpace apply_patch history for a non-Git Project. It is
+     * ignored for Git Projects, whose repository snapshot remains authoritative
+     * for this tool.
+     */
+    observedChanges?: ReviewChangesResult;
   }): Promise<ReviewChangesResult>;
   cleanupWorkspace(input: { workspaceId: string; root?: string }): Promise<void>;
-  cleanupStaleRefs(input: {
-    gitRoot: string;
-    activeWorkspaceIds?: Iterable<string>;
-    olderThanMs?: number;
-    maxWorkspaces?: number;
-    now?: number;
-  }): Promise<number>;
 }
 
-const REVIEW_REF_PREFIX = "refs/devspace/review";
-const DEFAULT_REVIEW_REF_RETENTION_MS = 30 * 24 * 60 * 60_000;
-const DEFAULT_MAX_REVIEW_WORKSPACES = 512;
 // Small diffs stay in memory for fast paging; every persistent deployment also
 // writes a private spool so page sequences survive manager/server recreation.
 const MAX_RETAINED_PATCH_BYTES = 2 * 1024 * 1024;
@@ -152,6 +150,37 @@ const MAX_RETAINED_METADATA_BYTES = 8 * 1024 * 1024;
 const MAX_RETAINED_PATCH_FILE_BYTES = 50 * 1024 * 1024;
 const RETAINED_PATCH_TTL_MS = 10 * 60_000;
 const RETAINED_KEY_PATTERN = /^[a-f0-9]{64}$/u;
+const READ_ONLY_GIT_ENV = {
+  GIT_OPTIONAL_LOCKS: "0",
+  GIT_TERMINAL_PROMPT: "0",
+  GIT_PAGER: "cat",
+  PAGER: "cat",
+  LC_ALL: "C",
+  LANG: "C",
+};
+const READ_ONLY_GIT_UNSET_ENV = [
+  "GIT_CONFIG_COUNT",
+  "GIT_CONFIG_PARAMETERS",
+  "GIT_EXTERNAL_DIFF",
+  "GIT_DIFF_OPTS",
+  "GIT_INDEX_FILE",
+  "GIT_WORK_TREE",
+  "GIT_DIR",
+  "GIT_COMMON_DIR",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  "GIT_CEILING_DIRECTORIES",
+  "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+  "GIT_ATTR_SOURCE",
+  "GIT_EXEC_PATH",
+] as const;
+const READ_ONLY_GIT_PREFIX = [
+  "--no-pager",
+  "-c",
+  "core.fsmonitor=false",
+] as const;
+const GIT_ATTRIBUTE_ARGUMENT_BYTES = 64 * 1024;
+const GIT_ATTRIBUTE_ARGUMENT_COUNT = 256;
 
 export function createReviewCheckpointManager(
   options: ReviewCheckpointManagerOptions = {},
@@ -169,14 +198,13 @@ export function createReviewCheckpointManager(
   async function initializeWorkspace(workspaceId: string, root: string): Promise<void> {
     let state = states.get(workspaceId);
     if (state) {
-      if (state.root !== root) throw new Error(`Workspace ${workspaceId} is already initialized for a different root.`);
-      if (state.closing) throw new Error(`Review checkpoints for workspace ${workspaceId} are being cleaned up.`);
+      if (state.root !== root) throw new Error(`Project runtime ${workspaceId} is already initialized for a different root.`);
+      if (state.closing) throw new Error(`Review state for Project runtime ${workspaceId} is being cleaned up.`);
       if (spoolRoot) await ensureSpoolRoot();
       if (state.initialization) return state.initialization;
     } else {
       state = {
         root,
-        ...reviewRefs(workspaceId),
         operationTail: Promise.resolve(),
         closing: false,
       };
@@ -185,29 +213,7 @@ export function createReviewCheckpointManager(
 
     const initializing = (async () => {
       try {
-        const eligibility = await getGitEligibility(root);
-        if (!eligibility.ok || !eligibility.gitRoot) {
-          state.diagnostic = eligibility.message ?? "show_changes requires a Git workspace in this version.";
-          return;
-        }
-
-        state.gitRoot = eligibility.gitRoot;
-        const refStatuses = await Promise.all([
-          reviewRefStatus(eligibility.gitRoot, state.openRef),
-          reviewRefStatus(eligibility.gitRoot, state.baselineRef),
-        ]);
-        if (refStatuses.every((status) => status === "valid")) return;
-        if (!refStatuses.every((status) => status === "missing")) {
-          throw new Error(
-            `Internal review checkpoint error for workspace ${workspaceId}: `
-            + `open ref is ${refStatuses[0]} and baseline ref is ${refStatuses[1]}. `
-            + "Refusing to reset review history.",
-          );
-        }
-
-        const commit = await createWorkingTreeSnapshot(eligibility.gitRoot);
-        await git(eligibility.gitRoot, ["update-ref", state.openRef, commit]);
-        await git(eligibility.gitRoot, ["update-ref", state.baselineRef, commit]);
+        state.gitRoot = await exactProjectGitRoot(root);
       } catch (error) {
         state.diagnostic = error instanceof Error ? error.message : String(error);
       }
@@ -219,7 +225,6 @@ export function createReviewCheckpointManager(
   const pagingKey = (
     workspaceId: string,
     pagingScope: ReviewPagingScope,
-    since: ReviewSince,
     revision: string,
   ): string => createHash("sha256")
     .update(workspaceId, "utf8")
@@ -227,8 +232,6 @@ export function createReviewCheckpointManager(
     .update(pagingScope.principalRef, "utf8")
     .update("\0", "utf8")
     .update(String(pagingScope.workspaceGeneration), "utf8")
-    .update("\0", "utf8")
-    .update(since, "utf8")
     .update("\0", "utf8")
     .update(revision, "utf8")
     .digest("hex");
@@ -384,10 +387,9 @@ export function createReviewCheckpointManager(
   async function retainReview(
     workspaceId: string,
     pagingScope: ReviewPagingScope,
-    since: ReviewSince,
     review: ReviewChangesResult,
   ): Promise<void> {
-    const key = pagingKey(workspaceId, pagingScope, since, review.revision);
+    const key = pagingKey(workspaceId, pagingScope, review.revision);
     const patchBytes = Buffer.byteLength(review.patch, "utf8");
     const patchHash = createHash("sha256").update(review.patch, "utf8").digest("hex");
     const retainedAt = now();
@@ -402,7 +404,6 @@ export function createReviewCheckpointManager(
       key,
       workspaceId,
       pagingScope: { ...pagingScope },
-      since,
       revision: review.revision,
       result,
       patchBytes,
@@ -415,11 +416,10 @@ export function createReviewCheckpointManager(
     if (paths) {
       await ensureSpoolRoot();
       const metadata: RetainedReviewMetadata = {
-        schemaVersion: 1,
+        schemaVersion: 2,
         key,
         workspaceId,
         pagingScope: { ...pagingScope },
-        since,
         revision: review.revision,
         result,
         patchBytes,
@@ -436,11 +436,10 @@ export function createReviewCheckpointManager(
   async function loadRetainedReview(
     workspaceId: string,
     pagingScope: ReviewPagingScope,
-    since: ReviewSince,
     revision: string,
   ): Promise<ReviewChangesResult | undefined> {
     if (spoolRoot) await ensureSpoolRoot();
-    const key = pagingKey(workspaceId, pagingScope, since, revision);
+    const key = pagingKey(workspaceId, pagingScope, revision);
     let retained = retainedPatches.get(key);
     if (!retained && spoolRoot) {
       const paths = spoolPaths(key)!;
@@ -454,7 +453,6 @@ export function createReviewCheckpointManager(
           metadata.workspaceId !== workspaceId ||
           metadata.pagingScope.principalRef !== pagingScope.principalRef ||
           metadata.pagingScope.workspaceGeneration !== pagingScope.workspaceGeneration ||
-          metadata.since !== since ||
           metadata.revision !== revision
         ) return undefined;
         retained = {
@@ -501,78 +499,67 @@ export function createReviewCheckpointManager(
     initializeWorkspace({ workspaceId, root }) {
       return initializeWorkspace(workspaceId, root);
     },
+    async reviewSource({ workspaceId, root }) {
+      await initializeWorkspace(workspaceId, root);
+      const state = states.get(workspaceId);
+      if (state?.diagnostic) throw new Error(state.diagnostic);
+      if (!state || state.closing) {
+        throw new Error(`Review state for Project runtime ${workspaceId} is unavailable.`);
+      }
+      return state.gitRoot ? "repository" : "apply_patch_history";
+    },
 
     async reviewChanges({
       workspaceId,
       root,
-      since = "last_shown",
-      markReviewed = true,
-      expectedRevision,
       continueRevision,
+      observedChanges,
       pagingScope = { principalRef: "local", workspaceGeneration: 0 },
     }) {
       await initializeWorkspace(workspaceId, root);
       const state = states.get(workspaceId);
 
       if (state?.diagnostic) throw new Error(state.diagnostic);
-      if (!state?.gitRoot) {
-        throw new Error("show_changes requires a Git workspace in this version.");
-      }
-      if (state.closing) throw new Error(`Review checkpoints for workspace ${workspaceId} are being cleaned up.`);
+      if (!state) throw new Error(`Review state for Project runtime ${workspaceId} is unavailable.`);
+      if (state.closing) throw new Error(`Review state for Project runtime ${workspaceId} is being cleaned up.`);
 
       return serialize(state, async () => {
         // Continuing a page sequence reads the diff that was materialized for
         // the first page. Recomputing here would make every page a fresh
-        // worktree snapshot, and any edit landing between pages would restart
-        // the sequence from byte zero. Advancing never takes this path: it has
-        // to observe the worktree as it is now to detect drift.
-        if (!markReviewed && continueRevision !== undefined) {
+        // repository snapshot, and any edit landing between pages would restart
+        // the sequence from byte zero.
+        if (continueRevision !== undefined) {
           const retained = await loadRetainedReview(
             workspaceId,
             pagingScope,
-            since,
             continueRevision,
           );
           if (!retained) throw new ReviewPagingExpiredError();
           return retained;
         }
 
-        const gitRoot = state.gitRoot!;
-        const baselineRef = since === "workspace_open" ? state.openRef : state.baselineRef;
-        const baseline = (await git(gitRoot, ["rev-parse", "--verify", `${baselineRef}^{commit}`])).stdout.trim();
-        const current = await createWorkingTreeSnapshot(gitRoot);
-        const patch = (await git(gitRoot, ["diff", "--binary", "--no-color", baseline, current], {
-          maxBuffer: 50 * 1024 * 1024,
-        })).stdout;
-        const numstat = (await git(gitRoot, ["diff", "--numstat", "-z", baseline, current], {
-          maxBuffer: 50 * 1024 * 1024,
-        })).stdout;
-        const files = parseNumstat(numstat);
+        if (!state.gitRoot) {
+          if (!observedChanges) {
+            throw new Error(
+              "show_changes requires server-observed apply_patch history for a non-Git Project.",
+            );
+          }
+          await retainReview(workspaceId, pagingScope, observedChanges);
+          return observedChanges;
+        }
+
+        const { head, patch, files } = await currentRepositoryChanges(state.gitRoot);
         const summary = summarizeFiles(files);
         const revision = `review_${createHash("sha256")
-          .update(baseline, "utf8")
+          .update(head, "utf8")
           .update("\0", "utf8")
           .update(patch, "utf8")
           .digest("base64url")}`;
 
-        if (markReviewed) {
-          if (expectedRevision !== undefined && expectedRevision !== revision) {
-            throw new ReviewRevisionChangedError();
-          }
-          await git(gitRoot, ["update-ref", state.baselineRef, current]);
-          try {
-            await discardWorkspaceRetained(workspaceId);
-          } catch (error) {
-            // The checkpoint has committed. Sidecar cleanup cannot turn a known
-            // successful mutation into an outcome-unknown operation.
-            onSpoolError(error);
-          }
-        }
-
         const reviewResult = {
           result:
             summary.files === 0
-              ? `No changes since ${since === "workspace_open" ? "workspace open" : "last shown changes"}.`
+              ? "No repository changes."
               : `Changed ${summary.files} ${summary.files === 1 ? "file" : "files"} (+${summary.additions} -${summary.removals}).`,
           summary,
           files,
@@ -580,42 +567,24 @@ export function createReviewCheckpointManager(
           revision,
         };
 
-        if (!markReviewed) {
-          await retainReview(workspaceId, pagingScope, since, reviewResult);
-        }
+        await retainReview(workspaceId, pagingScope, reviewResult);
 
         return reviewResult;
       });
     },
 
     async cleanupWorkspace({ workspaceId, root }) {
-      let state = states.get(workspaceId);
+      const state = states.get(workspaceId);
       if (!state) {
-        if (root === undefined) return;
-        const eligibility = await getGitEligibility(root);
-        if (!eligibility.ok || !eligibility.gitRoot) return;
-        state = {
-          root,
-          gitRoot: eligibility.gitRoot,
-          ...reviewRefs(workspaceId),
-          operationTail: Promise.resolve(),
-          closing: false,
-        };
-        states.set(workspaceId, state);
+        await discardWorkspaceRetained(workspaceId);
+        return;
       } else if (root !== undefined && state.root !== root) {
-        throw new Error(`Workspace ${workspaceId} is already initialized for a different root.`);
+        throw new Error(`Project runtime ${workspaceId} is already initialized for a different root.`);
       }
       state.closing = true;
       try {
         await state.initialization;
-        await serialize(state, async () => {
-          if (state.gitRoot) {
-            await Promise.all([
-              git(state.gitRoot, ["update-ref", "-d", state.openRef]),
-              git(state.gitRoot, ["update-ref", "-d", state.baselineRef]),
-            ]);
-          }
-        });
+        await serialize(state, async () => undefined);
       } finally {
         try {
           await discardWorkspaceRetained(workspaceId);
@@ -625,34 +594,6 @@ export function createReviewCheckpointManager(
           if (states.get(workspaceId) === state) states.delete(workspaceId);
         }
       }
-    },
-
-    async cleanupStaleRefs({
-      gitRoot,
-      activeWorkspaceIds = [],
-      olderThanMs = DEFAULT_REVIEW_REF_RETENTION_MS,
-      maxWorkspaces = DEFAULT_MAX_REVIEW_WORKSPACES,
-      now = Date.now(),
-    }) {
-      const activeSegments = new Set(Array.from(activeWorkspaceIds, safeWorkspaceRefSegment));
-      const output = (await git(gitRoot, [
-        "for-each-ref",
-        "--format=%(refname)%00%(creatordate:unix)",
-        REVIEW_REF_PREFIX,
-      ])).stdout;
-      const refs = parseReviewRefs(output).filter((entry) => !activeSegments.has(entry.segment));
-      const newestBySegment = new Map<string, number>();
-      for (const entry of refs) {
-        newestBySegment.set(entry.segment, Math.max(newestBySegment.get(entry.segment) ?? 0, entry.createdAt));
-      }
-      const inactive = Array.from(newestBySegment, ([segment, createdAt]) => ({ segment, createdAt }))
-        .sort((left, right) => right.createdAt - left.createdAt);
-      const expired = new Set(inactive
-        .filter((entry, index) => now - entry.createdAt > olderThanMs || index >= maxWorkspaces)
-        .map((entry) => entry.segment));
-      const deleting = refs.filter((entry) => expired.has(entry.segment));
-      await Promise.all(deleting.map((entry) => git(gitRoot, ["update-ref", "-d", entry.ref])));
-      return deleting.length;
     },
   };
 }
@@ -668,7 +609,6 @@ function parseRetainedReviewMetadata(
   const files = Array.isArray(result?.files)
     ? result.files.map(parseRetainedReviewFile)
     : undefined;
-  const since = record?.since;
   const patchBytes = safeNonNegativeInteger(record?.patchBytes);
   const retainedAt = safeNonNegativeInteger(record?.retainedAt);
   const workspaceGeneration = safeNonNegativeInteger(pagingScope?.workspaceGeneration);
@@ -676,13 +616,12 @@ function parseRetainedReviewMetadata(
   const additions = safeNonNegativeInteger(summary?.additions);
   const removals = safeNonNegativeInteger(summary?.removals);
   if (
-    record?.schemaVersion !== 1 ||
+    record?.schemaVersion !== 2 ||
     record.key !== expectedKey ||
     !RETAINED_KEY_PATTERN.test(expectedKey) ||
     typeof record.workspaceId !== "string" || !record.workspaceId ||
     typeof pagingScope?.principalRef !== "string" || !pagingScope.principalRef ||
     workspaceGeneration === undefined ||
-    (since !== "last_shown" && since !== "last_review" && since !== "workspace_open") ||
     typeof record.revision !== "string" || !record.revision.startsWith("review_") ||
     typeof result?.result !== "string" ||
     typeof result.revision !== "string" || result.revision !== record.revision ||
@@ -694,14 +633,13 @@ function parseRetainedReviewMetadata(
   ) return undefined;
 
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     key: expectedKey,
     workspaceId: record.workspaceId,
     pagingScope: {
       principalRef: pagingScope.principalRef,
       workspaceGeneration,
     },
-    since,
     revision: record.revision,
     result: {
       result: result.result,
@@ -753,28 +691,6 @@ function safeNonNegativeInteger(value: unknown): number | undefined {
     : undefined;
 }
 
-type ReviewRefStatus = "missing" | "valid" | "invalid";
-
-async function reviewRefStatus(gitRoot: string, ref: string): Promise<ReviewRefStatus> {
-  try {
-    await git(gitRoot, ["show-ref", "--verify", "--quiet", ref]);
-  } catch (error) {
-    return commandExitCode(error) === 1 ? "missing" : "invalid";
-  }
-
-  try {
-    await git(gitRoot, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`]);
-    return "valid";
-  } catch {
-    return "invalid";
-  }
-}
-
-function commandExitCode(error: unknown): number | undefined {
-  if (!error || typeof error !== "object" || !("code" in error)) return undefined;
-  return typeof error.code === "number" ? error.code : undefined;
-}
-
 async function serialize<T>(state: WorkspaceReviewState, operation: () => Promise<T>): Promise<T> {
   const previous = state.operationTail;
   let release!: () => void;
@@ -789,52 +705,330 @@ async function serialize<T>(state: WorkspaceReviewState, operation: () => Promis
   }
 }
 
-function parseReviewRefs(output: string): Array<{ ref: string; segment: string; createdAt: number }> {
-  const entries: Array<{ ref: string; segment: string; createdAt: number }> = [];
-  for (const line of output.split("\n")) {
-    if (!line) continue;
-    const [ref, timestamp] = line.split("\0");
-    const suffix = ref?.slice(`${REVIEW_REF_PREFIX}/`.length);
-    const segment = suffix?.split("/")[0];
-    const createdAt = Number(timestamp) * 1_000;
-    if (!ref?.startsWith(`${REVIEW_REF_PREFIX}/`) || !segment || !Number.isFinite(createdAt)) continue;
-    entries.push({ ref, segment, createdAt });
-  }
-  return entries;
-}
-
-function reviewRefs(workspaceId: string): Pick<WorkspaceReviewState, "openRef" | "baselineRef"> {
-  const segment = safeWorkspaceRefSegment(workspaceId);
-  return {
-    openRef: `${REVIEW_REF_PREFIX}/${segment}/open`,
-    baselineRef: `${REVIEW_REF_PREFIX}/${segment}/baseline`,
-  };
-}
-
-async function createWorkingTreeSnapshot(gitRoot: string): Promise<string> {
-  const tempDir = await mkdtemp(join(tmpdir(), "devspace-review-index-"));
-  const indexPath = join(tempDir, "index");
-  const env = checkpointEnv(indexPath);
-
+async function exactProjectGitRoot(root: string): Promise<string | undefined> {
+  let gitRoot: string;
   try {
-    await git(gitRoot, ["read-tree", "HEAD"], { env });
-    await git(gitRoot, ["add", "-A", "--", "."], { env });
-    const tree = (await git(gitRoot, ["write-tree"], { env })).stdout.trim();
-    const parent = (await git(gitRoot, ["rev-parse", "--verify", "HEAD^{commit}"])).stdout.trim();
-    return (await git(gitRoot, ["commit-tree", tree, "-p", parent, "-m", "DevSpace review snapshot"], { env })).stdout.trim();
-  } finally {
-    await rm(tempDir, { recursive: true, force: true });
+    gitRoot = (await readOnlyGit(root, ["rev-parse", "--show-toplevel"])).stdout.trim();
+  } catch (error) {
+    if (isMissingGitExecutable(error) || isNotWorkTree(error)) return undefined;
+    throw error;
+  }
+  if (!gitRoot) return undefined;
+  const [canonicalProjectRoot, canonicalGitRoot] = await Promise.all([
+    realpath(root),
+    realpath(gitRoot),
+  ]);
+  return canonicalProjectRoot === canonicalGitRoot ? canonicalProjectRoot : undefined;
+}
+
+async function currentRepositoryChanges(
+  gitRoot: string,
+): Promise<{ head: string; patch: string; files: ReviewFile[] }> {
+  const { untrackedPaths } = await safeReviewPathInventory(gitRoot);
+  const head = await currentHead(gitRoot);
+  const tracked = head
+    ? await diffAgainstHead(gitRoot)
+    : await diffUnbornRepository(gitRoot);
+  let patch = tracked.patch;
+  const files = [...tracked.files];
+  const nullDevice = process.platform === "win32" ? "NUL" : "/dev/null";
+  for (const path of untrackedPaths) {
+    const [untrackedPatch, untrackedNumstat] = await Promise.all([
+      gitNoIndexDiff(gitRoot, [
+        "--binary",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--",
+        nullDevice,
+        path,
+      ]),
+      gitNoIndexDiff(gitRoot, [
+        "--numstat",
+        "-z",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--",
+        nullDevice,
+        path,
+      ]),
+    ]);
+    patch += untrackedPatch.stdout;
+    if (Buffer.byteLength(patch, "utf8") > MAX_RETAINED_PATCH_FILE_BYTES) {
+      throw new Error("Repository diff exceeds the review output limit.");
+    }
+    const numstatTerminator = untrackedNumstat.stdout.indexOf("\0");
+    const numstatHeader = numstatTerminator === -1
+      ? untrackedNumstat.stdout
+      : untrackedNumstat.stdout.slice(0, numstatTerminator);
+    const [additions, removals] = numstatHeader
+      .split("\t")
+      .map(parseStatNumber);
+    files.push({
+      path,
+      type: "new",
+      additions: additions ?? 0,
+      removals: removals ?? 0,
+    });
+  }
+
+  return {
+    head: head ?? "unborn",
+    patch,
+    files,
+  };
+}
+
+async function diffAgainstHead(
+  gitRoot: string,
+): Promise<{ patch: string; files: ReviewFile[] }> {
+  const [patch, numstat] = await Promise.all([
+    readOnlyGit(gitRoot, [
+      "diff",
+      "--binary",
+      "--no-color",
+      "--no-ext-diff",
+      "--no-textconv",
+      "HEAD",
+      "--",
+      ".",
+    ]),
+    readOnlyGit(gitRoot, [
+      "diff",
+      "--numstat",
+      "-z",
+      "--no-ext-diff",
+      "--no-textconv",
+      "HEAD",
+      "--",
+      ".",
+    ]),
+  ]);
+  return { patch: patch.stdout, files: parseNumstat(numstat.stdout) };
+}
+
+async function diffUnbornRepository(
+  gitRoot: string,
+): Promise<{ patch: string; files: ReviewFile[] }> {
+  const patchArguments = [
+    "--binary",
+    "--no-color",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--",
+    ".",
+  ];
+  const numstatArguments = [
+    "--numstat",
+    "-z",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--",
+    ".",
+  ];
+  const [stagedPatch, unstagedPatch, stagedNumstat, unstagedNumstat] = await Promise.all([
+    readOnlyGit(gitRoot, ["diff", "--cached", ...patchArguments]),
+    readOnlyGit(gitRoot, ["diff", ...patchArguments]),
+    readOnlyGit(gitRoot, ["diff", "--cached", ...numstatArguments]),
+    readOnlyGit(gitRoot, ["diff", ...numstatArguments]),
+  ]);
+  return {
+    patch: joinPatchSegments(stagedPatch.stdout, unstagedPatch.stdout),
+    files: coalesceSequentialFiles([
+      ...parseNumstat(stagedNumstat.stdout),
+      ...parseNumstat(unstagedNumstat.stdout),
+    ]),
+  };
+}
+
+async function currentHead(gitRoot: string): Promise<string | undefined> {
+  try {
+    const result = await readOnlyGit(gitRoot, [
+      "rev-parse",
+      "--verify",
+      "--quiet",
+      "HEAD^{commit}",
+    ]);
+    return result.stdout.trim() || undefined;
+  } catch (error) {
+    if (gitExitCode(error) === 1 || gitExitCode(error) === 128) return undefined;
+    throw error;
   }
 }
 
-function checkpointEnv(indexPath: string): NodeJS.ProcessEnv {
+async function safeReviewPathInventory(
+  gitRoot: string,
+): Promise<{ untrackedPaths: string[] }> {
+  const [allResult, untrackedResult] = await Promise.all([
+    readOnlyGit(gitRoot, [
+      "ls-files",
+      "--cached",
+      "--others",
+      "--exclude-standard",
+      "-z",
+      "--",
+      ".",
+    ]),
+    readOnlyGit(gitRoot, [
+      "ls-files",
+      "--others",
+      "--exclude-standard",
+      "-z",
+      "--",
+      ".",
+    ]),
+  ]);
+  const allPaths = allResult.stdout.split("\0").filter(Boolean);
+  await assertNoExecutableFilters(gitRoot, allPaths);
   return {
-    GIT_INDEX_FILE: indexPath,
-    GIT_AUTHOR_NAME: "DevSpace",
-    GIT_AUTHOR_EMAIL: "devspace@users.noreply.local",
-    GIT_COMMITTER_NAME: "DevSpace",
-    GIT_COMMITTER_EMAIL: "devspace@users.noreply.local",
+    untrackedPaths: untrackedResult.stdout.split("\0").filter(Boolean),
   };
+}
+
+async function assertNoExecutableFilters(
+  gitRoot: string,
+  paths: readonly string[],
+): Promise<void> {
+  const filterDrivers = new Set<string>();
+  for (const batch of gitPathBatches(paths)) {
+    const result = await readOnlyGit(gitRoot, [
+      "check-attr",
+      "-z",
+      "filter",
+      "--",
+      ...batch,
+    ]);
+    const fields = result.stdout.split("\0");
+    for (let index = 0; index + 2 < fields.length; index += 3) {
+      const value = fields[index + 2];
+      if (
+        value &&
+        value !== "unspecified" &&
+        value !== "unset" &&
+        value !== "set"
+      ) {
+        filterDrivers.add(value);
+        if (filterDrivers.size > 128) {
+          throw new UnsafeGitReviewConfigurationError(["(too many filter drivers)"]);
+        }
+      }
+    }
+  }
+
+  const executableDrivers: string[] = [];
+  for (const driver of [...filterDrivers].sort()) {
+    if (
+      driver.length > 128 ||
+      !/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(driver)
+    ) {
+      executableDrivers.push("(invalid driver name)");
+      continue;
+    }
+    const commands = await Promise.all([
+      readOnlyGitAllowExit(gitRoot, ["config", "--get-all", `filter.${driver}.clean`], [1]),
+      readOnlyGitAllowExit(gitRoot, ["config", "--get-all", `filter.${driver}.process`], [1]),
+    ]);
+    if (commands.some((command) => command.stdout.trim().length > 0)) {
+      executableDrivers.push(driver);
+    }
+  }
+  if (executableDrivers.length > 0) {
+    throw new UnsafeGitReviewConfigurationError(executableDrivers);
+  }
+}
+
+function gitPathBatches(paths: readonly string[]): string[][] {
+  const batches: string[][] = [];
+  let batch: string[] = [];
+  let bytes = 0;
+  for (const path of paths) {
+    const pathBytes = Buffer.byteLength(path, "utf8") + 1;
+    if (
+      batch.length > 0 &&
+      (
+        batch.length >= GIT_ATTRIBUTE_ARGUMENT_COUNT ||
+        bytes + pathBytes > GIT_ATTRIBUTE_ARGUMENT_BYTES
+      )
+    ) {
+      batches.push(batch);
+      batch = [];
+      bytes = 0;
+    }
+    batch.push(path);
+    bytes += pathBytes;
+  }
+  if (batch.length > 0) batches.push(batch);
+  return batches;
+}
+
+function joinPatchSegments(...segments: string[]): string {
+  return segments
+    .filter((segment) => segment.length > 0)
+    .map((segment) => segment.endsWith("\n") ? segment : `${segment}\n`)
+    .join("");
+}
+
+async function gitNoIndexDiff(gitRoot: string, args: string[]): Promise<GitCommandResult> {
+  return readOnlyGitAllowExit(gitRoot, ["diff", "--no-index", ...args], [1]);
+}
+
+async function readOnlyGit(
+  gitRoot: string,
+  args: string[],
+): Promise<GitCommandResult> {
+  return git(gitRoot, [...READ_ONLY_GIT_PREFIX, ...args], {
+    env: READ_ONLY_GIT_ENV,
+    unsetEnv: READ_ONLY_GIT_UNSET_ENV,
+    maxBuffer: MAX_RETAINED_PATCH_FILE_BYTES,
+  });
+}
+
+async function readOnlyGitAllowExit(
+  gitRoot: string,
+  args: string[],
+  allowedExitCodes: readonly number[],
+): Promise<GitCommandResult> {
+  try {
+    return await readOnlyGit(gitRoot, args);
+  } catch (error) {
+    const commandError = error as {
+      code?: number;
+      stdout?: string | Buffer;
+      stderr?: string | Buffer;
+    };
+    if (
+      typeof commandError.code !== "number" ||
+      !allowedExitCodes.includes(commandError.code)
+    ) throw error;
+    return {
+      stdout: commandOutput(commandError.stdout),
+      stderr: commandOutput(commandError.stderr),
+    };
+  }
+}
+
+function gitExitCode(error: unknown): number | string | undefined {
+  return error && typeof error === "object" && "code" in error
+    ? (error as { code?: number | string }).code
+    : undefined;
+}
+
+function isMissingGitExecutable(error: unknown): boolean {
+  return gitExitCode(error) === "ENOENT";
+}
+
+function isNotWorkTree(error: unknown): boolean {
+  if (gitExitCode(error) !== 128) return false;
+  const stderr = error && typeof error === "object" && "stderr" in error
+    ? commandOutput((error as { stderr?: string | Buffer }).stderr)
+    : "";
+  return stderr.includes("not a git repository") ||
+    stderr.includes("must be run in a work tree");
+}
+
+function commandOutput(output: string | Buffer | undefined): string {
+  if (typeof output === "string") return output;
+  return output?.toString("utf8") ?? "";
 }
 
 function parseNumstat(output: string): ReviewFile[] {
@@ -867,6 +1061,29 @@ function parseNumstat(output: string): ReviewFile[] {
   }
 
   return files;
+}
+
+function coalesceSequentialFiles(files: readonly ReviewFile[]): ReviewFile[] {
+  const coalesced = new Map<string, ReviewFile>();
+  for (const file of files) {
+    const key = `${file.previousPath ?? ""}\0${file.path}`;
+    const existing = coalesced.get(key);
+    if (!existing) {
+      coalesced.set(key, { ...file });
+      continue;
+    }
+    if (existing.type === "new" && file.type === "deleted") {
+      coalesced.delete(key);
+      continue;
+    }
+    coalesced.set(key, {
+      ...existing,
+      type: existing.type === "new" ? "new" : file.type,
+      additions: existing.additions + file.additions,
+      removals: existing.removals + file.removals,
+    });
+  }
+  return [...coalesced.values()];
 }
 
 function parseStatNumber(value: string | undefined): number {

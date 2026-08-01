@@ -14,10 +14,7 @@ interface RevocationCleanupJobRow {
   connectionPrincipalId: string;
   workspaceId: string;
   workspaceRoot: string;
-  workspaceMode: WorkspaceMode;
-  sourceRoot: string | null;
-  managed: string;
-  dirtySource: string;
+  projectExecutionId: string | null;
   status: RevocationCleanupJobStatus;
   claimToken: string | null;
   leaseExpiresAt: string | null;
@@ -38,16 +35,15 @@ interface RevocationDirtyWorktreeArtifactRow {
   recordedAt: string;
 }
 
-export type WorkspaceMode = "checkout" | "worktree";
 export type WorkspaceStatus = "active" | "closed" | "revoked";
 export type WorkspaceWriteAccess = "read_only" | "read_write";
 
 export class WorkspaceQuotaError extends Error {
-  readonly code: "active_workspace_quota" | "managed_worktree_quota";
+  readonly code: "active_workspace_quota";
   readonly publicText: string;
 
   constructor(
-    code: "active_workspace_quota" | "managed_worktree_quota",
+    code: "active_workspace_quota",
     publicText: string,
   ) {
     super(publicText);
@@ -64,12 +60,6 @@ export interface WorkspaceSession {
   root: string;
   canonicalRoot?: string;
   status: WorkspaceStatus;
-  mode: WorkspaceMode;
-  sourceRoot?: string;
-  baseRef?: string;
-  baseSha?: string;
-  dirtySource: boolean;
-  managed: boolean;
   writeAccess: WorkspaceWriteAccess;
   stateGeneration: number;
   createdAt: string;
@@ -78,9 +68,6 @@ export interface WorkspaceSession {
 
 export interface ActiveWorkspaceSummary {
   alias: string;
-  mode: WorkspaceMode;
-  managed: boolean;
-  dirtySource?: boolean;
   writeAccess: WorkspaceWriteAccess;
   stateGeneration: number;
   createdAt: string;
@@ -105,10 +92,7 @@ export interface RevocationCleanupJob {
   connectionPrincipalId: string;
   workspaceId: string;
   workspaceRoot: string;
-  workspaceMode: WorkspaceMode;
-  sourceRoot?: string;
-  managed: boolean;
-  dirtySource: boolean;
+  projectExecutionId?: string;
   status: RevocationCleanupJobStatus;
   claimToken?: string;
   leaseExpiresAt?: string;
@@ -140,38 +124,9 @@ export interface WorkspaceStore {
     connectionPrincipalId: string;
     alias?: string;
     root: string;
-    mode?: WorkspaceMode;
-    sourceRoot?: string;
-    baseRef?: string;
-    baseSha?: string;
-    dirtySource?: boolean;
-    managed?: boolean;
     writeAccess?: WorkspaceWriteAccess;
     stateGeneration?: number;
-    maxActiveSessionsPerClient?: number;
   }): WorkspaceSession;
-  createOrReuseManagedSession?(input: {
-    id: string;
-    connectionPrincipalId: string;
-    alias?: string;
-    root: string;
-    sourceRoot: string;
-    baseRef: string;
-    baseSha: string;
-    dirtySource: boolean;
-    forceNew?: boolean;
-    stateGeneration?: number;
-    maxActiveSessionsPerClient?: number;
-  }): WorkspaceSession;
-  findActiveManagedSession?(
-    connectionPrincipalId: string,
-    sourceRoot: string,
-    baseSha: string,
-  ): WorkspaceSession | undefined;
-  findActiveManagedSessionsBySource?(
-    connectionPrincipalId: string,
-    sourceRoot: string,
-  ): WorkspaceSession[];
   createOrReuseCheckoutSession?(input: {
     id: string;
     connectionPrincipalId: string;
@@ -182,7 +137,6 @@ export interface WorkspaceStore {
     replaceWriteAccess?: boolean;
     requestedAlias?: string | null;
     stateGeneration?: number;
-    maxActiveSessionsPerClient?: number;
   }): WorkspaceSession;
   getActiveSessionByAlias?(connectionPrincipalId: string, alias: string): WorkspaceSession | undefined;
   getSessionByAlias?(connectionPrincipalId: string, alias: string): WorkspaceSession | undefined;
@@ -196,11 +150,6 @@ export interface WorkspaceStore {
     connectionPrincipalId: string,
     stateGeneration: number,
   ): boolean;
-  updateManagedSessionBaseSha?(
-    id: string,
-    connectionPrincipalId: string,
-    baseSha: string,
-  ): boolean;
   bumpStateGeneration?(id: string, connectionPrincipalId: string): number | undefined;
   bumpActiveStateGenerations?(connectionPrincipalId?: string): WorkspaceGenerationUpdate[];
   revokeSession?(id: string, connectionPrincipalId: string): number | undefined;
@@ -212,16 +161,15 @@ export interface WorkspaceStore {
   finalizeRevocationCleanupJob?(input: {
     id: number;
     claimToken: string;
-    retainedDirtyWorktreeReason?: string;
     now?: number;
   }): boolean;
+  listRevocationDirtyWorktreeArtifacts?(limit?: number): RevocationDirtyWorktreeArtifact[];
   failRevocationCleanupJob?(input: {
     id: number;
     claimToken: string;
     error: string;
     now?: number;
   }): boolean;
-  listRevocationDirtyWorktreeArtifacts?(limit?: number): RevocationDirtyWorktreeArtifact[];
   cleanupRevocationHistory?(
     before: string,
     limit: number,
@@ -229,13 +177,11 @@ export interface WorkspaceStore {
   reactivateClosedSession?(
     id: string,
     connectionPrincipalId: string,
-    maxActiveSessionsPerClient?: number,
   ): number | undefined;
   getSession(id: string, connectionPrincipalId: string): WorkspaceSession | undefined;
   touchSession(id: string, connectionPrincipalId: string): void;
   closeSession(id: string, connectionPrincipalId: string): boolean;
   deleteSession(id: string, connectionPrincipalId: string): boolean;
-  countManagedWorktrees(): number;
   countActiveSessions?(connectionPrincipalId?: string): number;
   listActiveSessions?(connectionPrincipalId?: string): WorkspaceSession[];
   closeSessions?(sessions: Array<{ id: string; connectionPrincipalId: string }>): number;
@@ -261,15 +207,8 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
     connectionPrincipalId: string;
     alias?: string;
     root: string;
-    mode?: WorkspaceMode;
-    sourceRoot?: string;
-    baseRef?: string;
-    baseSha?: string;
-    dirtySource?: boolean;
-    managed?: boolean;
     writeAccess?: WorkspaceWriteAccess;
     stateGeneration?: number;
-    maxActiveSessionsPerClient?: number;
   }): WorkspaceSession {
     const now = new Date().toISOString();
     const create = this.database.sqlite.transaction((): WorkspaceSession => {
@@ -279,23 +218,16 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
         alias: input.alias ?? generateWorkspaceAlias(
           this.database,
           input.connectionPrincipalId,
-          input.sourceRoot ?? input.root,
+          input.root,
           input.id,
         ),
         root: input.root,
         status: "active",
-        mode: input.mode ?? "checkout",
-        sourceRoot: input.sourceRoot,
-        baseRef: input.baseRef,
-        baseSha: input.baseSha,
-        dirtySource: input.dirtySource ?? false,
-        managed: input.managed ?? false,
         writeAccess: input.writeAccess ?? "read_write",
         stateGeneration: validateStateGeneration(input.stateGeneration ?? 1),
         createdAt: now,
         lastUsedAt: now,
       };
-      this.assertActiveSessionQuota(session.connectionPrincipalId, input.maxActiveSessionsPerClient);
       this.database.db
         .insert(workspaceSessions)
         .values({
@@ -303,14 +235,8 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
           connectionPrincipalId: session.connectionPrincipalId,
           alias: session.alias,
           root: session.root,
-          canonicalRoot: session.mode === "checkout" ? resolve(session.root) : null,
+          canonicalRoot: resolve(session.root),
           status: session.status,
-          mode: session.mode,
-          sourceRoot: session.sourceRoot ?? null,
-          baseRef: session.baseRef ?? null,
-          baseSha: session.baseSha ?? null,
-          dirtySource: String(session.dirtySource),
-          managed: String(session.managed),
           writeAccess: session.writeAccess,
           stateGeneration: session.stateGeneration,
           createdAt: session.createdAt,
@@ -320,102 +246,6 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
       return session;
     });
     return create.immediate();
-  }
-
-  createOrReuseManagedSession(input: {
-    id: string;
-    connectionPrincipalId: string;
-    alias?: string;
-    root: string;
-    sourceRoot: string;
-    baseRef: string;
-    baseSha: string;
-    dirtySource: boolean;
-    forceNew?: boolean;
-    stateGeneration?: number;
-    maxActiveSessionsPerClient?: number;
-  }): WorkspaceSession {
-    const now = new Date().toISOString();
-    const values = {
-      ...input,
-      stateGeneration: validateStateGeneration(input.stateGeneration ?? 1),
-      now,
-    };
-    const selectExisting = this.database.sqlite.prepare(`
-      select
-        id,
-        connection_principal_id as connectionPrincipalId,
-        alias,
-        root,
-        canonical_root as canonicalRoot,
-        status,
-        mode,
-        source_root as sourceRoot,
-        base_ref as baseRef,
-        base_sha as baseSha,
-        dirty_source as dirtySource,
-        managed,
-        write_access as writeAccess,
-        state_generation as stateGeneration,
-        created_at as createdAt,
-        last_used_at as lastUsedAt
-      from workspace_sessions
-      where connection_principal_id = @connectionPrincipalId
-        and source_root = @sourceRoot
-        and base_sha = @baseSha
-        and mode = 'worktree'
-        and managed = 'true'
-        and status = 'active'
-      order by last_used_at desc
-      limit 1
-    `);
-    const insertManaged = this.database.sqlite.prepare(`
-      insert into workspace_sessions (
-        id, connection_principal_id, alias, root, canonical_root, status, mode,
-        source_root, base_ref, base_sha, dirty_source, managed, write_access,
-        state_generation, created_at, last_used_at
-      ) values (
-        @id, @connectionPrincipalId, @alias, @root, null, 'active', 'worktree',
-        @sourceRoot, @baseRef, @baseSha, @dirtySource, 'true', 'read_write',
-        @stateGeneration, @now, @now
-      )
-      returning
-        id,
-        connection_principal_id as connectionPrincipalId,
-        alias,
-        root,
-        canonical_root as canonicalRoot,
-        status,
-        mode,
-        source_root as sourceRoot,
-        base_ref as baseRef,
-        base_sha as baseSha,
-        dirty_source as dirtySource,
-        managed,
-        write_access as writeAccess,
-        state_generation as stateGeneration,
-        created_at as createdAt,
-        last_used_at as lastUsedAt
-    `);
-    const createOrReuse = this.database.sqlite.transaction((): WorkspaceSessionRow => {
-      if (!input.forceNew) {
-        const existing = selectExisting.get(values) as WorkspaceSessionRow | undefined;
-        if (existing) return existing;
-      }
-      this.assertActiveSessionQuota(input.connectionPrincipalId, input.maxActiveSessionsPerClient);
-      return insertManaged.get({
-        ...values,
-        alias: input.alias ?? generateWorkspaceAlias(
-          this.database,
-          input.connectionPrincipalId,
-          input.sourceRoot,
-          input.id,
-        ),
-        dirtySource: String(input.dirtySource),
-      }) as WorkspaceSessionRow;
-    });
-
-    return rowToWorkspaceSession(createOrReuse.immediate());
   }
 
   createOrReuseCheckoutSession(input: {
@@ -428,12 +258,17 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
     replaceWriteAccess?: boolean;
     requestedAlias?: string | null;
     stateGeneration?: number;
-    maxActiveSessionsPerClient?: number;
   }): WorkspaceSession {
     const now = new Date().toISOString();
     const writeAccess = input.writeAccess ?? "read_write";
     const stateGeneration = validateStateGeneration(input.stateGeneration ?? 1);
-    const selectCanonical = this.database.sqlite.prepare(`
+    const alias = input.alias ?? generateWorkspaceAlias(
+      this.database,
+      input.connectionPrincipalId,
+      input.root,
+      input.id,
+    );
+    const selectAlias = this.database.sqlite.prepare(`
       select
         id,
         connection_principal_id as connectionPrincipalId,
@@ -441,22 +276,13 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
         root,
         canonical_root as canonicalRoot,
         status,
-        mode,
-        source_root as sourceRoot,
-        base_ref as baseRef,
-        base_sha as baseSha,
-        dirty_source as dirtySource,
-        managed,
         write_access as writeAccess,
         state_generation as stateGeneration,
         created_at as createdAt,
         last_used_at as lastUsedAt
       from workspace_sessions
       where connection_principal_id = @connectionPrincipalId
-        and canonical_root = @canonicalRoot
-        and mode = 'checkout'
-        and status in ('active', 'closed')
-      order by case status when 'active' then 0 else 1 end, last_used_at desc
+        and alias = @alias
       limit 1
     `);
     const updateExisting = this.database.sqlite.prepare(`
@@ -481,12 +307,6 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
         root,
         canonical_root as canonicalRoot,
         status,
-        mode,
-        source_root as sourceRoot,
-        base_ref as baseRef,
-        base_sha as baseSha,
-        dirty_source as dirtySource,
-        managed,
         write_access as writeAccess,
         state_generation as stateGeneration,
         created_at as createdAt,
@@ -494,28 +314,13 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
     `);
     const insertCheckout = this.database.sqlite.prepare(`
       insert into workspace_sessions (
-        id, connection_principal_id, alias, root, canonical_root, status, mode,
-        dirty_source, managed, write_access, state_generation, created_at, last_used_at
+        id, connection_principal_id, alias, root, canonical_root, status,
+        write_access, state_generation, created_at, last_used_at
       ) values (
-        @id, @connectionPrincipalId, @alias, @root, @canonicalRoot, 'active', 'checkout',
-        'false', 'false', @writeAccess, @stateGeneration, @now, @now
+        @id, @connectionPrincipalId, @alias, @root, @canonicalRoot, 'active',
+        @writeAccess, @stateGeneration, @now, @now
       )
-      on conflict(connection_principal_id, canonical_root)
-        where canonical_root is not null and mode = 'checkout' and status = 'active'
-      do update set
-        root = excluded.root,
-        write_access = case
-          when @replaceWriteAccess = 1 then excluded.write_access
-          else workspace_sessions.write_access
-        end,
-        state_generation = workspace_sessions.state_generation + case
-          when @replaceWriteAccess = 1
-            and workspace_sessions.write_access != excluded.write_access then 1
-          else 0
-        end,
-        last_used_at = excluded.last_used_at
-      where @requestedAlias is null
-        or workspace_sessions.alias = @requestedAlias
+      on conflict(connection_principal_id, alias) do nothing
       returning
         id,
         connection_principal_id as connectionPrincipalId,
@@ -523,12 +328,6 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
         root,
         canonical_root as canonicalRoot,
         status,
-        mode,
-        source_root as sourceRoot,
-        base_ref as baseRef,
-        base_sha as baseSha,
-        dirty_source as dirtySource,
-        managed,
         write_access as writeAccess,
         state_generation as stateGeneration,
         created_at as createdAt,
@@ -540,13 +339,15 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
         requestedAlias: string | null;
         now: string;
       }): WorkspaceSessionRow => {
-        const existing = selectCanonical.get(values) as WorkspaceSessionRow | undefined;
+        const existing = selectAlias.get(values) as WorkspaceSessionRow | undefined;
         if (existing) {
-          if (values.requestedAlias !== null && existing.alias !== values.requestedAlias) {
-            return existing;
-          }
-          if (existing.status === "closed") {
-            this.assertActiveSessionQuota(values.connectionPrincipalId, values.maxActiveSessionsPerClient);
+          if (
+            existing.status === "revoked" ||
+            existing.canonicalRoot !== values.canonicalRoot
+          ) {
+            throw new Error(
+              `Workspace alias ${values.alias} is already bound to another or revoked Project context.`,
+            );
           }
           return updateExisting.get({
             ...values,
@@ -554,24 +355,26 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
           }) as WorkspaceSessionRow;
         }
 
-        this.assertActiveSessionQuota(values.connectionPrincipalId, values.maxActiveSessionsPerClient);
         const inserted = insertCheckout.get({
           ...values,
-          alias: values.alias ?? generateWorkspaceAlias(
-            this.database,
-            values.connectionPrincipalId,
-            values.root,
-            values.id,
-          ),
         }) as WorkspaceSessionRow | undefined;
         if (inserted) return inserted;
-        const concurrent = selectCanonical.get(values) as WorkspaceSessionRow | undefined;
+        const concurrent = selectAlias.get(values) as WorkspaceSessionRow | undefined;
         if (!concurrent) throw new Error("Concurrent checkout workspace creation did not return a Workspace.");
+        if (
+          concurrent.status === "revoked" ||
+          concurrent.canonicalRoot !== values.canonicalRoot
+        ) {
+          throw new Error(
+            `Workspace alias ${values.alias} is already bound to another or revoked Project context.`,
+          );
+        }
         return concurrent;
       },
     );
     const row = getOrCreate.immediate({
       ...input,
+      alias,
       writeAccess,
       replaceWriteAccess: input.replaceWriteAccess ? 1 : 0,
       requestedAlias: input.requestedAlias === undefined
@@ -582,47 +385,6 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
     });
 
     return rowToWorkspaceSession(row);
-  }
-
-  findActiveManagedSession(
-    connectionPrincipalId: string,
-    sourceRoot: string,
-    baseSha: string,
-  ): WorkspaceSession | undefined {
-    const row = this.database.db
-      .select()
-      .from(workspaceSessions)
-      .where(and(
-        eq(workspaceSessions.connectionPrincipalId, connectionPrincipalId),
-        eq(workspaceSessions.sourceRoot, sourceRoot),
-        eq(workspaceSessions.baseSha, baseSha),
-        eq(workspaceSessions.mode, "worktree"),
-        eq(workspaceSessions.managed, "true"),
-        eq(workspaceSessions.status, "active"),
-      ))
-      .orderBy(workspaceSessions.lastUsedAt)
-      .get();
-    return row ? rowToWorkspaceSession(row) : undefined;
-  }
-
-  findActiveManagedSessionsBySource(
-    connectionPrincipalId: string,
-    sourceRoot: string,
-  ): WorkspaceSession[] {
-    return this.database.db
-      .select()
-      .from(workspaceSessions)
-      .where(and(
-        eq(workspaceSessions.connectionPrincipalId, connectionPrincipalId),
-        eq(workspaceSessions.sourceRoot, sourceRoot),
-        eq(workspaceSessions.mode, "worktree"),
-        eq(workspaceSessions.managed, "true"),
-        eq(workspaceSessions.status, "active"),
-      ))
-      .orderBy(workspaceSessions.lastUsedAt)
-      .all()
-      .map(rowToWorkspaceSession)
-      .reverse();
   }
 
   getActiveSessionByAlias(connectionPrincipalId: string, alias: string): WorkspaceSession | undefined {
@@ -707,26 +469,6 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
     return result.changes > 0;
   }
 
-  updateManagedSessionBaseSha(
-    id: string,
-    connectionPrincipalId: string,
-    baseSha: string,
-  ): boolean {
-    if (!/^[0-9a-f]{40,64}$/u.test(baseSha)) {
-      throw new Error("Managed workspace base SHA must be a full hexadecimal commit ID.");
-    }
-    const result = this.database.sqlite.prepare(`
-      update workspace_sessions
-      set base_sha = ?, last_used_at = ?
-      where id = ?
-        and connection_principal_id = ?
-        and status = 'active'
-        and mode = 'worktree'
-        and managed = 'true'
-    `).run(baseSha, new Date().toISOString(), id, connectionPrincipalId);
-    return result.changes > 0;
-  }
-
   bumpStateGeneration(id: string, connectionPrincipalId: string): number | undefined {
     const row = this.database.sqlite.prepare(`
       update workspace_sessions
@@ -758,16 +500,44 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
   }
 
   revokeSession(id: string, connectionPrincipalId: string): number | undefined {
-    const row = this.database.sqlite.prepare(`
-      update workspace_sessions
-      set status = 'revoked',
-          state_generation = state_generation + 1,
-          last_used_at = ?
-      where id = ? and connection_principal_id = ? and status in ('active', 'closed')
-      returning state_generation as stateGeneration
-    `).get(new Date().toISOString(), id, connectionPrincipalId) as
-      | { stateGeneration: number }
-      | undefined;
+    const revoke = this.database.sqlite.transaction(() => {
+      const now = new Date().toISOString();
+      const row = this.database.sqlite.prepare(`
+        update workspace_sessions
+        set status = 'revoked',
+            state_generation = state_generation + 1,
+            last_used_at = ?
+        where id = ? and connection_principal_id = ? and status in ('active', 'closed')
+        returning state_generation as stateGeneration
+      `).get(now, id, connectionPrincipalId) as
+        | { stateGeneration: number }
+        | undefined;
+      if (!row) return undefined;
+      this.database.sqlite.prepare(`
+        insert into oauth_revocation_cleanup_jobs (
+          connection_principal_id, workspace_id, workspace_root, status,
+          claim_token, lease_expires_at, attempts, last_error, created_at,
+          updated_at, completed_at
+        )
+        select
+          connection_principal_id, id, root, 'pending',
+          null, null, 0, null, @now, @now, null
+        from workspace_sessions
+        where id = @id and connection_principal_id = @connectionPrincipalId
+        on conflict(connection_principal_id, workspace_id) do update set
+          workspace_root = excluded.workspace_root,
+          status = 'pending',
+          claim_token = null,
+          lease_expires_at = null,
+          attempts = 0,
+          last_error = null,
+          updated_at = excluded.updated_at,
+          completed_at = null
+        where oauth_revocation_cleanup_jobs.status = 'completed'
+      `).run({ now, id, connectionPrincipalId });
+      return row;
+    });
+    const row = revoke.immediate();
     return row?.stateGeneration;
   }
 
@@ -778,10 +548,7 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
         connection_principal_id as connectionPrincipalId,
         workspace_id as workspaceId,
         workspace_root as workspaceRoot,
-        workspace_mode as workspaceMode,
-        source_root as sourceRoot,
-        managed,
-        dirty_source as dirtySource,
+        project_execution_id as projectExecutionId,
         status,
         claim_token as claimToken,
         lease_expires_at as leaseExpiresAt,
@@ -826,10 +593,7 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
         connection_principal_id as connectionPrincipalId,
         workspace_id as workspaceId,
         workspace_root as workspaceRoot,
-        workspace_mode as workspaceMode,
-        source_root as sourceRoot,
-        managed,
-        dirty_source as dirtySource,
+        project_execution_id as projectExecutionId,
         status,
         claim_token as claimToken,
         lease_expires_at as leaseExpiresAt,
@@ -847,16 +611,12 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
   finalizeRevocationCleanupJob(input: {
     id: number;
     claimToken: string;
-    retainedDirtyWorktreeReason?: string;
     now?: number;
   }): boolean {
     const id = positiveInteger(input.id, "Revocation cleanup job id");
     const claimToken = nonEmptyString(input.claimToken, "Revocation cleanup claim token");
     const now = new Date(nonNegativeInteger(input.now ?? Date.now(), "Revocation cleanup clock"))
       .toISOString();
-    const reason = input.retainedDirtyWorktreeReason === undefined
-      ? undefined
-      : nonEmptyString(input.retainedDirtyWorktreeReason, "Dirty worktree retention reason");
     const finalize = this.database.sqlite.transaction(() => {
       const job = this.database.sqlite.prepare(`
         select
@@ -864,10 +624,7 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
           connection_principal_id as connectionPrincipalId,
           workspace_id as workspaceId,
           workspace_root as workspaceRoot,
-          workspace_mode as workspaceMode,
-          source_root as sourceRoot,
-          managed,
-          dirty_source as dirtySource,
+          project_execution_id as projectExecutionId,
           status,
           claim_token as claimToken,
           lease_expires_at as leaseExpiresAt,
@@ -882,29 +639,6 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
       if (!job) return false;
       if (job.status === "completed") return job.claimToken === claimToken;
       if (job.status !== "claimed" || job.claimToken !== claimToken) return false;
-
-      if (reason !== undefined) {
-        if (job.workspaceMode !== "worktree" || job.managed !== "true") {
-          throw new Error("Only managed worktree cleanup jobs can retain a dirty worktree artifact.");
-        }
-        this.database.sqlite.prepare(`
-          insert into oauth_revocation_dirty_worktree_artifacts (
-            job_id, connection_principal_id, workspace_id, workspace_root,
-            source_root, reason, recorded_at
-          ) values (?, ?, ?, ?, ?, ?, ?)
-          on conflict(job_id) do update set
-            reason = excluded.reason,
-            recorded_at = excluded.recorded_at
-        `).run(
-          job.id,
-          job.connectionPrincipalId,
-          job.workspaceId,
-          job.workspaceRoot,
-          job.sourceRoot,
-          reason,
-          now,
-        );
-      }
       const result = this.database.sqlite.prepare(`
         update oauth_revocation_cleanup_jobs
         set status = 'completed',
@@ -948,15 +682,16 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
   listRevocationDirtyWorktreeArtifacts(limit = 100): RevocationDirtyWorktreeArtifact[] {
     const rows = this.database.sqlite.prepare(`
       select
-        job_id as jobId,
-        connection_principal_id as connectionPrincipalId,
-        workspace_id as workspaceId,
+        legacy_job_id as jobId,
+        coalesce(legacy_connection_principal_id, 'owner') as connectionPrincipalId,
+        legacy_workspace_id as workspaceId,
         workspace_root as workspaceRoot,
         source_root as sourceRoot,
         reason,
         recorded_at as recordedAt
-      from oauth_revocation_dirty_worktree_artifacts
-      order by recorded_at desc, job_id desc
+      from legacy_managed_worktree_artifacts
+      where artifact_kind = 'dirty_artifact'
+      order by recorded_at desc, artifact_id desc
       limit ?
     `).all(cleanupBatchSize(limit)) as RevocationDirtyWorktreeArtifactRow[];
     return rows.map(rowToRevocationDirtyWorktreeArtifact);
@@ -1002,7 +737,6 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
   reactivateClosedSession(
     id: string,
     connectionPrincipalId: string,
-    maxActiveSessionsPerClient?: number,
   ): number | undefined {
     const reactivate = this.database.sqlite.transaction(() => {
       const closed = this.database.sqlite.prepare(`
@@ -1011,7 +745,6 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
         where id = ? and connection_principal_id = ? and status = 'closed'
       `).get(id, connectionPrincipalId);
       if (!closed) return undefined;
-      this.assertActiveSessionQuota(connectionPrincipalId, maxActiveSessionsPerClient);
       return this.database.sqlite.prepare(`
       update workspace_sessions
       set status = 'active',
@@ -1067,18 +800,12 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
   deleteSession(id: string, connectionPrincipalId: string): boolean {
     const result = this.database.db
       .delete(workspaceSessions)
-      .where(and(eq(workspaceSessions.id, id), eq(workspaceSessions.connectionPrincipalId, connectionPrincipalId)))
+      .where(and(
+        eq(workspaceSessions.id, id),
+        eq(workspaceSessions.connectionPrincipalId, connectionPrincipalId),
+      ))
       .run();
     return result.changes > 0;
-  }
-
-  countManagedWorktrees(): number {
-    const row = this.database.sqlite
-      .prepare(
-        "select count(*) as count from workspace_sessions where managed = 'true' and status = 'active'",
-      )
-      .get() as { count: number };
-    return row.count;
   }
 
   countActiveSessions(connectionPrincipalId?: string): number {
@@ -1177,22 +904,6 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
     this.database.close();
   }
 
-  private assertActiveSessionQuota(
-    connectionPrincipalId: string,
-    maxActiveSessionsPerClient: number | undefined,
-  ): void {
-    if (maxActiveSessionsPerClient === undefined) return;
-    if (!Number.isInteger(maxActiveSessionsPerClient) || maxActiveSessionsPerClient < 1) {
-      throw new Error("Active workspace session quota must be a positive integer.");
-    }
-    if (this.countActiveSessions(connectionPrincipalId) >= maxActiveSessionsPerClient) {
-      throw new WorkspaceQuotaError(
-        "active_workspace_quota",
-        `Active workspace session limit reached for this OAuth client (${maxActiveSessionsPerClient}). Close an unused workspace before opening another.`,
-      );
-    }
-  }
-
 }
 
 export function createWorkspaceStore(stateDir: string): WorkspaceStore {
@@ -1207,12 +918,6 @@ function rowToWorkspaceSession(row: WorkspaceSessionRow): WorkspaceSession {
     root: row.root,
     canonicalRoot: row.canonicalRoot ?? undefined,
     status: row.status,
-    mode: workspaceMode(row.mode),
-    sourceRoot: row.sourceRoot ?? undefined,
-    baseRef: row.baseRef ?? undefined,
-    baseSha: row.baseSha ?? undefined,
-    dirtySource: row.dirtySource === "true",
-    managed: row.managed === "true",
     writeAccess: workspaceWriteAccess(row.writeAccess),
     stateGeneration: validateStateGeneration(row.stateGeneration),
     createdAt: row.createdAt,
@@ -1223,9 +928,6 @@ function rowToWorkspaceSession(row: WorkspaceSessionRow): WorkspaceSession {
 function rowToActiveWorkspaceSummary(row: WorkspaceSessionRow): ActiveWorkspaceSummary {
   return {
     alias: row.alias,
-    mode: workspaceMode(row.mode),
-    managed: row.managed === "true",
-    ...(row.managed === "true" ? { dirtySource: row.dirtySource === "true" } : {}),
     writeAccess: workspaceWriteAccess(row.writeAccess),
     stateGeneration: validateStateGeneration(row.stateGeneration),
     createdAt: row.createdAt,
@@ -1239,10 +941,9 @@ function rowToRevocationCleanupJob(row: RevocationCleanupJobRow): RevocationClea
     connectionPrincipalId: row.connectionPrincipalId,
     workspaceId: row.workspaceId,
     workspaceRoot: row.workspaceRoot,
-    workspaceMode: row.workspaceMode,
-    ...(row.sourceRoot === null ? {} : { sourceRoot: row.sourceRoot }),
-    managed: row.managed === "true",
-    dirtySource: row.dirtySource === "true",
+    ...(row.projectExecutionId === null
+      ? {}
+      : { projectExecutionId: row.projectExecutionId }),
     status: row.status,
     ...(row.claimToken === null ? {} : { claimToken: row.claimToken }),
     ...(row.leaseExpiresAt === null ? {} : { leaseExpiresAt: row.leaseExpiresAt }),
@@ -1302,11 +1003,6 @@ function validateStateGeneration(stateGeneration: number): number {
     throw new Error("Workspace state generation must be a positive integer.");
   }
   return stateGeneration;
-}
-
-function workspaceMode(value: string): WorkspaceMode {
-  if (value === "checkout" || value === "worktree") return value;
-  throw new Error(`Unsupported Workspace mode: ${value}`);
 }
 
 function workspaceWriteAccess(value: string): WorkspaceWriteAccess {

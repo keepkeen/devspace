@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { openDatabase } from "./db/client.js";
 import { createServer } from "./server.js";
 import { writeDevspaceConfig } from "./user-config.js";
 import { SqliteWorkspaceStore } from "./workspace-store.js";
@@ -30,23 +29,12 @@ process.env.DEVSPACE_LOG_LEVEL = "silent";
 writeDevspaceConfig({
   allowedRoots: [rootA],
   stateDir,
-  worktreeRoot: join(testRoot, "worktrees"),
   publicBaseUrl: "http://127.0.0.1:7676",
 }, process.env);
-const identityDatabase = openDatabase(stateDir);
-try {
-  const now = new Date(0).toISOString();
-  identityDatabase.sqlite.prepare(`
-    insert into connection_principals (principal_id, created_at, last_used_at, revoked_at)
-    values (?, ?, ?, null)
-  `).run("startup-client", now, now);
-} finally {
-  identityDatabase.close();
-}
 const staleStore = new SqliteWorkspaceStore(stateDir);
 staleStore.createSession({
   id: "ws_stale_startup_root",
-  connectionPrincipalId: "startup-client",
+  connectionPrincipalId: "owner",
   root: rootB,
 });
 staleStore.close();
@@ -62,7 +50,7 @@ try {
   await waitFor(() => {
     const store = new SqliteWorkspaceStore(stateDir);
     try {
-      return store.getSession("ws_stale_startup_root", "startup-client") === undefined;
+      return store.getSession("ws_stale_startup_root", "owner") === undefined;
     } finally {
       store.close();
     }
@@ -71,7 +59,6 @@ try {
   writeDevspaceConfig({
     allowedRoots: [rootB],
     stateDir,
-    worktreeRoot: join(testRoot, "worktrees"),
     publicBaseUrl: "http://127.0.0.1:7676",
   }, process.env);
   await waitFor(() => running.config.allowedRoots[0] === canonicalRootB);
@@ -84,7 +71,6 @@ try {
   writeDevspaceConfig({
     allowedRoots: [rootA, rootB],
     stateDir,
-    worktreeRoot: join(testRoot, "worktrees"),
     publicBaseUrl: "http://127.0.0.1:7676",
   }, process.env);
   await waitFor(() => running.config.allowedRoots.length === 2);

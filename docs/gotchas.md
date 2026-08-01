@@ -1,405 +1,365 @@
 # Troubleshooting Gotchas
 
-This page collects the setup issues users are most likely to hit.
+This guide covers the supported ChatGPT-web-only DevSpace architecture.
 
-Commands below assume this fork was cloned, built with `npm run build`, and the
-current directory is the repository root. After `npm link`, `devspace` can be
-used instead of `node dist/cli.js`.
+## `devspace` command not found
 
-## `devspace` Command Not Found
-
-Use `npx`:
+The repository-local command is always:
 
 ```bash
-node dist/cli.js init
-node dist/cli.js serve
+node dist/cli.js --help
 ```
 
-If you installed globally, confirm npm's global bin directory is on `PATH`.
+The shorter `devspace` command requires:
 
-## Unsupported Node Version
+```bash
+npm link
+```
 
-DevSpace requires Node `>=22.19 <27`.
+Run both from the DevSpace source checkout.
 
-Check:
+## Unsupported Node version
+
+DevSpace requires Node.js `>=22.19 <27`. Check:
 
 ```bash
 node --version
+npm --version
 ```
 
-Install Node 22 LTS with your preferred version manager such as `nvm`, `fnm`, or
-`mise`.
+Use the same Node installation for `npm ci`, `npm run build`, and the running
+service.
 
-## `better-sqlite3` Could Not Load
+## `better-sqlite3` could not load
 
-This usually means native dependencies were installed under a different Node
-runtime.
-
-Try:
+This usually means dependencies were installed under a different Node ABI.
 
 ```bash
-npm rebuild better-sqlite3
-```
-
-Then run:
-
-```bash
+npm ci
+npm run build
 node dist/cli.js doctor
 ```
 
-Release starts run a native dependency check before launching.
+If a service manager starts DevSpace, verify that it uses the same absolute
+Node binary as the successful build.
 
-## Public URL Includes `/mcp`
+## Public URL includes `/mcp`
 
-Use the origin for setup:
-
-```text
-https://your-tunnel-host.example.com
-```
-
-Use the MCP endpoint in the client:
+Store only the public origin:
 
 ```text
-https://your-tunnel-host.example.com/mcp
+https://devspace.example.com
 ```
 
-If you saved the wrong value:
+Use the origin plus `/mcp` only as the ChatGPT app endpoint:
 
-```bash
-node dist/cli.js config set publicBaseUrl https://your-tunnel-host.example.com
+```text
+https://devspace.example.com/mcp
 ```
 
-## Tunnel URL Changed
-
-Temporary tunnels often change URLs between runs.
-
-For a one-off run:
-
-```bash
-DEVSPACE_PUBLIC_BASE_URL="https://new-tunnel.example.com" node dist/cli.js serve
-```
-
-For a stable URL:
+Fix an incorrect value with:
 
 ```bash
 node dist/cli.js config set publicBaseUrl https://devspace.example.com
 ```
 
-## Host Header Or 403 Problems
+Then restart DevSpace and update the ChatGPT app.
 
-DevSpace derives allowed hosts from the configured public URL.
+## Tunnel URL changed
 
-Run:
+Random quick-tunnel hostnames are temporary. After a change:
 
-```bash
-node dist/cli.js doctor
-```
+1. update `publicBaseUrl`;
+2. restart DevSpace;
+3. confirm local and public `/readyz`;
+4. update the ChatGPT app endpoint;
+5. approve a new OAuth grant.
 
-Confirm the public URL hostname appears in allowed hosts. If you changed tunnel
-URLs, update `publicBaseUrl`.
+A stable hostname avoids repeating this procedure.
 
-Use this only for intentional local debugging:
+## Host header or HTTP 403 problems
 
-```bash
-DEVSPACE_ALLOWED_HOSTS="*" node dist/cli.js serve
-```
+Verify:
 
-## OAuth Redirect Host Rejected
+- `DEVSPACE_PUBLIC_BASE_URL` matches the browser-visible HTTPS origin;
+- the reverse proxy preserves an expected `Host` header;
+- `DEVSPACE_ALLOWED_HOSTS`, if set, includes the actual host;
+- only the public service port is tunneled.
 
-By default, DevSpace allows redirects for:
+Do not proxy the loopback admin/control port.
 
-```text
-chatgpt.com
-localhost
-127.0.0.1
-```
+## OAuth redirect host rejected
 
-If another MCP client uses a different redirect host, configure:
+The redirect URI must use an allowed host. Configure
+`DEVSPACE_OAUTH_ALLOWED_REDIRECT_HOSTS` only for hosts you trust. Do not add a
+broad wildcard to make an unknown redirect pass.
 
-```bash
-DEVSPACE_OAUTH_ALLOWED_REDIRECT_HOSTS="chatgpt.com,example.com" node dist/cli.js serve
-```
+## Owner password not accepted
 
-## Owner Password Not Accepted
+The stored verifier cannot recover the plaintext Owner password. Check for:
 
-Make sure you are entering the Owner password from:
+- transcription errors;
+- a different `DEVSPACE_CONFIG_DIR`;
+- an environment override in `DEVSPACE_OAUTH_OWNER_TOKEN`;
+- a service manager using different environment settings.
 
-```text
-~/.devspace/auth.json
-```
+Do not paste the Owner password into ChatGPT or a repository file.
 
-To regenerate setup:
+## A previous OAuth connection stopped working
 
-```bash
-node dist/cli.js init --force
-```
+Approving connection B does not replace connection A. DevSpace supports
+multiple concurrently active grants, including several grants for the same
+OAuth client.
 
-Changing the Owner password revokes issued access and refresh tokens but keeps
-registered OAuth clients, so an existing ChatGPT connector can reauthorize.
+If A stopped working, check whether A's exact grant was revoked or expired,
+refresh-token replay invalidated it, its authorization epoch changed, or its
+approved Project was removed. Reauthorize A without revoking B. If separate
+people or trust domains require OS-level isolation, run separate DevSpace
+instances under separate OS users because grants do not sandbox shared local
+files or commands.
 
-## `invalid_client` While Reconnecting ChatGPT
+## `project_selection_required`
 
-This error occurs before Owner-password validation. It means ChatGPT cached an
-OAuth `client_id` that is no longer registered, usually after the Admin panel's
-**revoke all clients and tokens** action or after replacing the state database.
+More than one Project is approved, so `use_project` cannot use a default.
+Call `list_projects`, let the user choose, then retry creation with its returned
+`projectRef` and the intended `operationId`.
 
-Close the authorization page, remove the current DevSpace connection or app in
-ChatGPT, and add it again. Clicking **Connect** alone may reuse the stale client
-ID. DevSpace then accepts a fresh dynamic client registration and shows the
-normal Owner-password approval page. The registration stays unassigned until a
-successful approval, which creates a new local connection principal by default.
+With exactly one approved Project, call `use_project` directly with
+`operationId`; listing first is unnecessary.
 
-To deliberately recover aliases owned by the earlier principal, run locally:
+## `project_execution_required` or `project_execution_not_found`
 
-```bash
-devspace auth principals
-devspace auth reconnect-code <principal-id>
-```
+Every Project-scoped tool requires the opaque `executionRef` returned by
+`use_project`. DevSpace never infers it from a ChatGPT account, conversation,
+transport, or most-recent selection.
 
-Enter that code once on the new approval page. Do not paste it into ChatGPT.
-Without this explicit link, reopening the project creates isolated connection
-state.
+If the reference is missing, pass the known value. If it is invalid, closed, or
+belongs to a replaced grant, create a new execution. Do not send an absolute
+path or guess/edit the opaque reference.
 
-## Missing Or Stale Workspace Context
+## `project_execution_recovery_required`
 
-ChatGPT-style hosts normally use the server-side binding for the current
-`openai/session`. Generic MCP clients pass a v5 `continuation.receipt`. A raw
-`workspaceId`, generation, or expired receipt is never authority, and an
-explicitly supplied invalid receipt never falls back to host session state.
-
-First use of an approved path starts with `open_workspace`, which returns
-`selected` by default. Promote it with
-`get_workspace_context(contextMode="full")`; full context returns an instruction
-manifest, and target paths are loaded through `load_workspace_instructions`.
-
-In a later conversation or after backend restart, follow the structured recovery:
-call `list_workspaces`, select the intended alias or `workspaceRef`, then call
-`resume_workspace(contextMode="full")`. Only open a path again when
-`hasRetainedWorkspaces=false`. Refresh the ChatGPT app tools after upgrading so
-the host receives the v5 schemas.
-
-Stateless HTTP reconnects do not invalidate persisted Workspace records. Restart,
-receipt expiry, grant/principal/epoch changes, Owner credential rotation, root
-authority changes, and lifecycle transitions invalidate in-process context
-bindings.
-
-## Managed Worktree Is Missing Or Platform Closed The Session
-
-The MCP transport, receipt, and browser conversation connection are not the
-Workspace. A platform-side session closure should be handled by opening a new
-transport, calling `list_workspaces`, and resuming the alias selected by that
-conversation. The same connection principal may have several project aliases;
-do not pick another project's alias merely because both are visible.
-
-If the managed worktree directory cannot be found, DevSpace keeps the Workspace
-active and lists it as `recovery_required`. `resume_workspace` attempts to
-recreate the original path under the same Workspace ID. It first uses Git's
-registered worktree HEAD, which preserves committed work even when the folder
-was removed, then falls back to the saved base commit. The recovery result marks
-`dataLossPossible=true`: uncommitted files that disappeared with the directory
-cannot be reconstructed from Git.
-
-When `open_workspace(mode="worktree")` finds exactly one active worktree for the
-same source repository, it reuses it even if the source branch has moved. When
-several exist, `workspace_selection_required` returns their aliases. Resume the
-correct alias or explicitly use `forceNew=true`; do not enter a loop of creating
-new branches to replace an inaccessible one.
-
-`open_workspace` is for the first use of a host path. It returns metadata by
-default; call `get_workspace_context` with that receipt and
-`contextMode="full"` before work. Every later scoped result echoes
-`workspace` and `continuation`, but ordinary tools do not renew the receipt's
-fixed expiry. Revision hints are only a cache optimization in explicit
-`retained` mode and do not prove that a new model conversation remembers the
-bodies. Version 2.0 does not accept the removed `workspaceId`/generation
-request shape.
-
-MCP transport behavior follows `DEVSPACE_MCP_HTTP_TRANSPORT`, not the host name
-or OAuth redirect. Stateless is the default. In explicit stateful mode, an
-unknown transport session returns a dedicated 404 and the server records a
-redacted `unknown_mcp_session` diagnostic.
-
-For log correlation, `oauthClientRef` identifies the dynamic OAuth
-registration, while `connectionRef` identifies the local principal. Neither is
-a verified ChatGPT account. `workspaceActivityRef` identifies the principal
-plus Workspace handle, which separates work against different projects.
-ChatGPT does not currently provide DevSpace a documented thread/conversation
-ID, so two conversations using the same principal and reused Workspace cannot
-be labeled as separate threads without an explicit client handshake.
+The approved shared Project path cannot be recovered or no longer matches the
+persisted Project identity. Restore the directory or approve the intended
+Project again, then resume. Create another logical context with a new
+`operationId` only when that is the intended action. DevSpace does not repair or
+change Git state.
 
 ## `insufficient_scope`
 
-The access token authenticated successfully but lacks a capability required by
-that tool. Reauthorize with the indicated scope rather than retrying the tool.
-Common combinations are:
+The active OAuth grant lacks the capability required by the tool. The public
+scopes are:
 
-- writable checkout: `workspace:read workspace:write`
-- managed worktree: add `worktree:create`
-- command execution: add `process:execute network:access`
-- close/revoke: add `workspace:revoke`
+- `project:read` for selection, instructions, Skills, reads, inspection, and
+  change review;
+- `project:write` for patches;
+- `process:execute` for commands and process interaction.
 
-Version 2.0 accepts only the six explicit capability scopes.
+Approve a new grant with the required capabilities. Other active grants remain
+valid.
 
-## Workspace Path Rejected
+## Added root or Project is still missing
 
-The path must be inside one of the allowed roots configured during setup.
+`DEVSPACE_ALLOWED_ROOTS` is the service-wide ceiling. OAuth approval separately
+selects Projects within that ceiling.
 
-Run:
+After adding a root:
 
-```bash
-node dist/cli.js config get
-```
+1. verify the root in the local admin panel or `config get`;
+2. call `list_projects`;
+3. if the Project is not authorized, approve a new grant and select it;
+4. call `use_project` directly for one Project, or `list_projects → use_project`
+   when several are approved.
 
-Then either open a project under an allowed root or rerun setup:
+Never approve a broad parent directory merely to make discovery easier.
 
-```bash
-node dist/cli.js init --force
-```
+## Project path rejected
 
-## User Instructions Are Missing Or Unexpected
+File paths and command `workdir` values must resolve inside the referenced
+Project.
+Common causes are:
 
-DevSpace does not automatically read `~/.codex/AGENTS.md`. That file often
-contains Codex-specific operating policy which is unnecessary context for a
-ChatGPT web connector. To opt in to one user-level file, set it in the local
-Admin panel or configure:
+- an absolute path instead of a Project-relative path;
+- `..` traversal outside the checkout;
+- a symlink whose canonical target is outside the approved root;
+- a `workdir` that names a file or missing directory;
+- the root was removed after the Project was selected.
 
-```bash
-DEVSPACE_USER_INSTRUCTIONS_PATH=~/.devspace/AGENTS.md node dist/cli.js serve
-```
+Use a path relative to the selected Project. Do not weaken the approved-root
+configuration to accommodate an unrelated path.
 
-The path must be a readable file. A missing path, directory, or unreadable file
-causes `open_workspace` to fail instead of silently dropping policy. The user
-file and applicable project instructions share the 32 KiB budget. Saved path
-changes require a backend restart; an environment override locks the Admin
-field until the startup environment is changed.
+## Instructions are missing or unexpected
 
-## Worktree Mode Fails
+`use_project` returns a compact bounded root instruction delta. `read_files`
+and `inspect` return a newly applicable nested `instructionsDelta` with the
+target result. A mutation or command may instead return
+`instructions_required` and start no effect; review that delta before retrying.
 
-Worktree mode requires:
+Check:
 
-- Git installed
-- the path is inside a Git repository
-- the repository has at least one commit
-- the requested `baseRef` resolves to a commit
+- the instruction file is inside the approved checkout;
+- the filename and nesting match the repository convention;
+- `AGENTS.override.md` or `AGENTS.md` is used by default;
+- `CLAUDE.md` is listed in `projectDocFallbackFilenames` or
+  `DEVSPACE_PROJECT_DOC_FALLBACK_FILENAMES` if that explicit fallback is
+  intended;
+- the file fits the configured instruction limits;
+- `DEVSPACE_USER_INSTRUCTIONS_PATH`, if set, points to the intended file;
+- the call uses the intended `executionRef`.
 
-For a new repository, create the first commit or use checkout mode.
+## Skills do not appear
 
-Uncommitted source checkout changes are not copied into the managed worktree.
-Commit, stash, or ask the model to work in checkout mode if those changes are
-needed.
+Check:
 
-## Windows Shell Commands Fail
+- the Skill has a readable `SKILL.md`;
+- required manifest fields are present;
+- the directory is in a discovered or explicitly configured Skill root;
+- it is not listed in `DEVSPACE_DISABLED_SKILL_PATHS`.
 
-DevSpace shell execution requires Bash. Native PowerShell and `cmd.exe` command
-execution are not supported yet.
+Use `skills` with `action=search` for explicit discovery. Then use the same tool
+with `action=load` and a returned `skillId` before following the selected
+instructions. Skill bodies are intentionally lazy.
 
-Install Git for Windows and use Git Bash, or use WSL, MSYS2, or Cygwin Bash.
+## `ifMatch` or file-version conflict
 
-Run:
+The file changed after ChatGPT read it. This is a safety check, not a transient
+write failure.
 
-```bash
-node dist/cli.js doctor
-```
+Recovery:
 
-Confirm Bash is detected.
+1. read the current file;
+2. reconcile the intended edit with the new content;
+3. create a new patch using the current version;
+4. review with `show_changes`.
 
-## Skills Do Not Appear
+Do not remove the precondition or blindly overwrite the newer file.
 
-Skills are enabled by default. Check:
+## A retry reports an operation conflict
 
-```bash
-DEVSPACE_SKILLS=1 node dist/cli.js serve
-```
+Effectful calls use operation replay protection. Reusing an operation identifier
+with a different request body is rejected.
 
-DevSpace checks these standard Agent Skills layers:
+- Retry an identical lost-response request with the same identifier.
+- Use a new identifier for a logically new effect.
+- If the server reports an uncertain outcome, inspect files or process output
+  before deciding what to do next.
 
-- project `.agents/skills` directories from the approved repository boundary to workspace
-- `~/.agents/skills`
-- `DEVSPACE_ADMIN_SKILLS_DIR` (default `/etc/codex/skills`)
-- Skills bundled with DevSpace
+## Project root is busy
 
-It also checks compatibility and custom paths:
+Another DevSpace write or tracked command holds the root lock. An interactive or
+background command may keep the lease until its process tree exits or is cleaned
+up.
 
-- `~/.devspace/skills`
-- `DEVSPACE_AGENT_DIR/skills`, defaulting to `~/.codex/skills`
-- additional paths from `DEVSPACE_SKILL_PATHS`
+Wait or finish the owning process. Do not bypass the lock by running a second
+DevSpace instance against the same checkout. External editors are not covered
+by this lock, so file-version checks still matter.
 
-When `DEVSPACE_SUBAGENTS=1`, DevSpace loads agent profiles from
-`~/.devspace/agents/*.md` and project `.devspace/agents/*.md`, then exposes a
-compact profile catalog through `open_workspace`. The bundled
-`subagent-delegation` skill keeps the model-facing workflow to
-`devspace agents ls`, `devspace agents run`, and `devspace agents show`.
-`devspace agents ls` lists existing subagent sessions, not profile
-definitions.
+## A command can access paths outside the Project
 
-Packaged agent profile examples under `examples/agents/` are starter templates.
-Copy or adapt them into one of the active profile directories before use.
+That is the documented security boundary. DevSpace validates the declared
+`workdir`, but it does not sandbox the child process. The command has the
+authority of the OS user running DevSpace and can use absolute paths and the
+network.
 
-Legacy project paths such as `.pi/skills` can be added through `DEVSPACE_SKILL_PATHS` when needed.
+Use a dedicated low-privilege OS user, container, or VM when stronger isolation
+is required. Treat `process:execute` as high-trust access.
 
-If a Skill appears in full context, ChatGPT web should call `load_skill` with
-its `skillId` before reading other files inside the Skill directory. Skills
-marked `explicitOnly=true` are intentionally absent from automatic context;
-after an explicit user request, call `list_skills` with the exact name or query.
-Duplicate names require the returned ID. Check `DEVSPACE_DISABLED_SKILL_PATHS`
-when an explicitly queried Skill is still missing; the automatic catalog also
-reports eligible entries omitted by its 8,000-byte UTF-8 budget.
+## Windows shell command fails
 
-## Review Card Does Not Appear
+`exec_command.cmd` is interpreted by the platform runtime. Shell syntax and
+program names differ across operating systems. Use commands valid for the OS
+running DevSpace and set `workdir` separately.
 
-Per-tool widget cards are enabled by default with:
+Do not assume a Unix shell is present on Windows.
 
-```bash
-DEVSPACE_WIDGETS=full
-```
+## Command output is truncated
 
-The aggregate `show_changes` tool is exposed according to OAuth/tool profile;
-`DEVSPACE_WIDGETS=changes` only limits which tools receive iframe metadata.
-Plain MCP clients may ignore ChatGPT Apps widget metadata and consume the
-model-visible structured result.
+`max_output_tokens` bounds the output returned by `exec_command`. A long-running
+command may return a process handle instead of waiting for completion.
 
-The default `show_changes` call is a read-only preview and does not advance the
-review checkpoint. Repeat it freely with the current Workspace context and page
-with `diff.nextCursor` until `diff.eof=true`. The final page returns a signed
-`reviewToken`. Set `advanceCheckpoint: true` only with that token, or with an
-explicit user-approved `acknowledgeTruncated=true`; advancement requires
-`workspace:write` and a new `operationId`.
+Use:
 
-## A Batch Tool Shows Only a Summary
+- `read_process_output` with `sessionId` to poll a live process;
+- `write_stdin` with a fresh `operationId` only when input, close, interrupt,
+  or terminal resize is needed;
+- `read_process_output` with `outputId` for the first retained-output read;
+- a narrower test or log filter when output is too large.
 
-`batch_read` and `batch_inspect` intentionally keep their independent payloads
-in `structuredContent.items[]`. Text `content` contains only a short completion
-summary. Give inputs short `ref` values when order alone is fragile; results
-echo refs and report top-level `completed`, `partial`, or `failed` plus counts.
-Successful `batch_read` items contain workspace-relative path, content,
-contentHash, mtimeNs, offset, and optional paging/truncation metadata; failures
-contain `error`. `batch_inspect` items retain the compact `result` form. Absolute
-host paths/operations and the former aggregate result are not emitted.
-Update clients or adapters that only display text content, or use single-item
-tools when structured results are unavailable.
+Retained output is size- and time-limited. It is not permanent storage.
 
-Other heavy results also have one canonical model-visible location: a single
-file body is in text `content`; Skill bodies are in structured `skill.content`;
-process output is in structured `output.text`, `page.text`, or
-`search.matches`. These repository/process payloads include untrusted
-provenance. Do not fall back to `_meta.card.payload.content`; `_meta` is optional
-widget presentation and may be absent. For durable output, use signed cursors
-with page/tail/search/errors modes rather than copying a multi-megabyte log into
-one model turn.
+## `write_stdin` cannot find the process
 
-## Safe Backend Restart
+The process may have exited, expired, been cleaned up, or belong to an inactive
+authorization or Project context. Inspect the original `exec_command` result and
+try `read_process_output` if retained output is still available.
 
-A restart necessarily closes existing HTTP connections and invalidates old
-in-memory Workspace bindings and receipts. It does not delete durable aliases,
-Workspace records, operation state, or retained process-output metadata.
+Do not guess process identifiers from another execution. An empty
+`write_stdin` call is not a poll; it is rejected because the tool is
+mutation-only.
 
-Before using the local Admin controlled restart, inspect loopback diagnostics
-and verify that no other MCP request, tracked process, physical-root lease,
-Workspace closing transition, allowed-root cleanup, or active output remains.
-The diagnostics request itself briefly appears as one request/process/lease; it
-must be the only activity. After restart, require a changed PID and readiness
-generation, check public `/readyz`, and recover with
-`list_workspaces → resume_workspace` instead of reopening remembered paths.
+## A continuation cursor is rejected
 
-If diagnostics show another active request or process, do not restart. Let it
-finish or explicitly coordinate its termination first.
+Signed cursors are self-contained and bound to the active grant, Project
+generation, resource revision, query, and paging parameters. On continuation,
+pass the same `executionRef` and cursor. Do not repeat or change the original
+`outputId`, mode, query, offset, or limit beside it.
+
+If the resource or Project changed, restart the read without the stale cursor.
+
+## `show_changes` is empty
+
+Confirm:
+
+- `executionRef` identifies the logical context you intended;
+- the edit succeeded rather than failing an `ifMatch` check;
+- the execution is still active under the current grant.
+
+When the Project root is the Git top level, also confirm that the change is
+visible to the current repository diff. A Project nested inside a larger Git
+repository intentionally uses the non-Git source. That source includes only the
+exact successful DevSpace `apply_patch` requests recorded under that execution;
+it excludes command writes, external edits, and patches from other executions,
+even though those files are visible in the shared directory. It is a bounded
+chronological operation log, not a net filesystem diff. If it is full, create a
+new logical context for the same Project.
+
+`show_changes` is read-only and bounded. A very large result may return a
+summary; narrow inspection to the reported files.
+
+## `read_files` or `inspect` returns a summary
+
+`read_files` and `inspect` bound both input and output. Large requests may omit
+bodies or return a summary.
+
+Split the request into smaller, known file sets. Avoid repeatedly scanning the
+whole repository.
+
+## Safe backend restart
+
+Before restarting:
+
+1. note any running command;
+2. stop or finish interactive work when practical;
+3. restart only the DevSpace service;
+4. confirm local and public `/readyz`;
+5. reuse the existing `executionRef`, or call
+   `use_project({"executionRef":"..."})` to explicitly resume it.
+
+Restarting may clean up running or retained process state, but persisted
+executions are revalidated when their references are used again. DevSpace
+termination covers only process groups it started and still tracks, on a
+best-effort basis; detached or untracked descendants may survive. Restart does
+not delete Project files or change Git state.
+
+## Different executions see the same files
+
+That is deliberate. Executions isolate opaque references, authorization,
+instruction state, idempotency, processes, and non-Git patch journals; they do
+not isolate the filesystem. All executions bound to the same approved Project
+use that existing directory.
+
+Ask the model to use ordinary Git branches or worktrees when isolation is
+needed. DevSpace itself never creates, removes, resets, or prunes them.
+
+See [ChatGPT Tool Contract](./chatgpt-tool-contract.md) for the canonical
+surface and recovery behavior.

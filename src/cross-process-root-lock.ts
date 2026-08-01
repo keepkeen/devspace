@@ -72,12 +72,12 @@ export interface CrossProcessWorkspaceRootLockOptions {
 }
 
 export class WorkspaceRootLockTimeoutError extends Error {
-  readonly code = "workspace_root_busy";
+  readonly code = "project_busy";
   readonly publicText =
-    "Another DevSpace process or retained workspace process is using this physical workspace root. Retry after it finishes or use an isolated managed worktree.";
+    "Another DevSpace process or retained command is writing this Project. Retry after it finishes.";
 
   constructor() {
-    super("Timed out acquiring the cross-process workspace root lock.");
+    super("Timed out acquiring the cross-process Project root lock.");
     this.name = "WorkspaceRootLockTimeoutError";
   }
 }
@@ -140,15 +140,15 @@ export class CrossProcessWorkspaceRootLock {
     metadata: WorkspaceRootLeaseMetadata = {},
     deadlineOverride?: number,
   ): Promise<WorkspaceRootLease> {
-    if (!key) throw new TypeError("Workspace root lock key is required.");
+    if (!key) throw new TypeError("Project root lock key is required.");
     if (mode !== "read" && mode !== "write") {
-      throw new TypeError("Workspace root lock mode must be read or write.");
+      throw new TypeError("Project root lock mode must be read or write.");
     }
     if (
       metadata.workspaceGeneration !== undefined &&
       (!Number.isSafeInteger(metadata.workspaceGeneration) || metadata.workspaceGeneration < 1)
     ) {
-      throw new TypeError("Workspace generation must be a positive safe integer.");
+      throw new TypeError("Project generation must be a positive safe integer.");
     }
     const paths = this.paths(key);
     await this.ensureDirectories(paths);
@@ -259,13 +259,6 @@ export class CrossProcessWorkspaceRootLock {
       ...(this.serverIdentity.bootIdentity
         ? { bootIdentity: this.serverIdentity.bootIdentity }
         : {}),
-      ownerPid: this.serverIdentity.pid,
-      ...(this.serverIdentity.startIdentity
-        ? { ownerStartIdentity: this.serverIdentity.startIdentity }
-        : {}),
-      ...(this.serverIdentity.processGroupId
-        ? { processGroupId: this.serverIdentity.processGroupId }
-        : {}),
       ...(metadata.workspaceGeneration === undefined
         ? {}
         : { workspaceGeneration: metadata.workspaceGeneration }),
@@ -341,7 +334,7 @@ export class CrossProcessWorkspaceRootLock {
     lease.release = release;
     lease.heartbeat = heartbeat;
     lease.attachProcess = async (owner): Promise<void> => {
-      if (released) throw new Error("Workspace root lease was already released.");
+      if (released) throw new Error("Project root lease was already released.");
       const identity = readProcessIdentity(owner.pid, this.runtime);
       const updated = await updateMarker((current) => ({
         ...current,
@@ -353,7 +346,7 @@ export class CrossProcessWorkspaceRootLock {
         heartbeatAt: this.now(),
       }));
       if (!updated) {
-        throw new Error("Workspace root lease marker is no longer owned by this process.");
+        throw new Error("Project root lease marker is no longer owned by this process.");
       }
     };
     return lease;
@@ -476,20 +469,20 @@ async function ensureSecureDirectory(path: string): Promise<void> {
   await mkdir(path, { recursive: true, mode: 0o700 });
   let metadata = await lstat(path);
   if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
-    throw new Error(`Workspace lock path is not a secure directory: ${path}`);
+    throw new Error(`Project lock path is not a secure directory: ${path}`);
   }
   if (typeof process.getuid === "function" && metadata.uid !== process.getuid()) {
-    throw new Error(`Workspace lock directory is owned by another OS user: ${path}`);
+    throw new Error(`Project lock directory is owned by another OS user: ${path}`);
   }
   if (process.platform !== "win32" && (metadata.mode & 0o777) !== 0o700) {
     await chmod(path, 0o700);
     metadata = await lstat(path);
     if (metadata.isSymbolicLink() || !metadata.isDirectory() || (metadata.mode & 0o777) !== 0o700) {
-      throw new Error(`Workspace lock directory permissions are not 0700: ${path}`);
+      throw new Error(`Project lock directory permissions are not 0700: ${path}`);
     }
   }
   const parent = dirname(path);
-  if (parent === path) throw new Error("Workspace lock directory cannot be a filesystem root.");
+  if (parent === path) throw new Error("Project lock directory cannot be a filesystem root.");
 }
 
 async function readerMarkers(directory: string): Promise<string[]> {
@@ -561,7 +554,7 @@ async function updateOwnedMarker(path: string, marker: LockMarker): Promise<bool
         written,
       );
       if (result.bytesWritten < 1) {
-        throw new Error("Workspace root lease marker write made no progress.");
+        throw new Error("Project root lease marker write made no progress.");
       }
       written += result.bytesWritten;
     }
