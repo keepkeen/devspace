@@ -15,11 +15,10 @@ export interface SecurityKeyring {
   source: MasterKeySource;
   legacyCompatibility: boolean;
   masterKeyFingerprint: string;
-  hostIdentity: Buffer;
+  legacyOwnerVerifier: Buffer;
   authorizationRoot: Buffer;
   projectFingerprint: Buffer;
   cursor: Buffer;
-  receipt: Buffer;
   auditReference: Buffer;
   internalDiagnostics: Buffer;
   internalConfigReload: Buffer;
@@ -114,11 +113,10 @@ export function createSecurityKeyring(input: {
       .update(masterKey)
       .digest("hex")
       .slice(0, 16),
-    hostIdentity: purpose("host-identity"),
+    legacyOwnerVerifier: purpose("legacy-owner-verifier"),
     authorizationRoot: purpose("authorization-root"),
     projectFingerprint: purpose("project-fingerprint"),
     cursor: purpose("cursor"),
-    receipt: purpose("receipt"),
     auditReference: purpose("audit-reference"),
     internalDiagnostics: purpose("internal-diagnostics"),
     internalConfigReload: purpose("internal-config-reload"),

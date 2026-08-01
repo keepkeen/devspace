@@ -1,66 +1,33 @@
 #!/usr/bin/env node
 import { createRequire } from "node:module";
 import { stdin as input, stdout as output } from "node:process";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { get as httpGet } from "node:http";
-import { mkdtempSync, writeFileSync } from "node:fs";
-import { readFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as prompts from "@clack/prompts";
 import { satisfies } from "semver";
 import { DEVSPACE_VERSION, SUPPORTED_NODE_RANGE } from "./version.js";
 import { loadConfig } from "./config.js";
-import { runLocalAgentProvider } from "./local-agent-adapters.js";
-import {
-  isLocalAgentProvider,
-  loadLocalAgentProfiles,
-  type LocalAgentProfile,
-} from "./local-agent-profiles.js";
-import {
-  assertLocalAgentProviderAvailable,
-  formatLocalAgentProviderAvailabilitySummary,
-} from "./local-agent-availability.js";
-import {
-  formatAvailableLocalAgentTargets,
-  parseLocalAgentRunArgs,
-  resolveLocalAgentTarget,
-} from "./local-agent-targets.js";
-import { createLocalAgentStore, type LocalAgentRecord } from "./local-agent-store.js";
-import {
-  readLocalAgentOutput,
-  removeLocalAgentOutputSync,
-  writeLocalAgentOutput,
-} from "./local-agent-output.js";
-import {
-  localAgentWorkerSpawnOptions,
-  shouldUnrefLocalAgentWorker,
-} from "./local-agent-worker.js";
-import type { LocalAgentRunResult } from "./local-agent-runtime.js";
-import {
-  cleanupDetachedAgentPromptArtifacts,
-  removeDetachedAgentPrompt,
-} from "./detached-agent-cleanup.js";
 import {
   createDevspaceAuth,
-  ensureDevspaceDefaultSkills,
   generateOwnerToken,
   loadDevspaceFiles,
-  resolveSubagentsFlag,
   writeDevspaceAuth,
   writeDevspaceConfig,
   updateDevspaceConfig,
   type DevspaceUserConfig,
 } from "./user-config.js";
-import { assertAllowedDirectory, expandHomePath } from "./roots.js";
+import { expandHomePath } from "./roots.js";
 import { shutdownHttpServers } from "./server-shutdown.js";
 import { AuditEventStore, type AuditEventQuery } from "./audit-events.js";
-import { formatChinaTimestamp } from "./logger.js";
+import { formatChinaTimestamp, identifierHash } from "./logger.js";
 import { inspectInstructionHealth } from "./instruction-health.js";
 import { inspectDoctorOAuthState } from "./doctor-oauth.js";
+import { internalDiagnosticsToken } from "./internal-auth.js";
 
-type Command = "serve" | "admin" | "init" | "doctor" | "config" | "auth" | "audit" | "agents" | "help" | "version";
+type Command = "serve" | "admin" | "init" | "doctor" | "config" | "auth" | "audit" | "help" | "version";
 const require = createRequire(import.meta.url);
 
 async function main(argv: string[]): Promise<void> {
@@ -87,16 +54,9 @@ async function main(argv: string[]): Promise<void> {
     case "config":
       runConfigCommand(args);
       return;
-    case "auth":
-      await ensureConfigured();
-      await runAuthCommand(args);
-      return;
     case "audit":
       await ensureConfigured();
-      runAuditCommand(args);
-      return;
-    case "agents":
-      await runAgentsCommand(args);
+      await runAuditCommand(args);
       return;
     case "help":
       printHelp();
@@ -115,8 +75,7 @@ function normalizeCommand(command: string | undefined): Command {
     command === "doctor" ||
     command === "config" ||
     command === "auth" ||
-    command === "audit" ||
-    command === "agents"
+    command === "audit"
   ) return command;
   if (command === "help" || command === "--help" || command === "-h") return "help";
   if (command === "version" || command === "--version" || command === "-v") return "version";
@@ -178,7 +137,7 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
 
     prompts.note(
       [
-        "DevSpace needs a public base URL so ChatGPT or Claude can reach this MCP server.",
+        "DevSpace needs a public base URL so ChatGPT can reach this MCP server.",
         "Create a tunnel or reverse proxy with Cloudflare Tunnel, ngrok, Pinggy, Tailscale Funnel, or your own HTTPS proxy.",
         "Paste the public origin here, without /mcp.",
         "",
@@ -201,7 +160,6 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
       port,
       allowedRoots,
       publicBaseUrl,
-      subagents: resolveSubagentsFlag(files.config),
     };
     const displayedOwnerPassword = files.auth.ownerPasswordHash
       ? files.migratedOwnerPassword
@@ -212,12 +170,10 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
 
     const configPath = writeDevspaceConfig(config);
     const authPath = writeDevspaceAuth(auth);
-    const seededSkillPaths = config.subagents ? ensureDevspaceDefaultSkills() : [];
 
     const lines = [
       `Config: ${configPath}`,
       `Auth: ${authPath}`,
-      ...seededSkillPaths.map((path) => `Default skill: ${path}`),
       `Local MCP URL: http://${config.host}:${config.port}/mcp`,
       ...(publicBaseUrl ? [`Public MCP URL: ${publicBaseUrl}/mcp`] : []),
     ];
@@ -226,7 +182,7 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
       prompts.note(
         [
           `Owner password: ${displayedOwnerPassword}`,
-          "Use this when ChatGPT or Claude asks you to approve DevSpace access.",
+          "Use this when ChatGPT asks you to approve DevSpace access.",
           "The password is shown only during creation or legacy migration; only its Argon2id hash is stored.",
           `Stored verifier and master key: ${authPath}`,
         ].join("\n"),
@@ -267,8 +223,16 @@ async function serve(): Promise<void> {
   }
 
   const { createServer } = await import("./server.js");
-  const { app, controlApp, config, beginClose, close, localAgentProviders } = createServer();
+  const {
+    app,
+    controlApp,
+    config,
+    setListenerBound,
+    beginClose,
+    close,
+  } = createServer();
   const httpServer = app.listen(config.port, config.host, () => {
+    setListenerBound("public", true);
     console.log(`devspace listening on http://${config.host}:${config.port}/mcp`);
     console.log(`public base url: ${config.publicBaseUrl}`);
     console.log(`allowed roots: ${config.allowedRoots.join(", ")}`);
@@ -278,11 +242,9 @@ async function serve(): Promise<void> {
     }
     console.log("auth: Owner password approval required");
     console.log(`logging: ${config.logging.level} ${config.logging.format}`);
-    if (config.subagents) {
-      console.log(`subagent providers: ${formatLocalAgentProviderAvailabilitySummary(localAgentProviders)}`);
-    }
   });
   const controlServer = controlApp.listen(config.controlPort, "127.0.0.1", () => {
+    setListenerBound("control", true);
     console.log(`local control plane: http://127.0.0.1:${config.controlPort}`);
   });
 
@@ -292,6 +254,7 @@ async function serve(): Promise<void> {
   // that did bind rather than leaving it accepting connections while draining.
   let listenFailureHandled = false;
   const listenerFailed = (listener: "public" | "control", error: unknown) => {
+    setListenerBound(listener, false);
     const code = error && typeof error === "object"
       ? (error as { code?: unknown }).code
       : undefined;
@@ -312,6 +275,8 @@ async function serve(): Promise<void> {
       .catch((closeError) => console.error("devspace shutdown failed", closeError))
       .finally(() => process.exit(1));
   };
+  httpServer.on("close", () => setListenerBound("public", false));
+  controlServer.on("close", () => setListenerBound("control", false));
   httpServer.on("error", (error) => listenerFailed("public", error));
   controlServer.on("error", (error) => listenerFailed("control", error));
 
@@ -428,7 +393,20 @@ async function runDoctor(): Promise<void> {
     } else if ((oauthInspection.legacyWildcardGrants ?? 0) > 0) {
       console.log(
         `Security warning: ${oauthInspection.legacyWildcardGrants} active legacy wildcard root grant(s) found. ` +
-        "Adding an allowed root expands those grants; reconnect them through OAuth and select explicit project roots.",
+        "Adding an allowed root expands those grants; reauthorize through OAuth and select explicit project roots.",
+      );
+    }
+    if (oauthInspection.projectExecutions) {
+      console.log(
+        `Project execution inventory: ${oauthInspection.projectExecutions.total} total, `
+        + `${oauthInspection.projectExecutions.open} open, `
+        + `${oauthInspection.projectExecutions.terminal} terminal`,
+      );
+    }
+    if (oauthInspection.migrationBackups) {
+      console.log(
+        `Database migration backups: ${oauthInspection.migrationBackups.count}; `
+        + `latest=${join(config.stateDir, oauthInspection.migrationBackups.latest)}`,
       );
     }
     const instructionHealth = await inspectInstructionHealth(
@@ -475,149 +453,44 @@ function runConfigCommand(args: string[]): void {
     return;
   }
 
-  throw new Error("Supported config keys: publicBaseUrl.");
-}
-
-async function runAuthCommand(args: string[]): Promise<void> {
-  const [subcommand, ...rawRest] = args;
-  const apply = rawRest.includes("--apply");
-  const rest = rawRest.filter((entry) => entry !== "--apply");
-  const config = loadConfig();
-  const { SqliteOAuthStore } = await import("./oauth-store.js");
-  const store = new SqliteOAuthStore(config.stateDir);
-  try {
-    switch (subcommand) {
-      case "principals":
-      case "ls":
-      case "list": {
-        const principals = store.listConnectionPrincipals();
-        if (principals.length === 0) {
-          console.log("No active connection principals.");
-          return;
-        }
-        for (const principal of principals) {
-          const aliases = principal.aliases.length > 0
-            ? ` aliases=${principal.aliases.join(",")}`
-            : "";
-          console.log(
-            `${principal.principalId} clients=${principal.clientCount}` +
-              ` activeWorkspaces=${principal.activeWorkspaces}` +
-              ` retainedWorkspaces=${principal.retainedWorkspaces}${aliases}`,
-          );
-        }
-        return;
-      }
-      case "reconnect-code": {
-        const [principalId, ...unexpected] = rest;
-        if (unexpected.length > 0) throw new Error(`Unexpected auth argument: ${unexpected[0]}`);
-        if (!principalId) {
-          throw new Error("`devspace auth reconnect-code` requires a connection principal ID.");
-        }
-        const issued = store.issueReconnectCode(principalId);
-        console.log(`Reconnect code: ${issued.code}`);
-        console.log(`Principal: ${issued.principalId}`);
-        console.log(`Expires: ${issued.expiresAt}`);
-        console.log("Enter this code once on the DevSpace OAuth approval page for the new connector registration.");
-        return;
-      }
-      case "transfer-workspaces": {
-        const [sourcePrincipalId, targetPrincipalId, ...unexpected] = rest;
-        if (!sourcePrincipalId || !targetPrincipalId || unexpected.length > 0) {
-          throw new Error(
-            "Usage: devspace auth transfer-workspaces <source-principal> <target-principal> [--apply]",
-          );
-        }
-        const preview = store.previewWorkspaceTransfer(sourcePrincipalId, targetPrincipalId);
-        console.log(JSON.stringify({ action: "transfer-workspaces", apply, preview }, null, 2));
-        if (!apply) {
-          console.log("Dry run only. Add --apply after reviewing conflicts and counts.");
-          return;
-        }
-        if (!preview.transferable) {
-          throw new Error("Workspace transfer is not safe; resolve the reported conflicts first.");
-        }
-        await assertBackendStopped(config);
-        console.log(JSON.stringify({
-          action: "transfer-workspaces",
-          result: store.transferPrincipalWorkspaces(sourcePrincipalId, targetPrincipalId),
-        }, null, 2));
-        return;
-      }
-      case "close-orphan": {
-        const [principalId, ...unexpected] = rest;
-        if (!principalId || unexpected.length > 0) {
-          throw new Error("Usage: devspace auth close-orphan <principal-id> [--apply]");
-        }
-        const preview = store.previewOrphanClose(principalId);
-        console.log(JSON.stringify({ action: "close-orphan", apply, preview }, null, 2));
-        if (!apply) {
-          console.log("Dry run only. Add --apply to close active records without deleting worktrees.");
-          return;
-        }
-        if (!preview.closable) throw new Error("The principal still has an active OAuth client.");
-        await assertBackendStopped(config);
-        console.log(JSON.stringify({
-          action: "close-orphan",
-          result: store.closeOrphanPrincipal(principalId),
-        }, null, 2));
-        return;
-      }
-      case "relink-client": {
-        const [clientId, targetPrincipalId, ...unexpected] = rest;
-        if (!clientId || !targetPrincipalId || unexpected.length > 0) {
-          throw new Error(
-            "Usage: devspace auth relink-client <oauth-client-id> <target-principal> [--apply]",
-          );
-        }
-        const preview = store.previewClientRelink(clientId, targetPrincipalId);
-        console.log(JSON.stringify({ action: "relink-client", apply, preview }, null, 2));
-        if (!apply) {
-          console.log("Dry run only. Add --apply to revoke current tokens and relink the client.");
-          return;
-        }
-        if (!preview.relinkable) {
-          throw new Error("Transfer or close the source principal's retained Workspaces first.");
-        }
-        await assertBackendStopped(config);
-        console.log(JSON.stringify({
-          action: "relink-client",
-          result: store.relinkClientToPrincipal(clientId, targetPrincipalId),
-        }, null, 2));
-        return;
-      }
-      case undefined:
-      case "help":
-      case "--help":
-      case "-h":
-        printAuthHelp();
-        return;
-      default:
-        throw new Error(`Unknown auth command: ${subcommand}`);
+  if (key === "widgets") {
+    if (value !== "off" && value !== "changes" && value !== "full") {
+      throw new Error("widgets must be one of: off, changes, full.");
     }
-  } finally {
-    store.close();
+    updateDevspaceConfig((config) => ({ ...config, widgets: value }));
+    console.log(`Updated ${files.configPath}`);
+    return;
   }
+
+  throw new Error("Supported config keys: publicBaseUrl, widgets.");
 }
 
-function printAuthHelp(): void {
-  console.log([
-    "DevSpace connection principals",
-    "",
-    "Usage:",
-    "  devspace auth principals",
-    "  devspace auth reconnect-code <principal-id>",
-    "  devspace auth transfer-workspaces <source> <target> [--apply]",
-    "  devspace auth close-orphan <principal-id> [--apply]",
-    "  devspace auth relink-client <oauth-client-id> <target> [--apply]",
-    "",
-    "Mutation commands are dry-run by default and require the backend to be stopped",
-    "when --apply is used. OAuth approval can also reuse a principal locally after",
-    "Owner-password verification. A principal is not a verified ChatGPT identity.",
-  ].join("\n"));
+interface BackendDiagnosticsSnapshot {
+  version?: string;
+  pid?: number;
+  generation?: string;
+  buildRevision?: string | null;
+  observability?: {
+    audit?: {
+      enabled?: boolean;
+      stateDirRef?: string;
+      eventCount?: number;
+      firstEventAt?: string;
+      lastEventAt?: string;
+      auditWriteFailures?: number;
+      lastAuditWriteFailureAt?: string;
+    };
+  };
 }
 
-function runAuditCommand(args: string[]): void {
+async function runAuditCommand(args: string[]): Promise<void> {
   const config = loadConfig();
+  if (args[0] === "health") {
+    const unexpected = args.slice(1).filter((argument) => argument !== "--json");
+    if (unexpected.length > 0) throw new Error(`Unknown audit health option: ${unexpected[0]}`);
+    await printAuditHealth(config, args.includes("--json"));
+    return;
+  }
   const query: AuditEventQuery = {};
   let json = false;
   for (let index = 0; index < args.length; index += 1) {
@@ -633,7 +506,7 @@ function runAuditCommand(args: string[]): void {
       case "--tool": query.tool = value; break;
       case "--request": query.requestId = value; break;
       case "--connection": query.connectionRef = value; break;
-      case "--workspace-activity": query.workspaceActivityRef = value; break;
+      case "--project-activity": query.workspaceActivityRef = value; break;
       case "--since": {
         const parsed = new Date(value);
         if (Number.isNaN(parsed.getTime())) throw new Error("--since must be an ISO timestamp.");
@@ -674,7 +547,7 @@ function runAuditCommand(args: string[]): void {
         event.tool ? `tool=${event.tool}` : "",
         event.requestId ? `request=${event.requestId}` : "",
         event.connectionRef ? `connection=${event.connectionRef}` : "",
-        event.workspaceActivityRef ? `workspace=${event.workspaceActivityRef}` : "",
+        event.workspaceActivityRef ? `project=${event.workspaceActivityRef}` : "",
         event.errorCode ? `error=${event.errorCode}` : "",
         Object.keys(event.details).length > 0 ? `details=${JSON.stringify(event.details)}` : "",
       ].filter(Boolean).join(" "));
@@ -684,28 +557,168 @@ function runAuditCommand(args: string[]): void {
   }
 }
 
-async function assertBackendStopped(config: ReturnType<typeof loadConfig>): Promise<void> {
+async function printAuditHealth(
+  config: ReturnType<typeof loadConfig>,
+  json: boolean,
+): Promise<void> {
+  const store = new AuditEventStore(config.stateDir);
+  let localAudit;
+  try {
+    localAudit = store.health();
+  } finally {
+    store.close();
+  }
+  const stateDirRef = auditStateDirRef(config);
+  const backend = await fetchBackendDiagnostics(config);
+  const backendAudit = backend?.observability?.audit;
+  const source = sourceRevisionSnapshot();
+  const generatedAt = new Date().toISOString();
+  const snapshot = {
+    generatedAt,
+    timeChina: formatChinaTimestamp(generatedAt),
+    cli: {
+      version: DEVSPACE_VERSION,
+      pid: process.pid,
+      stateDirRef,
+      auditEnabled: config.logging.auditEvents !== false,
+      ...localAudit,
+      sourceRevision: source.revision,
+      sourceDirty: source.dirty,
+    },
+    backend: backend
+      ? {
+          reachable: true,
+          version: backend.version,
+          pid: backend.pid,
+          generation: backend.generation,
+          buildRevision: backend.buildRevision ?? null,
+          audit: backendAudit,
+          stateDirMatches: backendAudit?.stateDirRef
+            ? backendAudit.stateDirRef === stateDirRef
+            : null,
+          sourceMatchesBuild: backend.buildRevision
+            ? backend.buildRevision === source.revision
+            : null,
+        }
+      : {
+          reachable: false,
+          stateDirMatches: null,
+          sourceMatchesBuild: null,
+        },
+  };
+  if (json) {
+    console.log(JSON.stringify(snapshot, null, 2));
+    return;
+  }
+  console.log(`Generated: ${snapshot.timeChina}`);
+  console.log(
+    `CLI: version=${DEVSPACE_VERSION} pid=${process.pid} stateDir=${stateDirRef} ` +
+      `auditEnabled=${snapshot.cli.auditEnabled} events=${localAudit.eventCount}`,
+  );
+  if (localAudit.firstEventAt) {
+    console.log(`First event: ${formatChinaTimestamp(localAudit.firstEventAt)}`);
+  }
+  if (localAudit.lastEventAt) {
+    console.log(`Last event: ${formatChinaTimestamp(localAudit.lastEventAt)}`);
+  }
+  console.log(
+    `Source: revision=${source.revision ?? "unknown"} dirty=${source.dirty ?? "unknown"}`,
+  );
+  if (!backend) {
+    console.log("Backend diagnostics: unreachable on the loopback control port.");
+    return;
+  }
+  console.log(
+    `Backend: version=${backend.version ?? "unknown"} pid=${backend.pid ?? "unknown"} ` +
+      `generation=${backend.generation ?? "unknown"} stateDirMatches=${snapshot.backend.stateDirMatches}`,
+  );
+  console.log(
+    `Backend audit: enabled=${backendAudit?.enabled ?? "unknown"} ` +
+      `events=${backendAudit?.eventCount ?? "unknown"} ` +
+      `writeFailures=${backendAudit?.auditWriteFailures ?? "unknown"}`,
+  );
+  if (backendAudit?.lastEventAt) {
+    console.log(`Backend last event: ${formatChinaTimestamp(backendAudit.lastEventAt)}`);
+  }
+  if (backendAudit?.lastAuditWriteFailureAt) {
+    console.log(
+      `Last audit write failure: ${formatChinaTimestamp(backendAudit.lastAuditWriteFailureAt)}`,
+    );
+  }
+}
+
+function auditStateDirRef(config: ReturnType<typeof loadConfig>): string {
+  const digest = identifierHash(
+    config.stateDir,
+    config.oauth.keys.auditReference,
+    "state-dir",
+  );
+  return `state_${digest ?? "unknown"}`;
+}
+
+function sourceRevisionSnapshot(): { revision?: string; dirty?: boolean } {
+  const sourceRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+  const revision = spawnSync("git", ["rev-parse", "HEAD"], {
+    cwd: sourceRoot,
+    encoding: "utf8",
+    timeout: 1_000,
+  });
+  if (revision.status !== 0) return {};
+  const status = spawnSync("git", ["status", "--porcelain"], {
+    cwd: sourceRoot,
+    encoding: "utf8",
+    timeout: 1_000,
+  });
+  return {
+    revision: revision.stdout.trim(),
+    ...(status.status === 0 ? { dirty: status.stdout.length > 0 } : {}),
+  };
+}
+
+function fetchBackendDiagnostics(
+  config: ReturnType<typeof loadConfig>,
+): Promise<BackendDiagnosticsSnapshot | undefined> {
   const host = config.host === "0.0.0.0" || config.host === "localhost"
     ? "127.0.0.1"
     : config.host === "::"
       ? "::1"
       : config.host;
-  const running = await new Promise<boolean>((resolveProbe) => {
-    const request = httpGet({ host, port: config.port, path: "/readyz", timeout: 500 }, (response) => {
-      response.resume();
-      resolveProbe(response.statusCode === 200);
+  return new Promise((resolveDiagnostics) => {
+    const request = httpGet({
+      host,
+      port: config.controlPort,
+      path: "/internal/diagnostics",
+      timeout: 1_000,
+      headers: {
+        "x-devspace-internal-token": internalDiagnosticsToken(
+          config.oauth.keys.internalDiagnostics,
+        ),
+      },
+    }, (response) => {
+      if (response.statusCode !== 200) {
+        response.resume();
+        resolveDiagnostics(undefined);
+        return;
+      }
+      response.setEncoding("utf8");
+      let body = "";
+      response.on("data", (chunk: string) => {
+        if (body.length <= 128 * 1_024) body += chunk;
+      });
+      response.on("end", () => {
+        try {
+          resolveDiagnostics(JSON.parse(body) as BackendDiagnosticsSnapshot);
+        } catch {
+          resolveDiagnostics(undefined);
+        }
+      });
     });
     request.on("timeout", () => {
       request.destroy();
-      resolveProbe(false);
+      resolveDiagnostics(undefined);
     });
-    request.on("error", () => resolveProbe(false));
+    request.on("error", () => resolveDiagnostics(undefined));
   });
-  if (running) {
-    throw new Error(
-      "Stop the DevSpace backend before applying principal state changes, then rerun this command.",
-    );
-  }
 }
 
 function printHelp(): void {
@@ -722,315 +735,13 @@ function printHelp(): void {
       "  devspace doctor          Show config, runtime, and native dependency status",
       "  devspace config get      Print persisted config",
       "  devspace config set publicBaseUrl <url|null>",
-      "  devspace auth principals List local connection principals",
-      "  devspace auth reconnect-code <principal-id>",
-      "  devspace auth transfer-workspaces <source> <target> [--apply]",
-      "  devspace auth close-orphan <principal-id> [--apply]",
-      "  devspace auth relink-client <oauth-client-id> <target> [--apply]",
+      "  devspace config set widgets <off|changes|full>",
       "  devspace audit [filters] Query persistent safe audit events in China time",
-      "  devspace agents ls       List subagent sessions",
-      "  devspace agents run <profile-or-provider-or-id> [--model <model>] <prompt>",
-      "  devspace agents show <id>",
+      "  devspace audit health [--json] Compare CLI and backend audit health",
       "  devspace -v, --version   Print the installed version",
       "",
       "For temporary tunnels:",
       "  DEVSPACE_PUBLIC_BASE_URL=https://example.trycloudflare.com devspace serve",
-    ].join("\n"),
-  );
-}
-
-async function runAgentsCommand(args: string[]): Promise<void> {
-  await cleanupDetachedAgentPromptArtifacts();
-  const [subcommand, ...rest] = args;
-  switch (subcommand) {
-    case "ls":
-    case "list":
-      await runAgentsList();
-      return;
-    case "run":
-      await runAgentsRun(rest);
-      return;
-    case "show":
-      await runAgentsShow(rest);
-      return;
-    case "__worker":
-      await runAgentsWorker(rest);
-      return;
-    case undefined:
-    case "help":
-    case "--help":
-    case "-h":
-      printAgentsHelp();
-      return;
-    default:
-      throw new Error(`Unknown agents command: ${subcommand}`);
-  }
-}
-
-async function runAgentsList(): Promise<void> {
-  const config = loadConfig();
-  const workspaceRoot = resolveCurrentWorkspaceRoot(config.allowedRoots);
-  const store = createLocalAgentStore(config);
-  store.cleanup();
-  const agents = store.list(resolveCurrentWorkspaceScope(workspaceRoot));
-
-  if (agents.length === 0) {
-    console.log("No subagent sessions found for this workspace.");
-    return;
-  }
-
-  for (const agent of agents) {
-    console.log(formatAgentLine(agent));
-  }
-}
-
-async function runAgentsRun(args: string[]): Promise<void> {
-  const parsed = parseLocalAgentRunArgs(args);
-
-  const config = loadConfig();
-  const workspaceRoot = resolveCurrentWorkspaceRoot(config.allowedRoots);
-  const workspaceScope = resolveCurrentWorkspaceScope(workspaceRoot);
-  const store = createLocalAgentStore(config);
-  store.cleanup();
-  const existing = store.get(parsed.target, workspaceScope);
-
-  if (existing) {
-    if (!isLocalAgentProvider(existing.provider)) {
-      throw new Error(`Unknown subagent provider for existing session: ${existing.provider}`);
-    }
-    assertLocalAgentProviderAvailable(existing.provider);
-    const promptFile = writeAgentPromptFile(parsed.prompt);
-    try {
-      removeLocalAgentOutputSync(config.stateDir, existing.id);
-      store.update(existing.id, {
-        status: "starting",
-        model: parsed.model ?? existing.model,
-        thinking: parsed.thinking ?? existing.thinking,
-        latestResponse: undefined,
-        error: undefined,
-      });
-      spawnAgentWorker(existing.id, promptFile);
-    } catch (error) {
-      await removeDetachedAgentPrompt(promptFile);
-      throw error;
-    }
-    console.log(formatAgentLine({
-      ...existing,
-      status: "running",
-      model: parsed.model ?? existing.model,
-      thinking: parsed.thinking ?? existing.thinking,
-    }));
-    return;
-  }
-
-  const profiles = await loadLocalAgentProfiles(config, workspaceRoot);
-  const target = resolveLocalAgentTarget(parsed.target, profiles, parsed.model, parsed.thinking);
-  if (!target) {
-    throw new Error(
-      `Unknown subagent profile, provider, or id: ${parsed.target}. Available ${formatAvailableLocalAgentTargets(profiles)}`,
-    );
-  }
-  assertLocalAgentProviderAvailable(target.provider);
-
-  const promptFile = writeAgentPromptFile(parsed.prompt);
-  let record: LocalAgentRecord;
-  try {
-    record = store.create({
-      workspaceId: process.env.DEVSPACE_WORKSPACE_ID,
-      workspaceRoot,
-      profileName: target.name,
-      provider: target.provider,
-      model: target.model,
-      thinking: target.thinking,
-    });
-    spawnAgentWorker(record.id, promptFile);
-  } catch (error) {
-    await removeDetachedAgentPrompt(promptFile);
-    throw error;
-  }
-  console.log(formatAgentLine({ ...record, status: "running" }));
-}
-
-async function runAgentsShow(args: string[]): Promise<void> {
-  const [id] = args;
-  if (!id) throw new Error("Usage: devspace agents show <id>");
-
-  const config = loadConfig();
-  const workspaceRoot = resolveCurrentWorkspaceRoot(config.allowedRoots);
-  const workspaceScope = resolveCurrentWorkspaceScope(workspaceRoot);
-  const store = createLocalAgentStore(config);
-  store.cleanup();
-  let record = store.get(id, workspaceScope);
-  if (!record) throw new Error(`Unknown subagent id: ${id}`);
-
-  const deadline = Date.now() + 15_000;
-  while ((record.status === "starting" || record.status === "running") && Date.now() < deadline) {
-    await sleep(500);
-    record = store.get(id, workspaceScope) ?? record;
-  }
-
-  console.log(formatAgentLine(record));
-  const retainedOutput = readLocalAgentOutput(config.stateDir, record.id);
-  if (retainedOutput !== undefined) {
-    output.write(retainedOutput);
-    if (!retainedOutput.endsWith("\n")) output.write("\n");
-    return;
-  }
-  if (record.latestResponse) {
-    console.log(record.latestResponse);
-    return;
-  }
-  if (record.error) {
-    console.log(record.error);
-    return;
-  }
-  if (record.status === "starting" || record.status === "running") {
-    console.log(`No final response yet. Call \`devspace agents show ${record.id}\` again later.`);
-  }
-}
-
-async function runAgentsWorker(args: string[]): Promise<void> {
-  const [id, promptFileFlag, promptFile] = args;
-  if (!id || promptFileFlag !== "--prompt-file" || !promptFile) {
-    throw new Error("Usage: devspace agents __worker <id> --prompt-file <path>");
-  }
-
-  const config = loadConfig();
-  const store = createLocalAgentStore(config);
-  try {
-    store.cleanup();
-    const record = store.getForWorker(id);
-    if (!record) throw new Error(`Unknown subagent id: ${id}`);
-    // The worker learns its workspace from the record, so the recorded root has
-    // to be confined here. Otherwise a stale or hand-written row could run an
-    // agent rooted outside every authorized project.
-    const workspaceRoot = assertAllowedDirectory(record.workspaceRoot, config.allowedRoots);
-    const effectiveRecord = { ...record, workspaceRoot };
-
-    store.update(record.id, { workspaceRoot, status: "running", error: undefined });
-    try {
-      const profiles = await loadLocalAgentProfiles(config, workspaceRoot);
-      const profile = profiles.find((candidate) => candidate.name === effectiveRecord.profileName);
-      const prompt = await readFile(promptFile, "utf8");
-      const result = profile
-        ? await runLocalAgentProfile(profile, effectiveRecord, prompt)
-        : await runRawLocalAgentProvider(effectiveRecord, prompt);
-      writeLocalAgentOutput(config.stateDir, effectiveRecord.id, result.finalResponse);
-      store.update(effectiveRecord.id, {
-        providerSessionId: result.providerSessionId ?? undefined,
-        status: "idle",
-        latestResponse: result.finalResponse,
-        error: undefined,
-      });
-    } catch (error) {
-      removeLocalAgentOutputSync(config.stateDir, effectiveRecord.id);
-      store.update(effectiveRecord.id, {
-        status: "error",
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
-  } finally {
-    await removeDetachedAgentPrompt(promptFile);
-  }
-}
-
-async function runLocalAgentProfile(
-  profile: LocalAgentProfile,
-  record: LocalAgentRecord,
-  prompt: string,
-): Promise<LocalAgentRunResult> {
-  const body = profile.body.trim();
-  const fullPrompt = body ? `${body}\n\nTask:\n${prompt}` : prompt;
-  return runLocalAgentProvider(profile.provider, {
-    prompt: fullPrompt,
-    workspace: record.workspaceRoot,
-    providerSessionId: record.providerSessionId,
-    writeMode: "allowed",
-    model: record.model ?? profile.model,
-    thinking: record.thinking ?? profile.thinking,
-  });
-}
-
-async function runRawLocalAgentProvider(
-  record: LocalAgentRecord,
-  prompt: string,
-): Promise<LocalAgentRunResult> {
-  if (record.profileName !== record.provider || !isLocalAgentProvider(record.provider)) {
-    throw new Error(`Subagent profile not found: ${record.profileName}`);
-  }
-
-  return runLocalAgentProvider(record.provider, {
-    prompt,
-    workspace: record.workspaceRoot,
-    providerSessionId: record.providerSessionId,
-    writeMode: "allowed",
-    model: record.model,
-    thinking: record.thinking,
-  });
-}
-
-function spawnAgentWorker(agentId: string, promptFile: string): void {
-  const child = spawn(process.execPath, [
-    ...process.execArgv,
-    fileURLToPath(import.meta.url),
-    "agents",
-    "__worker",
-    agentId,
-    "--prompt-file",
-    promptFile,
-  ], localAgentWorkerSpawnOptions(process.env));
-  child.once("error", () => {
-    void removeDetachedAgentPrompt(promptFile);
-  });
-  if (shouldUnrefLocalAgentWorker()) child.unref();
-}
-
-function writeAgentPromptFile(prompt: string): string {
-  const directory = mkdtempSync(join(tmpdir(), "devspace-agent-prompt-"));
-  const filePath = join(directory, "prompt.txt");
-  writeFileSync(filePath, prompt, { mode: 0o600 });
-  return filePath;
-}
-
-function resolveCurrentWorkspaceRoot(allowedRoots?: string[]): string {
-  const workspaceRoot = resolve(process.env.DEVSPACE_WORKSPACE_ROOT || process.cwd());
-  // DEVSPACE_WORKSPACE_ROOT is only protected on the MCP `environment` input, so
-  // any other entry point could otherwise root a subagent outside every
-  // authorized project.
-  return allowedRoots ? assertAllowedDirectory(workspaceRoot, allowedRoots) : workspaceRoot;
-}
-
-function resolveCurrentWorkspaceScope(
-  workspaceRoot = resolveCurrentWorkspaceRoot(),
-): { workspaceId?: string; workspaceRoot: string } {
-  return {
-    workspaceId: process.env.DEVSPACE_WORKSPACE_ID,
-    workspaceRoot,
-  };
-}
-
-function formatAgentLine(agent: Pick<
-  LocalAgentRecord,
-  "id" | "status" | "profileName" | "provider" | "model" | "thinking"
->): string {
-  const model = agent.model ? ` ${agent.model}` : "";
-  const thinking = agent.thinking ? ` thinking=${agent.thinking}` : "";
-  return `${agent.id} ${agent.status} ${agent.profileName} ${agent.provider}${model}${thinking}`;
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
-}
-
-function printAgentsHelp(): void {
-  console.log(
-    [
-      "DevSpace agents",
-      "",
-      "Usage:",
-      "  devspace agents ls",
-      "  devspace agents run <profile-or-provider-or-id> [--model <model>] [--thinking <level>] <prompt>",
-      "  devspace agents show <id>",
     ].join("\n"),
   );
 }

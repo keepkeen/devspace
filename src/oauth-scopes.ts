@@ -1,10 +1,7 @@
 export const DEVSPACE_CAPABILITY_SCOPES = [
-  "workspace:read",
-  "workspace:write",
+  "project:read",
+  "project:write",
   "process:execute",
-  "network:access",
-  "worktree:create",
-  "workspace:revoke",
 ] as const;
 
 export type DevSpaceCapabilityScope = typeof DEVSPACE_CAPABILITY_SCOPES[number];
@@ -12,19 +9,23 @@ export type DevSpaceCapabilityScope = typeof DEVSPACE_CAPABILITY_SCOPES[number];
 /** Every capability this server can support when explicitly requested. */
 export const FULL_DEVSPACE_OAUTH_SCOPES = [...DEVSPACE_CAPABILITY_SCOPES] as const;
 
-/** Historical public name for the default supported capability set. */
-export const DEFAULT_DEVSPACE_OAUTH_SCOPES = [...FULL_DEVSPACE_OAUTH_SCOPES] as const;
+/**
+ * Capabilities advertised by default. Local process execution is deliberately
+ * opt-in through DEVSPACE_OAUTH_SCOPES because it runs with the backend OS
+ * user's authority rather than inside a filesystem sandbox.
+ */
+export const DEFAULT_DEVSPACE_OAUTH_SCOPES = [
+  "project:read",
+  "project:write",
+] as const satisfies readonly DevSpaceCapabilityScope[];
 
 /** Least-privilege scopes used only when an authorization request omits `scope`. */
-export const DEFAULT_AUTHORIZATION_SCOPES = ["workspace:read"] as const;
+export const DEFAULT_AUTHORIZATION_SCOPES = ["project:read"] as const;
 
 const SCOPE_DESCRIPTIONS: Record<DevSpaceCapabilityScope, string> = {
-  "workspace:read": "Read approved workspace files, instructions, Skills, and metadata",
-  "workspace:write": "Modify approved workspace files and review checkpoints",
-  "process:execute": "Start and interact with local processes inside a writable workspace",
-  "network:access": "Allow executed processes to use the host network",
-  "worktree:create": "Create isolated managed Git worktrees",
-  "workspace:revoke": "Close or permanently revoke Workspace access",
+  "project:read": "Read approved project files, instructions, Skills, and metadata",
+  "project:write": "Modify approved project files",
+  "process:execute": "Start and interact with local processes inside an approved project",
 };
 
 export function oauthScopeAllows(

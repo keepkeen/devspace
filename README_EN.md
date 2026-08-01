@@ -26,51 +26,48 @@
 
 ## What DevSpace does
 
-ChatGPT runs in the cloud and cannot directly open `/Users/alice/code/my-app` on your computer.
-DevSpace runs a local MCP server that turns approved folders into file, search, patch, Git, and
-command tools.
-
-It does not upload the whole repository in advance, and it is not a hidden second coding model.
-Only content returned by actual tool calls is sent to the MCP client, and those calls appear in
-the conversation.
+ChatGPT runs in the cloud and cannot directly open a local checkout. DevSpace
+runs on your computer and exposes approved Projects to ChatGPT web through a
+local MCP server and a public HTTPS endpoint.
 
 ```text
-ChatGPT → HTTPS tunnel → DevSpace 127.0.0.1:7676 → approved local projects
-                              └→ local admin panel (localhost only)
+ChatGPT web → HTTPS tunnel → DevSpace on 127.0.0.1:7676 → approved Projects
+                                  └→ local-only admin panel
 ```
 
-## Recommended directories and working directories
+DevSpace does not upload an entire repository in advance and is not a second
+coding model. ChatGPT receives only content returned by the tools it calls.
 
-Keep the program, projects, and persistent state separate:
+DevSpace is designed for ChatGPT web. It does not provide compatibility modes
+for other MCP hosts.
 
-```text
-~/tools/devspace/                 # DevSpace installation
-~/code/work/                      # work projects; approve separately
-~/code/personal/                  # personal projects; approve separately
-~/.devspace/                      # config.json, auth.json, managed worktrees
-~/.local/share/devspace/          # SQLite, operations, process-output metadata
-```
+## Security boundary
 
-Important details:
+Approve narrow project roots. Do not approve your home directory, filesystem
+root, cloud-drive root, or a directory containing unrelated private data.
 
-1. `devspace init` uses the **current working directory** as the default allowed root. If you plan
-   to press Enter, first run `cd ~/code/work`; explicitly entering the path is safer.
-2. Do not approve `~`, `/`, an entire cloud drive, or a folder containing broad private data.
-   Keep work and personal roots separate when possible.
-3. Prefer installing DevSpace outside approved project roots. Open the DevSpace repository as a
-   project only when you are developing DevSpace itself.
-4. Once `allowedRoots` is explicit, the directory from which `devspace serve` starts no longer
-   defines authorization. A service manager should still use an absolute CLI path and set its
-   WorkingDirectory to the DevSpace installation.
-5. Project commands start at the current Workspace root. `workingDirectory` may select only a
-   subdirectory inside that Workspace; it cannot be used to escape the project.
+DevSpace validates Project selection, file paths, and command working
+directories against the configured roots. File writes also preserve
+`ifMatch`, `operationId`, and root-lock invariants.
+
+This boundary is not operating-system isolation. `exec_command` starts a local
+process with the authority of the OS user running DevSpace. That process may
+read or modify anything that user can access and may use the network. DevSpace
+does not provide a process sandbox, a command allow/deny policy, protected-path
+enforcement for child processes, or per-command network controls. Run DevSpace
+as a dedicated OS user, in a container, or in a VM if stronger isolation is
+required.
 
 ## Quick start
 
+The examples use the repository-local CLI. After an optional `npm link`, you
+may replace `node dist/cli.js` with `devspace`.
+
 ### 1. Install
 
-You need Node.js `>=22.19 <27`, npm, and Git. Use the same Node installation for dependency
-installation, builds, and the long-running service because `better-sqlite3` is tied to the Node ABI.
+You need Node.js `>=22.19 <27`, npm, Git, and a way to expose an HTTPS endpoint,
+such as
+[cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/).
 
 ```bash
 git clone https://github.com/keepkeen/devspace.git ~/tools/devspace
@@ -80,295 +77,245 @@ npm run build
 node dist/cli.js --help
 ```
 
-Optional:
+Use the same Node installation for install, build, and serving because
+`better-sqlite3` is tied to the Node ABI.
+
+### 2. Start an HTTPS tunnel
+
+For a temporary test, keep this running in a second terminal:
 
 ```bash
-npm link
-devspace --help
+cloudflared tunnel --url http://127.0.0.1:7676
 ```
 
-### 2. Initialize
+Copy the HTTPS origin it prints, for example
+`https://random-name.trycloudflare.com`. Do not append `/mcp` when entering the
+origin during initialization.
+
+### 3. Initialize and serve
 
 ```bash
+cd ~/tools/devspace
 node dist/cli.js init
+node dist/cli.js serve
 ```
 
-The wizard asks for:
+The initializer asks for:
 
-- approved project roots;
+- narrow roots containing the Projects you want to approve;
 - the local port, normally `7676`;
 - the public HTTPS origin, without `/mcp`.
 
-Normal configuration and security credentials are stored separately:
+Save the Owner password shown by the initializer. It is required to approve a
+ChatGPT OAuth connection and cannot be recovered from the stored verifier.
+
+Default configuration and state locations are:
 
 ```text
 ~/.devspace/config.json
 ~/.devspace/auth.json
+~/.local/share/devspace/
 ```
 
-`auth.json` stores only an Argon2id verifier for the Owner password, an independent random master
-key, and its derivation mode. It cannot recover the plaintext password, so save the password shown
-once by the initialization wizard. Never share or commit `auth.json`; its master key derives local
-identity, root, cursor, receipt, audit-reference, and internal-control keys.
-Legacy upgrades use `legacy-direct` to keep existing identifiers stable. If the file migration
-completed while SQLite still has the old verifier, the next startup proves the same secret against
-both old scrypt and new Argon2id state, then upgrades in place without deleting OAuth tokens.
-
-### 3. Start and check the server
+### 4. Check readiness
 
 ```bash
-node dist/cli.js serve
 curl http://127.0.0.1:7676/readyz
-```
-
-A healthy server returns HTTP `200` and includes:
-
-```json
-{"ok":true,"name":"devspace","status":"ready"}
-```
-
-For installation or native dependency problems:
-
-```bash
+curl https://random-name.trycloudflare.com/readyz
 node dist/cli.js doctor
 ```
 
-`doctor` also performs a bounded scan of approved roots and reports instruction files or lines over
-8 KiB, effective chains near the 32 KiB hard limit, repeated templates, and root rules that appear
-better scoped to a nested `AGENTS.md`.
+Both readiness requests should return HTTP `200` while the service is ready.
 
-### 4. Provide an HTTPS entry point
-
-ChatGPT cannot connect directly to a local port. Use an HTTPS tunnel or reverse proxy. A temporary
-example is:
-
-```bash
-cloudflared tunnel --url http://127.0.0.1:7676
-node dist/cli.js config set publicBaseUrl https://random-name.trycloudflare.com
-```
-
-Use a stable hostname for regular use. Forward only the DevSpace service port; never expose the
-local admin panel through the tunnel.
-
-### 5. Connect ChatGPT
+### 5. Connect ChatGPT web
 
 Enable Developer mode in ChatGPT and create a custom MCP app:
 
-1. Set the endpoint to `https://devspace.example.com/mcp`.
-2. Choose OAuth and scan the tools.
-3. Enter the Owner password saved during initialization; it cannot be recovered from `auth.json`.
-4. After password verification, create or reuse a local principal and select which approved roots
-   this grant may access.
-5. Finish the scan, create the app, and select it in a new conversation.
+1. Use the public origin plus `/mcp`, for example
+   `https://random-name.trycloudflare.com/mcp`.
+2. Choose OAuth and review the requested capabilities.
+3. Enter the Owner password and choose the Projects this connection may use.
+4. Complete authorization, scan the tools, and select the app in a conversation.
 
-ChatGPT UI, plan availability, and write permissions can change. Follow the current
-[OpenAI Developer mode and MCP apps guide](https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt).
-When DevSpace changes tool definitions, rescan or refresh the app in ChatGPT; restarting only the
-local server does not refresh ChatGPT's cached tools.
+The public OAuth scopes are:
 
-`DEVSPACE_TOOL_PROFILE=browse` exposes a fixed nine-tool lifecycle/read/inspection surface. The
-default `coding` profile additionally exposes Skill, mutation, process, worktree, operation, and
-revocation tools when the OAuth grant has the matching scopes. A profile is fixed when the server
-is created; reconnect or refresh tools after changing it rather than changing tools/list mid-chat.
+- `project:read` for Project discovery, instructions, Skills, reads,
+  inspection, and change review;
+- `project:write` for patches;
+- `process:execute` for local command and process interaction.
 
-## What happens during startup and shutdown
+DevSpace has one hidden local Owner, but multiple OAuth grants may remain active
+at the same time, including multiple grants for one OAuth client. Each bearer
+resolves only its own grant, scopes, and approved Projects. A new authorization
+does not replace grants belonging to other accounts or connections.
 
-`devspace serve` starts in this order:
+If a temporary tunnel URL changes, update the public origin and restart the
+service:
 
-1. Validate Node against `package.json#engines.node`.
-2. Ensure configuration exists. Environment variables override `config.json` and `auth.json`,
-   which in turn override defaults.
-3. Load `better-sqlite3` early so a Node ABI mismatch fails before the server starts.
-4. Acquire a singleton lease for the local state directory so two backends cannot write the same
-   state at once.
-5. Open and migrate the canonical v17 database. A `pending` mutation left by an abnormal stop is
-   recovered as `outcome_unknown`; DevSpace does not pretend that it never ran.
-6. Initialize OAuth, Workspaces, processes, output, audit storage, and a unique process generation.
-7. `/readyz` returns `200` only while the service is not closing and both the Workspace and OAuth
-   databases are ready.
-8. `/internal/*` exists only on `127.0.0.1:DEVSPACE_CONTROL_PORT`; the public MCP listener returns
-   404 for those paths.
-
-`/healthz` only means that the process is alive. Use `/readyz` for troubleshooting and service
-management.
-
-On `SIGINT` or `SIGTERM`, DevSpace stops accepting new work, drains HTTP requests, and then closes
-process and database resources. A controlled macOS restart verifies that **both the PID and the
-readiness generation changed** instead of trusting only the restart command's exit status. Restart
-is not zero-downtime: old receipts and in-memory bindings necessarily expire, so first confirm in
-local diagnostics that no other request, process, root lease, or cleanup job is active.
-
-## Workflow inside a conversation
-
-For the first task in a project, say something concrete:
-
-```text
-Use DevSpace.
-Open /Users/alice/code/my-app as alias my-app with write access.
-Read the project instructions, fix the failing test, run the smallest relevant verification,
-and summarize the changed files.
+```bash
+node dist/cli.js config set publicBaseUrl https://new-random-name.trycloudflare.com
+node dist/cli.js serve
 ```
 
-The actual workflow is:
+Then update the ChatGPT app endpoint and authorize again. Use a stable hostname
+for regular use. Tunnel only the DevSpace service port, never the local admin
+or control listener.
 
-1. `open_workspace` accepts only roots allowed by the current OAuth grant. Project selection may
-   return metadata; immediate analysis or editing uses full context.
-2. `get_workspace_context` loads the Workspace manifest and revisions without dumping every
-   project instruction and Skill body into the conversation.
-3. Before touching concrete files, `load_workspace_instructions(paths)` loads only the instruction
-   chain that applies to those paths. Large files use signed, UTF-8-safe 8 KiB fragments, and only
-   the final page returns the instruction token.
-4. `read` returns content and a version. `apply_patch` requires `ifMatch`, preventing an external
-   edit from being overwritten silently.
-5. Every mutation uses a unique `operationId`. If a response is lost, check the operation state
-   before trying the action again.
-6. Prefer `program + args` for commands. Use `shell: true + command` only for pipes, redirection,
-   and other shell syntax.
-7. Long-running commands may continue in the background; output and operation state are persisted.
-   Prefer small pages or `read_process_output` tail/search/errors modes instead of loading tens of
-   MiB into model context.
-8. `show_changes` exposes signed diff pages of at most 12 KiB. Read to EOF and pass the final
-   `reviewToken` with `advanceCheckpoint=true`; do not claim a truncated diff was fully reviewed.
+ChatGPT may cache a tool snapshot. Rescan or rebuild the app after DevSpace
+tool definitions change.
 
-The default MCP HTTP transport is stateless. When a ChatGPT conversation ends or the service
-restarts, the network transport, in-memory binding, and old receipt expire, but SQLite still keeps:
+## Conversation workflow
 
-- aliases and `workspaceRef` values;
-- checkout/worktree mode and write access;
-- project fingerprints, generations, operation states, and process-output metadata.
+Calls depend only on the OAuth bearer grant carried by that request. DevSpace neither reads nor
+stores ChatGPT account, conversation, `openai/subject`, or `openai/session`
+identity.
 
-After a new chat or restart, say:
+1. With one approved Project, call
+   `project_control({"action":"open","operationId":"..."})` directly; do not call `list_projects`
+   first.
+2. With multiple Projects, call `list_projects`. The default full card groups
+   Projects with actions to start fresh or continue a resumable Project task.
+   A click sends the intent to the
+   model, which calls `project_control`. Use `action=list` for private resumable
+   Threads and `action=resume` with an explicit `threadRef`; no recency guess is made.
+   when cards are disabled or limited to changes.
+3. Keep the returned `executionRef` and pass it explicitly to every subsequent
+   Project tool.
+4. Read the compact root instruction delta; use `read_files` or `inspect` for
+   target content and newly applicable nested instructions.
+5. Lazily load one Skill when relevant, make a small patch, review it with
+   `show_changes`, and run the smallest relevant check. For a long task or
+   before moving to a new conversation, save one compact snapshot with
+   `save_progress`.
+
+`project_control(action=open, projectRef, operationId)` uses the approved
+Project directory by default. For a Project whose root is the Git top level,
+`checkoutKind:"worktree"` explicitly creates a managed per-Thread worktree.
+An active worktree Thread owns one writable directory; dirty worktrees are not
+removed by `action=close`. Non-Git Projects continue to use checkout mode, and
+an identical retry never creates a second worktree.
+
+An `executionRef` is not owned by a ChatGPT conversation. It remains usable
+across transport reconnects and service restarts, and
+`project_control({"action":"hydrate","executionRef":"..."})` explicitly resumes it. Only the original
+grant can use it; another account or connection cannot cross that boundary even
+if it learns the reference. Revoking or expiring the original grant, Project
+deauthorization, or an unavailable Project path rejects the execution.
+Grant revocation also terminates processes still tracked for that execution and
+cleans up retained process output and review state. It does not delete Project
+files or alter Git branches, commits, or worktrees.
+
+`save_progress` persists an at-most-8-KiB model summary for the current private Thread, not the full
+chat transcript. Its title/progress JSON must also fit 12,000 serialized bytes,
+so escape-heavy text cannot make recovery exceed the context budget. Each
+Omit `ifMatch` on the first save; updates require the current Thread `version`.
+Use `project_control(action=list)` to discover Threads visible to the active
+grant and `action=resume` with an explicit `threadRef`. Continuing creates a new
+execution for that grant. Different grants do not see each other's Threads or
+checkpoints by default, even when both approve the same Project. Server-observed
+checkpoint fields are labeled accordingly; the model summary remains untrusted
+and relevant files must be reread.
+
+`show_changes` reads the current Git working-tree diff only when the Project
+root is itself the repository top level, and it never writes the index, objects,
+or refs. A Project nested inside a larger repository uses the non-Git path so
+review cannot cross the approved root. Non-Git results are a bounded, durable
+log of the exact successful `apply_patch` requests in that logical context;
+command and external edits are excluded. Start a new logical context when that
+journal reaches its limit—the shared directory is unchanged.
+
+## Model-visible tools
+
+The public vocabulary has exactly eleven tool names. Tools whose scopes were not
+approved are unavailable:
 
 ```text
-Use DevSpace. List the saved Workspaces, then resume alias my-app.
-Do not reopen the local path and do not automatically choose the most recently used Workspace.
+list_projects
+project_control
+save_progress
+read_files
+inspect
+skills
+apply_patch
+show_changes
+exec_command
+write_stdin
+read_process_output
 ```
 
-That means `list_workspaces → resume_workspace`. Resume issues a fresh context and receipt; an old
-connection becoming invalid does not mean the project record was lost.
+`exec_command` appears only when both `project:write` and the explicit,
+high-trust `process:execute` scope are granted. It follows the Codex-style
+input shape:
 
-## Checkout or worktree
+```json
+{
+  "executionRef": "pex1_...",
+  "operationId": "command-2026-07-30-001",
+  "program": "npm",
+  "args": ["test", "--", "--runInBand"],
+  "workingDirectory": ".",
+  "environment": {"CI": "1"},
+  "yieldTimeMs": 10000,
+  "maxOutputTokens": 12000,
+  "tty": false
+}
+```
 
-| Situation | Recommendation |
-| --- | --- |
-| Inspect the current directory | `checkout` + `read_only` |
-| Intentionally edit the current directory | `checkout` + `read_write` |
-| Parallel or experimental work | managed `worktree` |
-| Two principals writing the same repository | one separate worktree per principal |
+`workingDirectory` must resolve inside that execution's checkout or worktree.
+Only use `shell:true` with `command` and `approvalReason` when shell syntax such
+as pipes, redirection, or loops is actually required. The command still has the
+full file and network authority of the DevSpace OS user. `write_stdin` only
+sends input, closes, interrupts, or resizes an interactive process and is a
+mutation requiring `operationId`. Use read-only `read_process_output` for both
+live polling and retained, bounded output.
 
-Give a continuing task a clear alias such as `billing-api-auth-fix`. A ChatGPT conversation branch
-is not a Git branch; use a real worktree when file-level isolation matters.
+Mutating operations use `operationId` replay protection where defined by their
+tool schema. File edits use version preconditions (`ifMatch`) to prevent stale
+writes. Root locks coordinate concurrent writes and commands. Tool and process
+output is bounded, and retained process state is cleaned up according to server
+limits. When a tool returns a continuation cursor, pass the same `executionRef`
+and the cursor, but omit the initial query and paging parameters.
 
-## Permissions and security
+## Administration
 
-An OAuth grant may include:
-
-| Scope | Capability |
-| --- | --- |
-| `workspace:read` | open, read, search, inspect instructions and changes |
-| `workspace:write` | edit files and advance review checkpoints |
-| `process:execute` | start and control local processes |
-| `network:access` | let a command inherit host networking |
-| `worktree:create` | create managed worktrees |
-| `workspace:revoke` | close or revoke Workspaces |
-
-Each OAuth grant also binds specific approved roots. The global allowlist is not a shared pass for
-every account.
-
-> [!WARNING]
-> `exec_command` still runs as the OS user that runs DevSpace. Command policy is an accident
-> guardrail, not an operating-system sandbox.
-
-The default runtime has no process sandbox and cannot reliably deny networking per process. Use a
-dedicated OS account, container, or VM for high-risk projects. DevSpace blocks obvious self-kill
-and self-restart commands; backend restart is available only through the local Admin control plane.
-
-## Administration and long-running operation
+Run the loopback-only admin panel with:
 
 ```bash
 node dist/cli.js admin
 ```
 
-The admin panel listens only on localhost. It manages roots, quotas, Widgets, diagnostics, token
-revocation, and controlled restart. Backend diagnostics and security control also use a separate
-loopback control listener; neither local listener belongs behind the public tunnel. Allowed roots
-can hot-reload; most other runtime settings require a restart.
-
-For continuous availability, keep both of these running:
-
-```text
-DevSpace server + HTTPS tunnel
-```
-
-Use launchd, systemd, or another service manager and a stable hostname. Controlled restart on
-macOS requires the Admin process to know the same fixed launchd label:
+Useful commands include:
 
 ```bash
-DEVSPACE_LAUNCHD_SERVICE_LABEL=com.example.devspace node dist/cli.js admin
-```
-
-Useful checks:
-
-```bash
-curl http://127.0.0.1:7676/readyz
-curl https://devspace.example.com/readyz
 node dist/cli.js doctor
-node dist/cli.js audit --limit 50
+node dist/cli.js config get
+node dist/cli.js audit --limit 100
 ```
 
-## Development and verification
+The Admin panel reports Project-execution diagnostics. `doctor` reads the same
+SQLite state without mutating it and reports total, open, and terminal
+execution counts. DevSpace does not manage Git worktrees.
+
+`GET /healthz` is the liveness check. `GET /readyz` is the readiness check.
+Keep credentials, `auth.json`, internal control tokens, and tunnel credentials
+out of repositories and logs.
+
+## Development
 
 ```bash
 npm ci
-npm run typecheck
-npm test
-npm run test:browser
 npm run build
-npm run test:pack
+npm test
+npm run typecheck
 ```
 
-`npm test` recursively discovers every `src/**/*.test.ts`; the repository currently has **59 test
-files**. The runner prints the discovered count and fails if any discovered test does not complete,
-so a new test cannot be silently omitted from a handwritten list.
-
-Browser tests run separately. `test:pack` builds the npm package, installs it into a clean temporary
-project, checks both README files, runs CLI/SQLite/server smoke tests, and audits production
-dependencies.
-
-## Troubleshooting
-
-**Local `/readyz` fails:** inspect the DevSpace log, run `doctor`, and confirm that a second backend
-is not using the same state directory.
-
-**Local works but public access fails:** inspect the tunnel, DNS, and ingress. The public URL must
-forward to the DevSpace service port.
-
-**`better-sqlite3` cannot load:** installation and runtime probably use different Node ABIs. Switch
-to the intended Node version and run:
-
-```bash
-npm rebuild better-sqlite3
-node dist/cli.js doctor
-```
-
-**A new app cannot see an old Workspace:** verify that authorization reused the intended principal.
-Use `devspace auth principals` and dry-run migration commands for historical orphan principals;
-do not reopen paths at random and create duplicate Workspaces.
-
-## Upgrade
-
-Stop DevSpace and back up the entire state directory, normally `~/.local/share/devspace`, before
-upgrading. Do not copy only the primary SQLite file because process output and other persistent
-metadata are part of the state. Start the new version, let the canonical v17 migration complete,
-check `/readyz`, and then refresh the ChatGPT app tools.
+Use the repository scripts in `package.json` as the source of truth.
 
 ## More documentation
 
+- [ChatGPT coding workflow](./docs/chatgpt-coding-workflow.md)
+- [ChatGPT tool contract](./docs/chatgpt-tool-contract.md)
 - [Configuration reference](./docs/configuration.md)
 - [Security model](./docs/security.md)
-- [ChatGPT coding workflow](./docs/chatgpt-coding-workflow.md)
-- [Real-host acceptance matrix](./docs/chatgpt-host-acceptance.md)
 - [Troubleshooting](./docs/gotchas.md)
-
-DevSpace was created by [Waishnav](https://github.com/Waishnav). This fork preserves the original
-history and [MIT license](./LICENSE).
+- [Real ChatGPT host acceptance](./docs/chatgpt-host-acceptance.md)

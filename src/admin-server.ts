@@ -26,7 +26,7 @@ import { devspaceConfigPath } from "./user-config.js";
 import {
   AdminRuntimeError,
   AdminRuntimeManager,
-  probeBackendReadiness,
+  probeBackendRestartPreflight,
   type BackendRuntimeOperation,
   type BackendRuntimeStatus,
 } from "./admin-runtime.js";
@@ -105,7 +105,11 @@ export async function startAdminServer(
   const logging = initialConfig.logging;
   const runtimeManager = options.runtimeManager ?? new AdminRuntimeManager({
     env,
-    probeReady: () => probeBackendReadiness(initialConfig.host, initialConfig.port),
+    probeReady: () => probeBackendRestartPreflight(
+      "127.0.0.1",
+      initialConfig.controlPort,
+      initialConfig.oauth.keys.internalDiagnostics,
+    ),
     onEvent: (event, fields) => logEvent(logging, "info", event, fields),
   });
   const backendClient = options.backendClient ?? new HttpAdminBackendClient({
@@ -408,7 +412,6 @@ async function handleApiRequest(
     }
     return;
   }
-
   if (request.method === "OPTIONS") {
     throw new HttpError(405, "method_not_allowed", "CORS requests are not supported.");
   }

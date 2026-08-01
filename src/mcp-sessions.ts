@@ -12,56 +12,50 @@ export interface McpSessionReservationResult {
   reclaimed?: McpSessionCloseResult;
 }
 
+export interface McpSessionOwner {
+  readonly principalId: string;
+  readonly grantId: string;
+  readonly authorizationEpoch: number;
+}
+
 export interface McpSessionReservation {
   readonly id: symbol;
   readonly reclaimsSessionId?: string;
-  readonly connectionPrincipalId?: string;
-}
-
-export interface StatelessMcpRequestOwnerRefs {
-  readonly principalRef: string;
-  readonly clientRef: string;
+  readonly owner: McpSessionOwner;
 }
 
 export interface StatelessMcpRequestLease {
   readonly id: symbol;
-  readonly connectionPrincipalId: string;
+  readonly owner: McpSessionOwner;
   readonly acquiredAt: number;
-  readonly principalRef: string;
-  readonly clientRef: string;
 }
 
 export interface StatelessMcpRequestLeaseUsage {
   agesMs: number[];
-  byOwner: Array<{
-    principalRef: string;
-    clientRef: string;
-    active: number;
-    oldestLeaseAgeMs: number;
-  }>;
 }
 
 interface McpSessionEntry<TTransport> {
   transport: TTransport;
-  connectionPrincipalId: string;
+  owner: McpSessionOwner;
   lastActivityAt: number;
   activeRequests: number;
   closing: boolean;
   closePromise?: Promise<McpSessionCloseResult>;
+  activeRequestDrain?: {
+    promise: Promise<void>;
+    resolve: () => void;
+  };
 }
 
 interface McpSessionCloseAttempt {
   underlying: Promise<void>;
-  connectionPrincipalId: string;
+  owner: McpSessionOwner;
 }
 
 export interface McpSessionRegistryOptions {
   now?: () => number;
   maxSessions?: number;
-  maxSessionsPerClient?: number;
   closeTimeoutMs?: number;
-  /** Permit a client to reclaim another client's idle stateful session. Off by default. */
-  allowGlobalIdleReclaim?: boolean;
 }
 
 export interface McpSessionUsageSnapshot {
@@ -70,32 +64,27 @@ export interface McpSessionUsageSnapshot {
   statelessRequests: number;
   statelessLeases: StatelessMcpRequestLeaseUsage;
   limit: number;
-  owner?: {
-    sessions: number;
-    reservations: number;
-    statelessRequests: number;
-    limit: number;
-  };
 }
 
 export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
   private readonly sessions = new Map<string, McpSessionEntry<TTransport>>();
   private readonly inFlightClosings = new Map<string, McpSessionCloseAttempt>();
+  private readonly revokedAuthorizations = new Set<string>();
+  private readonly statelessAuthorizationDrains = new Map<string, {
+    promise: Promise<void>;
+    resolve: () => void;
+  }>();
   private readonly now: () => number;
   private readonly maxSessions: number;
-  private readonly maxSessionsPerClient: number;
   private readonly reservations = new Set<McpSessionReservation>();
   private readonly statelessRequests = new Set<StatelessMcpRequestLease>();
   private readonly closeTimeoutMs: number;
-  private readonly allowGlobalIdleReclaim: boolean;
   private sealed = false;
 
   constructor(options: McpSessionRegistryOptions = {}) {
     this.now = options.now ?? Date.now;
     this.maxSessions = options.maxSessions ?? Number.POSITIVE_INFINITY;
-    this.maxSessionsPerClient = options.maxSessionsPerClient ?? Number.POSITIVE_INFINITY;
     this.closeTimeoutMs = options.closeTimeoutMs ?? 5_000;
-    this.allowGlobalIdleReclaim = options.allowGlobalIdleReclaim === true;
   }
 
   get size(): number {
@@ -106,61 +95,56 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
     return size;
   }
 
-  tryReserve(connectionPrincipalId?: string): McpSessionReservation | undefined {
+  tryReserve(owner: McpSessionOwner): McpSessionReservation | undefined {
     if (
       this.sealed ||
-      this.occupiedSlots() >= this.maxSessions ||
-      (connectionPrincipalId !== undefined &&
-        this.occupiedClientSlots(connectionPrincipalId) >= this.maxSessionsPerClient)
+      this.revokedAuthorizations.has(authorizationKey(owner)) ||
+      this.occupiedSlots() >= this.maxSessions
     ) {
       return undefined;
     }
-    const reservation = { id: Symbol("mcp-session-reservation"), connectionPrincipalId };
+    const reservation = { id: Symbol("mcp-session-reservation"), owner: copyOwner(owner) };
     this.reservations.add(reservation);
     return reservation;
   }
 
   tryAcquireStatelessRequest(
-    connectionPrincipalId: string,
-    ownerRefs: StatelessMcpRequestOwnerRefs,
+    owner: McpSessionOwner,
   ): StatelessMcpRequestLease | undefined {
     if (
       this.sealed ||
-      this.occupiedSlots() >= this.maxSessions ||
-      this.occupiedClientSlots(connectionPrincipalId) >= this.maxSessionsPerClient
+      this.revokedAuthorizations.has(authorizationKey(owner)) ||
+      this.occupiedSlots() >= this.maxSessions
     ) {
       return undefined;
     }
     const lease = {
       id: Symbol("stateless-mcp-request"),
-      connectionPrincipalId,
+      owner: copyOwner(owner),
       acquiredAt: this.now(),
-      ...ownerRefs,
     };
     this.statelessRequests.add(lease);
     return lease;
   }
 
   releaseStatelessRequest(lease: StatelessMcpRequestLease): boolean {
-    return this.statelessRequests.delete(lease);
+    const released = this.statelessRequests.delete(lease);
+    if (released) this.resolveStatelessAuthorizationDrain(lease.owner);
+    return released;
   }
 
-  async reserveWithIdleReclaim(connectionPrincipalId: string): Promise<McpSessionReservationResult> {
-    const available = this.tryReserve(connectionPrincipalId);
+  async reserveWithIdleReclaim(owner: McpSessionOwner): Promise<McpSessionReservationResult> {
+    const available = this.tryReserve(owner);
     if (available) return { reservation: available };
-    if (this.sealed) return {};
+    if (this.sealed || this.revokedAuthorizations.has(authorizationKey(owner))) return {};
 
-    const clientAtCapacity = this.occupiedClientSlots(connectionPrincipalId) >= this.maxSessionsPerClient;
-    const candidate = this.oldestInactiveSession(
-      connectionPrincipalId,
-      clientAtCapacity || !this.allowGlobalIdleReclaim,
-    );
+    const candidate = this.oldestInactiveSession();
     if (!candidate) return {};
 
     const reservation = {
       id: Symbol("mcp-session-reclaim-reservation"),
       reclaimsSessionId: candidate.sessionId,
-      connectionPrincipalId,
+      owner: copyOwner(owner),
     };
     this.reservations.add(reservation);
     const reclaimed = await this.beginClosing(candidate.sessionId, candidate.entry).promise;
@@ -178,77 +162,78 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
   seal(): void {
     this.sealed = true;
     this.reservations.clear();
-    this.statelessRequests.clear();
   }
 
   register(
     sessionId: string,
-    connectionPrincipalId: string,
+    owner: McpSessionOwner,
     transport: TTransport,
     reservation?: McpSessionReservation,
     activeRequests = 0,
   ): void {
     if (this.sealed) throw new Error("The MCP session registry is closed.");
+    if (this.revokedAuthorizations.has(authorizationKey(owner))) {
+      throw new Error("The MCP session authorization has been revoked.");
+    }
     if (reservation && !this.reservations.has(reservation)) {
       throw new Error("The MCP session reservation is no longer valid.");
     }
     if (this.sessions.has(sessionId)) {
       throw new Error(`Duplicate MCP session: ${sessionId}`);
     }
-    if (reservation?.connectionPrincipalId && reservation.connectionPrincipalId !== connectionPrincipalId) {
-      throw new Error("The MCP session reservation belongs to a different OAuth client.");
+    if (reservation && !sameOwner(reservation.owner, owner)) {
+      throw new Error("The MCP session reservation belongs to a different authorization.");
     }
     if (this.occupiedSlots(reservation) >= this.maxSessions) {
       throw new Error(`MCP session limit reached (${this.maxSessions}).`);
     }
-    if (this.occupiedClientSlots(connectionPrincipalId, reservation) >= this.maxSessionsPerClient) {
-      throw new Error(`MCP session limit reached for this OAuth client (${this.maxSessionsPerClient}).`);
-    }
     if (reservation) this.reservations.delete(reservation);
     this.sessions.set(sessionId, {
       transport,
-      connectionPrincipalId,
+      owner: copyOwner(owner),
       lastActivityAt: this.now(),
       activeRequests,
       closing: false,
     });
   }
 
-  get(sessionId: string, connectionPrincipalId: string): TTransport | undefined {
+  get(sessionId: string, owner: McpSessionOwner): TTransport | undefined {
     const entry = this.sessions.get(sessionId);
-    if (!entry || entry.closing || entry.connectionPrincipalId !== connectionPrincipalId) return undefined;
+    if (!entry || entry.closing || !sameOwner(entry.owner, owner)) return undefined;
 
     entry.lastActivityAt = this.now();
     return entry.transport;
   }
 
-  acquire(sessionId: string, connectionPrincipalId: string): TTransport | undefined {
+  acquire(sessionId: string, owner: McpSessionOwner): TTransport | undefined {
     const entry = this.sessions.get(sessionId);
-    if (!entry || entry.closing || entry.connectionPrincipalId !== connectionPrincipalId) return undefined;
+    if (!entry || entry.closing || !sameOwner(entry.owner, owner)) return undefined;
     entry.lastActivityAt = this.now();
     entry.activeRequests += 1;
     return entry.transport;
   }
 
-  release(sessionId: string, connectionPrincipalId: string): void {
+  release(sessionId: string, owner: McpSessionOwner): void {
     const entry = this.sessions.get(sessionId);
-    if (!entry || entry.connectionPrincipalId !== connectionPrincipalId) return;
+    if (!entry || !sameOwner(entry.owner, owner)) return;
     entry.activeRequests = Math.max(0, entry.activeRequests - 1);
     entry.lastActivityAt = this.now();
+    if (entry.activeRequests === 0) this.resolveActiveRequestDrain(entry);
   }
 
-  remove(sessionId: string): boolean {
-    return this.sessions.delete(sessionId);
-  }
-
-  removeOnTransportClose(sessionId: string): "intentional" | "unexpected" | undefined {
+  remove(sessionId: string, owner: McpSessionOwner): boolean {
     const entry = this.sessions.get(sessionId);
-    if (!entry) return undefined;
+    return entry !== undefined && sameOwner(entry.owner, owner) && this.sessions.delete(sessionId);
+  }
+
+  removeOnTransportClose(
+    sessionId: string,
+    owner: McpSessionOwner,
+  ): "intentional" | "unexpected" | undefined {
+    const entry = this.sessions.get(sessionId);
+    if (!entry || !sameOwner(entry.owner, owner)) return undefined;
     this.sessions.delete(sessionId);
-    const inFlightClosing = this.inFlightClosings.get(sessionId);
-    if (entry.closing && inFlightClosing?.connectionPrincipalId === entry.connectionPrincipalId) {
-      this.inFlightClosings.delete(sessionId);
-    }
+    this.resolveActiveRequestDrain(entry);
     return entry.closing ? "intentional" : "unexpected";
   }
 
@@ -276,75 +261,76 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
     return this.closeActive();
   }
 
-  async closeActive(): Promise<McpSessionCloseResult[]> {
-    this.reservations.clear();
-    const allClosings = new Set<Promise<McpSessionCloseResult>>();
-    for (const [sessionId, closing] of [...this.inFlightClosings]) {
-      allClosings.add(closeSession(sessionId, closing.underlying, this.closeTimeoutMs));
+  /**
+   * Quarantines sessions for one revoked authorization tuple, waits for their
+   * admitted requests to drain, and closes them. Other grants on the same
+   * principal remain active. Capacity is released only after close succeeds or
+   * the transport reports that it closed.
+   */
+  async closeAuthorizationSessions(
+    owner: McpSessionOwner,
+  ): Promise<McpSessionCloseResult[]> {
+    this.revokedAuthorizations.add(authorizationKey(owner));
+    for (const reservation of [...this.reservations]) {
+      if (sameOwner(reservation.owner, owner)) this.reservations.delete(reservation);
     }
-    const initiatedClosings: Array<Promise<McpSessionCloseResult>> = [];
-
-    for (const [sessionId, entry] of [...this.sessions]) {
-      const closing = this.beginClosing(sessionId, entry);
-      allClosings.add(closing.promise);
-      if (closing.initiated) initiatedClosings.push(closing.promise);
+    const closings: Array<Promise<McpSessionCloseResult>> = [];
+    for (const [sessionId, entry] of this.sessions) {
+      if (!sameOwner(entry.owner, owner)) continue;
+      closings.push(this.beginClosing(sessionId, entry, true).promise);
     }
-
-    await Promise.all([...allClosings]);
-    return Promise.all(initiatedClosings);
+    const [closeResults] = await Promise.all([
+      Promise.all(closings),
+      this.waitForStatelessAuthorizationDrain(owner),
+    ]);
+    return closeResults;
   }
 
-  usageSnapshot(connectionPrincipalId?: string): McpSessionUsageSnapshot {
+  async closeActive(): Promise<McpSessionCloseResult[]> {
+    this.reservations.clear();
+    const allClosings = new Map<string, Promise<McpSessionCloseResult>>();
+    for (const [sessionId, entry] of this.sessions) {
+      const closing = this.beginClosing(sessionId, entry);
+      allClosings.set(sessionId, closing.promise);
+    }
+    for (const [sessionId, closing] of this.inFlightClosings) {
+      if (!allClosings.has(sessionId)) {
+        allClosings.set(
+          sessionId,
+          closeSession(sessionId, closing.underlying, this.closeTimeoutMs),
+        );
+      }
+    }
+    return Promise.all(allClosings.values());
+  }
+
+  usageSnapshot(): McpSessionUsageSnapshot {
     return {
       sessions: this.size,
       reservations: this.reservations.size,
       statelessRequests: this.statelessRequests.size,
       statelessLeases: this.statelessLeaseUsage(),
       limit: this.maxSessions,
-      ...(connectionPrincipalId === undefined ? {} : {
-        owner: {
-          sessions: this.clientSessionCount(connectionPrincipalId),
-          reservations: this.clientReservationCount(connectionPrincipalId),
-          statelessRequests: this.clientStatelessRequestCount(connectionPrincipalId),
-          limit: this.maxSessionsPerClient,
-        },
-      }),
     };
   }
 
   private statelessLeaseUsage(): StatelessMcpRequestLeaseUsage {
     const now = this.now();
     const agesMs: number[] = [];
-    const groups = new Map<string, StatelessMcpRequestLeaseUsage["byOwner"][number]>();
 
     for (const lease of this.statelessRequests) {
       const ageMs = Math.max(0, now - lease.acquiredAt);
       agesMs.push(ageMs);
-      const key = `${lease.principalRef}\0${lease.clientRef}`;
-      const current = groups.get(key);
-      if (current) {
-        current.active += 1;
-        current.oldestLeaseAgeMs = Math.max(current.oldestLeaseAgeMs, ageMs);
-      } else {
-        groups.set(key, {
-          principalRef: lease.principalRef,
-          clientRef: lease.clientRef,
-          active: 1,
-          oldestLeaseAgeMs: ageMs,
-        });
-      }
     }
 
     agesMs.sort((left, right) => right - left);
-    const byOwner = [...groups.values()].sort((left, right) =>
-      left.principalRef.localeCompare(right.principalRef) ||
-      left.clientRef.localeCompare(right.clientRef));
-    return { agesMs, byOwner };
+    return { agesMs };
   }
 
   private beginClosing(
     sessionId: string,
     entry: McpSessionEntry<TTransport>,
+    drainActiveRequests = false,
   ): { promise: Promise<McpSessionCloseResult>; initiated: boolean } {
     if (entry.closePromise) return { promise: entry.closePromise, initiated: false };
 
@@ -357,10 +343,16 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
     }
 
     entry.closing = true;
-    const underlyingClose = Promise.resolve().then(() => entry.transport.close());
+    const underlyingClose = Promise.resolve().then(async () => {
+      if (drainActiveRequests && entry.activeRequests > 0) {
+        await this.waitForActiveRequests(entry);
+      }
+      if (this.sessions.get(sessionId) !== entry) return;
+      await entry.transport.close();
+    });
     const promise = closeSession(sessionId, underlyingClose, this.closeTimeoutMs);
     entry.closePromise = promise;
-    const attempt = { underlying: underlyingClose, connectionPrincipalId: entry.connectionPrincipalId };
+    const attempt = { underlying: underlyingClose, owner: entry.owner };
     this.inFlightClosings.set(sessionId, attempt);
 
     void underlyingClose.then(
@@ -385,27 +377,29 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
     return { promise, initiated: true };
   }
 
-  private oldestInactiveSession(connectionPrincipalId: string, ownerOnly = false): {
+  private oldestInactiveSession(): {
     sessionId: string;
     entry: McpSessionEntry<TTransport>;
   } | undefined {
-    let oldestForOwner: { sessionId: string; entry: McpSessionEntry<TTransport> } | undefined;
-    let oldestGlobal: { sessionId: string; entry: McpSessionEntry<TTransport> } | undefined;
+    let oldest: {
+      sessionId: string;
+      entry: McpSessionEntry<TTransport>;
+    } | undefined;
 
     for (const [sessionId, entry] of this.sessions) {
-      if (entry.closePromise || entry.activeRequests > 0) continue;
-      if (!oldestGlobal || entry.lastActivityAt < oldestGlobal.entry.lastActivityAt) {
-        oldestGlobal = { sessionId, entry };
-      }
       if (
-        entry.connectionPrincipalId === connectionPrincipalId &&
-        (!oldestForOwner || entry.lastActivityAt < oldestForOwner.entry.lastActivityAt)
+        entry.closePromise ||
+        this.inFlightClosings.has(sessionId) ||
+        entry.activeRequests > 0
       ) {
-        oldestForOwner = { sessionId, entry };
+        continue;
+      }
+      if (!oldest || entry.lastActivityAt < oldest.entry.lastActivityAt) {
+        oldest = { sessionId, entry };
       }
     }
 
-    return oldestForOwner ?? (ownerOnly ? undefined : oldestGlobal);
+    return oldest;
   }
 
   private occupiedSlots(excludedReservation?: McpSessionReservation): number {
@@ -424,56 +418,75 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
     return occupied;
   }
 
-  private occupiedClientSlots(
-    connectionPrincipalId: string,
-    excludedReservation?: McpSessionReservation,
-  ): number {
-    let occupied =
-      this.clientSessionCount(connectionPrincipalId) + this.clientStatelessRequestCount(connectionPrincipalId);
-    for (const reservation of this.reservations) {
-      if (reservation === excludedReservation || reservation.connectionPrincipalId !== connectionPrincipalId) continue;
-      if (
-        reservation.reclaimsSessionId &&
-        this.occupiedSessionOwner(reservation.reclaimsSessionId) === connectionPrincipalId
-      ) {
-        continue;
-      }
-      occupied += 1;
-    }
-    return occupied;
+  private waitForActiveRequests(entry: McpSessionEntry<TTransport>): Promise<void> {
+    if (entry.activeRequests === 0) return Promise.resolve();
+    if (entry.activeRequestDrain) return entry.activeRequestDrain.promise;
+    let resolveDrain!: () => void;
+    const promise = new Promise<void>((resolve) => {
+      resolveDrain = resolve;
+    });
+    entry.activeRequestDrain = { promise, resolve: resolveDrain };
+    return promise;
   }
 
-  private clientSessionCount(connectionPrincipalId: string): number {
-    let count = 0;
-    for (const entry of this.sessions.values()) {
-      if (entry.connectionPrincipalId === connectionPrincipalId) count += 1;
-    }
-    for (const [sessionId, attempt] of this.inFlightClosings) {
-      if (!this.sessions.has(sessionId) && attempt.connectionPrincipalId === connectionPrincipalId) count += 1;
-    }
-    return count;
+  private resolveActiveRequestDrain(entry: McpSessionEntry<TTransport>): void {
+    const drain = entry.activeRequestDrain;
+    if (!drain) return;
+    entry.activeRequestDrain = undefined;
+    drain.resolve();
   }
 
-  private clientReservationCount(connectionPrincipalId: string): number {
-    let count = 0;
-    for (const reservation of this.reservations) {
-      if (reservation.connectionPrincipalId === connectionPrincipalId) count += 1;
-    }
-    return count;
+  private waitForStatelessAuthorizationDrain(owner: McpSessionOwner): Promise<void> {
+    if (this.exactStatelessRequestCount(owner) === 0) return Promise.resolve();
+    const key = authorizationKey(owner);
+    const existing = this.statelessAuthorizationDrains.get(key);
+    if (existing) return existing.promise;
+    let resolveDrain!: () => void;
+    const promise = new Promise<void>((resolve) => {
+      resolveDrain = resolve;
+    });
+    this.statelessAuthorizationDrains.set(key, { promise, resolve: resolveDrain });
+    return promise;
   }
 
-  private clientStatelessRequestCount(connectionPrincipalId: string): number {
+  private resolveStatelessAuthorizationDrain(owner: McpSessionOwner): void {
+    if (this.exactStatelessRequestCount(owner) > 0) return;
+    const key = authorizationKey(owner);
+    const drain = this.statelessAuthorizationDrains.get(key);
+    if (!drain) return;
+    this.statelessAuthorizationDrains.delete(key);
+    drain.resolve();
+  }
+
+  private exactStatelessRequestCount(owner: McpSessionOwner): number {
     let count = 0;
     for (const request of this.statelessRequests) {
-      if (request.connectionPrincipalId === connectionPrincipalId) count += 1;
+      if (sameOwner(request.owner, owner)) count += 1;
     }
     return count;
   }
+}
 
-  private occupiedSessionOwner(sessionId: string): string | undefined {
-    return this.sessions.get(sessionId)?.connectionPrincipalId
-      ?? this.inFlightClosings.get(sessionId)?.connectionPrincipalId;
-  }
+function copyOwner(owner: McpSessionOwner): McpSessionOwner {
+  return Object.freeze({
+    principalId: owner.principalId,
+    grantId: owner.grantId,
+    authorizationEpoch: owner.authorizationEpoch,
+  });
+}
+
+function sameOwner(left: McpSessionOwner, right: McpSessionOwner): boolean {
+  return left.principalId === right.principalId &&
+    left.grantId === right.grantId &&
+    left.authorizationEpoch === right.authorizationEpoch;
+}
+
+function authorizationKey(owner: McpSessionOwner): string {
+  return JSON.stringify([
+    owner.principalId,
+    owner.grantId,
+    owner.authorizationEpoch,
+  ]);
 }
 
 async function closeSession(

@@ -1,7 +1,15 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 
 export const CURSOR_SCHEMA_VERSION = 1 as const;
-export type CursorResourceType = "workspace" | "skill" | "instruction" | "process" | "diff";
+export type CursorResourceType = "instruction" | "skill" | "process" | "diff";
+export type CursorParameterValue = string | number | boolean;
+
+export interface CursorCallerIdentity {
+  connectionPrincipalId: string;
+  grantId: string;
+  authorizationEpoch: number;
+  executionId: string;
+}
 
 export interface CursorEnvelope {
   schemaVersion: typeof CURSOR_SCHEMA_VERSION;
@@ -11,6 +19,10 @@ export interface CursorEnvelope {
   queryHash: string;
   revision: string;
   offset: number;
+  /** Signed opaque resource identity used when continuation should need only the cursor. */
+  resourceId?: string;
+  /** Small signed query state used to reconstruct a continuation request. */
+  parameters?: Record<string, CursorParameterValue>;
   expiresAt: number;
 }
 
@@ -23,7 +35,7 @@ export class CursorProtocolError extends Error {
 
 const CURSOR_PREFIX = "dcur1.";
 const CURSOR_DOMAIN = "devspace-signed-cursor-v1\0";
-const PRINCIPAL_DOMAIN = "devspace-cursor-principal-v1\0";
+const CALLER_DOMAIN = "devspace-cursor-caller-v3\0";
 const DEFAULT_CURSOR_TTL_MS = 30 * 60_000;
 const MAX_CURSOR_TTL_MS = 24 * 60 * 60_000;
 const MAX_CURSOR_BYTES = 4_096;
@@ -46,6 +58,8 @@ export function encodeCursor(
     queryHash: input.queryHash,
     revision: input.revision,
     offset: input.offset,
+    ...(input.resourceId === undefined ? {} : { resourceId: input.resourceId }),
+    ...(input.parameters === undefined ? {} : { parameters: { ...input.parameters } }),
     expiresAt: input.expiresAt ?? now + ttlMs,
   };
   assertCursorEnvelope(envelope);
@@ -109,14 +123,14 @@ export function decodeCursor(
   }
 }
 
-export function cursorPrincipalRef(
-  connectionPrincipalId: string,
+export function cursorCallerRef(
+  identity: CursorCallerIdentity,
   key: string | Uint8Array,
 ): string {
-  if (!connectionPrincipalId) throw new TypeError("Cursor principal ID is required.");
+  assertCursorCallerIdentity(identity);
   return `cpr_${createHmac("sha256", key)
-    .update(PRINCIPAL_DOMAIN, "utf8")
-    .update(connectionPrincipalId, "utf8")
+    .update(CALLER_DOMAIN, "utf8")
+    .update(framedCallerIdentity(identity), "utf8")
     .digest("base64url")}`;
 }
 
@@ -146,7 +160,7 @@ function assertCursorEnvelope(value: unknown): asserts value is CursorEnvelope {
   const record = value as Partial<CursorEnvelope>;
   if (
     record.schemaVersion !== CURSOR_SCHEMA_VERSION ||
-    !["workspace", "skill", "instruction", "process", "diff"].includes(String(record.resourceType)) ||
+    !["instruction", "skill", "process", "diff"].includes(String(record.resourceType)) ||
     !boundedString(record.principalRef) ||
     !boundedString(record.queryHash) ||
     !boundedString(record.revision) ||
@@ -157,10 +171,52 @@ function assertCursorEnvelope(value: unknown): asserts value is CursorEnvelope {
     (
       record.workspaceGeneration !== undefined &&
       (!Number.isSafeInteger(record.workspaceGeneration) || record.workspaceGeneration < 1)
-    )
+    ) ||
+    (record.resourceId !== undefined && !boundedString(record.resourceId)) ||
+    (record.parameters !== undefined && !validCursorParameters(record.parameters))
   ) {
     throw new CursorProtocolError("invalid");
   }
+}
+
+function validCursorParameters(value: unknown): value is Record<string, CursorParameterValue> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const entries = Object.entries(value as Record<string, unknown>);
+  if (entries.length > 16 || Buffer.byteLength(JSON.stringify(value), "utf8") > 2_048) {
+    return false;
+  }
+  return entries.every(([key, entry]) => {
+    if (!key || Buffer.byteLength(key, "utf8") > 64) return false;
+    if (typeof entry === "string") return Buffer.byteLength(entry, "utf8") <= MAX_FIELD_BYTES;
+    if (typeof entry === "boolean") return true;
+    return typeof entry === "number" && Number.isSafeInteger(entry);
+  });
+}
+
+function assertCursorCallerIdentity(identity: CursorCallerIdentity): void {
+  if (
+    !identity ||
+    !boundedString(identity.connectionPrincipalId) ||
+    !boundedString(identity.grantId) ||
+    !Number.isSafeInteger(identity.authorizationEpoch) ||
+    identity.authorizationEpoch < 1 ||
+    !boundedString(identity.executionId)
+  ) {
+    throw new TypeError("Cursor caller identity is incomplete.");
+  }
+}
+
+function framedCallerIdentity(identity: CursorCallerIdentity): string {
+  return [
+    callerIdentityField("principal", identity.connectionPrincipalId),
+    callerIdentityField("grant", identity.grantId),
+    callerIdentityField("authorization_epoch", String(identity.authorizationEpoch)),
+    callerIdentityField("execution", identity.executionId),
+  ].join("");
+}
+
+function callerIdentityField(name: string, value: string): string {
+  return `${name}\0${Buffer.byteLength(value, "utf8")}:${value}\0`;
 }
 
 function boundedString(value: unknown): value is string {

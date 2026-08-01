@@ -8,15 +8,23 @@ import { InvalidGrantError, InvalidTokenError } from "@modelcontextprotocol/sdk/
 import type { OAuthClientInformationFull, OAuthTokens } from "@modelcontextprotocol/sdk/shared/auth.js";
 import { databasePath, openDatabase } from "./db/client.js";
 import {
+  CURRENT_DATABASE_SCHEMA_NAME,
+  CURRENT_DATABASE_SCHEMA_VERSION,
+} from "./db/canonical-schema.js";
+import {
   SingleUserOAuthProvider,
   type OAuthAuditEvent,
 } from "./oauth-provider.js";
 import {
-  PrincipalReconnectError,
   SqliteOAuthClientsStore,
   SqliteOAuthStore,
+  type OAuthGrantCreationResult,
 } from "./oauth-store.js";
 import { SqliteWorkspaceStore } from "./workspace-store.js";
+import {
+  ProjectExecutionStore,
+  type ProjectExecutionAuthorization,
+} from "./project-execution-store.js";
 import {
   DEFAULT_AUTHORIZATION_SCOPES,
   DEFAULT_DEVSPACE_OAUTH_SCOPES,
@@ -48,17 +56,21 @@ const redirectUri = "https://chatgpt.com/connector_platform_oauth_redirect";
 try {
   await testDatabaseConfiguration(join(root, "database-configuration"));
   testPersistenceAndTokenHashing(join(root, "persistence"));
-  testConnectionPrincipalReconnect(join(root, "principal-reconnect"));
-  testPrincipalManagement(join(root, "principal-management"));
+  testAuthorizationGrantCoexistence(join(root, "grant-coexistence"));
+  await testProjectCentricRequestAuthorization(join(root, "project-centric-authorization"));
   testAuthorizationLimitPersistence(join(root, "authorization-limits"));
   testExpiredTokenCleanup(join(root, "expiration"));
+  testStaleGrantRetainsProjectInventory(join(root, "stale-grant-inventory"));
   testPendingClientCleanupAndCapacity(join(root, "pending-client-capacity"));
   testTransactionalTokenRotation(join(root, "rotation"));
   testDurableWorkspaceRevocationCleanup(join(root, "workspace-revocation"));
-  testOrphanedWorkspaceReconciliation(join(root, "workspace-orphans"));
   testRedirectSchemeValidation(join(root, "redirect-schemes"));
   await testAuthorizationResponseHardening(join(root, "approval-headers"));
+  await testApprovalHidesPrincipalManagementAndPreservesAuthorization(
+    join(root, "coexisting-approval"),
+  );
   await testDefaultAuthorizationScopes(join(root, "default-scopes"));
+  await testDurableAuthorizationArtifacts(join(root, "durable-authorization-artifacts"));
   await testAuthorizationThrottling(join(root, "approval-throttling"));
   await testAuditFailuresAreBestEffort(join(root, "audit-failures"));
   await testProviderRestartRotationAndRevocation(join(root, "provider"));
@@ -81,7 +93,9 @@ async function testAuditFailuresAreBestEffort(stateDir: string): Promise<void> {
     mcpUrl,
     stateDir,
     () => { throw new Error("audit sink unavailable"); },
-    (change) => authorizationBoundaryChanges.push(change),
+    (change) => {
+      authorizationBoundaryChanges.push(change);
+    },
   );
   try {
     const client = await provider.clientsStore.registerClient?.({
@@ -94,10 +108,7 @@ async function testAuditFailuresAreBestEffort(stateDir: string): Promise<void> {
     const firstContext = provider.authorizeRequest(
       await provider.verifyAccessToken(firstAuthorization.tokens.access_token),
     );
-    assert.deepEqual(authorizationBoundaryChanges, [{
-      connectionPrincipalId: firstContext.connectionPrincipalId,
-      reason: "principal_created",
-    }]);
+    assert.deepEqual(authorizationBoundaryChanges, []);
 
     const repeatedAuthorization = await authorizeAndExchange(
       provider,
@@ -108,22 +119,17 @@ async function testAuditFailuresAreBestEffort(stateDir: string): Promise<void> {
       await provider.verifyAccessToken(repeatedAuthorization.tokens.access_token),
     );
     assert.notEqual(repeatedContext.grantId, firstContext.grantId);
-    assert.notEqual(repeatedContext.connectionPrincipalId, firstContext.connectionPrincipalId);
-    assert.deepEqual(authorizationBoundaryChanges, [
-      { connectionPrincipalId: firstContext.connectionPrincipalId, reason: "principal_created" },
-      { connectionPrincipalId: repeatedContext.connectionPrincipalId, reason: "principal_created" },
-    ]);
+    assert.equal(repeatedContext.connectionPrincipalId, firstContext.connectionPrincipalId);
+    assert.deepEqual(authorizationBoundaryChanges, []);
 
     const issued = firstAuthorization.tokens;
     assert.ok(issued.refresh_token);
-    const refreshed = await provider.exchangeRefreshToken(
+    assert.ok((await provider.exchangeRefreshToken(
       client,
       issued.refresh_token,
       [...DEFAULT_DEVSPACE_OAUTH_SCOPES],
       mcpUrl,
-    );
-    assert.ok(refreshed.access_token);
-    assert.ok(refreshed.refresh_token);
+    )).refresh_token);
   } finally {
     provider.close();
   }
@@ -149,10 +155,9 @@ async function testDefaultAuthorizationScopes(stateDir: string): Promise<void> {
       resource: mcpUrl,
     }, approval.response);
     assert.equal((approval.response as unknown as { statusCode: number }).statusCode, 302);
-    const [code, record] = [...provider["codes"].entries()][0] ?? [];
-    assert.equal(typeof code, "string");
-    assert.deepEqual(record?.params.scopes, [...DEFAULT_AUTHORIZATION_SCOPES]);
-    const tokens = await provider.exchangeAuthorizationCode(client, String(code), undefined, redirectUri, mcpUrl);
+    const code = new URL(String(approval.redirectLocation)).searchParams.get("code");
+    assert.ok(code);
+    const tokens = await provider.exchangeAuthorizationCode(client, code, undefined, redirectUri, mcpUrl);
     assert.equal(tokens.scope, DEFAULT_AUTHORIZATION_SCOPES.join(" "));
     assert.deepEqual(
       (await provider.verifyAccessToken(tokens.access_token)).scopes,
@@ -160,6 +165,118 @@ async function testDefaultAuthorizationScopes(stateDir: string): Promise<void> {
     );
   } finally {
     provider.close();
+  }
+}
+
+async function testDurableAuthorizationArtifacts(stateDir: string): Promise<void> {
+  const authorizationRoot = { id: "root-durable", path: stateDir, label: "Durable root" };
+  const config = { ...oauthConfig, resourceRoots: () => [authorizationRoot] };
+  const params = {
+    redirectUri,
+    codeChallenge: "durable-code-challenge",
+    scopes: [...DEFAULT_DEVSPACE_OAUTH_SCOPES],
+    resource: mcpUrl,
+  };
+
+  const firstProvider = new SingleUserOAuthProvider(config, mcpUrl, stateDir);
+  const client = await firstProvider.clientsStore.registerClient?.({
+    redirect_uris: [redirectUri],
+    client_name: "Durable authorization client",
+    token_endpoint_auth_method: "none",
+  });
+  assert.ok(client);
+  const approval = fakeAuthorizationResponse("POST", { owner_token: ownerPassword });
+  await firstProvider.authorize(client, params, approval.response);
+  assert.equal((approval.response as unknown as { statusCode: number }).statusCode, 200);
+  const selectionToken = approval.sentBody?.match(
+    /name="selection_token" value="([A-Za-z0-9_-]+)"/u,
+  )?.[1];
+  assert.ok(selectionToken);
+  firstProvider.close();
+
+  const secondProvider = new SingleUserOAuthProvider(config, mcpUrl, stateDir);
+  const selected = fakeAuthorizationResponse("POST", {
+    selection_token: selectionToken,
+    root_id: authorizationRoot.id,
+  });
+  await secondProvider.authorize(client, params, selected.response);
+  assert.equal((selected.response as unknown as { statusCode: number }).statusCode, 302);
+  const authorizationCode = new URL(String(selected.redirectLocation)).searchParams.get("code");
+  assert.ok(authorizationCode);
+  secondProvider.close();
+
+  const persisted = openDatabase(stateDir);
+  try {
+    assert.equal(
+      persisted.sqlite.prepare(`
+        select count(*) from oauth_authorization_selections where token_hash = ?
+      `).pluck().get(selectionToken),
+      0,
+      "the opaque selection token must never be persisted in plaintext",
+    );
+    assert.equal(
+      persisted.sqlite.prepare(`
+        select count(*) from oauth_authorization_codes where code_hash = ?
+      `).pluck().get(authorizationCode),
+      0,
+      "the opaque authorization code must never be persisted in plaintext",
+    );
+    assert.equal(
+      persisted.sqlite.prepare(`
+        select count(*) from oauth_authorization_codes where code_hash = ?
+      `).pluck().get(hashToken(authorizationCode)),
+      1,
+    );
+  } finally {
+    persisted.close();
+  }
+
+  const thirdProvider = new SingleUserOAuthProvider(config, mcpUrl, stateDir);
+  try {
+    assert.equal(
+      await thirdProvider.challengeForAuthorizationCode(client, authorizationCode),
+      params.codeChallenge,
+    );
+    const tokens = await thirdProvider.exchangeAuthorizationCode(
+      client,
+      authorizationCode,
+      undefined,
+      redirectUri,
+      mcpUrl,
+    );
+    assert.ok(tokens.access_token);
+    await assert.rejects(
+      thirdProvider.exchangeAuthorizationCode(
+        client,
+        authorizationCode,
+        undefined,
+        redirectUri,
+        mcpUrl,
+      ),
+      InvalidGrantError,
+    );
+
+    const selectionReplay = fakeAuthorizationResponse("POST", {
+      selection_token: selectionToken,
+      root_id: authorizationRoot.id,
+    });
+    await thirdProvider.authorize(client, params, selectionReplay.response);
+    assert.equal((selectionReplay.response as unknown as { statusCode: number }).statusCode, 400);
+
+    const expiringSelection = fakeAuthorizationResponse("POST", { owner_token: ownerPassword });
+    await thirdProvider.authorize(
+      client,
+      { ...params, codeChallenge: "expiring-selection-challenge" },
+      expiringSelection.response,
+    );
+    assert.equal((expiringSelection.response as unknown as { statusCode: number }).statusCode, 200);
+    assert.equal(
+      thirdProvider.cleanupExpired(Math.floor(Date.now() / 1_000) + 3_600)
+        .authorizationSelections,
+      1,
+    );
+  } finally {
+    thirdProvider.close();
   }
 }
 
@@ -242,26 +359,13 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
     const migrations = database.sqlite
       .prepare("select version, name from devspace_schema_migrations order by version")
       .all();
-    assert.deepEqual(migrations, [{ version: 17, name: "canonical-state-v17" }]);
+    assert.deepEqual(migrations, [{
+      version: CURRENT_DATABASE_SCHEMA_VERSION,
+      name: CURRENT_DATABASE_SCHEMA_NAME,
+    }]);
   } finally {
     database.close();
   }
-
-  const simulatedOldLifecycle = openDatabase(stateDir);
-  simulatedOldLifecycle.sqlite.prepare(
-    "update devspace_schema_migrations set version = 16, name = 'canonical-state-v16' where version = 17",
-  ).run();
-  simulatedOldLifecycle.sqlite.exec(`
-    drop trigger if exists oauth_grants_principal_insert_check;
-    drop trigger if exists oauth_grants_principal_update_check;
-    drop trigger if exists connection_principals_delete_check;
-    create trigger legacy_oauth_clients_insert_check
-      before insert on oauth_clients
-      begin
-        select raise(abort, 'legacy trigger rejected registration');
-      end;
-  `);
-  simulatedOldLifecycle.close();
 
   const upgraded = new SqliteOAuthStore(stateDir);
   try {
@@ -299,7 +403,7 @@ function testPersistenceAndTokenHashing(stateDir: string): void {
     /active authorization grant/,
   );
   const principalId = firstStore.ensurePrincipalForClient(client.client_id);
-  assert.match(principalId, /^principal-[0-9a-f-]{36}$/u);
+  assert.equal(principalId, "owner");
   assert.notEqual(principalId, client.client_id);
 
   firstStore.saveTokenPair({
@@ -350,270 +454,212 @@ function testPersistenceAndTokenHashing(stateDir: string): void {
   }
 }
 
-function testConnectionPrincipalReconnect(stateDir: string): void {
+function testAuthorizationGrantCoexistence(stateDir: string): void {
   const oauth = new SqliteOAuthStore(stateDir);
   const clients = new SqliteOAuthClientsStore(oauth, oauthConfig.allowedRedirectHosts);
-  const workspaces = new SqliteWorkspaceStore(stateDir);
   try {
-    const first = clients.registerClient({ redirect_uris: [redirectUri], client_name: "First" });
-    const second = clients.registerClient({ redirect_uris: [redirectUri], client_name: "Second" });
-    const firstPrincipal = oauth.ensurePrincipalForClient(first.client_id);
-    assert.equal(oauth.principalForClient(second.client_id), undefined);
-
-    workspaces.createSession({
-      id: "principal-reconnect-workspace",
-      connectionPrincipalId: firstPrincipal,
-      alias: "primary",
-      root: "/workspace/principal-reconnect",
+    const firstClient = clients.registerClient({
+      redirect_uris: [redirectUri],
+      client_name: "First authorization",
     });
-    const integrityDatabase = openDatabase(stateDir);
+    const secondClient = clients.registerClient({
+      redirect_uris: [redirectUri],
+      client_name: "Second authorization",
+    });
+    const firstGrant = oauth.createAuthorizationGrant({
+      clientId: firstClient.client_id,
+      scopes: ["project:read"],
+      allowedRootIds: ["root-first"],
+    });
+    oauth.saveAccessToken("first-access", {
+      clientId: firstClient.client_id,
+      grantId: firstGrant.grantId,
+      principalId: firstGrant.principalId,
+      authorizationEpoch: firstGrant.authorizationEpoch,
+      scopes: ["project:read"],
+      expiresAt: Math.floor(Date.now() / 1_000) + 3_600,
+    });
+    oauth.saveRefreshToken("first-refresh", {
+      clientId: firstClient.client_id,
+      grantId: firstGrant.grantId,
+      principalId: firstGrant.principalId,
+      authorizationEpoch: firstGrant.authorizationEpoch,
+      scopes: ["project:read"],
+      expiresAt: Math.floor(Date.now() / 1_000) + 3_600,
+    });
+    oauth.saveAuthorizationCode("first-code", {
+      clientId: firstClient.client_id,
+      grantId: firstGrant.grantId,
+      principalId: firstGrant.principalId,
+      authorizationEpoch: firstGrant.authorizationEpoch,
+      redirectUri,
+      codeChallenge: "first-code-challenge",
+      scopes: ["project:read"],
+    });
+    oauth.saveAuthorizationSelection("first-selection", {
+      clientId: firstClient.client_id,
+      authorizationSessionKey: "first-session",
+    });
+    createActiveProjectExecution(stateDir, {
+      principalId: firstGrant.principalId,
+      clientId: firstGrant.clientId,
+      grantId: firstGrant.grantId,
+      authorizationEpoch: firstGrant.authorizationEpoch,
+    }, "coexisting-execution");
+    const secondGrant = oauth.createAuthorizationGrant({
+      clientId: secondClient.client_id,
+      scopes: ["project:read", "project:write"],
+      allowedRootIds: ["root-second"],
+    });
+    const reauthorization = oauth.createAuthorizationGrant({
+      clientId: firstClient.client_id,
+      scopes: ["project:read"],
+      allowedRootIds: ["root-reauthorized"],
+    });
+
+    assert.equal(firstGrant.principalId, "owner");
+    assert.equal(secondGrant.principalId, "owner");
+    assert.equal(reauthorization.principalId, "owner");
+    for (const created of [secondGrant, reauthorization]) {
+      assert.deepEqual(created.revokedAuthorizations, []);
+      assert.deepEqual(created.authorizationCleanup, emptyAuthorizationCleanup());
+    }
+    assert.ok(oauth.getAuthorizationGrant(firstGrant.grantId));
+    assert.ok(oauth.getAuthorizationGrant(secondGrant.grantId));
+    assert.ok(oauth.getAuthorizationGrant(reauthorization.grantId));
+    assert.ok(oauth.getAccessToken("first-access"));
+    assert.ok(oauth.getRefreshToken("first-refresh"));
+    assert.ok(oauth.getAuthorizationCode("first-code", firstClient.client_id));
+    assert.ok(oauth.getAuthorizationSelection(
+      "first-selection",
+      firstClient.client_id,
+      "first-session",
+    ));
+    assert.equal(oauth.principalForClient(firstClient.client_id), "owner");
+    assert.equal(oauth.principalForClient(secondClient.client_id), "owner");
+
+    const database = openDatabase(stateDir);
     try {
-      assert.throws(
-        () => integrityDatabase.sqlite
-          .prepare("delete from connection_principals where principal_id = ?")
-          .run(firstPrincipal),
-        /connection principal still has retained state/,
+      assert.equal(
+        database.sqlite.prepare(
+          "select count(*) from oauth_grants where revoked_at is null",
+        ).pluck().get(),
+        3,
+      );
+      assert.equal(
+        database.sqlite.prepare(`
+          select status from project_executions where execution_id = 'coexisting-execution'
+        `).pluck().get(),
+        "active",
+      );
+      assert.deepEqual(
+        database.sqlite.prepare(
+          "select principal_id, revoked_at from connection_principals",
+        ).all(),
+        [{ principal_id: "owner", revoked_at: null }],
+      );
+      assert.equal(
+        database.sqlite.prepare(
+          "select count(*) from sqlite_master where type = 'table' and name = 'oauth_principal_reconnect_codes'",
+        ).pluck().get(),
+        0,
       );
     } finally {
-      integrityDatabase.close();
+      database.close();
     }
-    const reconnect = oauth.issueReconnectCode(firstPrincipal, 60_000);
-    assert.match(reconnect.code, /^reconnect-[A-Za-z0-9_-]+$/u);
-    assert.equal(reconnect.principalId, firstPrincipal);
-    assert.deepEqual(oauth.consumeReconnectCode(reconnect.code, second.client_id), {
-      clientId: second.client_id,
-      targetPrincipalId: firstPrincipal,
-      changed: true,
-    });
-    assert.equal(oauth.principalForClient(second.client_id), firstPrincipal);
-    assert.throws(
-      () => oauth.consumeReconnectCode(reconnect.code, second.client_id),
-      (error: unknown) =>
-        error instanceof PrincipalReconnectError && error.code === "reconnect_code_invalid",
-    );
-
-    const summary = oauth.listConnectionPrincipals();
-    assert.equal(summary.length, 1);
-    assert.deepEqual(
-      summary.find(({ principalId }) => principalId === firstPrincipal),
-      {
-        principalId: firstPrincipal,
-        clientCount: 2,
-        activeWorkspaces: 1,
-        retainedWorkspaces: 1,
-        aliases: ["primary"],
-        createdAt: summary.find(({ principalId }) => principalId === firstPrincipal)!.createdAt,
-        lastUsedAt: summary.find(({ principalId }) => principalId === firstPrincipal)!.lastUsedAt,
-      },
-    );
-
-    const samePrincipalCode = oauth.issueReconnectCode(firstPrincipal, 60_000);
-    assert.deepEqual(oauth.consumeReconnectCode(samePrincipalCode.code, second.client_id), {
-      clientId: second.client_id,
-      sourcePrincipalId: firstPrincipal,
-      targetPrincipalId: firstPrincipal,
-      changed: false,
-    });
-
-    const assigned = clients.registerClient({
-      redirect_uris: [redirectUri],
-      client_name: "Assigned before relink",
-    });
-    const assignedPrincipal = oauth.ensurePrincipalForClient(assigned.client_id);
-    oauth.saveAccessToken("pre-relink-access", {
-      clientId: assigned.client_id,
-      scopes: [...DEFAULT_DEVSPACE_OAUTH_SCOPES],
-      expiresAt: Math.floor(Date.now() / 1_000) + 3_600,
-    });
-    oauth.saveRefreshToken("pre-relink-refresh", {
-      clientId: assigned.client_id,
-      scopes: [...DEFAULT_DEVSPACE_OAUTH_SCOPES],
-      expiresAt: Math.floor(Date.now() / 1_000) + 3_600,
-    });
-    const assignedCode = oauth.issueReconnectCode(firstPrincipal, 60_000);
-    assert.deepEqual(oauth.consumeReconnectCode(assignedCode.code, assigned.client_id), {
-      clientId: assigned.client_id,
-      sourcePrincipalId: assignedPrincipal,
-      targetPrincipalId: firstPrincipal,
-      changed: true,
-    });
-    assert.equal(oauth.getAccessToken("pre-relink-access"), undefined);
-    assert.equal(oauth.getRefreshToken("pre-relink-refresh"), undefined);
-
-    const inUse = clients.registerClient({ redirect_uris: [redirectUri], client_name: "In use" });
-    const inUsePrincipal = oauth.ensurePrincipalForClient(inUse.client_id);
-    workspaces.createSession({
-      id: "principal-in-use-workspace",
-      connectionPrincipalId: inUsePrincipal,
-      root: "/workspace/principal-in-use",
-    });
-    const blockedCode = oauth.issueReconnectCode(firstPrincipal, 60_000);
-    assert.throws(
-      () => oauth.consumeReconnectCode(blockedCode.code, inUse.client_id),
-      (error: unknown) =>
-        error instanceof PrincipalReconnectError && error.code === "reconnect_source_in_use",
-    );
   } finally {
-    workspaces.close();
     oauth.close();
   }
 }
 
-function testPrincipalManagement(stateDir: string): void {
-  const oauth = new SqliteOAuthStore(stateDir);
-  const clients = new SqliteOAuthClientsStore(oauth, oauthConfig.allowedRedirectHosts);
-  const workspaces = new SqliteWorkspaceStore(stateDir);
+async function testProjectCentricRequestAuthorization(stateDir: string): Promise<void> {
+  const provider = new SingleUserOAuthProvider(oauthConfig, mcpUrl, stateDir);
   try {
-    const targetClient = clients.registerClient({
+    const client = await provider.clientsStore.registerClient?.({
       redirect_uris: [redirectUri],
-      client_name: "Target",
+      client_name: "Project-centric authorization",
     });
-    const targetGrant = oauth.createAuthorizationGrant({
-      clientId: targetClient.client_id,
-      scopes: ["workspace:read", "workspace:write"],
-      allowedRootIds: ["root_target"],
-    });
-    const reusedClient = clients.registerClient({
-      redirect_uris: [redirectUri],
-      client_name: "Explicit reuse",
-    });
-    const reusedGrant = oauth.createAuthorizationGrant({
-      clientId: reusedClient.client_id,
-      scopes: ["workspace:read"],
-      allowedRootIds: ["root_target"],
-      reusePrincipalId: targetGrant.principalId,
-    });
-    assert.equal(reusedGrant.principalId, targetGrant.principalId);
-    assert.equal(reusedGrant.principalReused, true);
-    assert.deepEqual(reusedGrant.allowedRootIds, ["root_target"]);
-
-    const sourceClient = clients.registerClient({
-      redirect_uris: [redirectUri],
-      client_name: "Source orphan",
-    });
-    const sourceGrant = oauth.createAuthorizationGrant({
-      clientId: sourceClient.client_id,
-      scopes: ["workspace:read", "workspace:write"],
-      allowedRootIds: ["root_source"],
-    });
-    const active = workspaces.createSession({
-      id: "transfer-active",
-      connectionPrincipalId: sourceGrant.principalId,
-      alias: "transfer-active",
-      root: "/workspace/transfer-active",
-    });
-    const closed = workspaces.createSession({
-      id: "transfer-closed",
-      connectionPrincipalId: sourceGrant.principalId,
-      alias: "transfer-closed",
-      root: "/workspace/transfer-closed",
-    });
-    assert.equal(workspaces.closeSession(closed.id, sourceGrant.principalId), true);
-    const database = openDatabase(stateDir);
+    assert.ok(client);
+    const accessToken = "project-centric-access-token";
+    const store = new SqliteOAuthStore(stateDir);
+    let grant: OAuthGrantCreationResult;
     try {
-      database.sqlite.prepare(`
-        insert into mutation_operations (
-          connection_principal_id, workspace_id, tool, operation_id,
-          workspace_generation, request_hash, state, result_json,
-          resolution_method, evidence_type, evidence_json, resolved_at, operator_ref,
-          created_at, updated_at, expires_at
-        ) values (?, ?, 'exec_command', 'transfer-operation', 1, 'hash',
-          'outcome_unknown', null, null, null, null, null, null, ?, ?, ?)
-      `).run(
-        sourceGrant.principalId,
-        active.id,
-        "2026-01-01T00:00:00.000Z",
-        "2026-01-01T00:00:00.000Z",
-        "2099-01-01T00:00:00.000Z",
-      );
-      database.sqlite.prepare("delete from oauth_clients where client_id = ?")
-        .run(sourceClient.client_id);
+      grant = store.createAuthorizationGrant({
+        clientId: client.client_id,
+        scopes: ["project:read"],
+        allowedRootIds: ["root-project-a"],
+      });
+      store.saveAccessToken(hashToken(accessToken), {
+        clientId: client.client_id,
+        grantId: grant.grantId,
+        principalId: grant.principalId,
+        authorizationEpoch: grant.authorizationEpoch,
+        scopes: ["project:read"],
+        expiresAt: Math.floor(Date.now() / 1_000) + 3_600,
+      });
     } finally {
-      database.close();
+      store.close();
     }
 
-    const preview = oauth.previewWorkspaceTransfer(
-      sourceGrant.principalId,
-      targetGrant.principalId,
-    );
-    assert.equal(preview.transferable, true);
-    assert.equal(preview.activeWorkspaces, 1);
-    assert.equal(preview.closedWorkspaces, 1);
-    assert.equal(preview.mutationOperations, 1);
-    const transferred = oauth.transferPrincipalWorkspaces(
-      sourceGrant.principalId,
-      targetGrant.principalId,
-    );
-    assert.equal(transferred.transferredWorkspaces, 2);
-    assert.equal(transferred.transferredOperations, 1);
-    assert.equal(workspaces.getSession(active.id, sourceGrant.principalId), undefined);
-    assert.equal(workspaces.getSession(active.id, targetGrant.principalId)?.alias, "transfer-active");
-    const transferredDatabase = openDatabase(stateDir);
-    try {
-      assert.equal(
-        transferredDatabase.sqlite.prepare(`
-          select connection_principal_id from mutation_operations
-          where operation_id = 'transfer-operation'
-        `).pluck().get(),
-        targetGrant.principalId,
-      );
-    } finally {
-      transferredDatabase.close();
-    }
+    const authInfo = await provider.verifyAccessToken(accessToken);
+    const authorization = provider.authorizeRequest(authInfo);
+    assert.deepEqual(authorization, {
+      clientId: client.client_id,
+      grantId: grant.grantId,
+      connectionPrincipalId: grant.principalId,
+      authorizationEpoch: grant.authorizationEpoch,
+      scopes: ["project:read"],
+      allowedRootIds: ["root-project-a"],
+    });
 
-    const orphanClient = clients.registerClient({
-      redirect_uris: [redirectUri],
-      client_name: "Closable orphan",
-    });
-    const orphanGrant = oauth.createAuthorizationGrant({
-      clientId: orphanClient.client_id,
-      scopes: ["workspace:read"],
-    });
-    workspaces.createSession({
-      id: "orphan-active",
-      connectionPrincipalId: orphanGrant.principalId,
-      alias: "orphan-active",
-      root: "/workspace/orphan-active",
-    });
-    const orphanDatabase = openDatabase(stateDir);
-    try {
-      orphanDatabase.sqlite.prepare("delete from oauth_clients where client_id = ?")
-        .run(orphanClient.client_id);
-    } finally {
-      orphanDatabase.close();
-    }
-    assert.equal(oauth.previewOrphanClose(orphanGrant.principalId).closable, true);
-    assert.equal(oauth.closeOrphanPrincipal(orphanGrant.principalId).closedWorkspaces, 1);
-    assert.equal(
-      workspaces.listSessions(orphanGrant.principalId, ["closed"])
-        .find((session) => session.id === "orphan-active")?.status,
-      "closed",
+    assert.throws(
+      () => provider.authorizeRequest({
+        ...authInfo,
+        clientId: "different-client",
+      }),
+      InvalidTokenError,
+    );
+    assert.throws(
+      () => provider.authorizeRequest({
+        ...authInfo,
+        extra: {
+          ...authInfo.extra,
+          "devspace/principal-id": "different-principal",
+        },
+      }),
+      InvalidTokenError,
+    );
+    assert.throws(
+      () => provider.authorizeRequest({
+        ...authInfo,
+        extra: {
+          ...authInfo.extra,
+          "devspace/authorization-epoch": grant.authorizationEpoch + 1,
+        },
+      }),
+      InvalidTokenError,
+    );
+    assert.throws(
+      () => provider.authorizeRequest({
+        ...authInfo,
+        scopes: ["project:read", "project:write"],
+      }),
+      InvalidTokenError,
     );
 
-    const relinkClient = clients.registerClient({
-      redirect_uris: [redirectUri],
-      client_name: "Relink client",
-    });
-    const relinkGrant = oauth.createAuthorizationGrant({
-      clientId: relinkClient.client_id,
-      scopes: ["workspace:read"],
-      allowedRootIds: ["root_relink"],
-    });
-    const relinkPreview = oauth.previewClientRelink(
-      relinkClient.client_id,
-      targetGrant.principalId,
-    );
-    assert.equal(relinkPreview.relinkable, true);
-    assert.equal(relinkPreview.sourcePrincipalId, relinkGrant.principalId);
-    assert.deepEqual(relinkPreview.allowedRootIds, ["root_relink"]);
-    assert.equal(
-      oauth.relinkClientToPrincipal(relinkClient.client_id, targetGrant.principalId).changed,
-      true,
-    );
-    assert.equal(oauth.principalForClient(relinkClient.client_id), targetGrant.principalId);
+    const replacementStore = new SqliteOAuthStore(stateDir);
+    try {
+      replacementStore.createAuthorizationGrant({
+        clientId: client.client_id,
+        scopes: ["project:read"],
+        allowedRootIds: ["root-project-b"],
+      });
+    } finally {
+      replacementStore.close();
+    }
+    assert.equal(provider.authorizeRequest(authInfo).grantId, grant.grantId);
   } finally {
-    workspaces.close();
-    oauth.close();
+    provider.close();
   }
 }
 
@@ -663,11 +709,12 @@ function testAuthorizationLimitPersistence(stateDir: string): void {
     assert.deepEqual(restored.cleanupExpired(Math.ceil((base + 10_000) / 1_000)), {
       accessTokens: 0,
       refreshTokens: 0,
-      reconnectCodes: 0,
       authorizationLimits: 1,
+      authorizationSelections: 0,
+      authorizationCodes: 0,
       unapprovedClients: 0,
-      orphanedGrants: 0,
-      revokedPrincipals: 0,
+      staleGrants: 0,
+      authorizationCleanup: emptyAuthorizationCleanup(),
     });
   } finally {
     restored.close();
@@ -701,11 +748,12 @@ function testExpiredTokenCleanup(stateDir: string): void {
   assert.deepEqual(store.cleanupExpired(expiredAt + 1), {
     accessTokens: 1,
     refreshTokens: 1,
-    reconnectCodes: 0,
     authorizationLimits: 0,
+    authorizationSelections: 0,
+    authorizationCodes: 0,
     unapprovedClients: 0,
-    orphanedGrants: 0,
-    revokedPrincipals: 0,
+    staleGrants: 0,
+    authorizationCleanup: emptyAuthorizationCleanup(),
   });
   store.close();
 
@@ -716,6 +764,59 @@ function testExpiredTokenCleanup(stateDir: string): void {
     assert.equal(reopened.getRefreshToken("expired-refresh-hash"), undefined);
   } finally {
     reopened.close();
+  }
+}
+
+function testStaleGrantRetainsProjectInventory(stateDir: string): void {
+  const oauth = new SqliteOAuthStore(stateDir);
+  const clients = new SqliteOAuthClientsStore(oauth, oauthConfig.allowedRedirectHosts);
+  const client = clients.registerClient({ redirect_uris: [redirectUri] });
+  const grant = oauth.createAuthorizationGrant({
+    clientId: client.client_id,
+    scopes: ["project:read"],
+  });
+  const authorization = {
+    principalId: grant.principalId,
+    clientId: grant.clientId,
+    grantId: grant.grantId,
+    authorizationEpoch: grant.authorizationEpoch,
+  };
+  createActiveProjectExecution(stateDir, authorization, "stale-grant-execution");
+  const database = openDatabase(stateDir);
+  try {
+    database.sqlite.prepare(`
+      update oauth_grants
+      set created_at = '2020-01-01T00:00:00.000Z'
+      where grant_id = ?
+    `).run(grant.grantId);
+  } finally {
+    database.close();
+  }
+
+  const firstCleanup = oauth.cleanupExpired(Math.floor(Date.now() / 1_000));
+  assert.equal(firstCleanup.staleGrants, 0);
+  assert.ok(oauth.getAuthorizationGrant(grant.grantId));
+
+  const executions = new ProjectExecutionStore(stateDir);
+  try {
+    assert.equal(executions.markRevoked(authorization, "test cleanup"), 1);
+  } finally {
+    executions.close();
+  }
+  const secondCleanup = oauth.cleanupExpired(Math.floor(Date.now() / 1_000));
+  assert.equal(secondCleanup.staleGrants, 1);
+  const retained = openDatabase(stateDir);
+  try {
+    assert.equal(
+      retained.sqlite.prepare(`
+        select count(*) from project_executions
+        where execution_id = 'stale-grant-execution' and status = 'revoked'
+      `).pluck().get(),
+      1,
+    );
+  } finally {
+    retained.close();
+    oauth.close();
   }
 }
 
@@ -791,16 +892,6 @@ function testDurableWorkspaceRevocationCleanup(stateDir: string): void {
     connectionPrincipalId: principalId,
     root: "/workspace/revoked-checkout",
   });
-  workspaces.createSession({
-    id: "revoked-worktree",
-    connectionPrincipalId: principalId,
-    root: "/workspace/revoked-worktree",
-    mode: "worktree",
-    sourceRoot: "/workspace/source",
-    baseRef: "main",
-    baseSha: "abc123",
-    managed: true,
-  });
   const closed = workspaces.createSession({
     id: "closed-workspace",
     connectionPrincipalId: principalId,
@@ -813,7 +904,7 @@ function testDurableWorkspaceRevocationCleanup(stateDir: string): void {
     grants: 1,
     accessTokens: 0,
     refreshTokens: 0,
-    workspaceCleanupJobs: 3,
+    workspaceCleanupJobs: 2,
   });
   assert.equal(workspaces.getSession(checkout.id, principalId), undefined);
   const database = openDatabase(stateDir);
@@ -825,7 +916,6 @@ function testDurableWorkspaceRevocationCleanup(stateDir: string): void {
       [
         { id: "closed-workspace", status: "revoked" },
         { id: "revoked-checkout", status: "revoked" },
-        { id: "revoked-worktree", status: "revoked" },
       ],
     );
   } finally {
@@ -841,51 +931,38 @@ function testDurableWorkspaceRevocationCleanup(stateDir: string): void {
       .sort((left, right) => left.workspaceId.localeCompare(right.workspaceId)), [
       { workspaceId: "closed-workspace", status: "pending" },
       { workspaceId: "revoked-checkout", status: "pending" },
-      { workspaceId: "revoked-worktree", status: "pending" },
     ]);
-    const worktreeJob = jobs.find(({ workspaceId }) => workspaceId === "revoked-worktree")!;
-    const firstClaim = restarted.claimRevocationCleanupJob(worktreeJob.id, { now: 1_000, leaseMs: 100 });
+    const checkoutJob = jobs.find(({ workspaceId }) => workspaceId === "revoked-checkout")!;
+    const firstClaim = restarted.claimRevocationCleanupJob(checkoutJob.id, { now: 1_000, leaseMs: 100 });
     assert.equal(firstClaim?.attempts, 1);
-    assert.equal(restarted.claimRevocationCleanupJob(worktreeJob.id, { now: 1_050, leaseMs: 100 }), undefined);
-    const reclaimed = restarted.claimRevocationCleanupJob(worktreeJob.id, { now: 1_101, leaseMs: 100 });
+    assert.equal(restarted.claimRevocationCleanupJob(checkoutJob.id, { now: 1_050, leaseMs: 100 }), undefined);
+    const reclaimed = restarted.claimRevocationCleanupJob(checkoutJob.id, { now: 1_101, leaseMs: 100 });
     assert.equal(reclaimed?.attempts, 2);
     assert.notEqual(reclaimed?.claimToken, firstClaim?.claimToken);
     assert.equal(restarted.finalizeRevocationCleanupJob({
-      id: worktreeJob.id,
+      id: checkoutJob.id,
       claimToken: firstClaim!.claimToken!,
-      retainedDirtyWorktreeReason: "stale worker must not finalize",
       now: 1_102,
     }), false);
     assert.equal(restarted.failRevocationCleanupJob({
-      id: worktreeJob.id,
+      id: checkoutJob.id,
       claimToken: reclaimed!.claimToken!,
       error: "temporary cleanup failure",
       now: 1_103,
     }), true);
-    const finalClaim = restarted.claimRevocationCleanupJob(worktreeJob.id, { now: 1_104 });
+    const finalClaim = restarted.claimRevocationCleanupJob(checkoutJob.id, { now: 1_104 });
     assert.equal(finalClaim?.attempts, 3);
     assert.equal(restarted.finalizeRevocationCleanupJob({
-      id: worktreeJob.id,
+      id: checkoutJob.id,
       claimToken: finalClaim!.claimToken!,
-      retainedDirtyWorktreeReason: "worktree has uncommitted changes",
       now: 1_105,
     }), true);
     assert.equal(restarted.finalizeRevocationCleanupJob({
-      id: worktreeJob.id,
+      id: checkoutJob.id,
       claimToken: finalClaim!.claimToken!,
-      retainedDirtyWorktreeReason: "worktree has uncommitted changes",
       now: 1_105,
     }), false);
 
-    const checkoutJob = restarted.listRevocationCleanupJobs().find(
-      ({ workspaceId }) => workspaceId === "revoked-checkout",
-    )!;
-    const checkoutClaim = restarted.claimRevocationCleanupJob(checkoutJob.id, { now: 1_105 });
-    assert.equal(restarted.finalizeRevocationCleanupJob({
-      id: checkoutJob.id,
-      claimToken: checkoutClaim!.claimToken!,
-      now: 1_106,
-    }), true);
     const closedJob = restarted.listRevocationCleanupJobs().find(
       ({ workspaceId }) => workspaceId === "closed-workspace",
     )!;
@@ -896,22 +973,16 @@ function testDurableWorkspaceRevocationCleanup(stateDir: string): void {
       now: 1_107,
     }), true);
     assert.deepEqual(restarted.listRevocationCleanupJobs(), []);
-    assert.deepEqual(restarted.listRevocationDirtyWorktreeArtifacts().map((artifact) => ({
-      workspaceId: artifact.workspaceId,
-      reason: artifact.reason,
-    })), [{
-      workspaceId: "revoked-worktree",
-      reason: "worktree has uncommitted changes",
-    }]);
+    assert.deepEqual(restarted.listRevocationDirtyWorktreeArtifacts(), []);
     assert.deepEqual(restarted.cleanupRevocationHistory("9999-01-01T00:00:00.000Z", 1), {
       jobs: 1,
       workspaceSessions: 1,
     });
     assert.deepEqual(restarted.cleanupRevocationHistory("9999-01-01T00:00:00.000Z", 10), {
-      jobs: 2,
-      workspaceSessions: 2,
+      jobs: 1,
+      workspaceSessions: 1,
     });
-    assert.equal(restarted.listRevocationDirtyWorktreeArtifacts().length, 1);
+    assert.equal(restarted.listRevocationDirtyWorktreeArtifacts().length, 0);
   } finally {
     restarted.close();
   }
@@ -920,7 +991,7 @@ function testDurableWorkspaceRevocationCleanup(stateDir: string): void {
     assert.equal(beforePrincipalCleanup.sqlite.prepare(`
       select count(*)
       from connection_principals
-      where principal_id = ? and revoked_at is not null
+      where principal_id = ? and revoked_at is null
     `).pluck().get(principalId), 1);
   } finally {
     beforePrincipalCleanup.close();
@@ -932,60 +1003,12 @@ function testDurableWorkspaceRevocationCleanup(stateDir: string): void {
       select count(*)
       from connection_principals
       where principal_id = ?
-    `).pluck().get(principalId), 0);
+    `).pluck().get(principalId), 1);
   } finally {
     afterPrincipalCleanup.close();
   }
 }
 
-function testOrphanedWorkspaceReconciliation(stateDir: string): void {
-  const principalId = "revoked-orphan-principal";
-  const database = openDatabase(stateDir);
-  try {
-    const now = new Date(0).toISOString();
-    database.sqlite.prepare(`
-      insert into connection_principals (principal_id, created_at, last_used_at, revoked_at)
-      values (?, ?, ?, null)
-    `).run(principalId, now, now);
-  } finally {
-    database.close();
-  }
-  const workspaces = new SqliteWorkspaceStore(stateDir);
-  workspaces.createSession({
-    id: "orphaned-workspace",
-    connectionPrincipalId: principalId,
-    root: "/workspace/orphaned",
-  });
-  workspaces.close();
-  const revoke = openDatabase(stateDir);
-  try {
-    revoke.sqlite.prepare(`
-      update connection_principals
-      set revoked_at = ?, last_used_at = ?
-      where principal_id = ?
-    `).run(new Date(1).toISOString(), new Date(1).toISOString(), principalId);
-  } finally {
-    revoke.close();
-  }
-
-  const oauth = new SqliteOAuthStore(stateDir);
-  try {
-    assert.equal(oauth.queueOrphanedWorkspaceCleanup(), 1);
-    assert.equal(oauth.queueOrphanedWorkspaceCleanup(), 0, "reconciliation is idempotent");
-  } finally {
-    oauth.close();
-  }
-  const restored = new SqliteWorkspaceStore(stateDir);
-  try {
-    assert.deepEqual(
-      restored.listRevocationCleanupJobs().map(({ workspaceId, status }) => ({ workspaceId, status })),
-      [{ workspaceId: "orphaned-workspace", status: "pending" }],
-    );
-    assert.equal(restored.getSession("orphaned-workspace", principalId), undefined);
-  } finally {
-    restored.close();
-  }
-}
 
 async function testAuthorizationResponseHardening(stateDir: string): Promise<void> {
   const provider = new SingleUserOAuthProvider(oauthConfig, mcpUrl, stateDir);
@@ -1020,13 +1043,90 @@ async function testAuthorizationResponseHardening(stateDir: string): Promise<voi
     assert.deepEqual(provider.cleanupExpired(Math.floor(Date.now() / 1_000) + 3_600), {
       accessTokens: 0,
       refreshTokens: 0,
-      reconnectCodes: 0,
       authorizationLimits: 0,
+      authorizationSelections: 0,
       unapprovedClients: 0,
-      orphanedGrants: 0,
-      revokedPrincipals: 0,
+      staleGrants: 0,
       authorizationCodes: 1,
+      authorizationCleanup: emptyAuthorizationCleanup(),
     });
+  } finally {
+    provider.close();
+  }
+}
+
+async function testApprovalHidesPrincipalManagementAndPreservesAuthorization(
+  stateDir: string,
+): Promise<void> {
+  const authorizationRoot = { id: "root-approved", path: stateDir, label: "Approved Project" };
+  const boundaryChanges: unknown[] = [];
+  const provider = new SingleUserOAuthProvider(
+    { ...oauthConfig, resourceRoots: () => [authorizationRoot] },
+    mcpUrl,
+    stateDir,
+    undefined,
+    (change) => {
+      boundaryChanges.push(change);
+    },
+  );
+  try {
+    const oldClient = await provider.clientsStore.registerClient?.({
+      redirect_uris: [redirectUri],
+      client_name: "Previous authorization",
+    });
+    const replacementClient = await provider.clientsStore.registerClient?.({
+      redirect_uris: [redirectUri],
+      client_name: "Replacement authorization",
+    });
+    assert.ok(oldClient);
+    assert.ok(replacementClient);
+    const store = new SqliteOAuthStore(stateDir);
+    const oldGrant = store.createAuthorizationGrant({
+      clientId: oldClient.client_id,
+      scopes: [...DEFAULT_DEVSPACE_OAUTH_SCOPES],
+      allowedRootIds: [authorizationRoot.id],
+    });
+    store.close();
+
+    const approval = fakeAuthorizationResponse("POST", { owner_token: ownerPassword });
+    await provider.authorize(replacementClient, {
+      redirectUri,
+      codeChallenge: "replacement-approval-challenge",
+      scopes: [...DEFAULT_DEVSPACE_OAUTH_SCOPES],
+      resource: mcpUrl,
+    }, approval.response);
+    assert.equal((approval.response as unknown as { statusCode: number }).statusCode, 200);
+    const html = approval.sentBody ?? "";
+    assert.doesNotMatch(
+      html,
+      /reconnect|transfer|share|target_principal_id|connection_mode|runtime security posture|sandbox/iu,
+    );
+    const selectionToken = html.match(
+      /name="selection_token" value="([A-Za-z0-9_-]+)"/u,
+    )?.[1];
+    assert.ok(selectionToken);
+
+    const selection = fakeAuthorizationResponse("POST", {
+      selection_token: selectionToken,
+      root_id: authorizationRoot.id,
+    });
+    await provider.authorize(replacementClient, {
+      redirectUri,
+      codeChallenge: "replacement-approval-challenge",
+      scopes: [...DEFAULT_DEVSPACE_OAUTH_SCOPES],
+      resource: mcpUrl,
+    }, selection.response);
+    assert.equal(
+      (selection.response as unknown as { statusCode: number }).statusCode,
+      302,
+    );
+    assert.deepEqual(boundaryChanges, []);
+    const restored = new SqliteOAuthStore(stateDir);
+    try {
+      assert.ok(restored.getAuthorizationGrant(oldGrant.grantId));
+    } finally {
+      restored.close();
+    }
   } finally {
     provider.close();
   }
@@ -1087,6 +1187,29 @@ function testTransactionalTokenRotation(stateDir: string): void {
       clientId: client.client_id,
       scopes: [...DEFAULT_DEVSPACE_OAUTH_SCOPES],
     });
+    assert.ok(store.getAccessToken("new-access-hash"));
+    assert.ok(store.getRefreshToken("new-refresh-hash"));
+    store.saveTokenPair({
+      accessTokenHash: "second-grant-access-hash",
+      accessToken: {
+        clientId: client.client_id,
+        grantId: secondGrant.grantId,
+        principalId: secondGrant.principalId,
+        authorizationEpoch: secondGrant.authorizationEpoch,
+        scopes: [...DEFAULT_DEVSPACE_OAUTH_SCOPES],
+        expiresAt,
+      },
+      refreshTokenHash: "second-grant-refresh-hash",
+      refreshToken: {
+        clientId: client.client_id,
+        grantId: secondGrant.grantId,
+        principalId: secondGrant.principalId,
+        authorizationEpoch: secondGrant.authorizationEpoch,
+        familyId: tombstone.familyId,
+        scopes: [...DEFAULT_DEVSPACE_OAUTH_SCOPES],
+        expiresAt,
+      },
+    });
     assert.throws(
       () => store.saveTokenPair({
         accessTokenHash: "cross-grant-access-hash",
@@ -1118,9 +1241,20 @@ function testTransactionalTokenRotation(stateDir: string): void {
       changed: true,
       connectionPrincipalId: tombstone.principalId,
       grantId: tombstone.grantId,
+      authorizationCleanup: {
+        ...emptyAuthorizationCleanup(),
+        revokedAuthorizations: [{
+          principalId: tombstone.principalId,
+          grantId: tombstone.grantId,
+          authorizationEpoch: tombstone.authorizationEpoch,
+        }],
+      },
     });
     assert.equal(store.getAccessToken("new-access-hash"), undefined);
     assert.equal(store.getRefreshToken("new-refresh-hash"), undefined);
+    assert.ok(store.getAuthorizationGrant(secondGrant.grantId));
+    assert.ok(store.getAccessToken("second-grant-access-hash"));
+    assert.ok(store.getRefreshToken("second-grant-refresh-hash"));
   } finally {
     store.close();
   }
@@ -1134,7 +1268,9 @@ async function testRefreshReplayRevokesFamily(stateDir: string): Promise<void> {
     mcpUrl,
     stateDir,
     (event) => auditEvents.push(event),
-    (change) => boundaryChanges.push(change),
+    (change) => {
+      boundaryChanges.push(change);
+    },
   );
   try {
     const client = await provider.clientsStore.registerClient?.({
@@ -1145,6 +1281,12 @@ async function testRefreshReplayRevokesFamily(stateDir: string): Promise<void> {
     const issued = (await authorizeAndExchange(provider, client, "refresh-replay-initial")).tokens;
     assert.ok(issued.refresh_token);
     const initialContext = provider.authorizeRequest(await provider.verifyAccessToken(issued.access_token));
+    createActiveProjectExecution(stateDir, {
+      principalId: initialContext.connectionPrincipalId,
+      clientId: client.client_id,
+      grantId: initialContext.grantId,
+      authorizationEpoch: initialContext.authorizationEpoch,
+    }, "replay-execution");
     const refreshed = await provider.exchangeRefreshToken(
       client,
       issued.refresh_token,
@@ -1171,7 +1313,17 @@ async function testRefreshReplayRevokesFamily(stateDir: string): Promise<void> {
     assert.deepEqual(boundaryChanges.at(-1), {
       connectionPrincipalId: initialContext.connectionPrincipalId,
       reason: "refresh_token_replay",
+      revokedAuthorizations: [{
+        principalId: initialContext.connectionPrincipalId,
+        grantId: initialContext.grantId,
+        authorizationEpoch: initialContext.authorizationEpoch,
+      }],
     });
+    assertProjectExecutionCleanupPersisted(
+      stateDir,
+      "replay-execution",
+      initialContext,
+    );
     await assert.rejects(provider.verifyAccessToken(refreshed.access_token), InvalidTokenError);
     await assert.rejects(
       provider.exchangeRefreshToken(
@@ -1205,11 +1357,27 @@ async function testAbsoluteGrantLifetime(stateDir: string): Promise<void> {
     assert.equal((issued.expires_in ?? 0) > 0, true);
     assert.equal((issued.expires_in ?? 0) <= grantLifetimeSeconds, true);
 
+    const coexistingStore = new SqliteOAuthStore(stateDir);
+    const coexistingGrant = coexistingStore.createAuthorizationGrant({
+      clientId: client.client_id,
+      scopes: [...DEFAULT_DEVSPACE_OAUTH_SCOPES],
+    });
+    coexistingStore.saveAccessToken("coexisting-lifetime-access", {
+      clientId: client.client_id,
+      grantId: coexistingGrant.grantId,
+      principalId: coexistingGrant.principalId,
+      authorizationEpoch: coexistingGrant.authorizationEpoch,
+      scopes: [...DEFAULT_DEVSPACE_OAUTH_SCOPES],
+      expiresAt: Math.floor(Date.now() / 1_000) + 3_600,
+    });
+    coexistingStore.close();
+
     const database = openDatabase(stateDir);
     try {
       const grant = database.sqlite.prepare(`
         select grant_id as grantId, absolute_expires_at as absoluteExpiresAt
-        from oauth_grants where client_id = ? and revoked_at is null
+        from oauth_grants
+        where client_id = ? and revoked_at is null and absolute_expires_at is not null
       `).get(client.client_id) as { grantId: string; absoluteExpiresAt: number };
       const now = Math.floor(Date.now() / 1_000);
       assert.equal(grant.absoluteExpiresAt > now, true);
@@ -1221,6 +1389,12 @@ async function testAbsoluteGrantLifetime(stateDir: string): Promise<void> {
       `).get({ grantId: grant.grantId }) as { accessExpiresAt: number; refreshExpiresAt: number };
       assert.equal(tokenExpiries.accessExpiresAt <= grant.absoluteExpiresAt, true);
       assert.equal(tokenExpiries.refreshExpiresAt <= grant.absoluteExpiresAt, true);
+      createActiveProjectExecution(stateDir, {
+        principalId: "owner",
+        clientId: client.client_id,
+        grantId: grant.grantId,
+        authorizationEpoch: 1,
+      }, "expired-execution");
       database.sqlite.prepare(
         "update oauth_grants set absolute_expires_at = ? where grant_id = ?",
       ).run(now - 1, grant.grantId);
@@ -1228,6 +1402,17 @@ async function testAbsoluteGrantLifetime(stateDir: string): Promise<void> {
       database.close();
     }
 
+    const cleanup = provider.cleanupExpired(Math.floor(Date.now() / 1_000));
+    assert.deepEqual(
+      cleanup.authorizationCleanup.revokedExecutions.map(
+        ({ executionId, workspaceRoot }) => ({ executionId, workspaceRoot }),
+      ),
+      [{
+        executionId: "expired-execution",
+        workspaceRoot: "/private/tmp/source/expired-execution",
+      }],
+    );
+    assert.equal(cleanup.authorizationCleanup.workspaceCleanupJobs.length, 1);
     await assert.rejects(provider.verifyAccessToken(issued.access_token), InvalidTokenError);
     await assert.rejects(
       provider.exchangeRefreshToken(
@@ -1238,6 +1423,13 @@ async function testAbsoluteGrantLifetime(stateDir: string): Promise<void> {
       ),
       InvalidGrantError,
     );
+    const survivingStore = new SqliteOAuthStore(stateDir);
+    try {
+      assert.ok(survivingStore.getAuthorizationGrant(coexistingGrant.grantId));
+      assert.ok(survivingStore.getAccessToken("coexisting-lifetime-access"));
+    } finally {
+      survivingStore.close();
+    }
   } finally {
     provider.close();
   }
@@ -1269,17 +1461,47 @@ async function testProviderRestartRotationAndRevocation(stateDir: string): Promi
     assert.ok(refreshed.refresh_token);
     assert.notEqual(refreshed.access_token, issued.access_token);
 
+    const foreignClient = await secondProvider.clientsStore.registerClient?.({
+      redirect_uris: [redirectUri],
+      client_name: "Foreign revocation client",
+      token_endpoint_auth_method: "none",
+    });
+    assert.ok(foreignClient);
+    await secondProvider.revokeToken(foreignClient, { token: refreshed.access_token });
+    assert.equal(
+      (await secondProvider.verifyAccessToken(refreshed.access_token)).clientId,
+      client.client_id,
+      "a foreign client revocation must not delete the token",
+    );
+    await secondProvider.revokeToken(foreignClient, { token: refreshed.refresh_token });
+
+    const afterForeignRevocation = await secondProvider.exchangeRefreshToken(
+      client,
+      refreshed.refresh_token,
+      [...DEFAULT_DEVSPACE_OAUTH_SCOPES],
+      mcpUrl,
+    );
+    assert.ok(afterForeignRevocation.refresh_token);
+
+    await secondProvider.revokeToken(client, { token: afterForeignRevocation.access_token });
     await assert.rejects(
-      secondProvider.exchangeRefreshToken(client, issued.refresh_token, [...DEFAULT_DEVSPACE_OAUTH_SCOPES], mcpUrl),
+      secondProvider.verifyAccessToken(afterForeignRevocation.access_token),
+      InvalidTokenError,
+    );
+
+    await secondProvider.revokeToken(client, { token: afterForeignRevocation.refresh_token });
+    await assert.rejects(
+      secondProvider.exchangeRefreshToken(
+        client,
+        afterForeignRevocation.refresh_token,
+        [...DEFAULT_DEVSPACE_OAUTH_SCOPES],
+        mcpUrl,
+      ),
       InvalidGrantError,
     );
 
-    await secondProvider.revokeToken(client, { token: refreshed.access_token });
-    await assert.rejects(secondProvider.verifyAccessToken(refreshed.access_token), InvalidTokenError);
-
-    await secondProvider.revokeToken(client, { token: refreshed.refresh_token });
     await assert.rejects(
-      secondProvider.exchangeRefreshToken(client, refreshed.refresh_token, [...DEFAULT_DEVSPACE_OAUTH_SCOPES], mcpUrl),
+      secondProvider.exchangeRefreshToken(client, issued.refresh_token, [...DEFAULT_DEVSPACE_OAUTH_SCOPES], mcpUrl),
       InvalidGrantError,
     );
   } finally {
@@ -1410,6 +1632,15 @@ async function testOwnerCredentialChangeAndRevokeAll(stateDir: string): Promise<
   const client = await firstProvider.clientsStore.registerClient?.({ redirect_uris: [redirectUri] });
   assert.ok(client);
   const tokens = (await authorizeAndExchange(firstProvider, client, "owner-change")).tokens;
+  const context = firstProvider.authorizeRequest(
+    await firstProvider.verifyAccessToken(tokens.access_token),
+  );
+  createActiveProjectExecution(stateDir, {
+    principalId: context.connectionPrincipalId,
+    clientId: client.client_id,
+    grantId: context.grantId,
+    authorizationEpoch: context.authorizationEpoch,
+  }, "revoke-all-execution");
   assert.deepEqual(firstProvider.diagnosticSnapshot(), {
     clients: 1,
     grants: 1,
@@ -1426,9 +1657,14 @@ async function testOwnerCredentialChangeAndRevokeAll(stateDir: string): Promise<
     grants: 1,
     accessTokens: 1,
     refreshTokens: 1,
-    workspaceCleanupJobs: 0,
+    workspaceCleanupJobs: 1,
   });
   assert.equal(await firstProvider.clientsStore.getClient?.(client.client_id), undefined);
+  assertProjectExecutionCleanupPersisted(
+    stateDir,
+    "revoke-all-execution",
+    context,
+  );
   await assert.rejects(firstProvider.verifyAccessToken(tokens.access_token), InvalidTokenError);
 
   const replacement = await firstProvider.clientsStore.registerClient?.({ redirect_uris: [redirectUri] });
@@ -1459,7 +1695,7 @@ async function testOwnerCredentialChangeAndRevokeAll(stateDir: string): Promise<
       principals: 1,
       accessTokens: 0,
       refreshTokens: 0,
-      workspaceCleanupJobs: 0,
+      workspaceCleanupJobs: 1,
       expiredAccessTokens: 0,
       expiredRefreshTokens: 0,
       legacyWildcardGrants: 1,
@@ -1486,9 +1722,11 @@ function fakeAuthorizationResponse(method: string, body: Record<string, string> 
   response: Response;
   headers: Map<string, string>;
   readonly redirectLocation?: string;
+  readonly sentBody?: string;
 } {
   const headers = new Map<string, string>();
   let redirectLocation: string | undefined;
+  let sentBody: string | undefined;
   const response = {
     req: { method, body },
     statusCode: 200,
@@ -1500,7 +1738,8 @@ function fakeAuthorizationResponse(method: string, body: Record<string, string> 
       headers.set(name.toLowerCase(), value);
       return this;
     },
-    send(_body: string) {
+    send(body: string) {
+      sentBody = body;
       return this;
     },
     redirect(code: number, location: string) {
@@ -1514,6 +1753,9 @@ function fakeAuthorizationResponse(method: string, body: Record<string, string> 
     get redirectLocation() {
       return redirectLocation;
     },
+    get sentBody() {
+      return sentBody;
+    },
   };
 }
 
@@ -1521,11 +1763,9 @@ async function authorizeAndExchange(
   provider: SingleUserOAuthProvider,
   client: OAuthClientInformationFull,
   codeChallenge: string,
-  reconnectCode?: string,
 ): Promise<{ tokens: OAuthTokens; approval: ReturnType<typeof fakeAuthorizationResponse> }> {
   const approval = fakeAuthorizationResponse("POST", {
     owner_token: ownerPassword,
-    ...(reconnectCode ? { reconnect_code: reconnectCode } : {}),
   });
   await provider.authorize(client, {
     redirectUri,
@@ -1562,4 +1802,88 @@ function assertAuthorizationHeaders(headers: Map<string, string>): void {
 
 function hashToken(token: string): string {
   return createHash("sha256").update(token).digest("base64url");
+}
+
+function emptyAuthorizationCleanup() {
+  return {
+    revokedAuthorizations: [],
+    revokedExecutions: [],
+    workspaceCleanupJobs: [],
+  };
+}
+
+function createActiveProjectExecution(
+  stateDir: string,
+  authorization: ProjectExecutionAuthorization,
+  executionId: string,
+): void {
+  const executions = new ProjectExecutionStore(stateDir, {
+    createExecutionId: () => executionId,
+  });
+  const workspaces = new SqliteWorkspaceStore(stateDir);
+  try {
+    const canonicalSourceRoot = `/private/tmp/source/${executionId}`;
+    const workspace = workspaces.createSession({
+      id: `workspace-${executionId}`,
+      connectionPrincipalId: authorization.principalId,
+      alias: `execution-${executionId}`,
+      root: canonicalSourceRoot,
+      writeAccess: "read_write",
+    });
+    const reserved = executions.reserve({
+      ...authorization,
+      projectRef: `project-${executionId}`,
+      projectFingerprint: `fingerprint-${executionId}`,
+      sourceRoot: canonicalSourceRoot,
+      canonicalSourceRoot,
+      createOperationId: `create-${executionId}`,
+      requestHash: `request-${executionId}`,
+    });
+    assert.equal(reserved.status, "new");
+    if (reserved.status !== "new") return;
+    assert.equal(executions.activate(executionId, authorization, {
+      workspaceId: workspace.id,
+    })?.status, "active");
+  } finally {
+    workspaces.close();
+    executions.close();
+  }
+}
+
+function assertProjectExecutionCleanupPersisted(
+  stateDir: string,
+  executionId: string,
+  authorization: {
+    connectionPrincipalId: string;
+    grantId: string;
+    authorizationEpoch: number;
+  },
+): void {
+  const database = openDatabase(stateDir);
+  try {
+    assert.deepEqual(database.sqlite.prepare(`
+      select status, principal_id as principalId, grant_id as grantId,
+        authorization_epoch as authorizationEpoch
+      from project_executions
+      where execution_id = ?
+    `).get(executionId), {
+      status: "revoked",
+      principalId: authorization.connectionPrincipalId,
+      grantId: authorization.grantId,
+      authorizationEpoch: authorization.authorizationEpoch,
+    });
+    assert.deepEqual(database.sqlite.prepare(`
+      select project_execution_id as projectExecutionId,
+        workspace_id as workspaceId, workspace_root as workspaceRoot, status
+      from oauth_revocation_cleanup_jobs
+      where project_execution_id = ?
+    `).get(executionId), {
+      projectExecutionId: executionId,
+      workspaceId: `workspace-${executionId}`,
+      workspaceRoot: `/private/tmp/source/${executionId}`,
+      status: "pending",
+    });
+  } finally {
+    database.close();
+  }
 }

@@ -1,58 +1,41 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { access, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   HeadTailBuffer,
-  isInteractiveShellCommand,
   MAX_PROCESS_INPUT_BYTES,
   nextTreeExitPollMs,
+  processLauncherEnvironment,
   ProcessSessionManager,
 } from "./process-sessions.js";
 import { ProcessOutputStore } from "./process-output-store.js";
+import type { WorkspaceRootLease } from "./workspace-root-locks.js";
 
-for (const command of [
-  "bash",
-  "/bin/zsh -i",
-  "env bash",
-  "/usr/bin/env TEST=1 /bin/sh -s",
-  "command zsh",
-  "nohup nice -n 5 bash",
-  "bash -s -- name",
-  "bash --rcfile /dev/null",
-  "bash -O extglob",
-  "sh -eu",
-  "zsh --no-rcs",
-  "dash -e",
-  "ksh -o vi",
-  "fish -C 'set greeting hello'",
-  "fish --no-config",
-  "env -S 'bash -s'",
-  "find . -exec bash -s {} \\;",
-  "printf x | xargs bash -s",
-  // Malformed or unknown options are conservatively treated as shell mode.
-  "bash -c",
-  "bash --future-option value",
-]) {
-  assert.equal(isInteractiveShellCommand(command), true, command);
-}
-
-for (const command of [
-  "python",
-  "bash -lc 'echo unsafe'",
-  "bash ./script.sh",
-  "bash --rcfile /dev/null ./script.sh",
-  "sh -eu ./script.sh",
-  "zsh -f ./script.zsh",
-  "dash -- ./script.sh",
-  "ksh -R xref ./script.ksh",
-  "fish -C 'set greeting hello' ./script.fish",
-  "fish --command 'echo unsafe'",
-  "fish --command='echo unsafe'",
-  "env -S \"bash -c 'echo delegated'\"",
-]) {
-  assert.equal(isInteractiveShellCommand(command), false, command);
-}
+assert.deepEqual(
+  processLauncherEnvironment({
+    PATH: "/safe/bin",
+    HOME: "/safe/home",
+    NODE_OPTIONS: "--require=/tmp/injected.cjs",
+    NODE_PATH: "/tmp/node-modules",
+    BASH_ENV: "/tmp/bash-env",
+    ENV: "/tmp/sh-env",
+    LD_PRELOAD: "/tmp/injected.so",
+    DYLD_INSERT_LIBRARIES: "/tmp/injected.dylib",
+  }),
+  {
+    PATH: "/safe/bin",
+    HOME: "/safe/home",
+    NO_COLOR: "1",
+    TERM: "dumb",
+    PAGER: "cat",
+    GIT_PAGER: "cat",
+    GH_PAGER: "cat",
+    CODEX_CI: "1",
+    LANG: "C.UTF-8",
+    LC_ALL: "C.UTF-8",
+  },
+);
 
 const smallBuffer = new HeadTailBuffer(100);
 smallBuffer.append("hello\n");
@@ -355,9 +338,8 @@ process.env.JAVA_HOME = "/tmp/devspace-java-home";
 const environment = await manager.start({
   connectionPrincipalId,
   workspaceId: "workspace-a",
-  workspaceRoot: "/tmp/devspace-workspace-a",
   cwd: process.cwd(),
-  command: `${node} -e "console.log([process.env.NO_COLOR, process.env.TERM, process.env.PAGER, process.env.GIT_PAGER, process.env.GH_PAGER, process.env.CODEX_CI, process.env.DEVSPACE_WORKSPACE_ID, process.env.DEVSPACE_WORKSPACE_ROOT, process.env.CDPATH ?? 'unset', process.env.DEVSPACE_TEST_SECRET ?? 'unset', process.env.DEVSPACE_EXPLICIT_ENV, process.env.PATH ? 'path' : 'no-path', process.env.JAVA_HOME].join(','))"`,
+  command: `${node} -e "console.log([process.env.NO_COLOR, process.env.TERM, process.env.PAGER, process.env.GIT_PAGER, process.env.GH_PAGER, process.env.CODEX_CI, process.env.DEVSPACE_WORKSPACE_ID ?? 'unset', process.env.DEVSPACE_WORKSPACE_ROOT ?? 'unset', process.env.CDPATH ?? 'unset', process.env.DEVSPACE_TEST_SECRET ?? 'unset', process.env.DEVSPACE_EXPLICIT_ENV, process.env.PATH ? 'path' : 'no-path', process.env.JAVA_HOME].join(','))"`,
   environment: { DEVSPACE_EXPLICIT_ENV: "explicit" },
   yieldTimeMs: 2_000,
 });
@@ -370,7 +352,7 @@ else process.env.JAVA_HOME = previousJavaHome;
 assert.equal(environment.running, false);
 assert.match(
   environment.output,
-  /1,dumb,cat,cat,cat,1,workspace-a,\/tmp\/devspace-workspace-a,unset,unset,explicit,path,\/tmp\/devspace-java-home/,
+  /1,dumb,cat,cat,cat,1,unset,unset,unset,unset,explicit,path,\/tmp\/devspace-java-home/,
 );
 
 const background = await manager.start({
@@ -659,11 +641,27 @@ try {
       connectionPrincipalId,
       workspaceId: "workspace-a",
       cwd: process.cwd(),
-      command: { program: process.execPath, args: ["-e", "setInterval(() => {}, 1000)"] },
+      command: {
+        program: process.execPath,
+        args: ["-e", "process.stdout.write('ready\\n'); setInterval(() => {}, 1000)"],
+      },
       tty: true,
       yieldTimeMs: 10,
     });
     assert.ok(interruptiblePty.sessionId);
+    let ptyReady = /ready/u.test(interruptiblePty.output);
+    const ptyReadyDeadline = Date.now() + 2_000;
+    while (interruptiblePty.running && !ptyReady && Date.now() < ptyReadyDeadline) {
+      const polledPty = await manager.write({
+        connectionPrincipalId,
+        workspaceId: "workspace-a",
+        sessionId: interruptiblePty.sessionId,
+        chars: "",
+        yieldTimeMs: 100,
+      });
+      ptyReady = /ready/u.test(polledPty.output);
+    }
+    assert.equal(ptyReady, true);
     const interruptedPty = await manager.write({
       connectionPrincipalId,
       workspaceId: "workspace-a",
@@ -699,7 +697,7 @@ try {
       command: `${node} -e "setInterval(() => {}, 1000)"`,
       yieldTimeMs: 5,
     }),
-    /limit reached for this workspace/,
+    /limit reached for this Project/,
   );
   await assert.rejects(
     quotaManager.write({
@@ -733,49 +731,6 @@ try {
   await quotaManager.shutdown();
 }
 
-const clientQuotaManager = new ProcessSessionManager({
-  maxSessions: 3,
-  maxSessionsPerClient: 1,
-  maxSessionsPerWorkspace: 2,
-  maxRuntimeMs: 10_000,
-});
-try {
-  const clientASession = await clientQuotaManager.start({
-    connectionPrincipalId: "client-a",
-    workspaceId: "client-quota-a",
-    cwd: process.cwd(),
-    command: `${node} -e "setInterval(() => {}, 1000)"`,
-    yieldTimeMs: 5,
-  });
-  assert.ok(clientASession.sessionId);
-  await assert.rejects(
-    clientQuotaManager.start({
-      connectionPrincipalId: "client-a",
-      workspaceId: "client-quota-b",
-      cwd: process.cwd(),
-      command: `${node} -e "setInterval(() => {}, 1000)"`,
-      yieldTimeMs: 5,
-    }),
-    /limit reached for this OAuth client/,
-  );
-  const clientBSession = await clientQuotaManager.start({
-    connectionPrincipalId: "client-b",
-    workspaceId: "client-quota-a",
-    cwd: process.cwd(),
-    command: `${node} -e "setInterval(() => {}, 1000)"`,
-    yieldTimeMs: 5,
-  });
-  assert.ok(clientBSession.sessionId);
-  assert.deepEqual(clientQuotaManager.usageSnapshot("client-a"), {
-    sessions: 2,
-    running: 2,
-    limit: 3,
-    principal: { sessions: 1, running: 1, limit: 1 },
-  });
-} finally {
-  await clientQuotaManager.shutdown();
-}
-
 const completedQuotaManager = new ProcessSessionManager({
   maxSessions: 1,
   completedSessionTtlMs: 5_000,
@@ -790,7 +745,7 @@ try {
   });
   assert.ok(awaitingPoll.sessionId);
   await waitForCondition(
-    () => completedQuotaManager.usageSnapshot(connectionPrincipalId).running === 0,
+    () => completedQuotaManager.usageSnapshot().running === 0,
   );
   await assert.rejects(
     completedQuotaManager.start({
@@ -874,7 +829,7 @@ try {
       cwd: process.cwd(),
       command: "echo should-not-run",
     }),
-    /Workspace is closing/,
+    /Project execution runtime is closing/,
   );
   closeManager.reopenWorkspace(connectionPrincipalId, "closing");
   const reopened = await closeManager.start({
@@ -894,7 +849,7 @@ try {
       cwd: process.cwd(),
       command: "echo should-not-run",
     }),
-    /Workspace is closing/,
+    /Project execution runtime is closing/,
   );
 } finally {
   await closeManager.shutdown();
@@ -1222,9 +1177,218 @@ try {
 
 const leaseManager = new ProcessSessionManager({
   maxRuntimeMs: 10_000,
-  terminationGraceMs: 1_000,
+  terminationGraceMs: 25,
 });
 try {
+  const startupLeaseRoot = await mkdtemp(join(tmpdir(), "devspace-startup-lease-"));
+  try {
+    const targetStartedPath = join(startupLeaseRoot, "target-started");
+    const stdinObservedPath = join(startupLeaseRoot, "stdin-observed");
+    let resolveAttachment!: () => void;
+    const attachmentGate = new Promise<void>((resolve) => {
+      resolveAttachment = resolve;
+    });
+    let attachedPid: number | undefined;
+    let startupLeaseReleases = 0;
+    const startupLeaseRelease = () => { startupLeaseReleases += 1; };
+    const startupLease = startupLeaseRelease as WorkspaceRootLease;
+    startupLease.release = startupLeaseRelease;
+    startupLease.heartbeat = async () => undefined;
+    startupLease.attachProcess = async (owner) => {
+      attachedPid = owner.pid;
+      await attachmentGate;
+    };
+
+    const guardedStart = leaseManager.start({
+      connectionPrincipalId,
+      workspaceId: "startup-root-lease",
+      cwd: process.cwd(),
+      command: {
+        program: process.execPath,
+        args: [
+          "-e",
+          "const fs=require('node:fs'); fs.writeFileSync(process.argv[1], String(process.pid)); process.stdin.once('data', () => { fs.writeFileSync(process.argv[2], 'seen'); process.exit(0); });",
+          targetStartedPath,
+          stdinObservedPath,
+        ],
+      },
+      stdin: "start\n",
+      yieldTimeMs: 2_000,
+      retainWorkspaceRootLease: () => startupLease,
+    });
+    await waitForCondition(() => attachedPid !== undefined);
+    await assert.rejects(access(targetStartedPath), { code: "ENOENT" });
+    await assert.rejects(access(stdinObservedPath), { code: "ENOENT" });
+    resolveAttachment();
+    const guardedSnapshot = await guardedStart;
+    assert.equal(guardedSnapshot.exitCode, 0);
+    const targetPid = Number(await readFile(targetStartedPath, "utf8"));
+    assert.ok(Number.isSafeInteger(targetPid) && targetPid > 0);
+    assert.equal(await readFile(stdinObservedPath, "utf8"), "seen");
+    assert.equal(startupLeaseReleases, 1);
+
+    if (process.platform !== "win32") {
+      const injectedBeforeAttachmentPath = join(startupLeaseRoot, "injected-before-attachment");
+      const nodeHookPath = join(startupLeaseRoot, "injected-hook.cjs");
+      const loaderOutputPath = join(startupLeaseRoot, "loader-injection");
+      await writeFile(
+        nodeHookPath,
+        `require("node:fs").writeFileSync(${JSON.stringify(injectedBeforeAttachmentPath)}, "injected");\n`,
+        { mode: 0o600 },
+      );
+      const loaderEnvironment: Record<string, string> = process.platform === "darwin"
+        ? {
+            DYLD_PRINT_LIBRARIES: "1",
+            DYLD_PRINT_TO_FILE: loaderOutputPath,
+          }
+        : process.platform === "linux"
+          ? {
+              LD_DEBUG: "libs",
+              LD_DEBUG_OUTPUT: loaderOutputPath,
+            }
+          : {};
+      const loaderArtifacts = async (): Promise<string[]> =>
+        (await readdir(startupLeaseRoot))
+          .filter((name) => name.startsWith("loader-injection"));
+      let resolveEnvironmentAttachment!: () => void;
+      const environmentAttachmentGate = new Promise<void>((resolve) => {
+        resolveEnvironmentAttachment = resolve;
+      });
+      let environmentAttachedPid: number | undefined;
+      const environmentLeaseRelease = () => undefined;
+      const environmentLease = environmentLeaseRelease as WorkspaceRootLease;
+      environmentLease.release = environmentLeaseRelease;
+      environmentLease.heartbeat = async () => undefined;
+      environmentLease.attachProcess = async (owner) => {
+        environmentAttachedPid = owner.pid;
+        await environmentAttachmentGate;
+      };
+      const environmentGuardedStart = leaseManager.start({
+        connectionPrincipalId,
+        workspaceId: "startup-environment-root-lease",
+        cwd: process.cwd(),
+        command: { program: process.execPath, args: ["-e", "process.stdout.write('target-ran')"] },
+        environment: {
+          BASH_ENV: nodeHookPath,
+          ENV: nodeHookPath,
+          NODE_OPTIONS: `--require=${nodeHookPath}`,
+          ...loaderEnvironment,
+        },
+        yieldTimeMs: 2_000,
+        retainWorkspaceRootLease: () => environmentLease,
+      });
+      await waitForCondition(() => environmentAttachedPid !== undefined);
+      await assert.rejects(access(injectedBeforeAttachmentPath), { code: "ENOENT" });
+      assert.deepEqual(await loaderArtifacts(), []);
+      resolveEnvironmentAttachment();
+      const environmentGuardedSnapshot = await environmentGuardedStart;
+      assert.equal(environmentGuardedSnapshot.exitCode, 0);
+      assert.equal(environmentGuardedSnapshot.output, "target-ran");
+      assert.equal(await readFile(injectedBeforeAttachmentPath, "utf8"), "injected");
+      if (process.platform === "darwin" || process.platform === "linux") {
+        assert.ok((await loaderArtifacts()).length > 0);
+      }
+    }
+
+    let failedAttachmentPid: number | undefined;
+    const failedTargetStartedPath = join(startupLeaseRoot, "failed-target-started");
+    let failedLeaseReleases = 0;
+    const failedLeaseRelease = () => { failedLeaseReleases += 1; };
+    const failedLease = failedLeaseRelease as WorkspaceRootLease;
+    failedLease.release = failedLeaseRelease;
+    failedLease.heartbeat = async () => undefined;
+    failedLease.attachProcess = async (owner) => {
+      failedAttachmentPid = owner.pid;
+      const internalManager = leaseManager as unknown as {
+        sessions: Map<number, {
+          process?: {
+            pid?: number;
+            kill(signal?: NodeJS.Signals): void;
+            treeAlive(): boolean;
+          };
+        }>;
+      };
+      const hiddenSession = Array.from(internalManager.sessions.values())
+        .find((candidate) => candidate.process?.pid === owner.pid);
+      assert.ok(hiddenSession?.process);
+      hiddenSession.process = {
+        ...hiddenSession.process,
+        // Simulate an OS process that survives both cleanup signals and keeps
+        // reporting a live tree after its private gate has been aborted.
+        kill: () => undefined,
+        treeAlive: () => true,
+      };
+      throw new Error("simulated lease attachment failure");
+    };
+    await assert.rejects(
+      leaseManager.start({
+        connectionPrincipalId,
+        workspaceId: "failed-startup-root-lease",
+        cwd: process.cwd(),
+        command: {
+          program: process.execPath,
+          args: [
+            "-e",
+            "require('node:fs').writeFileSync(process.argv[1], 'started'); setInterval(() => {}, 1000)",
+            failedTargetStartedPath,
+          ],
+        },
+        yieldTimeMs: 0,
+        retainWorkspaceRootLease: () => failedLease,
+      }),
+      /simulated lease attachment failure/u,
+    );
+    assert.ok(failedAttachmentPid);
+    assert.equal(failedLeaseReleases, 1);
+    assert.equal(leaseManager.usageSnapshot().sessions, 0);
+    await waitForCondition(() => !processExists(failedAttachmentPid!), 2_000);
+    await assert.rejects(access(failedTargetStartedPath), { code: "ENOENT" });
+
+    if (process.platform !== "win32") {
+      const ptyTargetStartedPath = join(startupLeaseRoot, "pty-target-started");
+      let resolvePtyAttachment!: () => void;
+      const ptyAttachmentGate = new Promise<void>((resolve) => {
+        resolvePtyAttachment = resolve;
+      });
+      let ptyAttachedPid: number | undefined;
+      let ptyLeaseReleases = 0;
+      const ptyLeaseRelease = () => { ptyLeaseReleases += 1; };
+      const ptyLease = ptyLeaseRelease as WorkspaceRootLease;
+      ptyLease.release = ptyLeaseRelease;
+      ptyLease.heartbeat = async () => undefined;
+      ptyLease.attachProcess = async (owner) => {
+        ptyAttachedPid = owner.pid;
+        await ptyAttachmentGate;
+      };
+      const guardedPtyStart = leaseManager.start({
+        connectionPrincipalId,
+        workspaceId: "startup-pty-root-lease",
+        cwd: process.cwd(),
+        command: {
+          program: process.execPath,
+          args: [
+            "-e",
+            "require('node:fs').writeFileSync(process.argv[1], String(process.pid))",
+            ptyTargetStartedPath,
+          ],
+        },
+        tty: true,
+        closeStdin: false,
+        yieldTimeMs: 2_000,
+        retainWorkspaceRootLease: () => ptyLease,
+      });
+      await waitForCondition(() => ptyAttachedPid !== undefined);
+      await assert.rejects(access(ptyTargetStartedPath), { code: "ENOENT" });
+      resolvePtyAttachment();
+      const guardedPtySnapshot = await guardedPtyStart;
+      assert.equal(guardedPtySnapshot.exitCode, 0);
+      assert.ok(Number(await readFile(ptyTargetStartedPath, "utf8")) > 0);
+      assert.equal(ptyLeaseReleases, 1);
+    }
+  } finally {
+    await rm(startupLeaseRoot, { recursive: true, force: true });
+  }
+
   let released = 0;
   const running = await leaseManager.start({
     connectionPrincipalId,

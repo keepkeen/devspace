@@ -12,15 +12,11 @@ export const DEFAULT_MAX_REQUEST_BODY_BYTES = 32 * 1024 * 1024;
 
 export const RESOURCE_LIMIT_MAXIMUMS = {
   maxMcpSessions: 1_024,
-  maxMcpSessionsPerClient: 1_024,
   maxProcessSessions: 256,
-  maxProcessSessionsPerClient: 256,
   maxProcessSessionsPerWorkspace: 256,
   maxProcessOutputFileBytes: 1024 * 1024 * 1024,
   maxProcessOutputStorageBytes: 10 * 1024 * 1024 * 1024,
   maxResidentWorkspaces: 4_096,
-  maxActiveWorkspacesPerClient: 4_096,
-  maxManagedWorktrees: 1_024,
   maxRequestBodyBytes: 64 * 1024 * 1024,
 } as const;
 

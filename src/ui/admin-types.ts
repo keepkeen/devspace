@@ -2,17 +2,13 @@ export type WidgetMode = "full" | "changes" | "off";
 
 export interface AdminResourceLimits {
   maxMcpSessions: number;
-  maxMcpSessionsPerClient: number;
   maxProcessSessions: number;
-  maxProcessSessionsPerClient: number;
   maxProcessSessionsPerWorkspace: number;
   maxProcessOutputFileBytes: number;
   maxProcessOutputStorageBytes: number;
   completedProcessOutputTtlMs: number;
   maxCommandRuntimeMs: number;
   maxResidentWorkspaces: number;
-  maxActiveWorkspacesPerClient: number;
-  maxManagedWorktrees: number;
   maxRequestBodyBytes: number;
 }
 
@@ -154,11 +150,18 @@ export interface AdminDiagnostics {
     workspaces?: AdminUsageMetric & { resident?: number | null; closing?: number | null };
     oauth?: {
       clients?: number | null;
-      principals?: number | null;
       accessTokens?: number | null;
       refreshTokens?: number | null;
       expiredRecords?: number | null;
       legacyWildcardGrants?: number | null;
+    };
+    projectExecutions?: {
+      total?: number | null;
+      provisioning?: number | null;
+      active?: number | null;
+      revoked?: number | null;
+      quarantined?: number | null;
+      closed?: number | null;
     };
   };
   observability?: {

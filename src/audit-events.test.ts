@@ -39,6 +39,12 @@ test("persistent audit events are queryable, bounded, and omit unsafe fields", (
       clientsPreserved: true,
     });
 
+    assert.deepEqual(store.health(), {
+      eventCount: 2,
+      firstEventAt: "2026-01-01T00:00:00.000Z",
+      lastEventAt: "2026-01-01T00:00:01.000Z",
+    });
+
     const failures = store.query({ event: "mcp_tool_error", connectionRef: "conn_abc" });
     assert.equal(failures.length, 1);
     assert.equal(failures[0]?.tool, "grep");

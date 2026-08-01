@@ -1,14 +1,16 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { loadConfig } from "./config.js";
 import { internalDiagnosticsToken, internalRevocationToken } from "./internal-auth.js";
-import { DEFAULT_DEVSPACE_OAUTH_SCOPES } from "./oauth-scopes.js";
+import { FULL_DEVSPACE_OAUTH_SCOPES } from "./oauth-scopes.js";
 import { createServer } from "./server.js";
 
 const root = await mkdtemp(join(tmpdir(), "devspace-oauth-http-test-"));
@@ -20,7 +22,17 @@ const changedOwnerToken = "oauth-http-test-changed-owner-token-long-enough";
 const redirectUri = "https://chatgpt.com/connector/oauth/devspace-test";
 const codeVerifier = "oauth-http-test-verifier-0123456789-abcdefghijklmnopqrstuvwxyz";
 const codeChallenge = createHash("sha256").update(codeVerifier).digest("base64url");
+const execFileAsync = promisify(execFile);
 await mkdir(workspaceRoot, { recursive: true });
+await writeFile(join(workspaceRoot, "README.md"), "OAuth HTTP fixture\n", "utf8");
+await execFileAsync("git", ["init", "-q"], { cwd: workspaceRoot });
+await execFileAsync("git", ["add", "."], { cwd: workspaceRoot });
+await execFileAsync("git", [
+  "-c", "user.name=DevSpace Test",
+  "-c", "user.email=devspace@example.invalid",
+  "-c", "commit.gpgsign=false",
+  "commit", "-qm", "fixture",
+], { cwd: workspaceRoot });
 
 const configEnvironment = {
   DEVSPACE_CONFIG_DIR: join(root, "config"),
@@ -28,6 +40,7 @@ const configEnvironment = {
   DEVSPACE_ALLOWED_ROOTS: workspaceRoot,
   DEVSPACE_ALLOWED_HOSTS: "*",
   DEVSPACE_PUBLIC_BASE_URL: publicBaseUrl,
+  DEVSPACE_OAUTH_SCOPES: FULL_DEVSPACE_OAUTH_SCOPES.join(","),
   DEVSPACE_LOG_LEVEL: "silent",
   PORT: "1",
 };
@@ -109,25 +122,29 @@ try {
       headers: { authorization: `Bearer ${String(replacementTokens.access_token)}` },
     },
   }));
-  const openedWorkspace = await mcpClient.callTool({
-    name: "open_workspace",
-    arguments: { path: workspaceRoot, contextMode: "full", writeAccess: "read_write" },
+  const selectedProject = await mcpClient.callTool({
+    name: "project_control",
+    arguments: { action: "open", operationId: "oauth-project-execution" },
   });
-  assert.notEqual(openedWorkspace.isError, true, JSON.stringify(openedWorkspace.content));
-  const workspaceId = String(
-    (openedWorkspace.structuredContent as { workspace?: { ref?: unknown } } | undefined)?.workspace?.ref ?? "",
+  assert.notEqual(selectedProject.isError, true, JSON.stringify(selectedProject.content));
+  const projectRef = String(
+    (selectedProject.structuredContent as { project?: { ref?: unknown } } | undefined)?.project?.ref ?? "",
   );
-  const receipt = String(
-    (openedWorkspace.structuredContent as {
-      continuation?: { receipt?: unknown };
-    } | undefined)?.continuation?.receipt ?? "",
+  assert.ok(projectRef);
+  const executionRef = String(
+    (selectedProject.structuredContent as {
+      project?: { executionRef?: unknown };
+    } | undefined)?.project?.executionRef ?? "",
   );
-  assert.ok(workspaceId);
-  assert.match(receipt, /^wctx5\./);
+  assert.match(executionRef, /^pex1_/u);
+  assert.doesNotMatch(
+    JSON.stringify(selectedProject.structuredContent),
+    /workspace|receipt|continuation|contextChanged|phase/iu,
+  );
   const backgroundProcess = await mcpClient.callTool({
     name: "exec_command",
     arguments: {
-      receipt,
+      executionRef,
       operationId: "oauth-background-process",
       program: process.execPath,
       args: ["-e", "setInterval(() => {}, 1000)"],
@@ -140,6 +157,139 @@ try {
     "number",
   );
 
+  const renewedTokens = await issueTokens(active.origin, clientId, changedOwnerToken);
+  await mcpClient.close().catch(() => undefined);
+  const replacementDiagnostics = await fetch(
+    new URL("/internal/diagnostics", active.controlOrigin),
+    {
+      headers: {
+        "x-devspace-internal-token": internalDiagnosticsToken(changedOwnerToken),
+      },
+    },
+  );
+  assert.equal(replacementDiagnostics.status, 200);
+  const replacementDiagnosticBody = await replacementDiagnostics.json() as {
+    usage?: {
+      processSessions?: { running?: unknown };
+      workspaces?: { active?: unknown };
+    };
+  };
+  assert.equal(
+    replacementDiagnosticBody.usage?.processSessions?.running,
+    1,
+    "reauthorizing must preserve the earlier grant's Project execution processes",
+  );
+  assert.equal(
+    replacementDiagnosticBody.usage?.workspaces?.active,
+    1,
+    "reauthorizing must preserve the earlier grant's Project execution workspaces",
+  );
+  const replacedGrantAccessToken = await fetch(new URL("/mcp", active.origin), {
+    headers: { authorization: `Bearer ${replacementTokens.access_token}` },
+  });
+  assert.notEqual(replacedGrantAccessToken.status, 401);
+
+  const renewedClient = new Client({
+    name: "oauth-renewed-grant-cleanup-test",
+    version: "1.0.0",
+  });
+  await renewedClient.connect(new StreamableHTTPClientTransport(new URL("/mcp", active.origin), {
+    requestInit: {
+      headers: { authorization: `Bearer ${String(renewedTokens.access_token)}` },
+    },
+  }));
+  const renewedProject = await renewedClient.callTool({
+    name: "project_control",
+    arguments: { action: "open", operationId: "oauth-renewed-project-execution" },
+  });
+  assert.notEqual(renewedProject.isError, true, JSON.stringify(renewedProject.content));
+  const renewedExecutionRef = String(
+    (renewedProject.structuredContent as {
+      project?: { executionRef?: unknown };
+    } | undefined)?.project?.executionRef ?? "",
+  );
+  assert.match(renewedExecutionRef, /^pex1_/u);
+  const renewedProgress = await renewedClient.callTool({
+    name: "save_progress",
+    arguments: {
+      executionRef: renewedExecutionRef,
+      operationId: "oauth-renewed-save-progress",
+      title: "Shared OAuth handoff",
+      progress: "Historical progress saved by the renewed grant.",
+    },
+  });
+  assert.notEqual(renewedProgress.isError, true, JSON.stringify(renewedProgress.content));
+  const renewedThreadRef = String(
+    (renewedProgress.structuredContent as {
+      thread?: { ref?: unknown };
+    } | undefined)?.thread?.ref ?? "",
+  );
+  assert.match(renewedThreadRef, /^pth1_/u);
+
+  const earlierGrantClient = new Client({
+    name: "oauth-earlier-grant-isolation-test",
+    version: "1.0.0",
+  });
+  await earlierGrantClient.connect(new StreamableHTTPClientTransport(new URL("/mcp", active.origin), {
+    requestInit: {
+      headers: { authorization: `Bearer ${String(replacementTokens.access_token)}` },
+    },
+  }));
+  const earlierGrantListing = await earlierGrantClient.callTool({
+    name: "project_control",
+    arguments: { action: "list" },
+  });
+  const renewedGrantListing = await renewedClient.callTool({
+    name: "project_control",
+    arguments: { action: "list" },
+  });
+  const earlierGrantThreads = (
+    earlierGrantListing.structuredContent as {
+      threads?: Array<{ threadRef?: unknown; title?: unknown }>;
+    } | undefined
+  )?.threads ?? [];
+  assert.equal(
+    earlierGrantThreads.length,
+    1,
+    "the earlier grant must retain only its own Project Thread",
+  );
+  assert.equal(earlierGrantThreads[0]?.title, "New task");
+  assert.notEqual(
+    earlierGrantThreads[0]?.threadRef,
+    renewedThreadRef,
+    "an earlier grant must not see another grant's private Project Thread",
+  );
+  assert.equal(
+    (renewedGrantListing.structuredContent as { threads?: unknown[] } | undefined)?.threads?.length,
+    1,
+    "the grant that saved progress must see its own Project Thread",
+  );
+  const crossGrantHandoffResume = await earlierGrantClient.callTool({
+    name: "project_control",
+    arguments: {
+      action: "resume",
+      threadRef: renewedThreadRef,
+      operationId: "oauth-earlier-resume-shared-handoff",
+    },
+  });
+  assert.equal(crossGrantHandoffResume.isError, true);
+  assert.equal(
+    (crossGrantHandoffResume.structuredContent as {
+      error?: { code?: unknown };
+    } | undefined)?.error?.code,
+    "project_thread_not_found",
+  );
+  const crossGrantResume = await earlierGrantClient.callTool({
+    name: "project_control",
+    arguments: { action: "hydrate", executionRef: renewedExecutionRef },
+  });
+  assert.equal(
+    crossGrantResume.isError,
+    true,
+    "an opaque execution reference must not cross the bearer grant boundary",
+  );
+  await earlierGrantClient.close();
+
   assert.equal(
     (await fetch(new URL("/internal/security/revoke", active.origin), {
       method: "POST",
@@ -147,7 +297,24 @@ try {
     })).status,
     404,
   );
-  const revocation = await fetch(new URL("/internal/security/revoke", active.controlOrigin), {
+  let heldToolSettled = false;
+  const heldTool = renewedClient.callTool({
+    name: "exec_command",
+    arguments: {
+      executionRef: renewedExecutionRef,
+      operationId: "oauth-revocation-held-command",
+      program: process.execPath,
+      args: ["-e", "setTimeout(() => {}, 750)"],
+      yieldTimeMs: 2_000,
+    },
+  }).then(
+    () => "fulfilled" as const,
+    () => "rejected" as const,
+  ).finally(() => {
+    heldToolSettled = true;
+  });
+  await delay(50);
+  const revocationRequest = fetch(new URL("/internal/security/revoke", active.controlOrigin), {
     method: "POST",
     headers: {
       "content-type": "application/json",
@@ -155,18 +322,34 @@ try {
     },
     body: JSON.stringify({ scope: "all_clients_and_tokens" }),
   });
+  const gatedResponseBody = await waitForRevocationGate(
+    active.origin,
+    renewedTokens.access_token,
+  );
+  assert.match(gatedResponseBody, /Global credential revocation is in progress/);
+  const revocation = await revocationRequest;
+  assert.equal(
+    heldToolSettled,
+    true,
+    "revokeAll must not complete before the admitted tool call settles",
+  );
+  const heldToolOutcome = await heldTool;
+  assert.ok(
+    heldToolOutcome === "fulfilled" || heldToolOutcome === "rejected",
+    "transport closure may hide the tool result, but the held call must settle before revokeAll",
+  );
   assert.equal(revocation.status, 200);
   const revoked = await revocation.json() as {
     revoked?: { clients?: unknown; grants?: unknown; accessTokens?: unknown; refreshTokens?: unknown; workspaceCleanupJobs?: unknown };
   };
   assert.deepEqual(revoked.revoked, {
     clients: 1,
-    grants: 2,
-    accessTokens: 1,
-    refreshTokens: 1,
-    workspaceCleanupJobs: 1,
+    grants: 3,
+    accessTokens: 2,
+    refreshTokens: 2,
+    workspaceCleanupJobs: 2,
   });
-  await mcpClient.close().catch(() => undefined);
+  await renewedClient.close().catch(() => undefined);
 
   const diagnostics = await fetch(new URL("/internal/diagnostics", active.controlOrigin), {
     headers: { "x-devspace-internal-token": internalDiagnosticsToken(changedOwnerToken) },
@@ -182,7 +365,7 @@ try {
   assert.equal(diagnosticBody.usage?.workspaces?.active, 0);
 
   const revokedAccessToken = await fetch(new URL("/mcp", active.origin), {
-    headers: { authorization: `Bearer ${replacementTokens.access_token}` },
+    headers: { authorization: `Bearer ${renewedTokens.access_token}` },
   });
   assert.equal(revokedAccessToken.status, 401);
 
@@ -192,7 +375,7 @@ try {
     body: new URLSearchParams({
       grant_type: "refresh_token",
       client_id: clientId,
-      refresh_token: replacementTokens.refresh_token,
+      refresh_token: renewedTokens.refresh_token,
       resource: `${publicBaseUrl}/mcp`,
     }),
   });
@@ -203,6 +386,35 @@ try {
   });
   const revokedHtml = await assertStaleResponse(revokedClient);
   assert.equal(revokedHtml.includes(clientId), false);
+
+  const newRegistration = await fetch(new URL("/register", active.origin), {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      client_name: "ChatGPT OAuth post-revocation test",
+      redirect_uris: [redirectUri],
+      token_endpoint_auth_method: "none",
+      grant_types: ["authorization_code", "refresh_token"],
+      response_types: ["code"],
+    }),
+  });
+  assert.equal(newRegistration.status, 201);
+  const newClientId = String(
+    (await newRegistration.json() as { client_id?: unknown }).client_id ?? "",
+  );
+  assert.ok(newClientId);
+  const postRevocationTokens = await issueTokens(active.origin, newClientId, changedOwnerToken);
+  const reauthorizedClient = new Client({
+    name: "oauth-post-revocation-authorization-test",
+    version: "1.0.0",
+  });
+  await reauthorizedClient.connect(new StreamableHTTPClientTransport(new URL("/mcp", active.origin), {
+    requestInit: {
+      headers: { authorization: `Bearer ${postRevocationTokens.access_token}` },
+    },
+  }));
+  assert.ok((await reauthorizedClient.listTools()).tools.length > 0);
+  await reauthorizedClient.close();
 } finally {
   await active?.close();
   await rm(root, { recursive: true, force: true });
@@ -223,7 +435,7 @@ function authorizationParams(
     response_type: "code",
     client_id: clientId,
     redirect_uri: redirectUri,
-    scope: DEFAULT_DEVSPACE_OAUTH_SCOPES.join(" "),
+    scope: FULL_DEVSPACE_OAUTH_SCOPES.join(" "),
     code_challenge: codeChallenge,
     code_challenge_method: "S256",
     resource: `${publicBaseUrl}/mcp`,
@@ -269,7 +481,6 @@ async function issueTokens(
     assert.ok(rootIds.length > 0);
     const selection = authorizationParams(clientId, "en-US", {
       selection_token: selectionToken,
-      connection_mode: "new",
     });
     for (const rootId of rootIds) selection.append("root_id", rootId);
     approval = await fetch(new URL("/authorize", origin), {
@@ -328,6 +539,24 @@ async function startServer(config: ReturnType<typeof loadConfig>): Promise<{
   };
 }
 
+async function waitForRevocationGate(origin: URL, accessToken: string): Promise<string> {
+  const deadline = Date.now() + 3_000;
+  while (Date.now() < deadline) {
+    const response = await fetch(new URL("/mcp", origin), {
+      headers: { authorization: `Bearer ${accessToken}` },
+    });
+    const body = await response.text();
+    if (response.status === 503 && body.includes("Global credential revocation is in progress")) {
+      return body;
+    }
+    if (response.status === 401) {
+      assert.fail("OAuth revocation completed before the admission gate was observed");
+    }
+    await delay(10);
+  }
+  throw new Error("Global revocation admission gate was not observed");
+}
+
 function listen(server: HttpServer): Promise<URL> {
   return new Promise((resolve, reject) => {
     server.once("error", reject);
@@ -338,6 +567,29 @@ function listen(server: HttpServer): Promise<URL> {
       resolve(new URL(`http://127.0.0.1:${address.port}`));
     });
   });
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function listedHandoffRefs(structuredContent: unknown): string[] {
+  const projects = (
+    structuredContent &&
+      typeof structuredContent === "object" &&
+      !Array.isArray(structuredContent)
+      ? (structuredContent as {
+          projects?: Array<{
+            handoffs?: Array<{ handoffRef?: unknown }>;
+          }>;
+        }).projects
+      : undefined
+  ) ?? [];
+  return projects.flatMap((project) =>
+    project.handoffs?.flatMap((handoff) =>
+      typeof handoff.handoffRef === "string" ? [handoff.handoffRef] : []
+    ) ?? []
+  );
 }
 
 function closeHttpServer(server: HttpServer): Promise<void> {

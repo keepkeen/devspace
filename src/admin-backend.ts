@@ -6,7 +6,7 @@ import {
 } from "./internal-auth.js";
 import type { SecurityKeyring } from "./security-credentials.js";
 
-const MAX_INTERNAL_RESPONSE_BYTES = 256 * 1_024;
+const MAX_INTERNAL_RESPONSE_BYTES = 2 * 1_024 * 1_024;
 
 export class AdminBackendProxyError extends Error {
   constructor(

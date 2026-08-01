@@ -17,24 +17,28 @@ import {
   MAX_PROJECT_DOC_FALLBACK_FILENAME_LENGTH,
   normalizeProjectDocFallbackFilenames,
 } from "./project-instructions.js";
-import { devspaceConfigPath, loadDevspaceFiles, withDevspaceConfigLockSync, writeDevspaceConfig } from "./user-config.js";
+import {
+  DevspaceConfigConflictError,
+  devspaceConfigPath,
+  loadDevspaceFiles,
+  readDevspaceConfigFileVersion,
+  type DevspaceConfigFileVersion,
+  withDevspaceConfigLockSync,
+  writeDevspaceConfig,
+} from "./user-config.js";
 
 const CONFIG_LOCK_WAIT_MS = 5_000;
 const CONFIG_LOCK_STALE_MS = 30_000;
 
 export interface AdminResourceLimits {
   maxMcpSessions: number;
-  maxMcpSessionsPerClient: number;
   maxProcessSessions: number;
-  maxProcessSessionsPerClient: number;
   maxProcessSessionsPerWorkspace: number;
   maxProcessOutputFileBytes: number;
   maxProcessOutputStorageBytes: number;
   completedProcessOutputTtlMs: number;
   maxCommandRuntimeMs: number;
   maxResidentWorkspaces: number;
-  maxActiveWorkspacesPerClient: number;
-  maxManagedWorktrees: number;
   maxRequestBodyBytes: number;
 }
 
@@ -59,7 +63,10 @@ export class AdminConfigValidationError extends Error {
 }
 
 export class AdminConfigConflictError extends Error {
-  constructor(readonly currentRevision: string) {
+  constructor(
+    readonly currentRevision: string,
+    readonly preservedConflictPath?: string,
+  ) {
     super("The configuration changed after it was loaded.");
     this.name = "AdminConfigConflictError";
   }
@@ -90,17 +97,13 @@ const adminConfigSchema = z.object({
   widgets: z.enum(["off", "changes", "full"]),
   resources: z.object({
     maxMcpSessions: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxMcpSessions),
-    maxMcpSessionsPerClient: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxMcpSessionsPerClient),
     maxProcessSessions: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxProcessSessions),
-    maxProcessSessionsPerClient: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxProcessSessionsPerClient),
     maxProcessSessionsPerWorkspace: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxProcessSessionsPerWorkspace),
     maxProcessOutputFileBytes: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxProcessOutputFileBytes),
     maxProcessOutputStorageBytes: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxProcessOutputStorageBytes),
     completedProcessOutputTtlMs: z.number().int().min(1_000).max(MAX_TIMER_MS),
     maxCommandRuntimeMs: z.number().int().min(MIN_COMMAND_RUNTIME_MS).max(MAX_TIMER_MS),
     maxResidentWorkspaces: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxResidentWorkspaces),
-    maxActiveWorkspacesPerClient: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxActiveWorkspacesPerClient),
-    maxManagedWorktrees: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxManagedWorktrees),
     maxRequestBodyBytes: z.number().int().min(64 * 1024).max(RESOURCE_LIMIT_MAXIMUMS.maxRequestBodyBytes),
   }).strict(),
 }).strict();
@@ -134,11 +137,25 @@ export async function saveAdminConfigIfMatch(
   revision: string;
 }> {
   return withConfigLock(env, async () => {
-    const currentRevision = await adminConfigRevision(env);
-    if (currentRevision !== expectedRevision) {
-      throw new AdminConfigConflictError(currentRevision);
+    const currentVersion = readDevspaceConfigFileVersion(env);
+    if (currentVersion.revision !== expectedRevision) {
+      throw new AdminConfigConflictError(currentVersion.revision);
     }
-    const saved = saveAdminConfig(input, env, { lockHeld: true });
+    let saved: ReturnType<typeof saveAdminConfig>;
+    try {
+      saved = saveAdminConfig(input, env, {
+        lockHeld: true,
+        expectedVersion: currentVersion,
+      });
+    } catch (error) {
+      if (error instanceof DevspaceConfigConflictError) {
+        throw new AdminConfigConflictError(
+          error.currentVersion.revision,
+          error.preservedConflictPath,
+        );
+      }
+      throw error;
+    }
     return { ...saved, revision: await adminConfigRevision(env) };
   });
 }
@@ -194,19 +211,7 @@ export function validateAdminConfig(input: unknown): AdminConfig {
     parsed.resources.maxProcessSessions
   ) {
     fields["resources.maxProcessSessionsPerWorkspace"] =
-      "Per-workspace process sessions cannot exceed global process sessions.";
-  }
-  if (parsed.resources.maxMcpSessionsPerClient > parsed.resources.maxMcpSessions) {
-    fields["resources.maxMcpSessionsPerClient"] =
-      "Per-client MCP sessions cannot exceed global MCP sessions.";
-  }
-  if (parsed.resources.maxProcessSessionsPerClient > parsed.resources.maxProcessSessions) {
-    fields["resources.maxProcessSessionsPerClient"] =
-      "Per-client process sessions cannot exceed global process sessions.";
-  }
-  if (parsed.resources.maxProcessSessionsPerWorkspace > parsed.resources.maxProcessSessionsPerClient) {
-    fields["resources.maxProcessSessionsPerWorkspace"] =
-      "Per-workspace process sessions cannot exceed per-client process sessions.";
+      "Per-Project process sessions cannot exceed global process sessions.";
   }
   if (parsed.resources.maxProcessOutputFileBytes > parsed.resources.maxProcessOutputStorageBytes) {
     fields["resources.maxProcessOutputFileBytes"] =
@@ -252,19 +257,7 @@ export function adminConfigWarnings(config: AdminConfig): AdminConfigWarnings {
   }
   if (config.resources.maxProcessSessionsPerWorkspace > config.resources.maxProcessSessions) {
     warnings["resources.maxProcessSessionsPerWorkspace"] =
-      "Per-workspace process sessions exceed the global process-session limit.";
-  }
-  if (config.resources.maxMcpSessionsPerClient > config.resources.maxMcpSessions) {
-    warnings["resources.maxMcpSessionsPerClient"] =
-      "Per-client MCP sessions exceed the global MCP-session limit.";
-  }
-  if (config.resources.maxProcessSessionsPerClient > config.resources.maxProcessSessions) {
-    warnings["resources.maxProcessSessionsPerClient"] =
-      "Per-client process sessions exceed the global process-session limit.";
-  }
-  if (config.resources.maxProcessSessionsPerWorkspace > config.resources.maxProcessSessionsPerClient) {
-    warnings["resources.maxProcessSessionsPerWorkspace"] =
-      "Per-workspace process sessions exceed the per-client process-session limit.";
+      "Per-Project process sessions exceed the global process-session limit.";
   }
   if (config.resources.maxProcessOutputFileBytes > config.resources.maxProcessOutputStorageBytes) {
     warnings["resources.maxProcessOutputFileBytes"] =
@@ -288,17 +281,13 @@ export function adminConfigOverridePaths(env: NodeJS.ProcessEnv = process.env): 
 
   const resourceOverrides: Array<[keyof AdminResourceLimits, string]> = [
     ["maxMcpSessions", "DEVSPACE_MAX_MCP_SESSIONS"],
-    ["maxMcpSessionsPerClient", "DEVSPACE_MAX_MCP_SESSIONS_PER_CLIENT"],
     ["maxProcessSessions", "DEVSPACE_MAX_PROCESS_SESSIONS"],
-    ["maxProcessSessionsPerClient", "DEVSPACE_MAX_PROCESS_SESSIONS_PER_CLIENT"],
     ["maxProcessSessionsPerWorkspace", "DEVSPACE_MAX_PROCESS_SESSIONS_PER_WORKSPACE"],
     ["maxProcessOutputFileBytes", "DEVSPACE_MAX_PROCESS_OUTPUT_FILE_BYTES"],
     ["maxProcessOutputStorageBytes", "DEVSPACE_MAX_PROCESS_OUTPUT_STORAGE_BYTES"],
     ["completedProcessOutputTtlMs", "DEVSPACE_COMPLETED_PROCESS_OUTPUT_TTL_SECONDS"],
     ["maxCommandRuntimeMs", "DEVSPACE_MAX_COMMAND_RUNTIME_SECONDS"],
     ["maxResidentWorkspaces", "DEVSPACE_MAX_RESIDENT_WORKSPACES"],
-    ["maxActiveWorkspacesPerClient", "DEVSPACE_MAX_ACTIVE_WORKSPACES_PER_CLIENT"],
-    ["maxManagedWorktrees", "DEVSPACE_MAX_MANAGED_WORKTREES"],
     ["maxRequestBodyBytes", "DEVSPACE_MAX_REQUEST_BODY_BYTES"],
   ];
   for (const [field, variable] of resourceOverrides) {
@@ -310,10 +299,16 @@ export function adminConfigOverridePaths(env: NodeJS.ProcessEnv = process.env): 
 export function saveAdminConfig(
   input: unknown,
   env: NodeJS.ProcessEnv = process.env,
-  options: { lockHeld?: boolean } = {},
+  options: {
+    lockHeld?: boolean;
+    expectedVersion?: DevspaceConfigFileVersion;
+  } = {},
 ): { config: AdminConfig; restartRequired: boolean; rootsChanged: boolean } {
   if (!options.lockHeld) {
-    return withDevspaceConfigLockSync(env, () => saveAdminConfig(input, env, { lockHeld: true }));
+    return withDevspaceConfigLockSync(env, () => saveAdminConfig(input, env, {
+      lockHeld: true,
+      expectedVersion: options.expectedVersion,
+    }));
   }
   const config = validateAdminConfig(input);
   const previous = loadAdminConfig(env);
@@ -342,35 +337,14 @@ export function saveAdminConfig(
     nextConfig.projectDocFallbackFilenames = config.projectDocFallbackFilenames;
   }
   if (!overridePaths.includes("widgets")) nextConfig.widgets = config.widgets;
-  const persistedMaxMcpSessions = resources.maxMcpSessions ?? 64;
-  const persistedPerClientMcp = resources.maxMcpSessionsPerClient ?? 8;
   const persistedMaxProcessSessions = resources.maxProcessSessions ?? 32;
-  const persistedPerClientProcess = resources.maxProcessSessionsPerClient ?? 16;
   const persistedPerWorkspace = resources.maxProcessSessionsPerWorkspace ?? 8;
   const persistedProcessOutputFileBytes = resources.maxProcessOutputFileBytes ?? 64 * 1024 * 1024;
   const persistedProcessOutputStorageBytes = resources.maxProcessOutputStorageBytes ?? 1024 * 1024 * 1024;
-  if (persistedPerClientMcp > persistedMaxMcpSessions) {
-    throw new AdminConfigValidationError({
-      "resources.maxMcpSessionsPerClient":
-        "The saved per-client limit cannot exceed the saved global MCP-session limit after environment overrides are removed.",
-    });
-  }
-  if (persistedPerClientProcess > persistedMaxProcessSessions) {
-    throw new AdminConfigValidationError({
-      "resources.maxProcessSessionsPerClient":
-        "The saved per-client limit cannot exceed the saved global process-session limit after environment overrides are removed.",
-    });
-  }
   if (persistedPerWorkspace > persistedMaxProcessSessions) {
     throw new AdminConfigValidationError({
       "resources.maxProcessSessionsPerWorkspace":
-        "The saved per-workspace limit cannot exceed the saved global process-session limit after environment overrides are removed.",
-    });
-  }
-  if (persistedPerWorkspace > persistedPerClientProcess) {
-    throw new AdminConfigValidationError({
-      "resources.maxProcessSessionsPerWorkspace":
-        "The saved per-workspace limit cannot exceed the saved per-client process-session limit after environment overrides are removed.",
+        "The saved per-Project limit cannot exceed the saved global process-session limit after environment overrides are removed.",
     });
   }
   if (persistedProcessOutputFileBytes > persistedProcessOutputStorageBytes) {
@@ -382,7 +356,7 @@ export function saveAdminConfig(
   writeDevspaceConfig(
     nextConfig,
     env,
-    { lockHeld: true },
+    { lockHeld: true, expectedVersion: options.expectedVersion },
   );
 
   const saved = loadAdminConfig(env);
@@ -444,17 +418,13 @@ function configWithoutAllowedRoots(config: AdminConfig): Omit<AdminConfig, "allo
 function pickAdminResourceLimits(resources: AdminResourceLimits): AdminResourceLimits {
   return {
     maxMcpSessions: resources.maxMcpSessions,
-    maxMcpSessionsPerClient: resources.maxMcpSessionsPerClient,
     maxProcessSessions: resources.maxProcessSessions,
-    maxProcessSessionsPerClient: resources.maxProcessSessionsPerClient,
     maxProcessSessionsPerWorkspace: resources.maxProcessSessionsPerWorkspace,
     maxProcessOutputFileBytes: resources.maxProcessOutputFileBytes,
     maxProcessOutputStorageBytes: resources.maxProcessOutputStorageBytes,
     completedProcessOutputTtlMs: resources.completedProcessOutputTtlMs,
     maxCommandRuntimeMs: resources.maxCommandRuntimeMs,
     maxResidentWorkspaces: resources.maxResidentWorkspaces,
-    maxActiveWorkspacesPerClient: resources.maxActiveWorkspacesPerClient,
-    maxManagedWorktrees: resources.maxManagedWorktrees,
     maxRequestBodyBytes: resources.maxRequestBodyBytes,
   };
 }

@@ -95,7 +95,6 @@ export const SKILL_DISCOVERY_LIMITS = Object.freeze({
   maxOpenAiYamlBytes: 262_144,
 });
 
-const SUBAGENT_DELEGATION_NAME = "subagent-delegation";
 const SKILL_MANIFEST = "SKILL.md";
 
 function bundledSkillsDir(): string {
@@ -445,8 +444,6 @@ function loadSkill(
 }
 
 export function loadWorkspaceSkills(config: ServerConfig, workspaceRoot: string): LoadedSkills {
-  if (!config.skillsEnabled) return { skills: [], diagnostics: [] };
-
   const skills: Skill[] = [];
   const diagnostics = new DiagnosticCollector();
   const disabledPaths = canonicalDisabledSkillPaths(config, workspaceRoot);
@@ -505,7 +502,7 @@ export function loadWorkspaceSkills(config: ServerConfig, workspaceRoot: string)
         diagnostics,
         canonicalDirectory,
       );
-      if (skill && (config.subagents || skill.name !== SUBAGENT_DELEGATION_NAME)) skills.push(skill);
+      if (skill) skills.push(skill);
       return;
     }
 
@@ -562,7 +559,7 @@ export function loadWorkspaceSkills(config: ServerConfig, workspaceRoot: string)
     if (sourceIsFile) {
       if (basename(source.path) === SKILL_MANIFEST) {
         const skill = loadSkill(source.path, source, disabledPaths, diagnostics);
-        if (skill && (config.subagents || skill.name !== SUBAGENT_DELEGATION_NAME)) skills.push(skill);
+        if (skill) skills.push(skill);
       }
       continue;
     }
@@ -652,7 +649,7 @@ export function resolveSkillReadPath(
     if (!skill) {
       throw new SkillUriError(
         "skill_not_found",
-        "The Skill is not available in this workspace; reopen the workspace and use its current skillId.",
+        "The Skill is not available in the selected Project; call skills with action=search and use its current skillId.",
       );
     }
     const absolutePath = resolve(skill.baseDir, skillUri.relativePath);

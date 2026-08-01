@@ -1,26 +1,16 @@
 import { createHash, createHmac, randomUUID } from "node:crypto";
-import { realpathSync, statSync, type Stats } from "node:fs";
+import { constants, realpathSync, statSync, type Stats } from "node:fs";
 import type {
   ActiveWorkspaceSummary,
-  WorkspaceMode,
   WorkspaceSession,
   WorkspaceSessionCursor,
   WorkspaceStatus,
   WorkspaceStore,
   WorkspaceWriteAccess,
 } from "./workspace-store.js";
-import { WorkspaceQuotaError } from "./workspace-store.js";
-import { lstat, mkdir, readFile, realpath, stat } from "node:fs/promises";
+import { lstat, open, readFile, realpath, stat } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import type { ServerConfig } from "./config.js";
-import {
-  createManagedWorktree,
-  removeManagedWorktree,
-  removeManagedWorktreeSync,
-  resolveManagedWorktreeBase,
-  restoreManagedWorktree,
-  validatedManagedWorktreeHead,
-} from "./git-worktrees.js";
 
 export { WorkspaceQuotaError } from "./workspace-store.js";
 import {
@@ -46,10 +36,6 @@ import {
   type SkillReadResolution,
 } from "./skills.js";
 import {
-  loadLocalAgentProfiles,
-  type LocalAgentProfile,
-} from "./local-agent-profiles.js";
-import {
   defaultWorkspaceRootLockDirectory,
   WorkspaceRootLockManager,
   type WorkspaceRootLease,
@@ -69,28 +55,15 @@ export interface AvailableAgentsFile {
   path: string;
 }
 
-export interface WorkspaceWorktree {
-  path: string;
-  baseRef: string;
-  baseSha: string;
-  dirtySource: boolean;
-  detached: boolean;
-  managed: boolean;
-}
-
 export interface Workspace {
   id: string;
   connectionPrincipalId: string;
   alias: string;
   root: string;
-  mode: WorkspaceMode;
   writeAccess: WorkspaceWriteAccess;
   stateGeneration: number;
-  sourceRoot?: string;
-  worktree?: WorkspaceWorktree;
   skills: LoadedSkills["skills"];
   skillDiagnostics: LoadedSkills["diagnostics"];
-  agentProfiles: LocalAgentProfile[];
   activatedSkillDirs: Set<string>;
   instructionContexts: Map<string, WorkspaceInstructionContext>;
   lastUsedAt: number;
@@ -104,10 +77,6 @@ export interface WorkspaceInstructionContext {
   deliveredInstructionVersions: Map<string, string>;
   acknowledgedInstructionVersions: Map<string, string>;
   acknowledgementGeneration: number;
-  pendingAcknowledgements: Map<string, {
-    createdAt: number;
-    files: Array<{ path: string; fingerprint: string; content: string }>;
-  }>;
   createdAt: number;
   lastUsedAt: number;
 }
@@ -133,10 +102,6 @@ export interface WorkspaceContext {
   availableAgentsFiles: AvailableAgentsFile[];
   instructionScan: InstructionScanResult;
   reused: boolean;
-  recovery?: {
-    kind: "managed_worktree_recreated";
-    dataLossPossible: true;
-  };
 }
 
 export interface WorkspaceReadPath {
@@ -152,11 +117,8 @@ export interface LoadedWorkspaceSkill {
 
 export interface OpenWorkspaceInput {
   path: string;
-  mode?: WorkspaceMode;
-  baseRef?: string;
   alias?: string;
   writeAccess?: WorkspaceWriteAccess;
-  forceNew?: boolean;
 }
 
 export interface WorkspaceSummary {
@@ -165,12 +127,9 @@ export interface WorkspaceSummary {
   projectFingerprint: string;
   displayPath: string;
   status: WorkspaceStatus;
-  mode: WorkspaceMode;
-  managed: boolean;
-  dirtySource?: boolean;
   writeAccess: WorkspaceWriteAccess;
   workspaceGeneration: number;
-  hydrationStatus: "ready" | "requires_resume" | "recovery_required";
+  hydrationStatus: "ready" | "requires_resume";
   createdAt: string;
   lastUsedAt: string;
 }
@@ -179,7 +138,6 @@ export interface WorkspaceListOptions {
   statuses?: WorkspaceStatus[];
   aliasPrefix?: string;
   projectFingerprint?: string;
-  mode?: WorkspaceMode;
   recentFirst?: boolean;
 }
 
@@ -216,36 +174,29 @@ export class InstructionBudgetError extends Error {
 }
 
 export class WorkspaceAliasConflictError extends Error {
-  readonly code = "workspace_alias_conflict";
+  readonly code = "project_runtime_conflict";
 
   constructor(readonly currentAlias: string) {
-    super(`An equivalent workspace already uses alias ${currentAlias}.`);
+    super(`An equivalent Project runtime already uses internal alias ${currentAlias}.`);
     this.name = "WorkspaceAliasConflictError";
   }
 }
 
 export class WorkspaceSelectionRequiredError extends Error {
-  readonly code = "workspace_selection_required";
+  readonly code = "project_selection_required";
 
   constructor(readonly aliases: string[]) {
-    super("Multiple active managed workspaces match this project.");
+    super("Multiple internal runtimes match this Project.");
     this.name = "WorkspaceSelectionRequiredError";
   }
 }
 
 export class WorkspaceRecoveryRequiredError extends Error {
-  readonly code = "workspace_recovery_required";
+  readonly code = "project_recovery_required";
 
   constructor(readonly alias: string, readonly reason: string) {
-    super(`Workspace ${alias} could not be recovered: ${reason}`);
+    super(`Project runtime could not be recovered: ${reason}`);
     this.name = "WorkspaceRecoveryRequiredError";
-  }
-}
-
-class ExistingManagedWorkspaceError extends Error {
-  constructor(readonly session: WorkspaceSession) {
-    super("An equivalent managed workspace is already active.");
-    this.name = "ExistingManagedWorkspaceError";
   }
 }
 
@@ -258,26 +209,17 @@ export interface AllowedRootsUpdateResult {
 }
 
 export class UnknownWorkspaceError extends Error {
-  readonly code = "unknown_workspace";
+  readonly code = "project_execution_required";
 
   constructor(readonly workspaceId: string) {
-    super("The workspace is no longer available.");
+    super("The Project execution runtime is no longer available.");
     this.name = "UnknownWorkspaceError";
-  }
-}
-
-export class InstructionTokenError extends Error {
-  readonly code = "instruction_token_invalid";
-
-  constructor() {
-    super("The instruction token is no longer valid.");
-    this.name = "InstructionTokenError";
   }
 }
 
 export class SkillNotLoadedError extends Error {
   readonly code = "skill_not_loaded";
-  readonly publicText = "Call load_skill for this workspace, then retry.";
+  readonly publicText = "Call skills with action=load for the selected Project, then retry.";
 
   constructor() {
     super("A Skill must be loaded before its files can be read.");
@@ -302,47 +244,47 @@ export class SkillLoadError extends Error {
 }
 
 export class WorkspaceResumeRequiredError extends Error {
-  readonly code = "workspace_resume_required";
+  readonly code = "project_execution_required";
 
   constructor() {
-    super("The persisted workspace must be resumed before use.");
+    super("The Project execution runtime must be loaded again.");
     this.name = "WorkspaceResumeRequiredError";
   }
 }
 
 export class UnknownWorkspaceAliasError extends Error {
-  readonly code = "unknown_workspace_alias";
+  readonly code = "project_execution_required";
 
   constructor() {
-    super("The workspace alias is unavailable.");
+    super("The Project execution runtime is unavailable.");
     this.name = "UnknownWorkspaceAliasError";
   }
 }
 
 export class WorkspaceReadOnlyError extends Error {
-  readonly code = "workspace_read_only";
+  readonly code = "project_read_only";
 
   constructor() {
-    super("The workspace is read-only.");
+    super("The selected Project is read-only.");
     this.name = "WorkspaceReadOnlyError";
   }
 }
 
 export class StaleWorkspaceGenerationError extends Error {
-  readonly code = "stale_workspace_generation";
+  readonly code = "project_execution_required";
 
   constructor() {
-    super("The workspace handle generation is stale.");
+    super("The Project execution runtime is stale.");
     this.name = "StaleWorkspaceGenerationError";
   }
 }
 
-export class WorkspaceContextSessionError extends Error {
-  readonly code = "workspace_context_required";
+export class InstructionContextError extends Error {
+  readonly code = "project_execution_required";
 
   constructor() {
-    super("The workspace context session is no longer available.");
-    this.name = "WorkspaceContextSessionError";
+    super("The Project execution instruction context is no longer available.");
+    this.name = "InstructionContextError";
   }
 }
 
@@ -355,25 +297,32 @@ interface WorkspaceLifecycleState {
 }
 
 const MAX_INSTRUCTION_VERSIONS_PER_WORKSPACE = 1_024;
-const MAX_PENDING_INSTRUCTION_ACKNOWLEDGEMENTS = 32;
 const MAX_INSTRUCTION_CONTEXTS_PER_WORKSPACE = 128;
 const MAX_EXPIRED_SESSION_CANDIDATE_SCAN = 1_024;
-const INSTRUCTION_ACKNOWLEDGEMENT_TTL_MS = 10 * 60_000;
 const INSTRUCTION_CONTEXT_TTL_MS = 6 * 60 * 60_000;
 const CLOSED_WORKSPACE_HISTORY_RETENTION_MS = 30 * 24 * 60 * 60_000;
 const MAX_EMPTY_INSTRUCTION_SCAN_BYTES = 1024 * 1024;
+const MAX_INSTRUCTION_DELTA_BYTES = 12 * 1024;
 
-type PathStats = Stats;
-type DirectoryOps = {
-  stat: (path: string) => Promise<PathStats>;
-  mkdir: (path: string, options: { recursive: true }) => Promise<unknown>;
+type InstructionIoHooks = {
+  beforeDirectoryRead?: (path: string) => void | Promise<void>;
+  beforeFileOpen?: (path: string) => void | Promise<void>;
 };
+type ServerConfigWithInstructionIoTestHooks = ServerConfig & {
+  instructionIoHooksForTests?: InstructionIoHooks;
+};
+
+const READ_ONLY_NOFOLLOW_FLAGS =
+  constants.O_RDONLY |
+  (typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0);
+const READ_ONLY_DIRECTORY_NOFOLLOW_FLAGS =
+  READ_ONLY_NOFOLLOW_FLAGS |
+  (typeof constants.O_DIRECTORY === "number" ? constants.O_DIRECTORY : 0);
 
 export class WorkspaceRegistry {
   private readonly workspaces = new Map<string, Workspace>();
   private readonly checkoutWorkspaceIds = new Map<string, string>();
   private readonly pendingCheckoutWorkspaces = new Map<string, Promise<WorkspaceContext>>();
-  private readonly pendingManagedWorkspaces = new Map<string, Promise<WorkspaceContext>>();
   private readonly pendingHydrations = new Map<string, Promise<WorkspaceContext>>();
   private readonly lifecycleStates = new Map<string, WorkspaceLifecycleState>();
   private readonly rootLocks: WorkspaceRootLockManager;
@@ -386,13 +335,15 @@ export class WorkspaceRegistry {
     content: string;
   }>();
   private readonly pendingSessionClosures = new Map<string, WorkspaceSession>();
-  private pendingManagedWorktreeCreations = 0;
+  private readonly instructionIoHooks: InstructionIoHooks;
   private expiredSessionScanCursor: WorkspaceSessionCursor | undefined;
 
   constructor(
     private readonly config: ServerConfig,
     private readonly store?: WorkspaceStore,
   ) {
+    this.instructionIoHooks =
+      (config as ServerConfigWithInstructionIoTestHooks).instructionIoHooksForTests ?? {};
     this.rootLocks = new WorkspaceRootLockManager({
       crossProcessLockRoot: defaultWorkspaceRootLockDirectory(config.stateDir),
       trustedStateRoot: config.stateDir,
@@ -405,43 +356,90 @@ export class WorkspaceRegistry {
     authorizedRoots: readonly string[] = this.config.allowedRoots,
   ): Promise<WorkspaceContext> {
     const options = typeof input === "string" ? { path: input } : input;
+    if ("mode" in options) {
+      throw new Error("Project mode selection is not supported; Projects always use shared directories.");
+    }
     if (
       authorizationRootsRestrictGlobal(authorizedRoots, this.config.allowedRoots) &&
       !pathAllowedByAuthorizationRoots(options.path, authorizedRoots)
     ) {
       throw new AccessDeniedError("Path is outside this OAuth grant's authorized roots");
     }
-    const mode = options.mode ?? "checkout";
     const alias = options.alias === undefined ? undefined : validateWorkspaceAlias(options.alias);
-    const writeAccess = options.writeAccess ?? (mode === "worktree" ? "read_write" : "read_only");
+    const writeAccess = options.writeAccess ?? "read_only";
 
     try {
-      if (mode === "worktree") {
-        if (writeAccess !== "read_write") {
-          throw new Error("Managed worktree workspaces must use writeAccess=read_write.");
-        }
-        return await this.openWorktreeWorkspace(
-          connectionPrincipalId,
-          options.path,
-          options.baseRef,
-          alias,
-          options.forceNew ?? false,
-        );
-      }
-
       return await this.openCheckoutWorkspace(
         connectionPrincipalId,
         options.path,
         alias,
         writeAccess,
         options.writeAccess !== undefined,
+        authorizedRoots,
       );
     } catch (error) {
       if (!(error instanceof AccessDeniedError)) throw error;
       throw new AccessDeniedError(
-        `${error.message}. Open the original approved project path. For an isolated checkout, use mode="worktree" and retain the returned Workspace alias or reference; do not open DevSpace's internal worktree directory. If this is a different project, ask the user to add its project root.`,
+        `${error.message}. Open the original approved project path. If this is a different project, ask the user to add its project root.`,
       );
     }
+  }
+
+  /**
+   * Opens a logical Project execution against the approved shared directory.
+   * The execution alias keeps process, idempotency, instruction, and audit
+   * state separate without creating a branch or worktree.
+   */
+  async openSharedProjectExecution(
+    connectionPrincipalId: string,
+    input: {
+      executionId: string;
+      path: string;
+      writeAccess: WorkspaceWriteAccess;
+    },
+    authorizedRoots: readonly string[] = this.config.allowedRoots,
+  ): Promise<WorkspaceContext> {
+    return this.openWorkspace(connectionPrincipalId, {
+      path: input.path,
+      alias: projectExecutionAlias(input.executionId),
+      writeAccess: input.writeAccess,
+    }, authorizedRoots);
+  }
+
+  /**
+   * Opens a server-managed worktree while retaining authorization against the
+   * original approved Project root. This method is intentionally not exposed
+   * through the generic Workspace API.
+   */
+  async openManagedProjectExecution(
+    connectionPrincipalId: string,
+    input: {
+      executionId: string;
+      sourceRoot: string;
+      worktreeRoot: string;
+      writeAccess: WorkspaceWriteAccess;
+    },
+    authorizedRoots: readonly string[] = this.config.allowedRoots,
+  ): Promise<WorkspaceContext> {
+    const sourceRoot = assertAllowedPath(input.sourceRoot, this.config.allowedRoots);
+    if (!pathAllowedByAuthorizationRoots(sourceRoot, authorizedRoots)) {
+      throw new AccessDeniedError("Project source is outside this OAuth grant's authorized roots");
+    }
+    const trustedRoot = resolve(this.config.stateDir, "worktrees");
+    const canonicalWorktreeRoot = await realpath(input.worktreeRoot);
+    if (!isPathInsideRoot(canonicalWorktreeRoot, trustedRoot)) {
+      throw new AccessDeniedError("Managed worktree is outside the trusted state root");
+    }
+    const rootStats = await stat(canonicalWorktreeRoot);
+    if (!rootStats.isDirectory()) throw new Error("Managed worktree root must be a directory.");
+    return this.createWorkspaceContext({
+      connectionPrincipalId,
+      alias: projectExecutionAlias(input.executionId),
+      root: canonicalWorktreeRoot,
+      canonicalRoot: canonicalWorktreeRoot,
+      writeAccess: input.writeAccess,
+      replaceWriteAccess: true,
+    });
   }
 
   getWorkspace(
@@ -451,15 +449,7 @@ export class WorkspaceRegistry {
   ): Workspace {
     const workspace = this.workspaces.get(workspaceId);
     if (workspace?.connectionPrincipalId === connectionPrincipalId) {
-      if (!this.workspaceRootAllowed(workspace.root, workspace.mode, workspace.sourceRoot)) {
-        if (workspace.mode === "worktree" && workspace.worktree?.managed) {
-          const lifecycle = this.lifecycleStates.get(workspaceId);
-          if (lifecycle && (lifecycle.phase === "closing" || lifecycle.activeOperations > 0)) {
-            throw new WorkspaceResumeRequiredError();
-          }
-          this.evictWorkspace(workspaceId, workspace.root);
-          throw new WorkspaceResumeRequiredError();
-        }
+      if (!this.workspaceRootAllowed(workspace.root)) {
         this.invalidateWorkspace(workspaceId, connectionPrincipalId, workspace.root);
         throw new UnknownWorkspaceError(workspaceId);
       }
@@ -483,7 +473,6 @@ export class WorkspaceRegistry {
     authorizedRoots: readonly string[] = this.config.allowedRoots,
     options: WorkspaceListOptions = {},
   ): WorkspaceSummary[] {
-    this.reconcileMissingManagedSessions();
     const statuses = options.statuses?.length ? [...new Set(options.statuses)] : ["active" as const];
     const sessions = this.store?.listSessions?.(connectionPrincipalId, statuses)
       ?? Array.from(this.workspaces.values())
@@ -494,14 +483,13 @@ export class WorkspaceRegistry {
     const summaries = sessions.flatMap((session): WorkspaceSummary[] => {
       const resident = this.workspaces.get(session.id);
       const available = resident
-        ? this.workspaceRootAllowed(resident.root, resident.mode, resident.sourceRoot)
-        : this.workspaceRootAllowed(session.root, session.mode, session.sourceRoot);
-      const identityRoot = resident?.sourceRoot ?? resident?.root ?? session.sourceRoot ?? session.root;
+        ? this.workspaceRootAllowed(resident.root)
+        : this.workspaceRootAllowed(session.root);
+      const identityRoot = resident?.root ?? session.root;
       if (!pathAllowedByAuthorizationRoots(identityRoot, authorizedRoots)) return [];
       const projectFingerprint = this.projectFingerprintForRoot(identityRoot);
       if (options.aliasPrefix && !session.alias.startsWith(options.aliasPrefix)) return [];
       if (options.projectFingerprint && projectFingerprint !== options.projectFingerprint) return [];
-      if (options.mode && session.mode !== options.mode) return [];
       return [{
         workspaceRef: session.id,
         alias: session.alias,
@@ -510,18 +498,11 @@ export class WorkspaceRegistry {
           identityRoot,
         ),
         status: session.status,
-        mode: session.mode,
-        managed: session.managed,
-        ...(session.managed
-          ? { dirtySource: resident?.worktree?.dirtySource ?? session.dirtySource }
-          : {}),
         writeAccess: session.writeAccess,
         workspaceGeneration: session.stateGeneration,
-        hydrationStatus: session.managed && !available
-          ? "recovery_required"
-          : resident && session.status === "active"
-            ? "ready"
-            : "requires_resume",
+        hydrationStatus: resident && session.status === "active"
+          ? "ready"
+          : "requires_resume",
         createdAt: session.createdAt,
         lastUsedAt: session.lastUsedAt,
       }];
@@ -543,14 +524,14 @@ export class WorkspaceRegistry {
     const resident = this.workspaces.get(workspaceId);
     if (resident?.connectionPrincipalId === connectionPrincipalId) {
       return pathAllowedByAuthorizationRoots(
-        resident.sourceRoot ?? resident.root,
+        resident.root,
         authorizedRoots,
       );
     }
     const session = this.store?.getSession(workspaceId, connectionPrincipalId);
     return Boolean(
-      session && pathAllowedByAuthorizationRoots(
-        session.sourceRoot ?? session.root,
+      session !== undefined && pathAllowedByAuthorizationRoots(
+        session.root,
         authorizedRoots,
       ),
     );
@@ -565,7 +546,7 @@ export class WorkspaceRegistry {
   }
 
   projectFingerprint(workspace: Workspace): string {
-    return this.projectFingerprintForRoot(workspace.sourceRoot ?? workspace.root);
+    return this.projectFingerprintForRoot(workspace.root);
   }
 
   async resumeWorkspaceByReference(
@@ -585,6 +566,16 @@ export class WorkspaceRegistry {
     const sessions = this.store?.listActiveSessions?.()
       ?? Array.from(this.workspaces.values()).map(workspaceToSessionSnapshot);
     return sessions.map((session) => ({ ...session }));
+  }
+
+  workspaceBusy(connectionPrincipalId: string, workspaceId: string): boolean {
+    const workspace = this.workspaces.get(workspaceId);
+    if (workspace?.connectionPrincipalId !== connectionPrincipalId) return false;
+    const lifecycle = this.lifecycleStates.get(workspaceId);
+    return Boolean(
+      lifecycle &&
+      (lifecycle.phase === "closing" || lifecycle.activeOperations > 0)
+    );
   }
 
   bumpAuthorityGenerations(connectionPrincipalId?: string): number {
@@ -625,35 +616,18 @@ export class WorkspaceRegistry {
     if (resident) {
       if (
         authorizationRootsRestrictGlobal(authorizedRoots, this.config.allowedRoots) &&
-        !pathAllowedByAuthorizationRoots(resident.sourceRoot ?? resident.root, authorizedRoots)
+        !pathAllowedByAuthorizationRoots(resident.root, authorizedRoots)
       ) {
-        throw new AccessDeniedError("Workspace is outside this OAuth grant's authorized roots");
+        throw new AccessDeniedError("Project is outside this OAuth grant's authorized roots");
       }
-      if (this.workspaceRootAllowed(resident.root, resident.mode, resident.sourceRoot)) {
-        if (resident.mode !== "worktree" || !resident.worktree?.managed || !resident.sourceRoot) {
-          return this.contextForWorkspace(resident, true);
-        }
-        const currentHead = await validatedManagedWorktreeHead(
-          resident.sourceRoot,
-          resident.root,
-        ).catch(() => undefined);
-        if (currentHead) {
-          if (resident.worktree.baseSha !== currentHead) {
-            resident.worktree.baseSha = currentHead;
-            this.store?.updateManagedSessionBaseSha?.(
-              resident.id,
-              resident.connectionPrincipalId,
-              currentHead,
-            );
-          }
-          return this.contextForWorkspace(resident, true);
-        }
+      if (this.workspaceRootAllowed(resident.root)) {
+        return this.contextForWorkspace(resident, true);
       }
       const lifecycle = this.lifecycleStates.get(resident.id);
       if (lifecycle && (lifecycle.phase === "closing" || lifecycle.activeOperations > 0)) {
         throw new WorkspaceRecoveryRequiredError(
           normalizedAlias,
-          "an active process or operation must finish before the missing worktree can be recreated",
+          "an active process or operation must finish before the Project can be reopened",
         );
       }
       this.evictWorkspace(resident.id, resident.root);
@@ -666,7 +640,6 @@ export class WorkspaceRegistry {
         const generation = this.store?.reactivateClosedSession?.(
           retained.id,
           connectionPrincipalId,
-          this.config.resources.maxActiveWorkspacesPerClient,
         );
         if (generation !== undefined) {
           session = this.store?.getSession(retained.id, connectionPrincipalId);
@@ -676,9 +649,9 @@ export class WorkspaceRegistry {
     if (!session) throw new UnknownWorkspaceAliasError();
     if (
       authorizationRootsRestrictGlobal(authorizedRoots, this.config.allowedRoots) &&
-      !pathAllowedByAuthorizationRoots(session.sourceRoot ?? session.root, authorizedRoots)
+      !pathAllowedByAuthorizationRoots(session.root, authorizedRoots)
     ) {
-      throw new AccessDeniedError("Workspace is outside this OAuth grant's authorized roots");
+      throw new AccessDeniedError("Project is outside this OAuth grant's authorized roots");
     }
     const identity = workspaceIdentity(session.id, connectionPrincipalId);
     const pending = this.pendingHydrations.get(identity);
@@ -726,12 +699,6 @@ export class WorkspaceRegistry {
         alias: workspace.alias,
         root: workspace.root,
         status: "active",
-        mode: workspace.mode,
-        sourceRoot: workspace.sourceRoot,
-        baseRef: workspace.worktree?.baseRef,
-        baseSha: workspace.worktree?.baseSha,
-        dirtySource: workspace.worktree?.dirtySource ?? false,
-        managed: workspace.worktree?.managed ?? false,
         writeAccess: workspace.writeAccess,
         stateGeneration: workspace.stateGeneration,
         createdAt: new Date(workspace.lastUsedAt).toISOString(),
@@ -739,7 +706,7 @@ export class WorkspaceRegistry {
       }),
     );
     const revoked = sessions.filter(
-      (session) => !this.workspaceRootAllowed(session.root, session.mode, session.sourceRoot),
+      (session) => !this.workspaceRootAllowed(session.root),
     );
     for (const session of revoked) {
       this.pendingSessionClosures.set(workspaceIdentity(session.id, session.connectionPrincipalId), session);
@@ -798,7 +765,7 @@ export class WorkspaceRegistry {
   resolvePath(workspace: Workspace, inputPath: string): string {
     const absolutePath = resolveAllowedPath(inputPath, workspace.root, [workspace.root]);
     if (!isPathInsideRoot(absolutePath, workspace.root)) {
-      throw new Error(`Path is outside workspace root: ${inputPath}`);
+      throw new Error(`Path is outside the selected Project: ${inputPath}`);
     }
 
     return absolutePath;
@@ -872,7 +839,7 @@ export class WorkspaceRegistry {
         existing = parent;
       }
     }
-    throw new Error(`Path cannot be confined to workspace root: ${inputPath}`);
+    throw new Error(`Path cannot be confined to the selected Project: ${inputPath}`);
   }
 
   async loadSkill(
@@ -883,7 +850,7 @@ export class WorkspaceRegistry {
     const workspace = this.getWorkspace(connectionPrincipalId, workspaceId);
     const skill = workspace.skills.find((candidate) => candidate.skillId === skillId);
     if (!skill) {
-      throw new SkillLoadError("skill_not_found", "The requested Skill is not available in this workspace.");
+      throw new SkillLoadError("skill_not_found", "The requested Skill is not available in this Project.");
     }
     try {
       const canonicalBaseDir = await realpath(skill.baseDir);
@@ -946,13 +913,13 @@ export class WorkspaceRegistry {
   async loadApplicableAgentsFiles(
     workspace: Workspace,
     inputPaths: string[],
-    options: { contextSessionId?: string; requireAcknowledged?: boolean } = {},
+    options: { instructionContextId?: string; requireAcknowledged?: boolean } = {},
   ): Promise<ApplicableAgentsFile[]> {
-    const instructionContext = options.contextSessionId === undefined
+    const instructionContext = options.instructionContextId === undefined
       ? undefined
-      : this.instructionContext(workspace, options.contextSessionId);
+      : this.instructionContext(workspace, options.instructionContextId);
     if (options.requireAcknowledged && !instructionContext) {
-      throw new WorkspaceContextSessionError();
+      throw new InstructionContextError();
     }
     const targetDirectories = new Set<string>();
     for (const inputPath of inputPaths) {
@@ -974,7 +941,13 @@ export class WorkspaceRegistry {
         if (knownVersions?.get(path) === file.fingerprint) continue;
         if (loadedPaths.has(path)) continue;
         const fileBytes = Buffer.byteLength(file.content, "utf8");
-        assertInstructionFitsBudget(path, loadedBytes, fileBytes, "instruction response");
+        assertInstructionFitsBudget(
+          path,
+          loadedBytes,
+          fileBytes,
+          "instruction response",
+          MAX_INSTRUCTION_DELTA_BYTES,
+        );
         loaded.push(file);
         loadedPaths.add(path);
         loadedBytes += fileBytes;
@@ -985,9 +958,9 @@ export class WorkspaceRegistry {
 
   createInstructionContext(
     workspace: Workspace,
-    contextSessionId = `wctxs_${randomUUID()}`,
+    instructionContextId = `ictx_${randomUUID()}`,
   ): string {
-    const id = validateInstructionContextSessionId(contextSessionId);
+    const id = validateInstructionContextId(instructionContextId);
     const existing = workspace.instructionContexts.get(id);
     if (existing) {
       if (
@@ -995,7 +968,7 @@ export class WorkspaceRegistry {
         existing.workspaceId !== workspace.id ||
         existing.workspaceGeneration !== workspace.stateGeneration
       ) {
-        throw new WorkspaceContextSessionError();
+        throw new InstructionContextError();
       }
       existing.lastUsedAt = Date.now();
       workspace.instructionContexts.delete(id);
@@ -1012,7 +985,6 @@ export class WorkspaceRegistry {
       deliveredInstructionVersions: new Map(),
       acknowledgedInstructionVersions: new Map(),
       acknowledgementGeneration: 0,
-      pendingAcknowledgements: new Map(),
       createdAt: now,
       lastUsedAt: now,
     });
@@ -1026,19 +998,27 @@ export class WorkspaceRegistry {
 
   async markAgentsFilesDelivered(
     workspace: Workspace,
-    contextSessionId: string,
+    instructionContextId: string,
     files: ApplicableAgentsFile[],
   ): Promise<void> {
-    const instructionContext = this.instructionContext(workspace, contextSessionId);
-    await this.assertCurrentInstructionChainsWithinBudget(workspace, files);
+    const instructionContext = this.instructionContext(workspace, instructionContextId);
     let deliveredBytes = 0;
     for (const file of files) {
-      const current = await this.readCachedInstruction(file.path);
+      const current = await this.readCachedInstruction(
+        file.path,
+        isPathInsideRoot(file.path, workspace.root) ? workspace.root : undefined,
+      );
       if (current.fingerprint !== file.fingerprint) {
         throw new Error("Applicable project instructions changed while marking them delivered. Retry the tool.");
       }
       const fileBytes = Buffer.byteLength(file.content, "utf8");
-      assertInstructionFitsBudget(file.path, deliveredBytes, fileBytes, "instruction response");
+      assertInstructionFitsBudget(
+        file.path,
+        deliveredBytes,
+        fileBytes,
+        "instruction response",
+        MAX_INSTRUCTION_DELTA_BYTES,
+      );
       deliveredBytes += fileBytes;
     }
     for (const file of files) {
@@ -1053,15 +1033,17 @@ export class WorkspaceRegistry {
 
   async markAgentsFilesAcknowledged(
     workspace: Workspace,
-    contextSessionId: string,
+    instructionContextId: string,
     files: ApplicableAgentsFile[],
   ): Promise<void> {
-    const instructionContext = this.instructionContext(workspace, contextSessionId);
-    await this.assertCurrentInstructionChainsWithinBudget(workspace, files);
+    const instructionContext = this.instructionContext(workspace, instructionContextId);
     let acknowledgementBytes = 0;
     let changed = false;
     for (const file of files) {
-      const current = await this.readCachedInstruction(file.path);
+      const current = await this.readCachedInstruction(
+        file.path,
+        isPathInsideRoot(file.path, workspace.root) ? workspace.root : undefined,
+      );
       if (current.fingerprint !== file.fingerprint) {
         throw new Error("Applicable project instructions changed while acknowledging context. Retry the tool.");
       }
@@ -1071,6 +1053,7 @@ export class WorkspaceRegistry {
         acknowledgementBytes,
         fileBytes,
         "instruction acknowledgement",
+        MAX_INSTRUCTION_DELTA_BYTES,
       );
       acknowledgementBytes += fileBytes;
       if (instructionContext.acknowledgedInstructionVersions.get(file.path) !== file.fingerprint) {
@@ -1094,66 +1077,26 @@ export class WorkspaceRegistry {
     if (changed) instructionContext.acknowledgementGeneration += 1;
   }
 
-  instructionAcknowledgementGeneration(
+  async markRootAgentsFilesAcknowledged(
     workspace: Workspace,
-    contextSessionId: string,
-  ): number {
-    return this.instructionContext(workspace, contextSessionId).acknowledgementGeneration;
-  }
-
-  async createInstructionAcknowledgement(
-    workspace: Workspace,
-    contextSessionId: string,
+    instructionContextId: string,
     files: ApplicableAgentsFile[],
-  ): Promise<string> {
-    const instructionContext = this.instructionContext(workspace, contextSessionId);
-    await this.assertCurrentInstructionChainsWithinBudget(workspace, files);
-    const token = `instructions_${randomUUID()}`;
-    const versionedFiles = [];
-    let acknowledgementBytes = 0;
-    for (const file of files) {
-      const current = await this.readCachedInstruction(file.path);
-      if (current.fingerprint !== file.fingerprint) {
-        throw new Error("Applicable project instructions changed while preparing instructionToken. Retry the tool.");
-      }
-      const fileBytes = Buffer.byteLength(file.content, "utf8");
-      assertInstructionFitsBudget(file.path, acknowledgementBytes, fileBytes, "instruction acknowledgement");
-      acknowledgementBytes += fileBytes;
-      versionedFiles.push({ path: file.path, fingerprint: file.fingerprint, content: file.content });
-    }
-    instructionContext.pendingAcknowledgements.set(token, {
-      createdAt: Date.now(),
-      files: versionedFiles,
-    });
-    while (instructionContext.pendingAcknowledgements.size > MAX_PENDING_INSTRUCTION_ACKNOWLEDGEMENTS) {
-      const oldest = instructionContext.pendingAcknowledgements.keys().next().value;
-      if (!oldest) break;
-      instructionContext.pendingAcknowledgements.delete(oldest);
-    }
-    return token;
-  }
-
-  async acknowledgeInstructions(
-    workspace: Workspace,
-    contextSessionId: string,
-    token: string,
   ): Promise<void> {
-    const instructionContext = this.instructionContext(workspace, contextSessionId);
-    const pending = instructionContext.pendingAcknowledgements.get(token);
-    if (!pending) throw new InstructionTokenError();
-    if (Date.now() - pending.createdAt > INSTRUCTION_ACKNOWLEDGEMENT_TTL_MS) {
-      instructionContext.pendingAcknowledgements.delete(token);
-      throw new InstructionTokenError();
-    }
-    for (const file of pending.files) {
-      const current = await this.readCachedInstruction(file.path);
+    const instructionContext = this.instructionContext(workspace, instructionContextId);
+    let changed = false;
+    for (const file of files) {
+      const current = await this.readCachedInstruction(
+        file.path,
+        isPathInsideRoot(file.path, workspace.root) ? workspace.root : undefined,
+      );
       if (current.fingerprint !== file.fingerprint) {
-        instructionContext.pendingAcknowledgements.delete(token);
-        throw new InstructionTokenError();
+        throw new Error("Root Project instructions changed during delivery. Restart project_control hydration.");
+      }
+      if (instructionContext.acknowledgedInstructionVersions.get(file.path) !== file.fingerprint) {
+        changed = true;
       }
     }
-    await this.assertCurrentInstructionChainsWithinBudget(workspace, pending.files);
-    for (const file of pending.files) {
+    for (const file of files) {
       setBoundedMap(
         instructionContext.deliveredInstructionVersions,
         file.path,
@@ -1167,15 +1110,47 @@ export class WorkspaceRegistry {
         MAX_INSTRUCTION_VERSIONS_PER_WORKSPACE,
       );
     }
-    instructionContext.pendingAcknowledgements.delete(token);
-    instructionContext.acknowledgementGeneration += 1;
+    if (changed) instructionContext.acknowledgementGeneration += 1;
+  }
+
+  rootAgentsFilesAcknowledged(
+    workspace: Workspace,
+    instructionContextId: string,
+    files: ApplicableAgentsFile[],
+  ): boolean {
+    const instructionContext = this.instructionContext(workspace, instructionContextId);
+    return files.every(
+      (file) =>
+        instructionContext.acknowledgedInstructionVersions.get(file.path) === file.fingerprint,
+    );
+  }
+
+  resetRootAgentsFilesAcknowledgement(
+    workspace: Workspace,
+    instructionContextId: string,
+    files: ApplicableAgentsFile[],
+  ): void {
+    const instructionContext = this.instructionContext(workspace, instructionContextId);
+    let changed = false;
+    for (const file of files) {
+      changed = instructionContext.deliveredInstructionVersions.delete(file.path) || changed;
+      changed = instructionContext.acknowledgedInstructionVersions.delete(file.path) || changed;
+    }
+    if (changed) instructionContext.acknowledgementGeneration += 1;
+  }
+
+  instructionAcknowledgementGeneration(
+    workspace: Workspace,
+    instructionContextId: string,
+  ): number {
+    return this.instructionContext(workspace, instructionContextId).acknowledgementGeneration;
   }
 
   private instructionContext(
     workspace: Workspace,
-    contextSessionId: string,
+    instructionContextId: string,
   ): WorkspaceInstructionContext {
-    const id = validateInstructionContextSessionId(contextSessionId);
+    const id = validateInstructionContextId(instructionContextId);
     const instructionContext = workspace.instructionContexts.get(id);
     if (
       !instructionContext ||
@@ -1183,7 +1158,7 @@ export class WorkspaceRegistry {
       instructionContext.workspaceId !== workspace.id ||
       instructionContext.workspaceGeneration !== workspace.stateGeneration
     ) {
-      throw new WorkspaceContextSessionError();
+      throw new InstructionContextError();
     }
     instructionContext.lastUsedAt = Date.now();
     workspace.instructionContexts.delete(id);
@@ -1235,21 +1210,21 @@ export class WorkspaceRegistry {
         existingLifecycle?.connectionPrincipalId === connectionPrincipalId &&
         existingLifecycle.phase === "closing"
       ) {
-        throw new Error(`Workspace ${workspaceId} is closing and cannot accept new operations.`);
+        throw new Error("The Project execution runtime is closing and cannot accept new operations.");
       }
       // Revalidate after waiting for the root lock. A close, revoke, allowed-root
       // edit, or generation bump may have invalidated the original handle.
       const workspace = this.getWorkspace(connectionPrincipalId, workspaceId, workspaceGeneration);
       lifecycle = this.ensureLifecycleState(workspace);
       if (lifecycle.phase === "closing") {
-        throw new Error(`Workspace ${workspaceId} is closing and cannot accept new operations.`);
+        throw new Error("The Project execution runtime is closing and cannot accept new operations.");
       }
       lifecycle.activeOperations += 1;
       try {
         return await callback(workspace, {
           retain: () => {
             if (retained) {
-              throw new Error("Workspace root operation lease was already retained.");
+              throw new Error("Project root operation lease was already retained.");
             }
             retained = true;
             return releaseRoot;
@@ -1258,7 +1233,7 @@ export class WorkspaceRegistry {
       } finally {
         lifecycle.activeOperations -= 1;
         if (lifecycle.activeOperations < 0) {
-          throw new Error(`Workspace ${workspaceId} operation count underflow.`);
+          throw new Error("Project operation count underflow.");
         }
         if (lifecycle.activeOperations === 0) lifecycle.resolveDrained?.();
         this.evictResidentWorkspaces();
@@ -1379,21 +1354,13 @@ export class WorkspaceRegistry {
   }
 
   cleanupLifecycleState(now = Date.now()): {
-    expiredInstructionTokens: number;
     deletedClosedWorkspaceSessions: number;
   } {
-    let expiredInstructionTokens = 0;
     for (const workspace of this.workspaces.values()) {
-      for (const [contextSessionId, instructionContext] of workspace.instructionContexts) {
+      for (const [instructionContextId, instructionContext] of workspace.instructionContexts) {
         if (now - instructionContext.lastUsedAt > INSTRUCTION_CONTEXT_TTL_MS) {
-          expiredInstructionTokens += instructionContext.pendingAcknowledgements.size;
-          workspace.instructionContexts.delete(contextSessionId);
+          workspace.instructionContexts.delete(instructionContextId);
           continue;
-        }
-        for (const [token, pending] of instructionContext.pendingAcknowledgements) {
-          if (now - pending.createdAt <= INSTRUCTION_ACKNOWLEDGEMENT_TTL_MS) continue;
-          instructionContext.pendingAcknowledgements.delete(token);
-          expiredInstructionTokens += 1;
         }
         trimMap(
           instructionContext.deliveredInstructionVersions,
@@ -1412,7 +1379,7 @@ export class WorkspaceRegistry {
       historyBefore,
       this.config.resources.maxResidentWorkspaces,
     ) ?? 0;
-    return { expiredInstructionTokens, deletedClosedWorkspaceSessions };
+    return { deletedClosedWorkspaceSessions };
   }
 
   closeWorkspace(connectionPrincipalId: string, workspaceId: string): boolean {
@@ -1433,6 +1400,9 @@ export class WorkspaceRegistry {
   deleteWorkspace(connectionPrincipalId: string, workspaceId: string): boolean {
     const workspace = this.workspaces.get(workspaceId);
     if (workspace && workspace.connectionPrincipalId !== connectionPrincipalId) return false;
+    if (!workspace && !this.store?.getSession(workspaceId, connectionPrincipalId)) {
+      return false;
+    }
     const lifecycle = this.lifecycleStates.get(workspaceId);
     if (lifecycle && (lifecycle.phase === "closing" || lifecycle.activeOperations > 0)) return false;
     const deleted = this.store?.deleteSession(workspaceId, connectionPrincipalId) ?? Boolean(workspace);
@@ -1486,26 +1456,6 @@ export class WorkspaceRegistry {
         if (hasActiveProcess(session.connectionPrincipalId, session.id)) continue;
         const lifecycle = this.lifecycleStates.get(session.id);
         if (lifecycle && (lifecycle.phase === "closing" || lifecycle.activeOperations > 0)) continue;
-        if (session.managed) {
-          if (!session.sourceRoot) {
-            this.invalidateWorkspace(session.id, session.connectionPrincipalId, session.root);
-            closed.push(session.id);
-            continue;
-          }
-          try {
-            const removal = removeManagedWorktreeSync({
-              sourceRoot: session.sourceRoot,
-              worktreePath: session.root,
-              config: {
-                ...this.config,
-                allowedRoots: [...this.config.allowedRoots, session.sourceRoot],
-              },
-            });
-            if (removal.reason === "dirty") continue;
-          } catch {
-            continue;
-          }
-        }
         if (!this.store.closeSession(session.id, session.connectionPrincipalId)) continue;
         this.workspaces.delete(session.id);
         this.lifecycleStates.delete(session.id);
@@ -1532,30 +1482,42 @@ export class WorkspaceRegistry {
     alias: string | undefined,
     writeAccess: WorkspaceWriteAccess,
     replaceWriteAccess: boolean,
+    authorizedRoots: readonly string[],
   ): Promise<WorkspaceContext> {
     const root = assertAllowedPath(path, this.config.allowedRoots);
-    const rootStats = await ensureCheckoutWorkspaceRoot(root);
+    const rootStats = await stat(root);
     if (!rootStats.isDirectory()) {
-      throw new Error(`Workspace root must be a directory: ${path}`);
+      throw new Error(`Project root must be a directory: ${path}`);
     }
 
     const canonicalRoot = await realpath(root);
-    const canonicalAllowedRoots = await Promise.all(
-      this.config.allowedRoots
-        .filter((allowedRoot) => isPathInsideRoot(root, allowedRoot))
-        .map((allowedRoot) => realpath(allowedRoot)),
+    const canonicalAllowedRoots = (await Promise.all(
+      this.config.allowedRoots.map((allowedRoot) => tryRealpath(allowedRoot)),
+    )).filter((allowedRoot): allowedRoot is string => allowedRoot !== undefined);
+    const canonicalAuthorizationRoots = (await Promise.all(
+      authorizedRoots.map((allowedRoot) => tryRealpath(allowedRoot)),
+    )).filter((allowedRoot): allowedRoot is string => allowedRoot !== undefined);
+    const validatedRoot = assertAllowedPath(
+      assertAllowedPath(canonicalRoot, canonicalAllowedRoots),
+      canonicalAuthorizationRoots,
     );
-    const validatedRoot = assertAllowedPath(canonicalRoot, canonicalAllowedRoots);
-    const checkoutKey = checkoutWorkspaceKey(connectionPrincipalId, canonicalRoot);
+    const bindingAlias = alias ?? this.defaultWorkspaceAlias(
+      connectionPrincipalId,
+      canonicalRoot,
+    );
+    const checkoutKey = checkoutWorkspaceKey(
+      connectionPrincipalId,
+      canonicalRoot,
+      bindingAlias,
+    );
     const previous = this.pendingCheckoutWorkspaces.get(checkoutKey);
     const opening = (async () => {
       if (previous) await previous.catch(() => undefined);
       return this.createWorkspaceContext({
         connectionPrincipalId,
-        alias,
+        alias: bindingAlias,
         root: validatedRoot,
         canonicalRoot,
-        mode: "checkout",
         writeAccess,
         replaceWriteAccess,
       });
@@ -1570,194 +1532,23 @@ export class WorkspaceRegistry {
     }
   }
 
-  private async openWorktreeWorkspace(
-    connectionPrincipalId: string,
-    path: string,
-    baseRef: string | undefined,
-    alias: string | undefined,
-    forceNew: boolean,
-  ): Promise<WorkspaceContext> {
-    const resolvedBase = await resolveManagedWorktreeBase({
-      sourcePath: path,
-      baseRef,
-      config: this.config,
-    });
-    this.reconcileMissingManagedSessions();
-
-    if (!forceNew) {
-      if (alias) {
-        const residentByAlias = Array.from(this.workspaces.values()).find(
-          (workspace) =>
-            workspace.connectionPrincipalId === connectionPrincipalId &&
-            workspace.alias === alias,
-        );
-        if (residentByAlias) {
-          if (
-            residentByAlias.worktree?.managed &&
-            residentByAlias.sourceRoot === resolvedBase.sourceRoot
-          ) {
-            return this.contextForWorkspace(residentByAlias, true);
-          }
-          throw new WorkspaceAliasConflictError(alias);
-        }
-        const persistedByAlias = this.store?.getActiveSessionByAlias?.(
-          connectionPrincipalId,
-          alias,
-        );
-        if (persistedByAlias) {
-          if (
-            persistedByAlias.managed &&
-            persistedByAlias.mode === "worktree" &&
-            persistedByAlias.sourceRoot === resolvedBase.sourceRoot
-          ) {
-            return this.reuseManagedSession(persistedByAlias, alias);
-          }
-          throw new WorkspaceAliasConflictError(alias);
-        }
-      }
-
-      const resident = Array.from(this.workspaces.values()).find(
-        (workspace) => workspace.connectionPrincipalId === connectionPrincipalId &&
-          workspace.worktree?.managed &&
-          workspace.sourceRoot === resolvedBase.sourceRoot &&
-          workspace.worktree.baseSha === resolvedBase.baseSha,
-      );
-      if (resident) {
-        if (alias && resident.alias !== alias) {
-          throw new WorkspaceAliasConflictError(resident.alias);
-        }
-        return this.contextForWorkspace(resident, true);
-      }
-
-      const persisted = this.store?.findActiveManagedSession?.(
-        connectionPrincipalId,
-        resolvedBase.sourceRoot,
-        resolvedBase.baseSha,
-      );
-      if (persisted) return this.reuseManagedSession(persisted, alias);
-
-      if (baseRef === undefined) {
-        const candidates = this.activeManagedSessionsForSource(
-          connectionPrincipalId,
-          resolvedBase.sourceRoot,
-        );
-        if (candidates.length === 1) {
-          return this.reuseManagedSession(candidates[0]!, alias);
-        }
-        if (candidates.length > 1) {
-          throw new WorkspaceSelectionRequiredError(
-            candidates.flatMap((session) => session.alias ? [session.alias] : []),
-          );
-        }
-      }
-    }
-
-    const managedKey = managedWorkspaceKey(
-      connectionPrincipalId,
-      resolvedBase.sourceRoot,
-      resolvedBase.baseSha,
-    );
-    if (!forceNew) {
-      const pending = this.pendingManagedWorkspaces.get(managedKey);
-      if (pending) {
-        return pending.then((context) => {
-          if (alias && context.workspace.alias !== alias) {
-            throw new WorkspaceAliasConflictError(context.workspace.alias);
-          }
-          return { ...context, reused: true };
-        });
-      }
-    }
-
-    const opening = this.createManagedWorkspaceContext(
-      connectionPrincipalId,
-      path,
-      alias,
-      forceNew,
-      resolvedBase,
-    );
-    if (!forceNew) this.pendingManagedWorkspaces.set(managedKey, opening);
-    try {
-      return await opening;
-    } finally {
-      if (!forceNew) this.pendingManagedWorkspaces.delete(managedKey);
-    }
-  }
-
-  private async createManagedWorkspaceContext(
-    connectionPrincipalId: string,
-    path: string,
-    alias: string | undefined,
-    forceNew: boolean,
-    resolvedBase: Awaited<ReturnType<typeof resolveManagedWorktreeBase>>,
-  ): Promise<WorkspaceContext> {
-    const retainedManagedWorktrees = this.store?.countManagedWorktrees()
-      ?? Array.from(this.workspaces.values()).filter((workspace) => workspace.worktree?.managed).length;
-    if (retainedManagedWorktrees + this.pendingManagedWorktreeCreations >= this.config.resources.maxManagedWorktrees) {
-      throw new WorkspaceQuotaError(
-        "managed_worktree_quota",
-        `Managed worktree limit reached (${this.config.resources.maxManagedWorktrees}). Close an unused managed workspace before opening another.`,
-      );
-    }
-    this.pendingManagedWorktreeCreations += 1;
-    try {
-      const worktree = await createManagedWorktree({
-        sourcePath: path,
-        config: this.config,
-        resolvedBase,
-      });
-      try {
-        return await this.createWorkspaceContext({
-          connectionPrincipalId,
-          alias,
-          root: worktree.path,
-          mode: "worktree",
-          writeAccess: "read_write",
-          sourceRoot: worktree.sourceRoot,
-          worktree,
-          forceNew,
-        });
-      } catch (error) {
-        try {
-          const cleanup = await removeManagedWorktree({
-            sourceRoot: worktree.sourceRoot,
-            worktreePath: worktree.path,
-            config: {
-              ...this.config,
-              allowedRoots: [...this.config.allowedRoots, worktree.sourceRoot],
-            },
-          });
-          if (!cleanup.removed && cleanup.reason !== "missing") {
-            throw new Error(`Created worktree could not be rolled back (${cleanup.reason}).`);
-          }
-        } catch (cleanupError) {
-          throw new AggregateError([error, cleanupError], "Workspace creation failed and worktree rollback failed");
-        }
-        if (error instanceof ExistingManagedWorkspaceError) {
-          return this.reuseManagedSession(error.session, alias);
-        }
-        throw error;
-      }
-    } finally {
-      this.pendingManagedWorktreeCreations -= 1;
-    }
-  }
-
   private async createWorkspaceContext(input: {
     connectionPrincipalId: string;
     alias?: string;
     root: string;
-    canonicalRoot?: string;
-    mode: WorkspaceMode;
+    canonicalRoot: string;
     writeAccess: WorkspaceWriteAccess;
     replaceWriteAccess?: boolean;
-    sourceRoot?: string;
-    worktree?: WorkspaceWorktree;
-    forceNew?: boolean;
   }): Promise<WorkspaceContext> {
-    const checkoutKey = input.canonicalRoot
-      ? checkoutWorkspaceKey(input.connectionPrincipalId, input.canonicalRoot)
-      : undefined;
+    const workspaceAlias = input.alias ?? this.defaultWorkspaceAlias(
+      input.connectionPrincipalId,
+      input.canonicalRoot,
+    );
+    const checkoutKey = checkoutWorkspaceKey(
+      input.connectionPrincipalId,
+      input.canonicalRoot,
+      workspaceAlias,
+    );
     const indexedCheckoutId = checkoutKey
       ? this.checkoutWorkspaceIds.get(checkoutKey)
       : undefined;
@@ -1770,18 +1561,11 @@ export class WorkspaceRegistry {
     const workspace: Workspace = {
       id: residentCheckoutId ?? `ws_${randomUUID()}`,
       connectionPrincipalId: input.connectionPrincipalId,
-      alias: input.alias ?? this.defaultWorkspaceAlias(
-        input.connectionPrincipalId,
-        input.sourceRoot ?? input.canonicalRoot ?? input.root,
-      ),
+      alias: workspaceAlias,
       root: input.root,
-      mode: input.mode,
       writeAccess: input.writeAccess,
       stateGeneration: 1,
-      sourceRoot: input.sourceRoot,
-      worktree: input.worktree,
       ...this.loadSkillsForWorkspace(input.root),
-      agentProfiles: await loadLocalAgentProfiles(this.config, input.root),
       activatedSkillDirs: new Set(),
       instructionContexts: new Map(),
       lastUsedAt: Date.now(),
@@ -1789,14 +1573,10 @@ export class WorkspaceRegistry {
     let reused = Boolean(residentCheckoutId);
 
     const agentsFiles = await this.loadInitialAgentsFiles(workspace.root);
-    workspace.root = this.assertWorkspaceRootAllowed(
-      workspace.root,
-      workspace.mode,
-      workspace.sourceRoot,
-    );
+    workspace.root = this.assertWorkspaceRootAllowed(workspace.root);
     const availableAgentsFiles: AvailableAgentsFile[] = [];
     const instructionScan = lazyInstructionScan();
-    if (input.mode === "checkout" && input.canonicalRoot && this.store?.createOrReuseCheckoutSession) {
+    if (this.store?.createOrReuseCheckoutSession) {
       const session = this.store.createOrReuseCheckoutSession({
         id: workspace.id,
         connectionPrincipalId: workspace.connectionPrincipalId,
@@ -1807,7 +1587,6 @@ export class WorkspaceRegistry {
         replaceWriteAccess: input.replaceWriteAccess,
         requestedAlias: input.alias ?? null,
         stateGeneration: workspace.stateGeneration,
-        maxActiveSessionsPerClient: this.config.resources.maxActiveWorkspacesPerClient,
       });
       if (this.lifecycleStates.get(session.id)?.phase === "closing") {
         throw new Error(`Workspace ${session.id} is closing and cannot be reopened yet.`);
@@ -1844,40 +1623,17 @@ export class WorkspaceRegistry {
         resident.stateGeneration += 1;
       }
       return this.contextForWorkspace(resident, true);
-    } else if (workspace.mode === "worktree" && workspace.worktree && this.store?.createOrReuseManagedSession) {
-      const session = this.store.createOrReuseManagedSession({
-        id: workspace.id,
-        connectionPrincipalId: workspace.connectionPrincipalId,
-        alias: workspace.alias,
-        root: workspace.root,
-        sourceRoot: workspace.sourceRoot!,
-        baseRef: workspace.worktree.baseRef,
-        baseSha: workspace.worktree.baseSha,
-        dirtySource: workspace.worktree.dirtySource,
-        forceNew: input.forceNew,
-        stateGeneration: workspace.stateGeneration,
-        maxActiveSessionsPerClient: this.config.resources.maxActiveWorkspacesPerClient,
-      });
-      if (session.id !== workspace.id) throw new ExistingManagedWorkspaceError(session);
-      workspace.alias = session.alias;
     } else {
       this.store?.createSession({
         id: workspace.id,
         connectionPrincipalId: workspace.connectionPrincipalId,
         alias: workspace.alias,
         root: workspace.root,
-        mode: workspace.mode,
-        sourceRoot: workspace.sourceRoot,
-        baseRef: workspace.worktree?.baseRef,
-        baseSha: workspace.worktree?.baseSha,
-        dirtySource: workspace.worktree?.dirtySource,
-        managed: workspace.worktree?.managed,
         writeAccess: workspace.writeAccess,
         stateGeneration: workspace.stateGeneration,
-        maxActiveSessionsPerClient: this.config.resources.maxActiveWorkspacesPerClient,
       });
     }
-    if (checkoutKey) this.checkoutWorkspaceIds.set(checkoutKey, workspace.id);
+    this.checkoutWorkspaceIds.set(checkoutKey, workspace.id);
     this.workspaces.set(workspace.id, workspace);
     this.ensureLifecycleState(workspace);
     this.evictResidentWorkspaces();
@@ -1914,82 +1670,10 @@ export class WorkspaceRegistry {
     let published = false;
     try {
       const alias = session.alias;
-      let recovery: WorkspaceContext["recovery"];
-      let recoveredWorktree: WorkspaceWorktree | undefined;
-      let currentWorktreeHead: string | undefined;
-      if (session.mode === "worktree" && session.managed) {
-        try {
-          const metadata = await stat(session.root);
-          if (!metadata.isDirectory()) {
-            throw new WorkspaceRecoveryRequiredError(alias, "the saved worktree path is not a directory");
-          }
-          if (!session.sourceRoot) {
-            throw new WorkspaceRecoveryRequiredError(
-              alias,
-              "the saved source repository metadata is incomplete",
-            );
-          }
-          currentWorktreeHead = await validatedManagedWorktreeHead(
-            session.sourceRoot,
-            session.root,
-          );
-          if (!currentWorktreeHead) {
-            throw new WorkspaceRecoveryRequiredError(
-              alias,
-              "the saved directory is no longer registered as the original Git worktree",
-            );
-          }
-          if (currentWorktreeHead !== session.baseSha) {
-            this.store?.updateManagedSessionBaseSha?.(
-              session.id,
-              session.connectionPrincipalId,
-              currentWorktreeHead,
-            );
-          }
-        } catch (error) {
-          if (error instanceof WorkspaceRecoveryRequiredError) throw error;
-          if (!isMissingPathError(error)) {
-            throw new WorkspaceRecoveryRequiredError(alias, "the saved worktree path is not accessible");
-          }
-          if (!session.sourceRoot || !session.baseSha) {
-            throw new WorkspaceRecoveryRequiredError(alias, "the saved source repository metadata is incomplete");
-          }
-          try {
-            recoveredWorktree = await restoreManagedWorktree({
-              sourceRoot: session.sourceRoot,
-              worktreePath: session.root,
-              baseRef: session.baseRef ?? "HEAD",
-              baseSha: session.baseSha,
-              dirtySource: session.dirtySource,
-              config: this.config,
-            });
-            this.store?.updateManagedSessionBaseSha?.(
-              session.id,
-              session.connectionPrincipalId,
-              recoveredWorktree.baseSha,
-            );
-            recovery = {
-              kind: "managed_worktree_recreated",
-              dataLossPossible: true,
-            };
-          } catch {
-            throw new WorkspaceRecoveryRequiredError(
-              alias,
-              "the source repository or saved base commit is unavailable",
-            );
-          }
-        }
-      }
       let root: string;
       try {
-        root = this.assertWorkspaceRootAllowed(session.root, session.mode, session.sourceRoot);
+        root = this.assertWorkspaceRootAllowed(session.root);
       } catch {
-        if (session.mode === "worktree" && session.managed) {
-          throw new WorkspaceRecoveryRequiredError(
-            alias,
-            "the source repository is no longer approved or accessible",
-          );
-        }
         this.invalidateWorkspace(session.id, session.connectionPrincipalId, session.root);
         throw new UnknownWorkspaceAliasError();
       }
@@ -2006,22 +1690,9 @@ export class WorkspaceRegistry {
         connectionPrincipalId: session.connectionPrincipalId,
         alias,
         root,
-        mode: session.mode,
         writeAccess: session.writeAccess ?? "read_write",
         stateGeneration,
-        sourceRoot: session.sourceRoot,
-        worktree: session.mode === "worktree"
-          ? recoveredWorktree ?? {
-              path: root,
-              baseRef: session.baseRef ?? "HEAD",
-              baseSha: currentWorktreeHead ?? session.baseSha ?? "",
-              dirtySource: session.dirtySource,
-              detached: true,
-              managed: session.managed,
-            }
-          : undefined,
         ...this.loadSkillsForWorkspace(root),
-        agentProfiles: await loadLocalAgentProfiles(this.config, root),
         activatedSkillDirs: new Set(),
         instructionContexts: new Map(),
         lastUsedAt: Date.now(),
@@ -2037,19 +1708,18 @@ export class WorkspaceRegistry {
         workspace.stateGeneration = activeSession.stateGeneration ?? workspace.stateGeneration;
       }
       this.workspaces.set(workspace.id, workspace);
-      if (workspace.mode === "checkout") {
-        this.checkoutWorkspaceIds.set(
-          checkoutWorkspaceKey(
-            workspace.connectionPrincipalId,
-            realpathSync(workspace.root),
-          ),
-          workspace.id,
-        );
-      }
+      this.checkoutWorkspaceIds.set(
+        checkoutWorkspaceKey(
+          workspace.connectionPrincipalId,
+          realpathSync(workspace.root),
+          workspace.alias,
+        ),
+        workspace.id,
+      );
       this.ensureLifecycleState(workspace);
       published = true;
       this.evictResidentWorkspaces();
-      return recovery ? { ...context, recovery } : context;
+      return context;
     } finally {
       lifecycle.activeOperations -= 1;
       if (lifecycle.activeOperations === 0) lifecycle.resolveDrained?.();
@@ -2060,53 +1730,31 @@ export class WorkspaceRegistry {
     }
   }
 
-  private async reuseManagedSession(
-    originalSession: WorkspaceSession,
-    alias: string | undefined,
-  ): Promise<WorkspaceContext> {
-    const session = originalSession;
-    if (alias && session.alias !== alias) {
-      throw new WorkspaceAliasConflictError(session.alias);
-    }
-    const resident = this.workspaces.get(session.id);
-    if (resident?.connectionPrincipalId === session.connectionPrincipalId) {
-      return this.contextForWorkspace(resident, true);
-    }
-    return this.hydrateWorkspaceSession(session);
-  }
-
-  private activeManagedSessionsForSource(
-    connectionPrincipalId: string,
-    sourceRoot: string,
-  ): WorkspaceSession[] {
-    const sessions = this.store?.findActiveManagedSessionsBySource?.(
-      connectionPrincipalId,
-      sourceRoot,
-    ) ?? [];
-    const byId = new Map(sessions.map((session) => [session.id, session]));
-    for (const workspace of this.workspaces.values()) {
-      if (
-        workspace.connectionPrincipalId !== connectionPrincipalId ||
-        workspace.sourceRoot !== sourceRoot ||
-        !workspace.worktree?.managed
-      ) continue;
-      byId.set(workspace.id, workspaceToSessionSnapshot(workspace));
-    }
-    return [...byId.values()].sort(
-      (left, right) => right.lastUsedAt.localeCompare(left.lastUsedAt),
-    );
-  }
-
   private defaultWorkspaceAlias(
     connectionPrincipalId: string,
     path: string,
   ): string {
+    const canonicalPath = tryRealpathSync(path) ?? resolve(path);
+    const reusableResident = Array.from(this.workspaces.values()).find((workspace) =>
+      workspace.connectionPrincipalId === connectionPrincipalId &&
+      !workspace.alias.startsWith("execution-") &&
+      (tryRealpathSync(workspace.root) ?? resolve(workspace.root)) === canonicalPath
+    );
+    if (reusableResident) return reusableResident.alias;
+    const activeSessions = this.store?.listActiveSessions?.() ?? [];
+    const reusablePersisted = activeSessions.find((session) =>
+      session.connectionPrincipalId === connectionPrincipalId &&
+      !session.alias.startsWith("execution-") &&
+      (session.canonicalRoot ?? resolve(session.root)) === canonicalPath
+    );
+    if (reusablePersisted) return reusablePersisted.alias;
+
     const normalized = basename(resolve(path))
       .replace(/[^A-Za-z0-9._-]+/gu, "-")
       .replace(/^-+|-+$/gu, "")
       .slice(0, 48) || "project";
     const occupied = new Set<string>();
-    for (const session of this.store?.listActiveSessions?.() ?? []) {
+    for (const session of activeSessions) {
       if (session.connectionPrincipalId === connectionPrincipalId && session.alias) {
         occupied.add(session.alias);
       }
@@ -2133,10 +1781,8 @@ export class WorkspaceRegistry {
     );
     workspace.lastUsedAt = Date.now();
     this.store?.touchSession(workspace.id, workspace.connectionPrincipalId);
-    const refreshedAgentProfiles = await loadLocalAgentProfiles(this.config, workspace.root);
     workspace.skills = refreshedSkills.skills;
     workspace.skillDiagnostics = refreshedSkills.skillDiagnostics;
-    workspace.agentProfiles = refreshedAgentProfiles;
     workspace.activatedSkillDirs = retainedActivatedSkillDirs;
     const agentsFiles = await this.loadInitialAgentsFiles(workspace.root);
     return {
@@ -2167,60 +1813,22 @@ export class WorkspaceRegistry {
     return `proj_${digest}`;
   }
 
-  private assertWorkspaceRootAllowed(root: string, mode: WorkspaceMode, sourceRoot: string | undefined): string {
+  private assertWorkspaceRootAllowed(root: string): string {
     const canonicalAllowedRoots = this.config.allowedRoots
       .map(tryRealpathSync)
       .filter((path): path is string => Boolean(path));
-    if (mode === "worktree") {
-      if (!sourceRoot) {
-        throw new Error(`Stored worktree workspace is missing sourceRoot: ${root}`);
-      }
-      assertAllowedPath(realpathSync(sourceRoot), canonicalAllowedRoots);
-      assertAllowedPath(realpathSync(root), [realpathSync(this.config.worktreeRoot)]);
-      if (!statSync(join(root, ".git")).isFile()) {
-        throw new Error(`Stored managed worktree is missing its Git link: ${root}`);
-      }
-      return assertAllowedPath(root, [this.config.worktreeRoot]);
-    }
-
-    return assertAllowedPath(realpathSync(root), canonicalAllowedRoots);
+    const canonicalRoot = realpathSync(root);
+    const managedRoot = resolve(this.config.stateDir, "worktrees");
+    if (isPathInsideRoot(canonicalRoot, managedRoot)) return canonicalRoot;
+    return assertAllowedPath(canonicalRoot, canonicalAllowedRoots);
   }
 
-  private workspaceRootAllowed(root: string, mode: WorkspaceMode, sourceRoot: string | undefined): boolean {
+  private workspaceRootAllowed(root: string): boolean {
     try {
-      this.assertWorkspaceRootAllowed(root, mode, sourceRoot);
+      this.assertWorkspaceRootAllowed(root);
       return true;
     } catch {
       return false;
-    }
-  }
-
-  private reconcileMissingManagedSessions(): void {
-    const sessions = this.store?.listActiveSessions?.()
-      ?? Array.from(this.workspaces.values()).map((workspace): WorkspaceSession => ({
-        id: workspace.id,
-        connectionPrincipalId: workspace.connectionPrincipalId,
-        alias: workspace.alias,
-        root: workspace.root,
-        status: "active",
-        mode: workspace.mode,
-        sourceRoot: workspace.sourceRoot,
-        baseRef: workspace.worktree?.baseRef,
-        baseSha: workspace.worktree?.baseSha,
-        dirtySource: workspace.worktree?.dirtySource ?? false,
-        managed: workspace.worktree?.managed ?? false,
-        writeAccess: workspace.writeAccess,
-        stateGeneration: workspace.stateGeneration,
-        createdAt: new Date(workspace.lastUsedAt).toISOString(),
-        lastUsedAt: new Date(workspace.lastUsedAt).toISOString(),
-      }));
-    for (const session of sessions) {
-      if (!session.managed || this.workspaceRootAllowed(session.root, session.mode, session.sourceRoot)) continue;
-      const lifecycle = this.lifecycleStates.get(session.id);
-      if (lifecycle && (lifecycle.phase === "closing" || lifecycle.activeOperations > 0)) continue;
-      // Keep managed sessions discoverable by alias. A missing path can often
-      // be recreated from the persisted source root and base SHA during resume.
-      this.evictWorkspace(session.id, session.root);
     }
   }
 
@@ -2257,64 +1865,56 @@ export class WorkspaceRegistry {
 
   private async loadInstructionChain(root: string, targetDirectory: string): Promise<ApplicableAgentsFile[]> {
     const loadedFiles: ApplicableAgentsFile[] = [];
-    let loadedBytes = 0;
     const userFile = await this.loadUserInstructionsFile();
     if (userFile) {
-      const fileBytes = Buffer.byteLength(userFile.content, "utf8");
-      assertInstructionFitsBudget(userFile.path, loadedBytes, fileBytes, "instruction chain");
       loadedFiles.push(userFile);
-      loadedBytes += fileBytes;
     }
 
     for (const directory of ancestorDirectories(root, targetDirectory)) {
       const file = await this.instructionFileForDirectory(root, directory);
       if (!file) continue;
-      const fileBytes = Buffer.byteLength(file.content, "utf8");
-      assertInstructionFitsBudget(file.path, loadedBytes, fileBytes, "instruction chain");
       loadedFiles.push(file);
-      loadedBytes += fileBytes;
     }
     return loadedFiles;
-  }
-
-  private async assertCurrentInstructionChainsWithinBudget(
-    workspace: Workspace,
-    files: Array<{ path: string }>,
-  ): Promise<void> {
-    const targets = new Set<string>();
-    for (const file of files) {
-      targets.add(isPathInsideRoot(file.path, workspace.root) ? dirname(file.path) : workspace.root);
-    }
-    for (const target of [...targets].sort()) {
-      await this.loadInstructionChain(workspace.root, target);
-    }
   }
 
   private async instructionFileForDirectory(root: string, directory: string): Promise<ApplicableAgentsFile | undefined> {
     const resolvedRoot = await realpath(root);
     const resolvedDirectory = await realpath(directory);
     if (!isPathInsideRoot(resolvedDirectory, resolvedRoot)) return undefined;
-    const directoryStats = await stat(resolvedDirectory);
-    const fingerprintParts = [statsFingerprint(directoryStats)];
-
-    const discoveredFiles: string[] = [];
-    for (const name of projectInstructionFilenames(this.config.projectDocFallbackFilenames)) {
-      const candidate = join(resolvedDirectory, name);
-      try {
-        const candidateStats = await lstat(candidate);
-        if (!candidateStats.isFile()) continue;
-        const resolvedPath = await realpath(candidate);
-        if (!isPathInsideRoot(resolvedPath, resolvedRoot)) continue;
-        const file = await this.readCachedInstruction(resolvedPath);
-        fingerprintParts.push(`${name}:${resolvedPath}:${file.fingerprint}`);
-        if (!hasProjectInstructionContent(file.content)) continue;
-        discoveredFiles.push(resolvedPath);
-        break;
-      } catch (error) {
-        if (!isMissingPathError(error)) throw error;
+    const { fingerprintParts, discoveredFile } = await this.readStableInstructionDirectory(
+      resolvedRoot,
+      resolvedDirectory,
+      async (directoryStats) => {
+        const stableFingerprintParts = [statsFingerprint(directoryStats)];
+        let stableDiscoveredFile: ApplicableAgentsFile | undefined;
+        for (const name of projectInstructionFilenames(this.config.projectDocFallbackFilenames)) {
+          const candidate = join(resolvedDirectory, name);
+          try {
+            const candidateStats = await lstat(candidate);
+            if (!candidateStats.isFile()) continue;
+            const resolvedPath = await realpath(candidate);
+            if (!isPathInsideRoot(resolvedPath, resolvedRoot)) continue;
+            const file = await this.readCachedInstruction(resolvedPath, resolvedRoot);
+            stableFingerprintParts.push(`${name}:${resolvedPath}:${file.fingerprint}`);
+            if (!hasProjectInstructionContent(file.content)) continue;
+            stableDiscoveredFile = {
+              path: resolvedPath,
+              content: file.content,
+              fingerprint: file.fingerprint,
+            };
+            break;
+          } catch (error) {
+            if (!isMissingPathError(error)) throw error;
+          }
+        }
+        return {
+          fingerprintParts: stableFingerprintParts,
+          discoveredFile: stableDiscoveredFile,
+        };
       }
-    }
-    const files = discoveredFiles;
+    );
+    const files = discoveredFile ? [discoveredFile.path] : [];
     const fingerprint = fingerprintParts.join("\0");
     const cached = this.instructionDirectoryCache.get(resolvedDirectory);
     if (cached?.fingerprint === fingerprint) {
@@ -2323,40 +1923,132 @@ export class WorkspaceRegistry {
       this.instructionDirectoryCache.set(resolvedDirectory, { fingerprint, files });
       this.trimInstructionCaches();
     }
-    const path = files[0];
-    if (!path) return undefined;
-    const file = await this.readCachedInstruction(path);
-    return { path, content: file.content, fingerprint: file.fingerprint };
+    return discoveredFile;
   }
 
-  private async readCachedInstruction(path: string): Promise<{
+  private async readCachedInstruction(path: string, allowedRoot?: string): Promise<{
     fingerprint: string;
     content: string;
   }> {
-    const metadata = await stat(path);
-    const fingerprint = statsFingerprint(metadata);
-    const cached = this.instructionFileCache.get(path);
-    if (cached?.fingerprint === fingerprint) {
-      refreshMapEntry(this.instructionFileCache, path, cached);
-      return cached;
+    const canonicalRoot = allowedRoot === undefined ? undefined : await realpath(allowedRoot);
+    const rootBefore = canonicalRoot === undefined ? undefined : await lstat(canonicalRoot);
+    if (rootBefore && !rootBefore.isDirectory()) {
+      throw new Error(`Instruction root must be a directory: ${allowedRoot}`);
     }
-    let content: string;
-    if (metadata.size > MAX_PROJECT_INSTRUCTION_BYTES) {
-      if (metadata.size > MAX_EMPTY_INSTRUCTION_SCAN_BYTES) {
-        assertInstructionFitsBudget(path, 0, metadata.size, "instruction file");
-      }
-      const oversizedCandidate = await readFile(path, "utf8");
-      if (hasProjectInstructionContent(oversizedCandidate)) {
-        assertInstructionFitsBudget(path, 0, metadata.size, "instruction file");
-      }
-      content = "";
-    } else {
-      content = await readFile(path, "utf8");
+    const canonicalPathBefore = await realpath(path);
+    if (canonicalPathBefore !== path) {
+      throw new Error(`Instruction file path changed before read: ${path}`);
     }
-    const entry = { fingerprint, content };
+    if (canonicalRoot && !isPathInsideRoot(canonicalPathBefore, canonicalRoot)) {
+      throw new AccessDeniedError(`Instruction file is outside the Project root: ${path}`);
+    }
+    const pathBefore = await lstat(path);
+    if (!pathBefore.isFile()) throw new Error(`Instruction path must be a file: ${path}`);
+
+    await this.instructionIoHooks.beforeFileOpen?.(path);
+    const handle = await open(path, READ_ONLY_NOFOLLOW_FLAGS);
+    let entry: { fingerprint: string; content: string };
+    try {
+      const descriptorBefore = await handle.stat();
+      if (!descriptorBefore.isFile()) throw new Error(`Instruction path must be a file: ${path}`);
+      assertSamePathIdentity(pathBefore, descriptorBefore, path, "Instruction file");
+      const fingerprint = statsFingerprint(descriptorBefore);
+      const cached = this.instructionFileCache.get(path);
+      let content: string;
+      if (cached?.fingerprint === fingerprint) {
+        content = cached.content;
+      } else if (descriptorBefore.size > MAX_EMPTY_INSTRUCTION_SCAN_BYTES) {
+        assertInstructionFitsBudget(
+          path,
+          0,
+          descriptorBefore.size,
+          "instruction file",
+          MAX_EMPTY_INSTRUCTION_SCAN_BYTES,
+        );
+        content = "";
+      } else {
+        content = await handle.readFile({ encoding: "utf8" });
+      }
+      const descriptorAfter = await handle.stat();
+      if (!sameStatsSnapshot(descriptorBefore, descriptorAfter)) {
+        throw new Error(`Instruction file changed during read: ${path}`);
+      }
+      entry = { fingerprint: statsFingerprint(descriptorAfter), content };
+    } finally {
+      await handle.close();
+    }
+
+    const pathAfter = await lstat(path);
+    if (!pathAfter.isFile() || entry.fingerprint !== statsFingerprint(pathAfter)) {
+      throw new Error(`Instruction file changed during read: ${path}`);
+    }
+    const canonicalPathAfter = await realpath(path);
+    if (canonicalPathAfter !== canonicalPathBefore) {
+      throw new Error(`Instruction file changed during read: ${path}`);
+    }
+    if (canonicalRoot) {
+      const canonicalRootAfter = await realpath(allowedRoot!);
+      const rootAfter = await lstat(canonicalRoot);
+      if (
+        canonicalRootAfter !== canonicalRoot ||
+        !rootAfter.isDirectory() ||
+        !sameStatsSnapshot(rootBefore!, rootAfter) ||
+        !isPathInsideRoot(canonicalPathAfter, canonicalRoot)
+      ) {
+        throw new Error(`Instruction root changed during read: ${allowedRoot}`);
+      }
+    }
+
     this.instructionFileCache.set(path, entry);
     this.trimInstructionCaches();
     return entry;
+  }
+
+  private async readStableInstructionDirectory<T>(
+    resolvedRoot: string,
+    resolvedDirectory: string,
+    read: (metadata: Stats) => Promise<T>,
+  ): Promise<T> {
+    const rootBefore = await lstat(resolvedRoot);
+    const pathBefore = await lstat(resolvedDirectory);
+    if (!rootBefore.isDirectory() || !pathBefore.isDirectory()) {
+      throw new Error(`Instruction path must be a directory: ${resolvedDirectory}`);
+    }
+    const handle = await open(resolvedDirectory, READ_ONLY_DIRECTORY_NOFOLLOW_FLAGS);
+    let result: T;
+    let descriptorAfter: Stats;
+    try {
+      const descriptorBefore = await handle.stat();
+      if (!descriptorBefore.isDirectory()) {
+        throw new Error(`Instruction path must be a directory: ${resolvedDirectory}`);
+      }
+      assertSamePathIdentity(pathBefore, descriptorBefore, resolvedDirectory, "Instruction directory");
+      await this.instructionIoHooks.beforeDirectoryRead?.(resolvedDirectory);
+      result = await read(descriptorBefore);
+      descriptorAfter = await handle.stat();
+      if (!sameStatsSnapshot(descriptorBefore, descriptorAfter)) {
+        throw new Error(`Instruction directory changed during read: ${resolvedDirectory}`);
+      }
+    } finally {
+      await handle.close();
+    }
+
+    const rootAfterPath = await realpath(resolvedRoot);
+    const rootAfter = await lstat(resolvedRoot);
+    const directoryAfterPath = await realpath(resolvedDirectory);
+    const directoryAfter = await lstat(resolvedDirectory);
+    if (
+      rootAfterPath !== resolvedRoot ||
+      !rootAfter.isDirectory() ||
+      !sameStatsSnapshot(rootBefore, rootAfter) ||
+      directoryAfterPath !== resolvedDirectory ||
+      !directoryAfter.isDirectory() ||
+      !sameStatsSnapshot(descriptorAfter, directoryAfter) ||
+      !isPathInsideRoot(directoryAfterPath, rootAfterPath)
+    ) {
+      throw new Error(`Instruction directory changed during read: ${resolvedDirectory}`);
+    }
+    return result;
   }
 
   private evictResidentWorkspaces(): void {
@@ -2411,24 +2103,14 @@ export class WorkspaceRegistry {
 function checkoutWorkspaceKey(
   connectionPrincipalId: string,
   canonicalRoot: string,
+  alias: string,
 ): string {
-  return JSON.stringify([connectionPrincipalId, canonicalRoot]);
+  return JSON.stringify([connectionPrincipalId, canonicalRoot, alias]);
 }
 
-export async function ensureCheckoutWorkspaceRoot(
-  path: string,
-  ops: DirectoryOps = { stat, mkdir },
-): Promise<PathStats> {
-  try {
-    return await ops.stat(path);
-  } catch (error) {
-    if (!isErrnoException(error) || error.code !== "ENOENT") {
-      throw error;
-    }
-  }
-
-  await ops.mkdir(path, { recursive: true });
-  return await ops.stat(path);
+function projectExecutionAlias(executionId: string): string {
+  const digest = createHash("sha256").update(executionId, "utf8").digest("hex").slice(0, 24);
+  return `execution-${digest}`;
 }
 
 export function formatAgentsPath(path: string, workspaceRoot: string | undefined): string {
@@ -2515,29 +2197,21 @@ function authorizationRootsRestrictGlobal(
   );
 }
 
-function validateInstructionContextSessionId(contextSessionId: string): string {
-  if (!/^wctxs_[A-Za-z0-9-]{1,128}$/u.test(contextSessionId)) {
-    throw new WorkspaceContextSessionError();
+function validateInstructionContextId(instructionContextId: string): string {
+  if (!/^ictx_[A-Za-z0-9-]{1,128}$/u.test(instructionContextId)) {
+    throw new InstructionContextError();
   }
-  return contextSessionId;
+  return instructionContextId;
 }
 
 function formatWorkspaceDisplayPath(path: string | undefined): string {
-  if (!path) return "workspace";
+  if (!path) return "project";
   const resolvedPath = resolve(path);
   return `…/${basename(resolvedPath)}`;
 }
 
 function workspaceIdentity(workspaceId: string, connectionPrincipalId: string): string {
   return `${connectionPrincipalId}\0${workspaceId}`;
-}
-
-function managedWorkspaceKey(
-  connectionPrincipalId: string,
-  sourceRoot: string,
-  baseSha: string,
-): string {
-  return `${connectionPrincipalId}\0${sourceRoot}\0${baseSha}`;
 }
 
 function lazyInstructionScan(): InstructionScanResult {
@@ -2588,6 +2262,21 @@ function statsFingerprint(metadata: Stats): string {
   return `${metadata.dev}:${metadata.ino}:${metadata.size}:${metadata.mtimeMs}:${metadata.ctimeMs}`;
 }
 
+function assertSamePathIdentity(
+  left: Stats,
+  right: Stats,
+  path: string,
+  kind: string,
+): void {
+  if (left.dev !== right.dev || left.ino !== right.ino) {
+    throw new Error(`${kind} changed during read: ${path}`);
+  }
+}
+
+function sameStatsSnapshot(left: Stats, right: Stats): boolean {
+  return statsFingerprint(left) === statsFingerprint(right);
+}
+
 function computeInstructionRevision(files: LoadedAgentsFile[]): string {
   const hash = createHash("sha256");
   hash.update("devspace-instructions-v1\0", "utf8");
@@ -2627,12 +2316,6 @@ function workspaceToSessionSnapshot(workspace: Workspace): WorkspaceSession {
     alias: workspace.alias,
     root: workspace.root,
     status: "active",
-    mode: workspace.mode,
-    sourceRoot: workspace.sourceRoot,
-    baseRef: workspace.worktree?.baseRef,
-    baseSha: workspace.worktree?.baseSha,
-    dirtySource: workspace.worktree?.dirtySource ?? false,
-    managed: workspace.worktree?.managed ?? false,
     writeAccess: workspace.writeAccess,
     stateGeneration: workspace.stateGeneration,
     createdAt: lastUsedAt,
@@ -2667,11 +2350,12 @@ function assertInstructionFitsBudget(
   consumedBytes: number,
   fileBytes: number,
   context: string,
+  maximumBytes = MAX_PROJECT_INSTRUCTION_BYTES,
 ): void {
   const totalBytes = consumedBytes + fileBytes;
-  if (totalBytes <= MAX_PROJECT_INSTRUCTION_BYTES) return;
+  if (totalBytes <= maximumBytes) return;
   throw new InstructionBudgetError(
-    `Project ${context} exceeds the ${MAX_PROJECT_INSTRUCTION_BYTES}-byte UTF-8 limit: ` +
+    `Project ${context} exceeds the ${maximumBytes}-byte UTF-8 limit: ` +
     `${path} requires ${fileBytes} bytes after ${consumedBytes} bytes of earlier instructions ` +
     `(total ${totalBytes} bytes). Empty or shorten this file before retrying.`,
   );

@@ -9,6 +9,7 @@ import {
   CrossProcessWorkspaceRootLock,
   WorkspaceRootLockTimeoutError,
 } from "./cross-process-root-lock.js";
+import type { ProcessIdentityRuntime } from "./process-identity.js";
 import { WorkspaceRootLockManager } from "./workspace-root-locks.js";
 import { WorkspaceRegistry } from "./workspaces.js";
 
@@ -177,6 +178,52 @@ try {
     releaseLongLived();
   }
 
+  const liveLauncherGroup = 77_777;
+  const deadServerPid = 88_881;
+  const contenderPid = 88_882;
+  const livePids = new Set([deadServerPid, contenderPid]);
+  const identityRuntime: ProcessIdentityRuntime = {
+    platform: "linux",
+    currentPid: deadServerPid,
+    processAlive: (pid) => livePids.has(pid),
+    processGroupAlive: (processGroupId) => processGroupId === liveLauncherGroup,
+    processStartIdentity: (pid) => `start-${pid}`,
+    processGroupId: () => liveLauncherGroup,
+    bootIdentity: () => "test-boot",
+  };
+  const deadServerGroupLock = new CrossProcessWorkspaceRootLock({
+    root: crossProcessRoot,
+    acquireTimeoutMs: 100,
+    pollIntervalMs: 10,
+    heartbeatIntervalMs: 60_000,
+    processIdentityRuntime: identityRuntime,
+    serverIdentity: {
+      pid: deadServerPid,
+      startIdentity: `start-${deadServerPid}`,
+      bootIdentity: "test-boot",
+      processGroupId: liveLauncherGroup,
+    },
+  });
+  const deadServerGroupLease = await deadServerGroupLock.acquire(
+    "dead-server-live-launcher-group",
+    "write",
+  );
+  livePids.delete(deadServerPid);
+  const releaseAfterDeadServer = await new CrossProcessWorkspaceRootLock({
+    root: crossProcessRoot,
+    acquireTimeoutMs: 500,
+    pollIntervalMs: 10,
+    processIdentityRuntime: { ...identityRuntime, currentPid: contenderPid },
+    serverIdentity: {
+      pid: contenderPid,
+      startIdentity: `start-${contenderPid}`,
+      bootIdentity: "test-boot",
+      processGroupId: liveLauncherGroup,
+    },
+  }).acquire("dead-server-live-launcher-group", "write");
+  deadServerGroupLease.release();
+  releaseAfterDeadServer.release();
+
   const temporaryCleanupKey = "temporary-cleanup-root";
   const temporaryCleanupDigest = createHash("sha256")
     .update("devspace-cross-process-root-lock-v1\0", "utf8")
@@ -318,6 +365,88 @@ try {
   }
 
   if (process.platform !== "win32") {
+    const processSessionModuleUrl = new URL("./process-sessions.ts", import.meta.url).href;
+    const preAttachmentTarget = join(crossProcessRoot, "pre-attachment-target-started");
+    const preAttachmentSource = `
+      import { CrossProcessWorkspaceRootLock } from ${JSON.stringify(lockModuleUrl)};
+      import { ProcessSessionManager } from ${JSON.stringify(processSessionModuleUrl)};
+      const lock = new CrossProcessWorkspaceRootLock({
+        root: process.argv[1],
+        acquireTimeoutMs: 2_000,
+        pollIntervalMs: 10,
+        heartbeatIntervalMs: 50,
+      });
+      const lease = await lock.acquire("pre-attachment-root", "write");
+      const wrappedLease = (() => lease.release());
+      wrappedLease.release = () => lease.release();
+      wrappedLease.heartbeat = () => lease.heartbeat();
+      wrappedLease.attachProcess = async ({ pid }) => {
+        process.stdout.write("ATTACHING " + pid + "\\n");
+        await new Promise(() => {});
+      };
+      const manager = new ProcessSessionManager({ maxRuntimeMs: 10_000 });
+      void manager.start({
+        connectionPrincipalId: "test-principal",
+        workspaceId: "pre-attachment",
+        cwd: process.cwd(),
+        command: {
+          program: process.execPath,
+          args: [
+            "-e",
+            "require('node:fs').writeFileSync(process.argv[1], 'started'); setInterval(() => {}, 1000)",
+            process.argv[2],
+          ],
+        },
+        yieldTimeMs: 0,
+        retainWorkspaceRootLease: () => wrappedLease,
+      });
+    `;
+    const preAttachmentServer = spawn(
+      process.execPath,
+      [
+        "--import",
+        "tsx",
+        "--input-type=module",
+        "-e",
+        preAttachmentSource,
+        crossProcessRoot,
+        preAttachmentTarget,
+      ],
+      { stdio: "pipe" },
+    );
+    let preAttachmentStderr = "";
+    preAttachmentServer.stderr.on("data", (chunk) => { preAttachmentStderr += String(chunk); });
+    let gatedLauncherPid: number | undefined;
+    try {
+      const line = await waitForChildLine(preAttachmentServer, /^ATTACHING (\d+)$/u);
+      gatedLauncherPid = Number(/^ATTACHING (\d+)$/u.exec(line)?.[1]);
+      assert.ok(Number.isSafeInteger(gatedLauncherPid) && gatedLauncherPid > 0, preAttachmentStderr);
+      await assert.rejects(access(preAttachmentTarget), { code: "ENOENT" });
+      preAttachmentServer.kill("SIGKILL");
+      const preAttachmentExit = await waitForChildExit(preAttachmentServer);
+      assert.equal(preAttachmentExit.signal, "SIGKILL", preAttachmentStderr);
+      const releasePreAttachmentContender = await new CrossProcessWorkspaceRootLock({
+        root: crossProcessRoot,
+        acquireTimeoutMs: 2_000,
+        pollIntervalMs: 10,
+      }).acquire("pre-attachment-root", "write");
+      releasePreAttachmentContender();
+      await waitForProcessExit(gatedLauncherPid);
+      await assert.rejects(access(preAttachmentTarget), { code: "ENOENT" });
+    } finally {
+      if (preAttachmentServer.exitCode === null && preAttachmentServer.signalCode === null) {
+        preAttachmentServer.kill("SIGKILL");
+        await waitForChildExit(preAttachmentServer).catch(() => undefined);
+      }
+      if (gatedLauncherPid) {
+        try {
+          process.kill(-gatedLauncherPid, "SIGKILL");
+        } catch {
+          // The gated launcher already exited.
+        }
+      }
+    }
+
     const crashSource = `
       import { spawn } from "node:child_process";
       import { CrossProcessWorkspaceRootLock } from ${JSON.stringify(lockModuleUrl)};

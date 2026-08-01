@@ -11,17 +11,13 @@ const overrideSources: Record<string, string> = {
   projectDocFallbackFilenames: "DEVSPACE_PROJECT_DOC_FALLBACK_FILENAMES",
   widgets: "DEVSPACE_WIDGETS",
   "resources.maxMcpSessions": "DEVSPACE_MAX_MCP_SESSIONS",
-  "resources.maxMcpSessionsPerClient": "DEVSPACE_MAX_MCP_SESSIONS_PER_CLIENT",
   "resources.maxProcessSessions": "DEVSPACE_MAX_PROCESS_SESSIONS",
-  "resources.maxProcessSessionsPerClient": "DEVSPACE_MAX_PROCESS_SESSIONS_PER_CLIENT",
   "resources.maxProcessSessionsPerWorkspace": "DEVSPACE_MAX_PROCESS_SESSIONS_PER_WORKSPACE",
   "resources.maxProcessOutputFileBytes": "DEVSPACE_MAX_PROCESS_OUTPUT_FILE_BYTES",
   "resources.maxProcessOutputStorageBytes": "DEVSPACE_MAX_PROCESS_OUTPUT_STORAGE_BYTES",
   "resources.completedProcessOutputTtlMs": "DEVSPACE_COMPLETED_PROCESS_OUTPUT_TTL_SECONDS",
   "resources.maxCommandRuntimeMs": "DEVSPACE_MAX_COMMAND_RUNTIME_SECONDS",
   "resources.maxResidentWorkspaces": "DEVSPACE_MAX_RESIDENT_WORKSPACES",
-  "resources.maxActiveWorkspacesPerClient": "DEVSPACE_MAX_ACTIVE_WORKSPACES_PER_CLIENT",
-  "resources.maxManagedWorktrees": "DEVSPACE_MAX_MANAGED_WORKTREES",
   "resources.maxRequestBodyBytes": "DEVSPACE_MAX_REQUEST_BODY_BYTES",
 };
 

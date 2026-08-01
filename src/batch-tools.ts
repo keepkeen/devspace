@@ -48,6 +48,17 @@ export interface BatchOptions<T extends BatchWorkItem> {
   allocationChunkCharacters?: number;
 }
 
+class UnsafeBatchReadTruncationError extends Error {
+  readonly code = "read_files_truncation_unsafe";
+  readonly publicText =
+    "A file read exceeded the output budget. Call read_files with fewer files or fewer lines so each continuation remains exact.";
+
+  constructor() {
+    super("Refusing to return a read_files continuation after its visible content was truncated.");
+    this.name = "UnsafeBatchReadTruncationError";
+  }
+}
+
 export function limitBatchText(
   text: string,
   maxCharacters = BATCH_TOTAL_MAX_CHARACTERS,
@@ -95,6 +106,9 @@ export async function runBoundedBatch<T extends BatchWorkItem>(
         response.result,
         response.ok ? BATCH_ITEM_MAX_CHARACTERS : BATCH_ERROR_MAX_CHARACTERS,
       );
+      if (item.operation === "read" && response.ok && limited.truncated) {
+        throw new UnsafeBatchReadTruncationError();
+      }
       return {
         index,
         operation: item.operation,
@@ -106,6 +120,7 @@ export async function runBoundedBatch<T extends BatchWorkItem>(
         truncated: limited.truncated,
       };
     } catch (error) {
+      if (error instanceof UnsafeBatchReadTruncationError) throw error;
       options.onError?.(error, item, index);
       const limited = limitText(
         publicBatchError(error),
@@ -141,12 +156,18 @@ export async function runBoundedBatch<T extends BatchWorkItem>(
     minItemCharacters,
     allocationChunkCharacters,
   );
+  if (results.some((item) => item.operation === "read" && item.ok && item.truncated)) {
+    throw new UnsafeBatchReadTruncationError();
+  }
   const aggregateTruncated = results.some((item) => item.truncated || item.omitted === true);
 
   const formatted = limitText(
     results.map(formatBatchItem).join("\n\n"),
     totalMaxCharacters,
   );
+  if (formatted.truncated && results.some((item) => item.operation === "read" && item.ok)) {
+    throw new UnsafeBatchReadTruncationError();
+  }
   return {
     items: results,
     result: formatted.text,

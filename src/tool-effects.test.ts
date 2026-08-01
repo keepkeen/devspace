@@ -4,10 +4,6 @@ import {
   createApplyPatchEffects,
   createProcessInteractEffects,
   createProcessStartEffects,
-  createReviewEffects,
-  createWorkspaceCloseEffects,
-  createWorkspaceOpenEffects,
-  createWorkspaceRevokeEffects,
 } from "./tool-effects.js";
 
 const observedAt = "2026-07-23T10:00:00.000Z";
@@ -84,7 +80,6 @@ const startInput = {
     interrupt: false,
   },
   snapshot: runningSnapshot,
-  networkAllowed: true,
 };
 assert.deepEqual(createProcessStartEffects(startInput), {
   observedAt,
@@ -103,7 +98,6 @@ assert.deepEqual(createProcessStartEffects(startInput), {
     },
     untrackedSideEffects: true,
   },
-  network: { confidence: "declared", allowed: true, observed: false },
 });
 
 const interactEffects = createProcessInteractEffects({
@@ -180,70 +174,10 @@ const serializedProcessEffects = JSON.stringify(interactEffects);
 assert.equal(serializedProcessEffects.includes("secret command output"), false);
 assert.equal(serializedProcessEffects.includes("network"), false);
 
-assert.deepEqual(createWorkspaceOpenEffects({
-  observedAt,
-  reused: false,
-  managedWorktree: true,
-}), {
-  observedAt,
-  workspace: {
-    confidence: "observed",
-    action: "open",
-    result: "opened",
-    worktree: "created",
-    processesTerminated: 0,
-  },
-});
-assert.deepEqual(createWorkspaceCloseEffects({
-  observedAt,
-  closed: false,
-  managedWorktree: true,
-  worktreeRemoved: false,
-  processesTerminated: 2,
-}), {
-  observedAt,
-  workspace: {
-    confidence: "observed",
-    action: "close",
-    result: "retained",
-    worktree: "retained",
-    processesTerminated: 2,
-  },
-});
-assert.deepEqual(createWorkspaceRevokeEffects({
-  observedAt,
-  revoked: true,
-  managedWorktree: true,
-  worktreeRemoved: true,
-  processesTerminated: 1,
-}), {
-  observedAt,
-  workspace: {
-    confidence: "observed",
-    action: "revoke",
-    result: "revoked",
-    worktree: "removed",
-    processesTerminated: 1,
-  },
-});
-
-const reviewInput = { observedAt, since: "last_shown" as const, advanced: true };
-const reviewEffects = createReviewEffects(reviewInput);
-assert.deepEqual(reviewEffects, {
-  observedAt,
-  reviewCheckpoint: { confidence: "observed", since: "last_shown", advanced: true },
-});
-
-assert.equal(
-  JSON.stringify(createReviewEffects(reviewInput)),
-  JSON.stringify(createReviewEffects(reviewInput)),
-);
 assert.deepEqual(JSON.parse(JSON.stringify({
   patchEffects,
   interactEffects,
-  reviewEffects,
 })), {
   patchEffects,
   interactEffects,
-  reviewEffects,
 });

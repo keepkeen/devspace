@@ -1,9 +1,11 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   closeSync,
   chmodSync,
   existsSync,
+  fstatSync,
   fsyncSync,
+  linkSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -59,31 +61,24 @@ const devspaceUserConfigSchema = z.object({
   publicBaseUrl: z.string().nullable().optional(),
   allowedHosts: z.array(z.string()).optional(),
   stateDir: z.string().optional(),
-  worktreeRoot: z.string().optional(),
   userInstructionsPath: z.string().trim().min(1).nullable().optional(),
   skillPaths: z.array(z.string().trim().min(1)).optional(),
   disabledSkillPaths: z.array(z.string().trim().min(1)).optional(),
   adminSkillsDir: z.string().trim().min(1).optional(),
   projectDocFallbackFilenames: projectDocFallbackFilenamesSchema.optional(),
-  subagents: z.boolean().optional(),
-  toolProfile: z.enum(["browse", "coding"]).optional(),
   widgets: z.enum(["off", "changes", "full"]).optional(),
   mcpHttpTransport: z.enum(["stateless", "stateful"]).optional(),
   mcpGlobalIdleReclaim: z.boolean().optional(),
   oauthGrantMaxLifetimeSeconds: z.number().int().min(0).max(10 * 365 * 24 * 60 * 60).optional(),
   resources: z.object({
     maxMcpSessions: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxMcpSessions).optional(),
-    maxMcpSessionsPerClient: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxMcpSessionsPerClient).optional(),
     maxProcessSessions: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxProcessSessions).optional(),
-    maxProcessSessionsPerClient: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxProcessSessionsPerClient).optional(),
     maxProcessSessionsPerWorkspace: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxProcessSessionsPerWorkspace).optional(),
     maxProcessOutputFileBytes: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxProcessOutputFileBytes).optional(),
     maxProcessOutputStorageBytes: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxProcessOutputStorageBytes).optional(),
     completedProcessOutputTtlMs: z.number().int().min(1_000).max(MAX_TIMER_MS).optional(),
     maxCommandRuntimeMs: z.number().int().min(MIN_COMMAND_RUNTIME_MS).max(MAX_TIMER_MS).optional(),
     maxResidentWorkspaces: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxResidentWorkspaces).optional(),
-    maxActiveWorkspacesPerClient: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxActiveWorkspacesPerClient).optional(),
-    maxManagedWorktrees: z.number().int().min(1).max(RESOURCE_LIMIT_MAXIMUMS.maxManagedWorktrees).optional(),
   }).passthrough().optional(),
 }).passthrough();
 
@@ -104,31 +99,24 @@ export interface DevspaceUserConfig {
   publicBaseUrl?: string | null;
   allowedHosts?: string[];
   stateDir?: string;
-  worktreeRoot?: string;
   userInstructionsPath?: string | null;
   skillPaths?: string[];
   disabledSkillPaths?: string[];
   adminSkillsDir?: string;
   projectDocFallbackFilenames?: string[];
-  subagents?: boolean;
-  toolProfile?: "browse" | "coding";
   widgets?: "off" | "changes" | "full";
   mcpHttpTransport?: "stateless" | "stateful";
   mcpGlobalIdleReclaim?: boolean;
   oauthGrantMaxLifetimeSeconds?: number;
   resources?: {
     maxMcpSessions?: number;
-    maxMcpSessionsPerClient?: number;
     maxProcessSessions?: number;
-    maxProcessSessionsPerClient?: number;
     maxProcessSessionsPerWorkspace?: number;
     maxProcessOutputFileBytes?: number;
     maxProcessOutputStorageBytes?: number;
     completedProcessOutputTtlMs?: number;
     maxCommandRuntimeMs?: number;
     maxResidentWorkspaces?: number;
-    maxActiveWorkspacesPerClient?: number;
-    maxManagedWorktrees?: number;
     maxRequestBodyBytes?: number;
     [key: string]: unknown;
   };
@@ -156,6 +144,23 @@ export interface DevspaceFiles {
   migratedOwnerPassword?: string;
 }
 
+export interface DevspaceConfigFileVersion {
+  exists: boolean;
+  device?: string;
+  inode?: string;
+  revision: string;
+}
+
+export class DevspaceConfigConflictError extends Error {
+  constructor(
+    readonly currentVersion: DevspaceConfigFileVersion,
+    readonly preservedConflictPath?: string,
+  ) {
+    super("The DevSpace configuration changed before it could be committed.");
+    this.name = "DevspaceConfigConflictError";
+  }
+}
+
 export function devspaceConfigDir(env: NodeJS.ProcessEnv = process.env): string {
   return resolve(expandHomePath(env.DEVSPACE_CONFIG_DIR ?? join(homedir(), ".devspace")));
 }
@@ -170,10 +175,6 @@ export function devspaceAuthPath(env: NodeJS.ProcessEnv = process.env): string {
 
 export function devspaceSkillsDir(env: NodeJS.ProcessEnv = process.env): string {
   return join(devspaceConfigDir(env), "skills");
-}
-
-export function devspaceAgentsDir(env: NodeJS.ProcessEnv = process.env): string {
-  return join(devspaceConfigDir(env), "agents");
 }
 
 export function loadDevspaceFiles(env: NodeJS.ProcessEnv = process.env): DevspaceFiles {
@@ -201,7 +202,12 @@ export function loadDevspaceFiles(env: NodeJS.ProcessEnv = process.env): Devspac
 export function writeDevspaceConfig(
   config: DevspaceUserConfig,
   env: NodeJS.ProcessEnv = process.env,
-  options: { lockHeld?: boolean } = {},
+  options: {
+    lockHeld?: boolean;
+    expectedVersion?: DevspaceConfigFileVersion;
+    /** Test seam invoked after final CAS validation and before no-clobber publish. */
+    beforePublish?: () => void;
+  } = {},
 ): string {
   const write = () => {
     const filePath = devspaceConfigPath(env);
@@ -209,10 +215,39 @@ export function writeDevspaceConfig(
     writeJsonFile(filePath, {
       ...config,
       schemaVersion: CURRENT_CONFIG_SCHEMA_VERSION,
-    }, 0o600);
+    }, 0o600, options.expectedVersion, options.beforePublish);
     return filePath;
   };
   return options.lockHeld ? write() : withDevspaceConfigLockSync(env, write);
+}
+
+export function readDevspaceConfigFileVersion(
+  env: NodeJS.ProcessEnv = process.env,
+): DevspaceConfigFileVersion {
+  return readConfigFileVersion(devspaceConfigPath(env));
+}
+
+function readConfigFileVersion(filePath: string): DevspaceConfigFileVersion {
+  let descriptor: number | undefined;
+  try {
+    descriptor = openSync(filePath, "r");
+    const fileStat = fstatSync(descriptor, { bigint: true });
+    const contents = readFileSync(descriptor);
+    return {
+      exists: true,
+      device: String(fileStat.dev),
+      inode: String(fileStat.ino),
+      revision: createHash("sha256").update(contents).digest("base64url"),
+    };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    return {
+      exists: false,
+      revision: createHash("sha256").update(Buffer.alloc(0)).digest("base64url"),
+    };
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+  }
 }
 
 export function updateDevspaceConfig(
@@ -290,27 +325,6 @@ export function createDevspaceAuth(ownerPassword: string): DevspaceAuthConfig {
   };
 }
 
-export function ensureDevspaceDefaultSkills(env: NodeJS.ProcessEnv = process.env): string[] {
-  const targetPath = join(devspaceSkillsDir(env), "subagent-delegation", "SKILL.md");
-  if (existsSync(targetPath)) return [];
-
-  const sourcePath = new URL("../skills/subagent-delegation/SKILL.md", import.meta.url);
-  mkdirSync(dirname(targetPath), { recursive: true });
-  writeFileSync(targetPath, readFileSync(sourcePath, "utf8"), { mode: 0o644 });
-  return [targetPath];
-}
-
-export function resolveSubagentsFlag(
-  config: Pick<DevspaceUserConfig, "subagents">,
-  env: NodeJS.ProcessEnv = process.env,
-): boolean | undefined {
-  if (env.DEVSPACE_SUBAGENTS === undefined) return config.subagents;
-  const value = env.DEVSPACE_SUBAGENTS.toLowerCase();
-  if (["1", "true", "yes", "on"].includes(value)) return true;
-  if (["0", "false", "no", "off"].includes(value)) return false;
-  throw new Error(`Invalid DEVSPACE_SUBAGENTS: ${env.DEVSPACE_SUBAGENTS} (expected boolean)`);
-}
-
 function readJsonFile<T>(filePath: string, schema: z.ZodType<T>): T {
   try {
     return schema.parse(JSON.parse(readFileSync(filePath, "utf8")));
@@ -333,8 +347,8 @@ function migrateAuthDocument(auth: DevspaceAuthConfig): {
       auth: {
         schemaVersion: DEVSPACE_AUTH_SCHEMA_VERSION,
         ownerPasswordHash: hashOwnerPassword(ownerPassword),
-        // Direct derivation preserves root IDs, host identity hashes, and local
-        // admin tokens created by pre-v2 installations.
+        // Direct derivation preserves keyed identifiers and local admin tokens
+        // created by pre-v2 installations.
         masterKey: legacyMasterKeyFromOwnerPassword(ownerPassword),
         keyDerivation: "legacy-direct",
       },
@@ -420,7 +434,13 @@ function writeJsonBackup(filePath: string, source: string): void {
   }
 }
 
-function writeJsonFile(filePath: string, value: unknown, mode: number): void {
+function writeJsonFile(
+  filePath: string,
+  value: unknown,
+  mode: number,
+  expectedVersion?: DevspaceConfigFileVersion,
+  beforePublish?: () => void,
+): void {
   const temporaryPath = join(
     dirname(filePath),
     `.${basename(filePath)}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`,
@@ -430,11 +450,17 @@ function writeJsonFile(filePath: string, value: unknown, mode: number): void {
   try {
     descriptor = openSync(temporaryPath, "wx", mode);
     writeFileSync(descriptor, JSON.stringify(value, null, 2) + "\n", "utf8");
+    chmodSync(temporaryPath, mode);
     fsyncSync(descriptor);
     closeSync(descriptor);
     descriptor = undefined;
-    renameSync(temporaryPath, filePath);
-    chmodSync(filePath, mode);
+    if (expectedVersion) {
+      publishConfigFileIfMatch(temporaryPath, filePath, expectedVersion, beforePublish);
+    } else {
+      renameSync(temporaryPath, filePath);
+      chmodSync(filePath, mode);
+      fsyncDirectory(dirname(filePath));
+    }
   } catch (error) {
     if (descriptor !== undefined) closeSync(descriptor);
     try {
@@ -443,5 +469,108 @@ function writeJsonFile(filePath: string, value: unknown, mode: number): void {
       // The temporary file may already have been renamed or never created.
     }
     throw error;
+  }
+}
+
+function publishConfigFileIfMatch(
+  temporaryPath: string,
+  filePath: string,
+  expectedVersion: DevspaceConfigFileVersion,
+  beforePublish?: () => void,
+): void {
+  const directoryPath = dirname(filePath);
+  if (!expectedVersion.exists) {
+    beforePublish?.();
+    try {
+      linkSync(temporaryPath, filePath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        throw new DevspaceConfigConflictError(readConfigFileVersion(filePath));
+      }
+      throw error;
+    }
+    unlinkSync(temporaryPath);
+    fsyncDirectory(directoryPath);
+    return;
+  }
+
+  const displacedPath = join(
+    directoryPath,
+    `.${basename(filePath)}.cas-conflict.${process.pid}.${randomBytes(8).toString("hex")}`,
+  );
+  try {
+    renameSync(filePath, displacedPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      throw new DevspaceConfigConflictError(readConfigFileVersion(filePath));
+    }
+    throw error;
+  }
+
+  let displacedVersion: DevspaceConfigFileVersion;
+  try {
+    displacedVersion = readConfigFileVersion(displacedPath);
+  } catch (error) {
+    recoverDisplacedConfig(displacedPath, filePath);
+    fsyncDirectory(directoryPath);
+    throw error;
+  }
+  if (!configFileVersionsEqual(displacedVersion, expectedVersion)) {
+    const preservedConflictPath = recoverDisplacedConfig(displacedPath, filePath);
+    fsyncDirectory(directoryPath);
+    throw new DevspaceConfigConflictError(
+      readConfigFileVersion(filePath),
+      preservedConflictPath,
+    );
+  }
+
+  try {
+    beforePublish?.();
+    linkSync(temporaryPath, filePath);
+  } catch (error) {
+    const preservedConflictPath = recoverDisplacedConfig(displacedPath, filePath);
+    fsyncDirectory(directoryPath);
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      throw new DevspaceConfigConflictError(
+        readConfigFileVersion(filePath),
+        preservedConflictPath,
+      );
+    }
+    throw error;
+  }
+
+  unlinkSync(temporaryPath);
+  unlinkSync(displacedPath);
+  fsyncDirectory(directoryPath);
+}
+
+/** Restores without replacing a concurrently created target; returns a preserved conflict path. */
+function recoverDisplacedConfig(displacedPath: string, filePath: string): string | undefined {
+  try {
+    linkSync(displacedPath, filePath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return displacedPath;
+    throw error;
+  }
+  unlinkSync(displacedPath);
+  return undefined;
+}
+
+function configFileVersionsEqual(
+  left: DevspaceConfigFileVersion,
+  right: DevspaceConfigFileVersion,
+): boolean {
+  return left.exists === right.exists &&
+    left.device === right.device &&
+    left.inode === right.inode &&
+    left.revision === right.revision;
+}
+
+function fsyncDirectory(directoryPath: string): void {
+  const descriptor = openSync(directoryPath, "r");
+  try {
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
   }
 }

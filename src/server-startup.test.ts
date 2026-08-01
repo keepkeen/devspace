@@ -1,13 +1,16 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { createServer as createHttpServer } from "node:http";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "./config.js";
-import { openDatabase } from "./db/client.js";
+import { authorizationRootId } from "./authorization-roots.js";
 import { MutationOperationStore } from "./mutation-operation-store.js";
+import { SqliteOAuthClientsStore, SqliteOAuthStore } from "./oauth-store.js";
 import {
   createServer,
+  configurePublicHttpServer,
   listenerErrorKind,
   oauthDiscoveryCompatibilityPath,
   patchFitsUtf8ByteLimit,
@@ -68,8 +71,18 @@ try {
       PORT: "1",
     });
     assert.equal(bodyLimitConfig.resources.maxRequestBodyBytes, 65_536);
+    const bodyLimitAccessToken = "server-startup-body-limit-access-token";
+    seedAccessToken(
+      bodyLimitConfig,
+      workspaceRoot,
+      bodyLimitAccessToken,
+    );
     const bodyLimitServer = createServer(bodyLimitConfig);
     const httpServer = createHttpServer(bodyLimitServer.app);
+    configurePublicHttpServer(httpServer, 64);
+    assert.equal(httpServer.headersTimeout, 15_000);
+    assert.equal(httpServer.requestTimeout, 120_000);
+    assert.equal(httpServer.maxConnections, 128);
     try {
       const origin = await new Promise<string>((resolveOrigin) => {
         httpServer.listen(0, "127.0.0.1", () => {
@@ -79,18 +92,31 @@ try {
           );
         });
       });
-      const response = await fetch(new URL("/mcp", origin), {
+      const requestBody = JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: { clientInfo: { name: "x", version: "1", padding: "y".repeat(200_000) } },
+      });
+      const unauthenticated = await fetch(new URL("/mcp", origin), {
         method: "POST",
         headers: {
           "content-type": "application/json",
           accept: "application/json, text/event-stream",
         },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: 1,
-          method: "initialize",
-          params: { clientInfo: { name: "x", version: "1", padding: "y".repeat(200_000) } },
-        }),
+        body: requestBody,
+      });
+      assert.equal(unauthenticated.status, 401);
+      assert.match(unauthenticated.headers.get("www-authenticate") ?? "", /^Bearer /u);
+
+      const response = await fetch(new URL("/mcp", origin), {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${bodyLimitAccessToken}`,
+          "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+        },
+        body: requestBody,
       });
       assert.equal(response.status, 413);
       assert.match(response.headers.get("content-type") ?? "", /application\/json/u);
@@ -102,6 +128,7 @@ try {
       const malformed = await fetch(new URL("/mcp", origin), {
         method: "POST",
         headers: {
+          authorization: `Bearer ${bodyLimitAccessToken}`,
           "content-type": "application/json",
           accept: "application/json, text/event-stream",
         },
@@ -121,25 +148,15 @@ try {
     }
   }
 
-  const identityDatabase = openDatabase(stateDir);
-  try {
-    const now = new Date(0).toISOString();
-    identityDatabase.sqlite.prepare(`
-      insert into connection_principals (principal_id, created_at, last_used_at, revoked_at)
-      values (?, ?, ?, null)
-    `).run("owner-a", now, now);
-  } finally {
-    identityDatabase.close();
-  }
   workspaceStore = new SqliteWorkspaceStore(stateDir);
   workspaceStore.createSession({
     id: "workspace-a",
-    connectionPrincipalId: "owner-a",
+    connectionPrincipalId: "owner",
     root: workspaceRoot,
   });
   mutationStore = new MutationOperationStore(stateDir);
   const key = {
-    connectionPrincipalId: "owner-a",
+    connectionPrincipalId: "owner",
     workspaceId: "workspace-a",
     tool: "exec_command",
     operationId: "live-operation",
@@ -177,7 +194,7 @@ try {
   active = createServer(rotatedConfig);
   workspaceStore = new SqliteWorkspaceStore(stateDir);
   assert.equal(
-    workspaceStore.getSession("workspace-a", "owner-a")?.stateGeneration,
+    workspaceStore.getSession("workspace-a", "owner")?.stateGeneration,
     2,
     "Owner credential epoch changes must stale active Workspace handles",
   );
@@ -186,4 +203,56 @@ try {
   workspaceStore?.close();
   await active?.close();
   await rm(root, { recursive: true, force: true });
+}
+
+function seedAccessToken(
+  config: ReturnType<typeof loadConfig>,
+  allowedRoot: string,
+  accessToken: string,
+): void {
+  const store = new SqliteOAuthStore(config.stateDir);
+  try {
+    const client = new SqliteOAuthClientsStore(
+      store,
+      config.oauth.allowedRedirectHosts,
+    ).registerClient({
+      redirect_uris: ["https://chatgpt.com/connector_platform_oauth_redirect"],
+      client_name: "server-startup-body-limit",
+    });
+    const grant = store.createAuthorizationGrant({
+      clientId: client.client_id,
+      scopes: ["project:read"],
+      allowedRootIds: [
+        authorizationRootId(allowedRoot, config.oauth.keys.authorizationRoot),
+      ],
+    });
+    const resource = new URL("/mcp", config.publicBaseUrl).href;
+    const expiresAt = Math.floor(Date.now() / 1_000) + 3_600;
+    store.saveTokenPair({
+      accessTokenHash: createHash("sha256").update(accessToken).digest("base64url"),
+      accessToken: {
+        grantId: grant.grantId,
+        clientId: client.client_id,
+        principalId: grant.principalId,
+        authorizationEpoch: grant.authorizationEpoch,
+        scopes: [...grant.grantedScopes],
+        expiresAt,
+        resource,
+      },
+      refreshTokenHash: createHash("sha256")
+        .update(`${accessToken}-refresh`)
+        .digest("base64url"),
+      refreshToken: {
+        grantId: grant.grantId,
+        clientId: client.client_id,
+        principalId: grant.principalId,
+        authorizationEpoch: grant.authorizationEpoch,
+        scopes: [...grant.grantedScopes],
+        expiresAt,
+        resource,
+      },
+    });
+  } finally {
+    store.close();
+  }
 }

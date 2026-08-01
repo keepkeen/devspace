@@ -10,18 +10,19 @@ import {
   rmSync,
   statSync,
 } from "node:fs";
-import { basename, dirname, resolve } from "node:path";
+import { basename, dirname, isAbsolute, normalize, resolve } from "node:path";
 import Database from "better-sqlite3";
 import {
   createCanonicalSchema,
   CURRENT_DATABASE_SCHEMA_VERSION,
+  OWNER_PRINCIPAL_ID,
+  sealLegacyManagedWorktreeArtifacts,
   validateCanonicalDatabase,
 } from "./canonical-schema.js";
 import { DEVSPACE_CAPABILITY_SCOPES } from "../oauth-scopes.js";
 import { ALL_AUTHORIZED_ROOTS_ID } from "../authorization-roots.js";
 
 const LEGACY_UNOWNED_PRINCIPAL = "__legacy_unowned__";
-const LEGACY_FULL_SCOPE = "devspace";
 
 type Row = Record<string, unknown>;
 
@@ -43,8 +44,6 @@ interface NormalizedOAuthGrant {
   grantId: string;
   clientId: string;
   principalId: string;
-  subjectHash: string | null;
-  organizationHash: string | null;
   grantedScopes: string[];
   allowedRootIds: string[];
   authorizationEpoch: number;
@@ -57,7 +56,9 @@ interface NormalizedOAuthGrant {
 interface NormalizedWorkspace {
   id: string;
   connectionPrincipalId: string;
+  legacyConnectionPrincipalId: string;
   alias: string;
+  legacyAlias: string;
   root: string;
   canonicalRoot: string | null;
   status: "active" | "closed" | "revoked";
@@ -98,6 +99,11 @@ interface NormalizedOperation {
   expiresAt: string;
 }
 
+interface LegacyIsolatedProjectExecution {
+  row: Row;
+  workspaceRoot: string;
+}
+
 export interface DatabasePreparationResult {
   migrated: boolean;
   sourceVersion: number;
@@ -113,6 +119,7 @@ export function prepareDatabaseFile(path: string): DatabasePreparationResult {
     source.pragma("busy_timeout = 5000");
     source.pragma("foreign_keys = ON");
     source.pragma("wal_checkpoint(TRUNCATE)");
+    validateSourceDatabase(source);
     sourceVersion = databaseSchemaVersion(source);
     if (sourceVersion > CURRENT_DATABASE_SCHEMA_VERSION) {
       throw new Error(
@@ -145,8 +152,9 @@ export function prepareDatabaseFile(path: string): DatabasePreparationResult {
     targetDatabase.pragma("foreign_keys = ON");
 
     const migrate = targetDatabase.transaction(() => {
-      createCanonicalSchema(targetDatabase!);
+      createCanonicalSchema(targetDatabase!, { deferLegacyQuarantineSeal: true });
       migrateLegacyData(sourceDatabase!, targetDatabase!, sourceVersion);
+      sealLegacyManagedWorktreeArtifacts(targetDatabase!);
     });
     migrate.immediate();
     validateCanonicalDatabase(targetDatabase);
@@ -184,6 +192,21 @@ export function prepareDatabaseFile(path: string): DatabasePreparationResult {
   }
 }
 
+function validateSourceDatabase(source: Database.Database): void {
+  const integrity = source.pragma("integrity_check") as Array<{ integrity_check: string }>;
+  if (integrity.length !== 1 || integrity[0]?.integrity_check !== "ok") {
+    throw new Error(
+      `Cannot migrate a database that fails SQLite integrity_check: ${JSON.stringify(integrity.slice(0, 10))}`,
+    );
+  }
+  const foreignKeyFailures = source.pragma("foreign_key_check") as Row[];
+  if (foreignKeyFailures.length > 0) {
+    throw new Error(
+      `Cannot migrate a database that fails foreign_key_check: ${JSON.stringify(foreignKeyFailures.slice(0, 10))}`,
+    );
+  }
+}
+
 export function migrateDatabase(sqlite: Database.Database): void {
   const version = databaseSchemaVersion(sqlite);
   if (version === 0 && userTableNames(sqlite).length === 0) {
@@ -205,7 +228,6 @@ function migrateLegacyData(
   const now = new Date().toISOString();
   const principalMap = normalizePrincipals(source, now);
   const clients = normalizeOAuthClients(source, sourceVersion, principalMap, now);
-  const grants = normalizeOAuthGrants(source, clients, principalMap, now);
   const clientPrincipalMap = new Map(
     clients
       .filter((client): client is NormalizedOAuthClient & { principalId: string } => Boolean(client.principalId))
@@ -220,26 +242,106 @@ function migrateLegacyData(
     legacyOwner,
     now,
   );
-  normalizeDuplicateCheckouts(workspaces);
+  assertCompatibleRetainedOwnership(
+    source,
+    sourceVersion,
+    workspaces,
+    clientPrincipalMap,
+    legacyOwner,
+  );
+  for (const workspace of workspaces) {
+    workspace.connectionPrincipalId = OWNER_PRINCIPAL_ID;
+  }
+  const checkoutWorkspaces = workspaces.filter((workspace) => workspace.mode === "checkout");
+  const worktreeWorkspaces = workspaces.filter((workspace) => workspace.mode === "worktree");
+  assertNoLiveUnresolvedWorktreeMutations(source, worktreeWorkspaces, now);
+  normalizeCollapsedWorkspaceAliases(checkoutWorkspaces);
+  normalizeDuplicateCheckouts(checkoutWorkspaces);
+  // Pre-v21 checkout rows belong to the removed session/workspace selection
+  // model. Retain them for audit and mutation recovery, but never revive them
+  // as active Project runtimes after a Project-centric upgrade.
+  if (sourceVersion < 21) {
+    for (const workspace of checkoutWorkspaces) workspace.status = "closed";
+  }
 
-  insertPrincipals(target, principalMap.values());
   insertOAuthClients(target, clients);
-  insertOAuthGrants(target, grants);
-  insertWorkspaces(target, workspaces);
-  insertLoadedAgentFiles(source, target, new Set(workspaces.map((workspace) => workspace.id)));
+  insertWorkspaces(target, checkoutWorkspaces);
+  insertLoadedAgentFiles(
+    source,
+    target,
+    new Set(checkoutWorkspaces.map((workspace) => workspace.id)),
+  );
   insertMutationOperations(
     target,
-    normalizeMutationOperations(source, workspaces, sourceVersion, clientPrincipalMap, legacyOwner),
+    normalizeMutationOperations(source, checkoutWorkspaces),
   );
+  insertApplyPatchChanges(source, target);
+  insertAuditEvents(source, target);
   insertOAuthOwnerCredential(source, target);
-  insertOAuthTokens(source, target, "oauth_access_tokens", grants, principalMap);
-  insertOAuthTokens(source, target, "oauth_refresh_tokens", grants, principalMap);
-  insertRefreshTokenTombstones(source, target);
-  insertReconnectCodes(source, target, principalMap);
+  let isolatedProjectExecutions: LegacyIsolatedProjectExecution[] = [];
+  if (sourceVersion >= 20) {
+    const grants = normalizeOAuthGrants(source, clients, principalMap, now);
+    insertOAuthGrants(target, grants);
+    insertOAuthTokens(source, target, "oauth_access_tokens", grants, principalMap);
+    insertOAuthTokens(source, target, "oauth_refresh_tokens", grants, principalMap);
+    insertRefreshTokenTombstones(source, target);
+    insertAuthorizationArtifacts(source, target, clients, grants, principalMap);
+    if (sourceVersion >= 21) {
+      isolatedProjectExecutions = insertProjectExecutions(source, target);
+    }
+  }
+  // Pre-v20 authorization is deliberately not carried across the single-Owner
+  // boundary. v20 already has that boundary, so its grants and tokens survive
+  // the sessionless Project-execution migration.
   insertAuthorizationLimits(source, target);
-  insertCleanupJobs(source, target, sourceVersion, clientPrincipalMap, legacyOwner);
-  insertDirtyArtifacts(source, target, sourceVersion, clientPrincipalMap, legacyOwner);
-  insertLocalAgentSessions(source, target);
+  insertCleanupJobs(source, target);
+  insertLegacyManagedWorktreeArtifacts(
+    source,
+    target,
+    sourceVersion,
+    worktreeWorkspaces,
+    isolatedProjectExecutions,
+    now,
+  );
+  validateMigratedWorkspaceCounts(
+    source,
+    target,
+    checkoutWorkspaces.length,
+    worktreeWorkspaces.length + isolatedProjectExecutions.length,
+  );
+}
+
+function assertCompatibleRetainedOwnership(
+  source: Database.Database,
+  sourceVersion: number,
+  workspaces: readonly NormalizedWorkspace[],
+  clientPrincipalMap: ReadonlyMap<string, string>,
+  legacyOwner: string | undefined,
+): void {
+  const retained = new Set(workspaces.map((workspace) => workspace.connectionPrincipalId));
+  for (const table of [
+    "oauth_revocation_cleanup_jobs",
+    "oauth_revocation_dirty_worktree_artifacts",
+  ] as const) {
+    for (const row of tableRows(source, table)) {
+      const principalId = canonicalHistoricalPrincipalId(
+        row,
+        sourceVersion,
+        clientPrincipalMap,
+        legacyOwner,
+      );
+      if (principalId) retained.add(principalId);
+    }
+  }
+  if (
+    sourceVersion >= 20 &&
+    [...retained].some((principalId) => principalId !== OWNER_PRINCIPAL_ID)
+  ) {
+    throw new Error(
+      "Cannot migrate post-Owner retained state with a non-Owner principal " +
+      `(${[...retained].sort().join(", ")}).`,
+    );
+  }
 }
 
 function normalizePrincipals(
@@ -271,7 +373,7 @@ function normalizeOAuthClients(
     // Pre-grant schemas used OAuth client identity as the ownership boundary.
     // Canonical v15+ intentionally removed oauth_clients.principal_id because
     // the authorization grant is the source of truth. Do not resurrect a
-    // client ID as an orphan connection principal when migrating those schemas.
+    // client ID as a retained connection principal when migrating those schemas.
     let principalId = hasPrincipalColumn
       ? nullableString(row, "principal_id")
       : sourceVersion < 13
@@ -319,19 +421,15 @@ function normalizeOAuthGrants(
         !principals.has(principalId) ||
         principals.get(principalId)?.revokedAt
       ) return [];
-      const grantedScopes = normalizeOAuthScopes(
-        nullableString(row, "granted_scopes_json"),
-      ) ?? migratedClientScopes(source, clientId);
+      const grantedScopes = normalizeOAuthScopes(nullableString(row, "granted_scopes_json"));
+      const allowedRootIds = normalizeAllowedRootIds(nullableString(row, "allowed_root_ids_json"));
+      if (!grantedScopes || !allowedRootIds) return [];
       return [{
         grantId: requiredString(row, "grant_id"),
         clientId,
         principalId,
-        subjectHash: nullableString(row, "subject_hash"),
-        organizationHash: nullableString(row, "organization_hash"),
         grantedScopes,
-        allowedRootIds: normalizeAllowedRootIds(
-          nullableString(row, "allowed_root_ids_json"),
-        ),
+        allowedRootIds,
         authorizationEpoch: positiveInteger(row.authorization_epoch, 1),
         absoluteExpiresAt: nullablePositiveInteger(row.absolute_expires_at),
         createdAt: optionalString(row, "created_at") ?? now,
@@ -341,54 +439,10 @@ function normalizeOAuthGrants(
     });
   }
 
-  const grants: NormalizedOAuthGrant[] = [];
-  for (const client of clients) {
-    if (!client.principalId || principals.get(client.principalId)?.revokedAt) continue;
-    const grantedScopes = migratedClientScopes(source, client.clientId);
-    const createdAt = client.issuedAt > 0
-      ? new Date(client.issuedAt * 1_000).toISOString()
-      : now;
-    grants.push({
-      grantId: migratedGrantId(client.clientId, client.principalId),
-      clientId: client.clientId,
-      principalId: client.principalId,
-      subjectHash: null,
-      organizationHash: null,
-      grantedScopes,
-      allowedRootIds: [ALL_AUTHORIZED_ROOTS_ID],
-      authorizationEpoch: 1,
-      absoluteExpiresAt: null,
-      createdAt,
-      lastUsedAt: principals.get(client.principalId)?.lastUsedAt ?? createdAt,
-      revokedAt: null,
-    });
-  }
-  return grants;
-}
-
-function migratedClientScopes(source: Database.Database, clientId: string): string[] {
-  const requested = new Set<string>();
-  for (const table of ["oauth_access_tokens", "oauth_refresh_tokens"] as const) {
-    for (const row of tableRows(source, table)) {
-      if (optionalString(row, "client_id") !== clientId) continue;
-      for (const scope of normalizeOAuthScopes(nullableString(row, "scopes_json")) ?? []) {
-        requested.add(scope);
-      }
-    }
-  }
-  const scopes = DEVSPACE_CAPABILITY_SCOPES.filter((scope) => requested.has(scope));
-  return scopes.length > 0 ? scopes : [...DEVSPACE_CAPABILITY_SCOPES];
-}
-
-function migratedGrantId(clientId: string, principalId: string): string {
-  const digest = createHash("sha256")
-    .update("devspace-migrated-oauth-grant-v1\0", "utf8")
-    .update(clientId, "utf8")
-    .update("\0", "utf8")
-    .update(principalId, "utf8")
-    .digest("base64url")
-    .slice(0, 32);
-  return `grant-${digest}`;
+  // v20 introduced persisted grants. If none are present, there is no
+  // authorization source of truth to reconstruct safely from client or token
+  // rows, so require reauthorization instead of synthesizing authority.
+  return [];
 }
 
 function resolveLegacyOwner(
@@ -422,7 +476,10 @@ function normalizeWorkspaces(
     : columns.has("owner_client_id")
       ? "owner_client_id"
       : undefined;
-  const raw = tableRows(source, "workspace_sessions").map((row): Omit<NormalizedWorkspace, "alias"> & {
+  const raw = tableRows(source, "workspace_sessions").map((row): Omit<
+    NormalizedWorkspace,
+    "alias" | "legacyAlias"
+  > & {
     requestedAlias?: string;
   } => {
     const id = requiredString(row, "id");
@@ -439,7 +496,11 @@ function normalizeWorkspaces(
       now,
       `workspace ${id}`,
     );
-    const canonical = mode === "checkout" ? canonicalWorkspaceRoot(root) : { path: null, available: true };
+    const canonical = mode !== "checkout"
+      ? { path: null, available: true }
+      : sourceVersion >= 19
+        ? { path: optionalString(row, "canonical_root") ?? resolve(root), available: true }
+        : canonicalWorkspaceRoot(root);
     if (mode === "checkout" && status === "active" && !canonical.available) status = "closed";
     const writeAccess = mode === "worktree"
       ? "read_write"
@@ -447,6 +508,7 @@ function normalizeWorkspaces(
     return {
       id,
       connectionPrincipalId,
+      legacyConnectionPrincipalId: connectionPrincipalId,
       requestedAlias: optionalString(row, "alias"),
       root,
       canonicalRoot: canonical.path,
@@ -484,13 +546,26 @@ function normalizeWorkspaces(
       const candidate = workspace.requestedAlias && validAlias(workspace.requestedAlias)
         ? workspace.requestedAlias.trim()
         : derivedWorkspaceAlias(workspace);
+      const alias = uniqueAlias(candidate, used);
       normalized.push({
         ...workspace,
-        alias: uniqueAlias(candidate, used),
+        alias,
+        legacyAlias: alias,
       });
     }
   }
   return normalized;
+}
+
+function normalizeCollapsedWorkspaceAliases(workspaces: NormalizedWorkspace[]): void {
+  const used = new Set<string>();
+  workspaces.sort((left, right) =>
+    workspaceStatusRank(left.status) - workspaceStatusRank(right.status) ||
+    right.lastUsedAt.localeCompare(left.lastUsedAt) ||
+    left.id.localeCompare(right.id));
+  for (const workspace of workspaces) {
+    workspace.alias = uniqueAlias(workspace.alias, used);
+  }
 }
 
 function normalizeDuplicateCheckouts(workspaces: NormalizedWorkspace[]): void {
@@ -547,18 +622,16 @@ function insertOAuthGrants(
 ): void {
   const insert = target.prepare(`
     insert into oauth_grants (
-      grant_id, client_id, principal_id, subject_hash, organization_hash,
+      grant_id, client_id, principal_id,
       granted_scopes_json, allowed_root_ids_json, authorization_epoch, absolute_expires_at,
       created_at, last_used_at, revoked_at
-    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   for (const grant of grants) {
     insert.run(
       grant.grantId,
       grant.clientId,
       grant.principalId,
-      grant.subjectHash,
-      grant.organizationHash,
       JSON.stringify(grant.grantedScopes),
       JSON.stringify(grant.allowedRootIds),
       grant.authorizationEpoch,
@@ -573,10 +646,9 @@ function insertOAuthGrants(
 function insertWorkspaces(target: Database.Database, workspaces: readonly NormalizedWorkspace[]): void {
   const insert = target.prepare(`
     insert into workspace_sessions (
-      id, connection_principal_id, alias, root, canonical_root, status, mode,
-      source_root, base_ref, base_sha, dirty_source, managed, write_access,
-      state_generation, created_at, last_used_at
-    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      id, connection_principal_id, alias, root, canonical_root, status,
+      write_access, state_generation, created_at, last_used_at
+    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   for (const workspace of workspaces) {
     insert.run(
@@ -586,12 +658,6 @@ function insertWorkspaces(target: Database.Database, workspaces: readonly Normal
       workspace.root,
       workspace.canonicalRoot,
       workspace.status,
-      workspace.mode,
-      workspace.sourceRoot,
-      workspace.baseRef,
-      workspace.baseSha,
-      workspace.dirtySource,
-      workspace.managed,
       workspace.writeAccess,
       workspace.stateGeneration,
       workspace.createdAt,
@@ -627,15 +693,8 @@ function insertLoadedAgentFiles(
 function normalizeMutationOperations(
   source: Database.Database,
   workspaces: readonly NormalizedWorkspace[],
-  sourceVersion: number,
-  clientPrincipalMap: ReadonlyMap<string, string>,
-  legacyOwner: string | undefined,
 ): NormalizedOperation[] {
   const workspaceById = new Map(workspaces.map((workspace) => [workspace.id, workspace]));
-  const columns = tableColumns(source, "mutation_operations");
-  const ownerColumn = columns.has("connection_principal_id")
-    ? "connection_principal_id"
-    : "owner_client_id";
   const candidates = new Map<string, Array<NormalizedOperation & { rowId: number }>>();
   for (const row of tableRows(source, "mutation_operations", true)) {
     const workspaceId = optionalString(row, "workspace_id");
@@ -643,26 +702,6 @@ function normalizeMutationOperations(
     if (!workspaceId || !operationId) continue;
     const workspace = workspaceById.get(workspaceId);
     if (!workspace) continue;
-    let principalId: string;
-    try {
-      principalId = canonicalPrincipalId(
-        optionalString(row, ownerColumn),
-        sourceVersion,
-        new Map([[workspace.connectionPrincipalId, {
-          principalId: workspace.connectionPrincipalId,
-          createdAt: workspace.createdAt,
-          lastUsedAt: workspace.lastUsedAt,
-          revokedAt: null,
-        }]]),
-        clientPrincipalMap,
-        legacyOwner,
-        workspace.createdAt,
-        `operation ${operationId}`,
-      );
-    } catch {
-      continue;
-    }
-    if (principalId !== workspace.connectionPrincipalId) continue;
     const state = enumValue(
       row.state,
       [
@@ -676,7 +715,7 @@ function normalizeMutationOperations(
       "outcome_unknown",
     );
     const operation: NormalizedOperation & { rowId: number } = {
-      connectionPrincipalId: principalId,
+      connectionPrincipalId: OWNER_PRINCIPAL_ID,
       workspaceId,
       tool: optionalString(row, "tool") ?? "unknown",
       operationId,
@@ -694,7 +733,7 @@ function normalizeMutationOperations(
       expiresAt: optionalString(row, "expires_at") ?? workspace.lastUsedAt,
       rowId: nonNegativeInteger(row.__rowid, 0),
     };
-    const key = `${principalId}\0${operationId}`;
+    const key = `${OWNER_PRINCIPAL_ID}\0${workspaceId}\0${operationId}`;
     const group = candidates.get(key) ?? [];
     group.push(operation);
     candidates.set(key, group);
@@ -745,6 +784,69 @@ function insertMutationOperations(
   }
 }
 
+function insertApplyPatchChanges(
+  source: Database.Database,
+  target: Database.Database,
+): void {
+  const retainedMutation = target.prepare(`
+    select 1
+    from mutation_operations
+    where connection_principal_id = ? and workspace_id = ? and operation_id = ?
+  `);
+  const insert = target.prepare(`
+    insert into apply_patch_changes (
+      sequence, connection_principal_id, workspace_id, operation_id, tool,
+      workspace_generation, applied_at, patch, files_json, summary_json
+    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  for (const row of tableRows(source, "apply_patch_changes")) {
+    const workspaceId = optionalString(row, "workspace_id");
+    const operationId = optionalString(row, "operation_id");
+    if (!workspaceId || !operationId) continue;
+    if (!retainedMutation.get(OWNER_PRINCIPAL_ID, workspaceId, operationId)) continue;
+    insert.run(
+      positiveInteger(row.sequence, undefined),
+      OWNER_PRINCIPAL_ID,
+      workspaceId,
+      operationId,
+      "apply_patch",
+      positiveInteger(row.workspace_generation, 1),
+      requiredString(row, "applied_at"),
+      requiredString(row, "patch"),
+      requiredString(row, "files_json"),
+      requiredString(row, "summary_json"),
+    );
+  }
+}
+
+function insertAuditEvents(source: Database.Database, target: Database.Database): void {
+  const insert = target.prepare(`
+    insert into audit_events (
+      id, ts, level, event, request_id, tool, oauth_client_ref, connection_ref,
+      workspace_activity_ref, operation_ref, error_code, error_category,
+      error_fingerprint, details_json
+    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  for (const row of tableRows(source, "audit_events")) {
+    insert.run(
+      positiveInteger(row.id, undefined),
+      requiredString(row, "ts"),
+      enumValue(row.level, ["error", "warn", "info", "debug"] as const, "info"),
+      requiredString(row, "event"),
+      nullableString(row, "request_id"),
+      nullableString(row, "tool"),
+      nullableString(row, "oauth_client_ref"),
+      nullableString(row, "connection_ref"),
+      nullableString(row, "workspace_activity_ref"),
+      nullableString(row, "operation_ref"),
+      nullableString(row, "error_code"),
+      nullableString(row, "error_category"),
+      nullableString(row, "error_fingerprint"),
+      requiredString(row, "details_json"),
+    );
+  }
+}
+
 function insertOAuthOwnerCredential(source: Database.Database, target: Database.Database): void {
   const insert = target.prepare(`
     insert into oauth_owner_credential (id, salt, verifier, updated_at)
@@ -763,7 +865,7 @@ function insertOAuthTokens(
   grants: readonly NormalizedOAuthGrant[],
   principals: ReadonlyMap<string, NormalizedPrincipal>,
 ): void {
-  const grantByClientId = new Map(grants.map((grant) => [grant.clientId, grant]));
+  const grantById = new Map(grants.map((grant) => [grant.grantId, grant]));
   const insert = table === "oauth_refresh_tokens"
     ? target.prepare(`
         insert into oauth_refresh_tokens (
@@ -779,10 +881,20 @@ function insertOAuthTokens(
       `);
   for (const row of tableRows(source, table)) {
     const clientId = optionalString(row, "client_id");
-    const grant = clientId ? grantByClientId.get(clientId) : undefined;
-    if (!grant || principals.get(grant.principalId)?.revokedAt) continue;
+    const persistedGrantId = optionalString(row, "grant_id");
+    const persistedPrincipalId = optionalString(row, "principal_id");
+    const persistedAuthorizationEpoch = nullablePositiveInteger(row.authorization_epoch);
+    const grant = persistedGrantId ? grantById.get(persistedGrantId) : undefined;
+    if (
+      !grant ||
+      grant.clientId !== clientId ||
+      grant.principalId !== persistedPrincipalId ||
+      grant.authorizationEpoch !== persistedAuthorizationEpoch ||
+      grant.revokedAt !== null ||
+      principals.get(grant.principalId)?.revokedAt
+    ) continue;
     const scopes = normalizeOAuthScopes(nullableString(row, "scopes_json"));
-    if (!scopes) continue;
+    if (!scopes || scopes.some((scope) => !grant.grantedScopes.includes(scope))) continue;
     const tokenHash = requiredString(row, "token_hash");
     const common = [
       tokenHash,
@@ -852,28 +964,6 @@ function migratedRefreshFamilyId(tokenHash: string): string {
     .digest("base64url")}`;
 }
 
-function insertReconnectCodes(
-  source: Database.Database,
-  target: Database.Database,
-  principals: ReadonlyMap<string, NormalizedPrincipal>,
-): void {
-  const insert = target.prepare(`
-    insert into oauth_principal_reconnect_codes (
-      code_hash, principal_id, created_at, expires_at
-    ) values (?, ?, ?, ?)
-  `);
-  for (const row of tableRows(source, "oauth_principal_reconnect_codes")) {
-    const principalId = optionalString(row, "principal_id");
-    if (!principalId || !principals.has(principalId) || principals.get(principalId)?.revokedAt) continue;
-    insert.run(
-      requiredString(row, "code_hash"),
-      principalId,
-      nonNegativeInteger(row.created_at, 0),
-      nonNegativeInteger(row.expires_at, 0),
-    );
-  }
-}
-
 function insertAuthorizationLimits(source: Database.Database, target: Database.Database): void {
   const insert = target.prepare(`
     insert into oauth_authorization_limits (
@@ -895,32 +985,90 @@ function insertAuthorizationLimits(source: Database.Database, target: Database.D
   }
 }
 
-function insertCleanupJobs(
+function insertAuthorizationArtifacts(
   source: Database.Database,
   target: Database.Database,
-  sourceVersion: number,
-  clientPrincipalMap: ReadonlyMap<string, string>,
-  legacyOwner: string | undefined,
+  clients: readonly NormalizedOAuthClient[],
+  grants: readonly NormalizedOAuthGrant[],
+  principals: ReadonlyMap<string, NormalizedPrincipal>,
 ): void {
+  const clientIds = new Set(clients.map((client) => client.clientId));
+  const selectionInsert = target.prepare(`
+    insert or ignore into oauth_authorization_selections (
+      token_hash, client_id, authorization_session_key, created_at, expires_at
+    ) values (?, ?, ?, ?, ?)
+  `);
+  for (const row of tableRows(source, "oauth_authorization_selections")) {
+    const clientId = optionalString(row, "client_id");
+    const createdAt = nullablePositiveInteger(row.created_at);
+    const expiresAt = nullablePositiveInteger(row.expires_at);
+    if (
+      !clientId || !clientIds.has(clientId) || !createdAt || !expiresAt ||
+      expiresAt !== createdAt + 300_000
+    ) {
+      continue;
+    }
+    selectionInsert.run(
+      requiredString(row, "token_hash"),
+      clientId,
+      requiredString(row, "authorization_session_key"),
+      createdAt,
+      expiresAt,
+    );
+  }
+
+  const grantsById = new Map(grants.map((grant) => [grant.grantId, grant]));
+  const codeInsert = target.prepare(`
+    insert or ignore into oauth_authorization_codes (
+      code_hash, client_id, grant_id, principal_id, authorization_epoch,
+      redirect_uri, code_challenge, scopes_json, resource, created_at, expires_at
+    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  for (const row of tableRows(source, "oauth_authorization_codes")) {
+    const clientId = optionalString(row, "client_id");
+    const grantId = optionalString(row, "grant_id");
+    const principalId = optionalString(row, "principal_id");
+    const grant = grantId ? grantsById.get(grantId) : undefined;
+    const scopes = normalizeOAuthScopes(nullableString(row, "scopes_json"));
+    const createdAt = nullablePositiveInteger(row.created_at);
+    const expiresAt = nullablePositiveInteger(row.expires_at);
+    if (
+      !clientId || !principalId || !grant || !scopes || !createdAt || !expiresAt ||
+      expiresAt !== createdAt + 300_000 ||
+      grant.clientId !== clientId ||
+      grant.principalId !== principalId ||
+      grant.authorizationEpoch !== positiveInteger(row.authorization_epoch, 1) ||
+      principals.get(principalId)?.revokedAt
+    ) continue;
+    codeInsert.run(
+      requiredString(row, "code_hash"),
+      clientId,
+      grantId,
+      principalId,
+      grant.authorizationEpoch,
+      requiredString(row, "redirect_uri"),
+      requiredString(row, "code_challenge"),
+      JSON.stringify(scopes),
+      nullableString(row, "resource"),
+      createdAt,
+      expiresAt,
+    );
+  }
+}
+
+function insertCleanupJobs(source: Database.Database, target: Database.Database): void {
   const insert = target.prepare(`
     insert into oauth_revocation_cleanup_jobs (
-      id, connection_principal_id, workspace_id, workspace_root, workspace_mode,
-      source_root, managed, dirty_source, status, claim_token, lease_expires_at,
+      id, connection_principal_id, workspace_id, workspace_root, project_execution_id,
+      status, claim_token, lease_expires_at,
       attempts, last_error, created_at, updated_at, completed_at
-    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const used = new Set<string>();
   for (const row of tableRows(source, "oauth_revocation_cleanup_jobs")) {
     const workspaceId = optionalString(row, "workspace_id");
     if (!workspaceId) continue;
-    const principalId = canonicalHistoricalPrincipalId(
-      row,
-      sourceVersion,
-      clientPrincipalMap,
-      legacyOwner,
-    );
-    if (!principalId) continue;
-    const uniqueKey = `${principalId}\0${workspaceId}`;
+    const uniqueKey = `${OWNER_PRINCIPAL_ID}\0${workspaceId}`;
     if (used.has(uniqueKey)) continue;
     used.add(uniqueKey);
     const originalStatus = enumValue(
@@ -934,13 +1082,10 @@ function insertCleanupJobs(
       : null;
     insert.run(
       positiveInteger(row.id, undefined),
-      principalId,
+      OWNER_PRINCIPAL_ID,
       workspaceId,
       requiredString(row, "workspace_root"),
-      enumValue(row.workspace_mode, ["checkout", "worktree"] as const, "checkout"),
-      nullableString(row, "source_root"),
-      booleanText(row.managed, "false"),
-      booleanText(row.dirty_source, "false"),
+      retainedProjectExecutionId(target, nullableString(row, "project_execution_id")),
       status,
       null,
       null,
@@ -953,62 +1098,365 @@ function insertCleanupJobs(
   }
 }
 
-function insertDirtyArtifacts(
+function insertProjectExecutions(
+  source: Database.Database,
+  target: Database.Database,
+): LegacyIsolatedProjectExecution[] {
+  const insert = target.prepare(`
+    insert into project_executions (
+      execution_id, principal_id, client_id, grant_id, authorization_epoch,
+      project_ref, project_fingerprint, source_root, canonical_source_root,
+      workspace_id, handoff_id, handoff_retired, status, state_generation,
+      create_operation_id, request_hash, error,
+      created_at, last_used_at, updated_at
+    ) values (
+      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, null, 0, ?, ?, ?, ?, ?, ?, ?, ?
+    )
+  `);
+  const retainedWorkspaceIds = new Set(
+    (target.prepare("select id from workspace_sessions").all() as Array<{ id: string }>)
+      .map((row) => row.id),
+  );
+  const isolatedExecutions: LegacyIsolatedProjectExecution[] = [];
+  for (const row of tableRows(source, "project_executions")) {
+    const originalStatus = enumValue(
+      row.status,
+      ["provisioning", "active", "revoked", "quarantined", "closed"] as const,
+      "quarantined",
+    );
+    const isolatedExecution = legacyIsolatedProjectExecution(row);
+    if (isolatedExecution) isolatedExecutions.push(isolatedExecution);
+    const status = isolatedExecution &&
+        (originalStatus === "provisioning" || originalStatus === "active")
+      ? "quarantined"
+      : originalStatus;
+    const workspaceId = nullableString(row, "workspace_id");
+    insert.run(
+      requiredString(row, "execution_id"),
+      OWNER_PRINCIPAL_ID,
+      requiredString(row, "client_id"),
+      requiredString(row, "grant_id"),
+      positiveInteger(row.authorization_epoch, 1),
+      requiredString(row, "project_ref"),
+      requiredString(row, "project_fingerprint"),
+      requiredString(row, "source_root"),
+      requiredString(row, "canonical_source_root"),
+      !isolatedExecution && workspaceId && retainedWorkspaceIds.has(workspaceId)
+        ? workspaceId
+        : null,
+      status,
+      positiveInteger(row.state_generation, 1),
+      requiredString(row, "create_operation_id"),
+      requiredString(row, "request_hash"),
+      status === "quarantined" && status !== originalStatus
+        ? "Legacy isolated-worktree execution cannot resume under the shared Project runtime. " +
+          "Open the Project again with a new project_control operation."
+        : nullableString(row, "error"),
+      requiredString(row, "created_at"),
+      requiredString(row, "last_used_at"),
+      requiredString(row, "updated_at"),
+    );
+  }
+  return isolatedExecutions;
+}
+
+function legacyIsolatedProjectExecution(
+  row: Row,
+): LegacyIsolatedProjectExecution | undefined {
+  const worktreeRoot = optionalString(row, "worktree_root");
+  const projectRoot = optionalString(row, "project_root");
+  const gitRoot = optionalString(row, "git_root");
+  const branchRef = optionalString(row, "branch_ref");
+  const managedBranch = branchRef?.startsWith("refs/heads/devspace/") ?? false;
+  const isolatedGitRoot = Boolean(
+    projectRoot &&
+    gitRoot &&
+    sameAbsolutePath(projectRoot, gitRoot) &&
+    reliablyDifferentAbsolutePath(gitRoot, optionalString(row, "canonical_source_root")) &&
+    reliablyDifferentAbsolutePath(gitRoot, optionalString(row, "source_root")),
+  );
+  if (!worktreeRoot && !managedBranch && !isolatedGitRoot) return undefined;
+  const workspaceRoot = worktreeRoot ?? projectRoot ?? gitRoot;
+  return workspaceRoot ? { row, workspaceRoot } : undefined;
+}
+
+function sameAbsolutePath(left: string, right: string): boolean {
+  return isAbsolute(left) && isAbsolute(right) && normalize(left) === normalize(right);
+}
+
+function reliablyDifferentAbsolutePath(left: string, right: string | undefined): boolean {
+  return Boolean(
+    right &&
+    isAbsolute(left) &&
+    isAbsolute(right) &&
+    normalize(left) !== normalize(right),
+  );
+}
+
+function retainedProjectExecutionId(
+  target: Database.Database,
+  executionId: string | null,
+): string | null {
+  if (!executionId) return null;
+  const retained = target.prepare(
+    "select 1 from project_executions where execution_id = ?",
+  ).get(executionId);
+  return retained ? executionId : null;
+}
+
+function insertLegacyManagedWorktreeArtifacts(
   source: Database.Database,
   target: Database.Database,
   sourceVersion: number,
-  clientPrincipalMap: ReadonlyMap<string, string>,
-  legacyOwner: string | undefined,
+  worktrees: readonly NormalizedWorkspace[],
+  isolatedProjectExecutions: readonly LegacyIsolatedProjectExecution[],
+  recordedAt: string,
 ): void {
   const insert = target.prepare(`
-    insert into oauth_revocation_dirty_worktree_artifacts (
-      job_id, connection_principal_id, workspace_id, workspace_root,
-      source_root, reason, recorded_at
-    ) values (?, ?, ?, ?, ?, ?, ?)
+    insert into legacy_managed_worktree_artifacts (
+      artifact_kind, source_schema_version, legacy_workspace_id,
+      legacy_connection_principal_id, legacy_alias, workspace_root,
+      canonical_root, source_root, base_ref, base_sha, dirty_source, managed,
+      previous_status, write_access, state_generation, workspace_created_at,
+      workspace_last_used_at, legacy_job_id, reason, recorded_at
+    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
-  for (const row of tableRows(source, "oauth_revocation_dirty_worktree_artifacts")) {
-    const principalId = canonicalHistoricalPrincipalId(
-      row,
-      sourceVersion,
-      clientPrincipalMap,
-      legacyOwner,
-    );
-    if (!principalId) continue;
+  const worktreeById = new Map(worktrees.map((workspace) => [workspace.id, workspace]));
+  const expiredMutationNotes = expiredUnresolvedWorktreeMutationNotes(
+    source,
+    worktreeById.keys(),
+    recordedAt,
+  );
+  for (const row of tableRows(source, "legacy_managed_worktree_artifacts")) {
     insert.run(
-      positiveInteger(row.job_id, undefined),
-      principalId,
-      requiredString(row, "workspace_id"),
+      requiredString(row, "artifact_kind"),
+      nonNegativeInteger(row.source_schema_version, 0),
+      requiredString(row, "legacy_workspace_id"),
+      nullableString(row, "legacy_connection_principal_id"),
+      nullableString(row, "legacy_alias"),
       requiredString(row, "workspace_root"),
+      nullableString(row, "canonical_root"),
       nullableString(row, "source_root"),
+      nullableString(row, "base_ref"),
+      nullableString(row, "base_sha"),
+      nullableString(row, "dirty_source"),
+      nullableString(row, "managed"),
+      nullableString(row, "previous_status"),
+      nullableString(row, "write_access"),
+      nullablePositiveInteger(row.state_generation),
+      nullableString(row, "workspace_created_at"),
+      nullableString(row, "workspace_last_used_at"),
+      nullablePositiveInteger(row.legacy_job_id),
+      nullableString(row, "reason"),
+      requiredString(row, "recorded_at"),
+    );
+  }
+  for (const workspace of worktrees) {
+    insert.run(
+      "workspace",
+      sourceVersion,
+      workspace.id,
+      workspace.legacyConnectionPrincipalId,
+      workspace.legacyAlias,
+      workspace.root,
+      workspace.canonicalRoot,
+      workspace.sourceRoot,
+      workspace.baseRef,
+      workspace.baseSha,
+      workspace.dirtySource,
+      workspace.managed,
+      workspace.status,
+      workspace.writeAccess,
+      workspace.stateGeneration,
+      workspace.createdAt,
+      workspace.lastUsedAt,
+      null,
+      expiredMutationNotes.get(workspace.id) ?? null,
+      recordedAt,
+    );
+  }
+  for (const execution of isolatedProjectExecutions) {
+    const row = execution.row;
+    const originalStatus = enumValue(
+      row.status,
+      ["provisioning", "active", "revoked", "quarantined", "closed"] as const,
+      "quarantined",
+    );
+    insert.run(
+      "workspace",
+      sourceVersion,
+      nullableString(row, "workspace_id") ?? requiredString(row, "execution_id"),
+      nullableString(row, "principal_id"),
+      requiredString(row, "project_ref"),
+      execution.workspaceRoot,
+      nullableString(row, "project_root") ?? execution.workspaceRoot,
+      nullableString(row, "source_root"),
+      nullableString(row, "branch_ref"),
+      nullableString(row, "base_sha"),
+      enumValue(row.dirty_source, ["true", "false"] as const, "false"),
+      "true",
+      originalStatus === "revoked"
+        ? "revoked"
+        : originalStatus === "active" || originalStatus === "provisioning"
+          ? "active"
+          : "closed",
+      null,
+      positiveInteger(row.state_generation, 1),
+      requiredString(row, "created_at"),
+      requiredString(row, "last_used_at"),
+      null,
+      `Legacy isolated Project execution ${requiredString(row, "execution_id")} ` +
+        `(${originalStatus}) quarantined during the shared-Project migration.`,
+      recordedAt,
+    );
+  }
+
+  for (const row of tableRows(source, "oauth_revocation_dirty_worktree_artifacts")) {
+    const workspaceId = requiredString(row, "workspace_id");
+    const workspace = worktreeById.get(workspaceId);
+    insert.run(
+      "dirty_artifact",
+      sourceVersion,
+      workspaceId,
+      optionalString(row, "connection_principal_id") ??
+        optionalString(row, "owner_client_id") ??
+        workspace?.legacyConnectionPrincipalId ??
+        OWNER_PRINCIPAL_ID,
+      workspace?.legacyAlias ?? null,
+      requiredString(row, "workspace_root"),
+      workspace?.canonicalRoot ?? null,
+      nullableString(row, "source_root") ?? workspace?.sourceRoot ?? null,
+      workspace?.baseRef ?? null,
+      workspace?.baseSha ?? null,
+      workspace?.dirtySource ?? null,
+      workspace?.managed ?? null,
+      workspace?.status ?? null,
+      workspace?.writeAccess ?? null,
+      workspace?.stateGeneration ?? null,
+      workspace?.createdAt ?? null,
+      workspace?.lastUsedAt ?? null,
+      positiveInteger(row.job_id, undefined),
       requiredString(row, "reason"),
       requiredString(row, "recorded_at"),
     );
   }
 }
 
-function insertLocalAgentSessions(source: Database.Database, target: Database.Database): void {
-  const columns = tableColumns(source, "local_agent_sessions");
-  const insert = target.prepare(`
-    insert into local_agent_sessions (
-      id, workspace_id, workspace_root, profile_name, provider, model, thinking,
-      provider_session_id, status, latest_response, error, created_at, updated_at
-    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-  for (const row of tableRows(source, "local_agent_sessions")) {
-    insert.run(
-      requiredString(row, "id"),
-      nullableString(row, "workspace_id"),
-      requiredString(row, "workspace_root"),
-      requiredString(row, "profile_name"),
-      requiredString(row, "provider"),
-      nullableString(row, "model"),
-      columns.has("thinking") ? nullableString(row, "thinking") : null,
-      nullableString(row, "provider_session_id"),
-      requiredString(row, "status"),
-      nullableString(row, "latest_response"),
-      nullableString(row, "error"),
-      requiredString(row, "created_at"),
-      requiredString(row, "updated_at"),
+interface LegacyUnresolvedWorktreeMutation {
+  workspaceId: string;
+  operationId: string;
+  state: "pending" | "outcome_unknown";
+  expiresAt: string | undefined;
+}
+
+function legacyUnresolvedWorktreeMutations(
+  source: Database.Database,
+  worktreeIds: Iterable<string>,
+): LegacyUnresolvedWorktreeMutation[] {
+  const retainedIds = new Set(worktreeIds);
+  if (retainedIds.size === 0) return [];
+  const mutations: LegacyUnresolvedWorktreeMutation[] = [];
+  for (const row of tableRows(source, "mutation_operations")) {
+    const workspaceId = optionalString(row, "workspace_id");
+    if (!workspaceId || !retainedIds.has(workspaceId)) continue;
+    const state = optionalString(row, "state");
+    if (state !== "pending" && state !== "outcome_unknown") continue;
+    mutations.push({
+      workspaceId,
+      operationId: optionalString(row, "operation_id") ?? "<unknown>",
+      state,
+      expiresAt: optionalString(row, "expires_at"),
+    });
+  }
+  return mutations;
+}
+
+function assertNoLiveUnresolvedWorktreeMutations(
+  source: Database.Database,
+  worktrees: readonly NormalizedWorkspace[],
+  migrationTime: string,
+): void {
+  const migrationTimestamp = Date.parse(migrationTime);
+  for (const mutation of legacyUnresolvedWorktreeMutations(
+    source,
+    worktrees.map((workspace) => workspace.id),
+  )) {
+    const expiresTimestamp = mutation.expiresAt ? Date.parse(mutation.expiresAt) : Number.NaN;
+    if (Number.isFinite(expiresTimestamp) && expiresTimestamp <= migrationTimestamp) continue;
+    throw new Error(
+      `Cannot migrate legacy managed worktree ${mutation.workspaceId}: mutation ${mutation.operationId} is ${mutation.state}. ` +
+      "Resolve or acknowledge the mutation with the pre-v20 DevSpace installation, then retry the upgrade.",
+    );
+  }
+}
+
+function expiredUnresolvedWorktreeMutationNotes(
+  source: Database.Database,
+  worktreeIds: Iterable<string>,
+  migrationTime: string,
+): Map<string, string> {
+  const migrationTimestamp = Date.parse(migrationTime);
+  const byWorkspace = new Map<string, LegacyUnresolvedWorktreeMutation[]>();
+  for (const mutation of legacyUnresolvedWorktreeMutations(source, worktreeIds)) {
+    const expiresTimestamp = mutation.expiresAt ? Date.parse(mutation.expiresAt) : Number.NaN;
+    if (!Number.isFinite(expiresTimestamp) || expiresTimestamp > migrationTimestamp) continue;
+    const mutations = byWorkspace.get(mutation.workspaceId) ?? [];
+    mutations.push(mutation);
+    byWorkspace.set(mutation.workspaceId, mutations);
+  }
+  return new Map(
+    [...byWorkspace].map(([workspaceId, mutations]) => {
+      mutations.sort((left, right) => left.operationId.localeCompare(right.operationId));
+      const shown = mutations.slice(0, 20).map((mutation) =>
+        `${mutation.operationId} (${mutation.state})`
+      );
+      if (mutations.length > shown.length) shown.push(`and ${mutations.length - shown.length} more`);
+      return [
+        workspaceId,
+        `Quarantined with ${mutations.length} expired unresolved mutation(s); effects remain unknown. ` +
+          `Operation IDs: ${shown.join(", ")}. Full records remain in the pre-v25 backup.`,
+      ];
+    }),
+  );
+}
+
+function validateMigratedWorkspaceCounts(
+  source: Database.Database,
+  target: Database.Database,
+  expectedCheckouts: number,
+  expectedWorktrees: number,
+): void {
+  const liveCount = target.prepare("select count(*) as count from workspace_sessions").get() as {
+    count: number;
+  };
+  if (liveCount.count !== expectedCheckouts) {
+    throw new Error(
+      `Workspace migration count mismatch: expected ${expectedCheckouts} live checkout(s), wrote ${liveCount.count}.`,
+    );
+  }
+
+  const quarantineCounts = target.prepare(`
+    select
+      sum(case when artifact_kind = 'workspace' then 1 else 0 end) as worktrees,
+      sum(case when artifact_kind = 'dirty_artifact' then 1 else 0 end) as dirtyArtifacts
+    from legacy_managed_worktree_artifacts
+  `).get() as { worktrees: number | null; dirtyArtifacts: number | null };
+  const expectedDirtyArtifacts = tableRows(
+    source,
+    "oauth_revocation_dirty_worktree_artifacts",
+  ).length + tableRows(source, "legacy_managed_worktree_artifacts")
+    .filter((row) => optionalString(row, "artifact_kind") === "dirty_artifact").length;
+  const expectedQuarantinedWorktrees = expectedWorktrees +
+    tableRows(source, "legacy_managed_worktree_artifacts")
+      .filter((row) => optionalString(row, "artifact_kind") === "workspace").length;
+  if (
+    (quarantineCounts.worktrees ?? 0) !== expectedQuarantinedWorktrees ||
+    (quarantineCounts.dirtyArtifacts ?? 0) !== expectedDirtyArtifacts
+  ) {
+    throw new Error(
+      "Legacy managed-worktree quarantine count mismatch: " +
+      `expected ${expectedQuarantinedWorktrees} worktree(s) and ${expectedDirtyArtifacts} dirty artifact(s), ` +
+      `wrote ${quarantineCounts.worktrees ?? 0} and ${quarantineCounts.dirtyArtifacts ?? 0}.`,
     );
   }
 }
@@ -1082,7 +1530,7 @@ function canonicalWorkspaceRoot(path: string): { path: string; available: boolea
 }
 
 function derivedWorkspaceAlias(
-  workspace: Omit<NormalizedWorkspace, "alias"> & { requestedAlias?: string },
+  workspace: Omit<NormalizedWorkspace, "alias" | "legacyAlias"> & { requestedAlias?: string },
 ): string {
   const identity = workspace.sourceRoot ?? workspace.root;
   const name = basename(resolve(identity));
@@ -1161,32 +1609,29 @@ function normalizeOAuthScopes(value: string | null): string[] | undefined {
   if (!Array.isArray(parsed) || parsed.some((scope) => typeof scope !== "string")) return undefined;
   const requested = new Set(parsed as string[]);
   const unknown = [...requested].filter(
-    (scope) => scope !== LEGACY_FULL_SCOPE && !DEVSPACE_CAPABILITY_SCOPES.includes(scope as never),
+    (scope) => !DEVSPACE_CAPABILITY_SCOPES.includes(scope as never),
   );
   if (unknown.length > 0) return undefined;
-  if (requested.has(LEGACY_FULL_SCOPE)) {
-    for (const scope of DEVSPACE_CAPABILITY_SCOPES) requested.add(scope);
-    requested.delete(LEGACY_FULL_SCOPE);
-  }
   const scopes = DEVSPACE_CAPABILITY_SCOPES.filter((scope) => requested.has(scope));
   return scopes.length > 0 ? scopes : undefined;
 }
 
-function normalizeAllowedRootIds(value: string | null): string[] {
-  if (!value) return [ALL_AUTHORIZED_ROOTS_ID];
+function normalizeAllowedRootIds(value: string | null): string[] | undefined {
+  if (!value) return undefined;
   let parsed: unknown;
   try {
     parsed = JSON.parse(value);
   } catch {
-    return [ALL_AUTHORIZED_ROOTS_ID];
+    return undefined;
   }
-  if (!Array.isArray(parsed)) return [ALL_AUTHORIZED_ROOTS_ID];
-  const ids = [...new Set(parsed.filter(
-    (entry): entry is string =>
-      typeof entry === "string" && entry.length > 0 && entry.length <= 128,
-  ))];
+  if (
+    !Array.isArray(parsed) ||
+    parsed.length === 0 ||
+    parsed.some((entry) => typeof entry !== "string" || entry.length === 0 || entry.length > 128)
+  ) return undefined;
+  const ids = [...new Set(parsed as string[])];
   if (ids.includes(ALL_AUTHORIZED_ROOTS_ID)) return [ALL_AUTHORIZED_ROOTS_ID];
-  return ids.length > 0 ? ids.sort() : [ALL_AUTHORIZED_ROOTS_ID];
+  return ids.sort();
 }
 
 function tableRows(source: Database.Database, table: string, includeRowId = false): Row[] {

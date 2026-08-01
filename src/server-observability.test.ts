@@ -1,18 +1,13 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { resolve } from "node:path";
 import {
-  OPEN_WORKSPACE_ANNOTATIONS,
+  USE_PROJECT_ANNOTATIONS,
+  SAVE_PROGRESS_ANNOTATIONS,
   SHOW_CHANGES_ANNOTATIONS,
   MAX_SKILL_CATALOG_BYTES,
   buildWorkspaceSkillCatalog,
   containsBatchedToolCall,
-  commandInstructionScopePaths,
   jsonRpcRequestId,
   isExpectedPiToolError,
-  processInputInstructionScopePaths,
-  processInputPolicyViolation,
   processEnvironmentViolation,
   processCallSucceeded,
   processContentSummary,
@@ -20,14 +15,13 @@ import {
   processResult,
   requiredOAuthScopesForToolCall,
   requiredOAuthScopesForTool,
-  recoverableWorkspaceError,
+  recoverableProjectExecutionError,
   toolSurface,
   toolCallOperationId,
-  legacyWorkspaceIdHint,
   readinessSnapshot,
-  workspaceToolRootLockMode,
-  toolCallWorkspaceReceipt,
-  workspaceAppAssetPaths,
+  projectToolRootLockMode,
+  projectAppAssetPaths,
+  shouldAttachWidget,
 } from "./server.js";
 import type { Skill } from "./skills.js";
 import { InvalidSearchPatternError } from "./pi-tools.js";
@@ -336,261 +330,24 @@ assert.doesNotMatch(processResult({
   stdinClosed: true,
 }), /read_process_output|unrecoverable-output/);
 
-const shellWorkspaceRoot = mkdtempSync(resolve(tmpdir(), "devspace-shell-scopes-"));
-mkdirSync(resolve(shellWorkspaceRoot, "nested"));
-mkdirSync(resolve(shellWorkspaceRoot, "foo", "bar"), { recursive: true });
-mkdirSync(resolve(shellWorkspaceRoot, "bar"), { recursive: true });
-const staticShellScopes = commandInstructionScopePaths(
-  shellWorkspaceRoot,
-  "cd nested && pwd",
-  shellWorkspaceRoot,
-  undefined,
-);
-assert.ok("paths" in staticShellScopes);
-assert.deepEqual(staticShellScopes.paths, [".", resolve(shellWorkspaceRoot, "nested")]);
-const dynamicShellScopes = commandInstructionScopePaths(
-  shellWorkspaceRoot,
-  'cd "$TARGET" && pwd',
-  shellWorkspaceRoot,
-  undefined,
-);
-assert.ok("error" in dynamicShellScopes);
-assert.match(dynamicShellScopes.error.content[0]?.type === "text" ? dynamicShellScopes.error.content[0].text : "", /No command was executed/);
-const missingShellScopes = commandInstructionScopePaths(
-  shellWorkspaceRoot,
-  "mkdir future && cd future && pwd",
-  shellWorkspaceRoot,
-  undefined,
-);
-assert.ok("paths" in missingShellScopes);
-assert.ok(missingShellScopes.paths.includes(resolve(shellWorkspaceRoot, "future")));
-const ambiguousChainedShellScopes = commandInstructionScopePaths(
-  shellWorkspaceRoot,
-  "cd foo && cd missing && pwd",
-  shellWorkspaceRoot,
-  undefined,
-);
-assert.ok("paths" in ambiguousChainedShellScopes);
-assert.ok(ambiguousChainedShellScopes.paths.includes(resolve(shellWorkspaceRoot, "foo", "missing")));
-assert.deepEqual(
-  commandInstructionScopePaths(
-    shellWorkspaceRoot,
-    "/bin/bash -i",
-    shellWorkspaceRoot,
-    undefined,
-  ),
-  { paths: ["."] },
-);
-
-assert.equal(
-  processInputInstructionScopePaths(shellWorkspaceRoot, undefined, {
-    cwd: shellWorkspaceRoot,
-    scopePaths: [shellWorkspaceRoot],
-  }),
-  undefined,
-);
-const interruptInput = processInputInstructionScopePaths(shellWorkspaceRoot, "\u0003", {
-    cwd: shellWorkspaceRoot,
-    scopePaths: [shellWorkspaceRoot],
-  });
-assert.ok(interruptInput && "paths" in interruptInput);
-assert.equal(interruptInput.preparedInput.charsToWrite, "\u0003");
-const interactiveInputScopes = processInputInstructionScopePaths(
-  shellWorkspaceRoot,
-  "cd nested\npwd\n",
-  {
-    cwd: shellWorkspaceRoot,
-    scopePaths: [shellWorkspaceRoot],
-  },
-);
-assert.ok(interactiveInputScopes && "paths" in interactiveInputScopes);
-assert.deepEqual(interactiveInputScopes.paths, [
-  shellWorkspaceRoot,
-  resolve(shellWorkspaceRoot, "nested"),
-]);
-const retainedInteractiveScopes = processInputInstructionScopePaths(
-  shellWorkspaceRoot,
-  "cd bar\n",
-  {
-    cwd: shellWorkspaceRoot,
-    scopePaths: [shellWorkspaceRoot, resolve(shellWorkspaceRoot, "foo")],
-  },
-);
-assert.ok(retainedInteractiveScopes && "paths" in retainedInteractiveScopes);
-assert.deepEqual(retainedInteractiveScopes.paths, [
-  shellWorkspaceRoot,
-  resolve(shellWorkspaceRoot, "foo"),
-  resolve(shellWorkspaceRoot, "bar"),
-]);
-assert.equal(retainedInteractiveScopes.preparedInput.nextCwd, resolve(shellWorkspaceRoot, "bar"));
-
-const firstInputFragment = processInputInstructionScopePaths(
-  shellWorkspaceRoot,
-  "c",
-  {
-    cwd: shellWorkspaceRoot,
-    scopePaths: [shellWorkspaceRoot],
-    inputMode: "shell",
-    pendingInput: "",
-    inputRevision: 0,
-  },
-);
-assert.ok(firstInputFragment && "paths" in firstInputFragment);
-assert.equal(firstInputFragment.preparedInput.charsToWrite, "");
-assert.equal(firstInputFragment.preparedInput.pendingInput, "c");
-const completedInputFragment = processInputInstructionScopePaths(
-  shellWorkspaceRoot,
-  "d nested\n",
-  {
-    cwd: shellWorkspaceRoot,
-    scopePaths: [shellWorkspaceRoot],
-    inputMode: "shell",
-    pendingInput: "c",
-    inputRevision: 1,
-  },
-);
-assert.ok(completedInputFragment && "paths" in completedInputFragment);
-assert.equal(completedInputFragment.preparedInput.charsToWrite, "cd nested\n");
-assert.equal(completedInputFragment.preparedInput.nextCwd, resolve(shellWorkspaceRoot, "nested"));
-assert.ok(completedInputFragment.paths.includes(resolve(shellWorkspaceRoot, "nested")));
-assert.equal(processInputPolicyViolation(completedInputFragment.preparedInput), undefined);
-
-const flushedInputFragment = processInputInstructionScopePaths(
-  shellWorkspaceRoot,
-  undefined,
-  {
-    cwd: shellWorkspaceRoot,
-    scopePaths: [shellWorkspaceRoot],
-    inputMode: "shell",
-    pendingInput: "cd nested",
-    inputRevision: 1,
-  },
-  { flushPending: true },
-);
-assert.ok(flushedInputFragment && "paths" in flushedInputFragment);
-assert.equal(flushedInputFragment.preparedInput.charsToWrite, "cd nested");
-assert.equal(flushedInputFragment.preparedInput.pendingInput, "");
-assert.equal(flushedInputFragment.preparedInput.nextCwd, resolve(shellWorkspaceRoot, "nested"));
-
-const dangerousInputFragment = processInputInstructionScopePaths(
-  shellWorkspaceRoot,
-  " -rf nested/file\n",
-  {
-    cwd: shellWorkspaceRoot,
-    scopePaths: [shellWorkspaceRoot],
-    inputMode: "shell",
-    pendingInput: "rm",
-    inputRevision: 1,
-  },
-);
-assert.ok(dangerousInputFragment && "paths" in dangerousInputFragment);
-assert.equal(processInputPolicyViolation(dangerousInputFragment.preparedInput), undefined);
-const multilineDangerousInput = processInputInstructionScopePaths(
-  shellWorkspaceRoot,
-  "echo ok\nrm -rf nested/file\n",
-  {
-    cwd: shellWorkspaceRoot,
-    scopePaths: [shellWorkspaceRoot],
-    inputMode: "shell",
-    pendingInput: "",
-    inputRevision: 0,
-  },
-);
-assert.ok(multilineDangerousInput && "paths" in multilineDangerousInput);
-assert.equal(processInputPolicyViolation(multilineDangerousInput.preparedInput), undefined);
-const privilegedInput = processInputInstructionScopePaths(
-  shellWorkspaceRoot,
-  "sudo id\n",
-  {
-    cwd: shellWorkspaceRoot,
-    scopePaths: [shellWorkspaceRoot],
-    inputMode: "shell",
-    pendingInput: "",
-    inputRevision: 0,
-  },
-);
-assert.ok(privilegedInput && "paths" in privilegedInput);
-assert.match(
-  processInputPolicyViolation(privilegedInput.preparedInput) ?? "",
-  /blocked by command policy/i,
-);
-const outsideWriteInput = processInputInstructionScopePaths(
-  shellWorkspaceRoot,
-  `touch ${resolve(shellWorkspaceRoot, "..", "outside-write.txt")}\n`,
-  {
-    cwd: shellWorkspaceRoot,
-    scopePaths: [shellWorkspaceRoot],
-    inputMode: "shell",
-    pendingInput: "",
-    inputRevision: 0,
-  },
-);
-assert.ok(outsideWriteInput && "paths" in outsideWriteInput);
-assert.match(
-  processInputPolicyViolation(outsideWriteInput.preparedInput, {
-    cwd: shellWorkspaceRoot,
-    workspaceRoot: shellWorkspaceRoot,
-  }) ?? "",
-  /outside the workspace/i,
-);
-const opaqueInteractiveCwd = processInputInstructionScopePaths(
-  shellWorkspaceRoot,
-  "eval cd ..\ntouch escaped\n",
-  {
-    cwd: shellWorkspaceRoot,
-    scopePaths: [shellWorkspaceRoot],
-    inputMode: "shell",
-    pendingInput: "",
-    inputRevision: 0,
-  },
-);
-assert.ok(opaqueInteractiveCwd && "error" in opaqueInteractiveCwd);
-assert.match(
-  opaqueInteractiveCwd.error.content[0]?.type === "text"
-    ? opaqueInteractiveCwd.error.content[0].text
-    : "",
-  /can change an interactive cwd without a verifiable path/i,
-);
-const chainedOpaqueInteractiveCwd = processInputInstructionScopePaths(
-  shellWorkspaceRoot,
-  "true && eval cd ..\ntouch escaped\n",
-  {
-    cwd: shellWorkspaceRoot,
-    scopePaths: [shellWorkspaceRoot],
-    inputMode: "shell",
-    pendingInput: "",
-    inputRevision: 0,
-  },
-);
-assert.ok(chainedOpaqueInteractiveCwd && "error" in chainedOpaqueInteractiveCwd);
-
-assert.equal(
-  processInputInstructionScopePaths(shellWorkspaceRoot, 'print("$TARGET")\n', {
-    cwd: shellWorkspaceRoot,
-    scopePaths: [shellWorkspaceRoot],
-    inputMode: "opaque",
-    pendingInput: "",
-    inputRevision: 0,
-  }),
-  undefined,
-);
-const dynamicInteractiveInputScopes = processInputInstructionScopePaths(
-  shellWorkspaceRoot,
-  'cd "$TARGET"\n',
-  {
-    cwd: shellWorkspaceRoot,
-    scopePaths: [shellWorkspaceRoot],
-  },
-);
-assert.ok(dynamicInteractiveInputScopes && "error" in dynamicInteractiveInputScopes);
-
-assert.deepEqual(OPEN_WORKSPACE_ANNOTATIONS, {
+assert.deepEqual(USE_PROJECT_ANNOTATIONS, {
+  readOnlyHint: false,
   destructiveHint: false,
+  idempotentHint: true,
   openWorldHint: false,
 });
 
 assert.deepEqual(SHOW_CHANGES_ANNOTATIONS, {
+  readOnlyHint: true,
   destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: false,
+});
+
+assert.deepEqual(SAVE_PROGRESS_ANNOTATIONS, {
+  readOnlyHint: false,
+  destructiveHint: false,
+  idempotentHint: true,
   openWorldHint: false,
 });
 
@@ -637,10 +394,6 @@ const generated = readinessSnapshot({
 });
 assert.equal(generated.body.generation, "generation-test");
 
-assert.equal(toolCallWorkspaceReceipt({
-  method: "tools/call",
-  params: { name: "read", arguments: { receipt: `wctx5.${"A".repeat(43)}` } },
-}), `wctx5.${"A".repeat(43)}`);
 assert.equal(toolCallOperationId({
   method: "tools/call",
   params: { name: "exec_command", arguments: { operationId: "operation-17" } },
@@ -649,76 +402,70 @@ assert.equal(toolCallOperationId({
   method: "tools/call",
   params: { name: "exec_command", arguments: { operationId: "x".repeat(129) } },
 }), undefined);
-assert.equal(workspaceToolRootLockMode({
+assert.equal(projectToolRootLockMode({
   method: "tools/call",
-  params: { name: "read", arguments: { receipt: `wctx5.${"A".repeat(43)}` } },
+  params: { name: "read_files", arguments: {} },
 }), "read");
-assert.equal(workspaceToolRootLockMode({
+assert.equal(projectToolRootLockMode({
   method: "tools/call",
-  params: { name: "apply_patch", arguments: { receipt: `wctx5.${"A".repeat(43)}` } },
+  params: { name: "apply_patch", arguments: {} },
 }), "write");
-assert.equal(workspaceToolRootLockMode({
-  method: "tools/call",
-  params: { name: "write_stdin", arguments: { receipt: `wctx5.${"A".repeat(43)}`, sessionId: 1 } },
-}), undefined);
-assert.equal(workspaceToolRootLockMode({
+assert.equal(projectToolRootLockMode({
   method: "tools/call",
   params: {
     name: "write_stdin",
-    arguments: { receipt: `wctx5.${"A".repeat(43)}`, sessionId: 1, chars: "input" },
+    arguments: {
+      operationId: "input-1",
+      sessionId: 1,
+      chars: "input",
+    },
   },
 }), undefined);
-assert.deepEqual(requiredOAuthScopesForTool("read"), ["workspace:read"]);
-assert.deepEqual(requiredOAuthScopesForTool("get_operation_status"), ["workspace:read"]);
-assert.deepEqual(requiredOAuthScopesForTool("resolve_operation"), [
-  "workspace:read",
-  "workspace:write",
-]);
+assert.equal(projectToolRootLockMode({
+  method: "tools/call",
+  params: {
+    name: "save_progress",
+    arguments: { operationId: "save-1" },
+  },
+}), undefined);
+assert.deepEqual(requiredOAuthScopesForTool("read_files"), ["project:read"]);
 assert.deepEqual(requiredOAuthScopesForTool("exec_command"), [
-  "workspace:read",
-  "workspace:write",
+  "project:read",
+  "project:write",
   "process:execute",
-  "network:access",
 ]);
 assert.deepEqual(requiredOAuthScopesForTool("read_process_output"), [
-  "workspace:read",
+  "project:read",
   "process:execute",
 ]);
 assert.deepEqual(requiredOAuthScopesForTool("show_changes"), [
-  "workspace:read",
+  "project:read",
+]);
+assert.deepEqual(requiredOAuthScopesForTool("save_progress"), [
+  "project:read",
 ]);
 assert.deepEqual(requiredOAuthScopesForToolCall({
   method: "tools/call",
   params: { name: "show_changes", arguments: {} },
-}), ["workspace:read"]);
-assert.deepEqual(requiredOAuthScopesForToolCall({
-  method: "tools/call",
-  params: { name: "show_changes", arguments: { advanceCheckpoint: true } },
-}), ["workspace:read", "workspace:write"]);
-assert.equal(workspaceToolRootLockMode({
+}), ["project:read"]);
+assert.equal(projectToolRootLockMode({
   method: "tools/call",
   params: { name: "show_changes", arguments: {} },
 }), "read");
-assert.equal(workspaceToolRootLockMode({
-  method: "tools/call",
-  params: { name: "show_changes", arguments: { advanceCheckpoint: true } },
-}), "write");
-assert.deepEqual(requiredOAuthScopesForToolCall({
-  method: "tools/call",
-  params: { name: "write_stdin", arguments: { sessionId: 1 } },
-}), ["workspace:read", "process:execute"]);
-assert.deepEqual(requiredOAuthScopesForToolCall({
-  method: "tools/call",
-  params: { name: "write_stdin", arguments: { sessionId: 1, chars: "input" } },
-}), ["workspace:read", "process:execute", "workspace:write", "network:access"]);
 assert.deepEqual(requiredOAuthScopesForToolCall({
   method: "tools/call",
   params: {
-    name: "open_workspace",
-    arguments: { path: "/tmp/project", mode: "worktree" },
+    name: "write_stdin",
+    arguments: { operationId: "input-1", sessionId: 1, chars: "input" },
   },
-}), ["workspace:read", "workspace:write", "worktree:create"]);
-assert.deepEqual(requiredOAuthScopesForTool("revoke_workspace"), ["workspace:revoke"]);
+}), ["project:read", "process:execute"]);
+assert.deepEqual(requiredOAuthScopesForToolCall({
+  method: "tools/call",
+  params: {
+    name: "project_control",
+    arguments: { action: "open", projectRef: "project-1", operationId: "project-1-open" },
+  },
+}), ["project:read"]);
 assert.equal(processEnvironmentViolation({ VALID_NAME: "value" }), undefined);
 assert.match(
   processEnvironmentViolation(Object.fromEntries(
@@ -731,82 +478,54 @@ assert.match(
   /byte limit/,
 );
 assert.match(processEnvironmentViolation({ CDPATH: "/tmp" }) ?? "", /managed by DevSpace/);
-assert.equal(legacyWorkspaceIdHint({
-  method: "tools/call",
-  params: { name: "close_workspace", arguments: { workspaceId: "ws_test" } },
-}), "ws_test");
-assert.equal(legacyWorkspaceIdHint({
-  method: "tools/call",
-  params: { name: "open_workspace", arguments: { path: "/tmp/project" } },
-}), undefined);
-assert.equal(legacyWorkspaceIdHint([{ method: "tools/call" }]), undefined);
 assert.equal(jsonRpcRequestId({ jsonrpc: "2.0", id: 42 }), 42);
 assert.equal(jsonRpcRequestId({ jsonrpc: "2.0", id: "call-1" }), "call-1");
 assert.equal(jsonRpcRequestId([{ jsonrpc: "2.0", id: 42 }]), null);
 assert.match(
-  recoverableWorkspaceError(new UnknownWorkspaceError("ws_stale")) ?? "",
-  /^unknown_workspace: Call list_workspaces/,
+  recoverableProjectExecutionError(new UnknownWorkspaceError("ws_stale")) ?? "",
+  /^project_execution_required: Call project_control with action=hydrate and the same executionRef\./,
 );
 assert.doesNotMatch(
-  recoverableWorkspaceError(new UnknownWorkspaceError("ws_stale")) ?? "",
+  recoverableProjectExecutionError(new UnknownWorkspaceError("ws_stale")) ?? "",
   /ws_stale/,
 );
-assert.equal(recoverableWorkspaceError(new Error("database failure")), undefined);
+assert.equal(recoverableProjectExecutionError(new Error("database failure")), undefined);
 
 const commonTools = [
-  "apply_patch", "batch_inspect", "batch_read", "close_workspace", "exec_command",
-  "get_operation_status", "get_workspace_context", "list_workspaces", "load_workspace_instructions",
-  "open_workspace", "read", "read_process_output", "resume_workspace", "revoke_workspace", "show_changes",
-  "resolve_operation", "write_stdin",
+  "apply_patch", "exec_command", "inspect", "list_projects", "read_files",
+  "project_control", "read_process_output", "save_progress", "show_changes", "skills",
+  "write_stdin",
 ];
-assert.deepEqual(toolSurface({ widgets: "off", skillsEnabled: true }), [
-  ...commonTools, "list_skills", "load_skill",
-].sort());
-assert.deepEqual(
-  toolSurface({ widgets: "off", skillsEnabled: true, toolProfile: "browse" }),
-  [
-    "batch_inspect",
-    "batch_read",
-    "get_workspace_context",
-    "list_workspaces",
-    "load_workspace_instructions",
-    "open_workspace",
-    "read",
-    "resume_workspace",
-    "show_changes",
-  ],
-);
-assert.deepEqual(
-  toolSurface(
-    { widgets: "off", skillsEnabled: true, toolProfile: "browse" },
-    ["workspace:write", "process:execute", "network:access"],
-  ),
-  [],
-  "browse profile still requires workspace:read and never promotes elevated tools",
-);
+assert.deepEqual(toolSurface(), commonTools.sort());
 for (const widgets of ["off", "full", "changes"] as const) {
   assert.equal(
-    toolSurface({ widgets, skillsEnabled: false }, ["workspace:read"]).includes("show_changes"),
+    toolSurface(["project:read"]).includes("show_changes"),
     true,
-    `show_changes must remain visible with workspace:read when widgets=${widgets}`,
+    `show_changes must remain visible with project:read when widgets=${widgets}`,
   );
 }
-const changesSurface = toolSurface({ widgets: "changes", skillsEnabled: false });
+assert.equal(shouldAttachWidget("off", "list_projects"), false);
+assert.equal(shouldAttachWidget("changes", "list_projects"), false);
+assert.equal(shouldAttachWidget("full", "list_projects"), true);
+assert.equal(shouldAttachWidget("off", "show_changes"), false);
+assert.equal(shouldAttachWidget("changes", "show_changes"), true);
+assert.equal(shouldAttachWidget("full", "show_changes"), true);
+const changesSurface = toolSurface(["project:read"]);
 assert.ok(changesSurface.includes("show_changes"));
-assert.equal(changesSurface.includes("load_skill"), false);
+assert.equal(changesSurface.includes("skills"), true);
 assert.equal(changesSurface.includes("bash"), false);
 assert.equal(changesSurface.some((name) => ["write", "edit", "grep", "glob", "ls"].includes(name)), false);
 assert.equal(changesSurface.some((name) => name.startsWith("ui://")), false);
 assert.equal(containsBatchedToolCall([
-  { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "close_workspace", arguments: { workspaceId: "ws_test" } } },
-  { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "exec_command", arguments: { workspaceId: "ws_test", command: "pwd" } } },
+  { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "read_files", arguments: { workspaceId: "ws_test", files: [{ path: "README.md" }] } } },
+  { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "exec_command", arguments: { workspaceId: "ws_test", program: "pwd", args: [] } } },
 ]), true);
 assert.equal(containsBatchedToolCall([
   { jsonrpc: "2.0", id: 1, method: "ping" },
   { jsonrpc: "2.0", method: "notifications/initialized" },
 ]), false);
 
-const publicAssets = workspaceAppAssetPaths();
+const publicAssets = projectAppAssetPaths();
 assert.equal(publicAssets.has("admin.html"), false);
 assert.equal([...publicAssets].some((path) => /(^|\/)admin-[^/]+\.(?:js|css)$/.test(path)), false);
 assert.equal([...publicAssets].every((path) => path.startsWith("assets/")), true);

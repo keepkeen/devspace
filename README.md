@@ -9,7 +9,7 @@
 <h1 align="center">DevSpace</h1>
 
 <p align="center">
-  让 ChatGPT 在你批准的本地项目里读代码、改文件、运行测试。
+  让 ChatGPT 读取、修改并测试你明确授权的本地项目。
 </p>
 
 <p align="center">
@@ -20,51 +20,47 @@
 
 > [!IMPORTANT]
 > 这是 [Waishnav/devspace](https://github.com/Waishnav/devspace) 的社区增强分支，
-> 基于上游提交 [`80423b5`](https://github.com/Waishnav/devspace/commit/80423b5)，
-> 由 [keepkeen/devspace](https://github.com/keepkeen/devspace) 独立维护。
+> 基于上游提交
+> [`80423b5`](https://github.com/Waishnav/devspace/commit/80423b5)，由
+> [keepkeen/devspace](https://github.com/keepkeen/devspace) 独立维护。
 
 ## DevSpace 是什么
 
-ChatGPT 在云端，不能直接打开你电脑上的 `/Users/alice/code/my-app`。
-DevSpace 在本机运行一个 MCP 服务，把你批准的目录变成文件、搜索、补丁、Git 和命令工具。
-
-它不会先上传整个仓库，也不是藏在后台的第二个编码模型。只有工具调用实际返回的内容
-会发送给 MCP 客户端，调用过程会显示在对话里。
+ChatGPT 运行在云端，不能直接打开你的本地 checkout。DevSpace 在你的电脑上运行，
+通过本地 MCP 服务和公网 HTTPS 入口，把你明确批准的 Project 提供给 ChatGPT 网页版。
 
 ```text
-ChatGPT → HTTPS Tunnel → DevSpace 127.0.0.1:7676 → 已批准的本地项目
-                              └→ 本地管理面板（仅 localhost）
+ChatGPT 网页版 → HTTPS 隧道 → 127.0.0.1:7676 上的 DevSpace → 已批准的 Project
+                                      └→ 仅限本机的管理面板
 ```
 
-## 推荐目录与工作目录
+DevSpace 不会预先上传整个仓库，也不是第二个隐藏的编程模型。ChatGPT 只会收到
+它实际调用工具后返回的内容。
 
-建议把“程序、项目、状态”分开：
+DevSpace 只面向 ChatGPT 网页版，不提供其他 MCP host 的兼容模式。
 
-```text
-~/tools/devspace/                 # DevSpace 安装目录
-~/code/work/                      # 工作项目根目录，可单独授权
-~/code/personal/                  # 个人项目根目录，可单独授权
-~/.devspace/                      # config.json、auth.json、managed worktrees
-~/.local/share/devspace/          # SQLite、操作记录、进程输出元数据
-```
+## 安全边界
 
-几个容易踩坑的点：
+只批准范围较小的项目根目录。不要批准 home 目录、文件系统根目录、云盘根目录，
+或包含无关隐私数据的目录。
 
-1. `devspace init` 默认把**当前工作目录**当作允许根目录。准备直接按回车时，先
-   `cd ~/code/work`；更稳妥的做法是明确输入路径。
-2. 不要授权 `~`、`/`、整个云盘或包含大量私密资料的目录。工作和个人项目最好分开授权。
-3. 一般把 DevSpace 安装在允许根目录之外。只有开发 DevSpace 本身时，才需要把它作为项目打开。
-4. 配置中明确写好 `allowedRoots` 后，`devspace serve` 从哪里启动不再决定授权范围。
-   服务管理器仍建议使用绝对 CLI 路径，并把 WorkingDirectory 设为 DevSpace 安装目录。
-5. 项目命令默认在当前 Workspace 根目录运行。`workingDirectory` 只用于 Workspace 内的子目录，
-   不能借它跳到项目外面。
+DevSpace 会检查 Project 选择、文件路径和命令工作目录是否位于已配置的根目录内。
+文件写入同时保留 `ifMatch`、`operationId` 和根锁等并发安全约束。
+
+这不是操作系统级隔离。`exec_command` 会以运行 DevSpace 的本地 OS 用户权限启动
+进程；该进程可以读取或修改此用户能访问的任何内容，也可以访问网络。DevSpace
+不提供进程沙箱、命令允许/拒绝策略、对子进程的受保护路径强制，也不提供逐命令
+网络控制。如需更强隔离，请使用专用 OS 用户、容器或虚拟机。
 
 ## 快速开始
 
+以下示例使用仓库内 CLI。可选执行 `npm link` 后，可以用 `devspace` 替代
+`node dist/cli.js`。
+
 ### 1. 安装
 
-需要 Node.js `>=22.19 <27`、npm 和 Git。安装、构建和长期运行应使用同一个 Node 版本，
-因为 `better-sqlite3` 与 Node ABI 相关。
+需要 Node.js `>=22.19 <27`、npm、Git，以及可提供 HTTPS 入口的工具，例如
+[cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/)。
 
 ```bash
 git clone https://github.com/keepkeen/devspace.git ~/tools/devspace
@@ -74,265 +70,225 @@ npm run build
 node dist/cli.js --help
 ```
 
-可选：
+安装、构建和长期运行请使用同一个 Node 安装，因为 `better-sqlite3` 与 Node ABI
+相关。
+
+### 2. 启动 HTTPS 隧道
+
+临时测试时，在另一个终端保持以下命令运行：
 
 ```bash
-npm link
-devspace --help
+cloudflared tunnel --url http://127.0.0.1:7676
 ```
 
-### 2. 初始化
+复制它输出的 HTTPS origin，例如 `https://random-name.trycloudflare.com`。
+初始化时不要追加 `/mcp`。
+
+### 3. 初始化并启动
 
 ```bash
+cd ~/tools/devspace
 node dist/cli.js init
+node dist/cli.js serve
 ```
 
-向导会询问：
+初始化向导会询问：
 
-- 允许访问的项目根目录；
-- 本地端口，默认 `7676`；
-- 公网 HTTPS 地址，不要带 `/mcp`。
+- 需要批准的 Project 所在的窄范围根目录；
+- 本地端口，通常为 `7676`；
+- 公网 HTTPS origin，不含 `/mcp`。
 
-普通配置与安全凭据分开保存：
+保存初始化时显示的 Owner 密码。批准 ChatGPT OAuth 连接时需要它，存储的验证值
+无法恢复明文密码。
+
+默认配置和状态位置：
 
 ```text
 ~/.devspace/config.json
 ~/.devspace/auth.json
+~/.local/share/devspace/
 ```
 
-`auth.json` 只保存 Owner 密码的 Argon2id 校验值、独立随机 master key 和派生模式，
-不保存可恢复的明文密码。初始化时请保存向导一次性显示的 Owner 密码。不要分享或提交
-`auth.json`，其中的 master key 会派生本机身份、授权根、cursor、receipt 和内部控制令牌。
-旧版升级使用 `legacy-direct` 保持既有标识稳定；如果文件迁移完成而 SQLite 仍是旧 verifier，
-下次启动会同时校验旧 scrypt 与新 Argon2id，匹配时原位升级并保留现有 OAuth token。
-
-### 3. 启动并检查
+### 4. 检查就绪状态
 
 ```bash
-node dist/cli.js serve
 curl http://127.0.0.1:7676/readyz
-```
-
-正常时返回 HTTP `200`，并包含：
-
-```json
-{"ok":true,"name":"devspace","status":"ready"}
-```
-
-安装或原生依赖有问题时：
-
-```bash
+curl https://random-name.trycloudflare.com/readyz
 node dist/cli.js doctor
 ```
 
-`doctor` 还会有界扫描批准的根目录，提示超过 8 KiB 的指令文件或单行、接近 32 KiB 的
-有效指令链、重复模板，以及适合下沉到子目录 `AGENTS.md` 的根规则。
+服务就绪时，两个 readiness 请求都应返回 HTTP `200`。
 
-### 4. 建立 HTTPS 入口
+### 5. 连接 ChatGPT 网页版
 
-ChatGPT 不能直接连接本机端口，需要 HTTPS Tunnel 或反向代理。临时测试示例：
+在 ChatGPT 中启用开发者模式并创建自定义 MCP App：
+
+1. 使用公网 origin 加 `/mcp`，例如
+   `https://random-name.trycloudflare.com/mcp`。
+2. 选择 OAuth，并检查请求的能力。
+3. 输入 Owner 密码，选择此连接允许使用的 Project。
+4. 完成授权、扫描工具，然后在对话中选择此 App。
+
+对外 OAuth scope 只有：
+
+- `project:read`：发现 Project、加载指令和 Skill、读取、检查与审阅变更；
+- `project:write`：应用补丁；
+- `process:execute`：运行本地命令并与进程交互。
+
+DevSpace 只有一个隐藏的本地 Owner，但允许多个 OAuth grant 同时有效，包括同一个
+OAuth client 下的多个授权。每个 bearer 只解析到自己的 grant、scope 和已批准
+Project；新增或重新授权不会替换其他账号/连接的 grant。
+
+临时隧道地址变化后，更新公网 origin 并重新启动服务：
 
 ```bash
-cloudflared tunnel --url http://127.0.0.1:7676
-node dist/cli.js config set publicBaseUrl https://random-name.trycloudflare.com
+node dist/cli.js config set publicBaseUrl https://new-random-name.trycloudflare.com
+node dist/cli.js serve
 ```
 
-长期使用请配置固定域名。Tunnel 只转发 DevSpace 服务端口，不要暴露本地管理面板。
+随后更新 ChatGPT App endpoint 并重新授权。长期使用建议配置稳定域名。隧道只应
+转发 DevSpace 服务端口，绝不能转发本地管理或控制端口。
 
-### 5. 连接 ChatGPT
+ChatGPT 可能缓存工具快照。DevSpace 工具定义变化后，请重新扫描或重建 App。
 
-在 ChatGPT 中启用 Developer mode 并创建自定义 MCP App：
+## 对话内工作流
 
-1. Endpoint 填 `https://devspace.example.com/mcp`。
-2. 选择 OAuth，然后扫描工具。
-3. 在 DevSpace 页面输入初始化时保存的 Owner 密码；`auth.json` 不能反推出该密码。
-4. 密码通过后，选择创建或复用本地 principal，并勾选这个授权能访问的根目录。
-5. 扫描完成后创建 App，在新对话中选择它。
+每次调用都必须通过当前 OAuth bearer grant 的权限检查。ChatGPT 提供匿名
+`openai/subject`、`openai/organization` 或 `openai/session` 时，DevSpace 只保存这些值的
+HMAC 引用，用于长期 Actor 所有权和当前对话到 Thread 的绑定，不保存原始标识，也拿不到
+完整 ChatGPT 对话记录或隐藏 reasoning。
 
-ChatGPT 的界面、套餐和写入权限会变化，请以
-[OpenAI 的 Developer mode 与 MCP App 说明](https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt)
-为准。DevSpace 工具定义变化后，需要在 ChatGPT 里重新扫描或刷新；只重启本地服务不会
-刷新 ChatGPT 的工具缓存。
+1. 同一个 ChatGPT 对话继续任务时，先调用
+   `project_control({"action":"resolve"})`。只有完全相同的匿名 session 才会解析现有
+   Thread；DevSpace 不按最近使用时间自动选择。
+2. 只有一个已批准 Project 且没有 session binding 时，直接调用
+   `project_control({"action":"open","operationId":"..."})`；不要先调用 `list_projects`。
+3. 有多个 Project 时，先用 `list_projects` 获取不透明 `projectRef`，再调用
+   `project_control`。使用 `action=list` 查看当前 OAuth grant 私有的可恢复 Thread，
+   使用 `action=resume` 和明确的 `threadRef` 继续任务；DevSpace 不按最近使用时间猜测。
+4. 保存 `project_control` 返回的 `executionRef`，后续每个 Project 工具都显式传入它。
+5. 阅读紧凑根指令增量；用 `read_files` 或 `inspect` 获取目标内容和新出现的嵌套指令。
+6. 相关时用 `skills` 延迟加载一个 Skill；应用小补丁、用 `show_changes` 审阅，再运行
+   最小范围验证。长任务或准备换新对话时，用 `save_progress` 保存一个精简任务快照。
 
-`DEVSPACE_TOOL_PROFILE=browse` 固定暴露 9 个生命周期、读取和检查工具；默认的
-`coding` profile 再按 OAuth scope 加入 Skill、写入、进程、worktree、状态与撤销工具。
-profile 在服务创建时固定，修改后应重新连接或刷新工具，不能依赖对话中途改变 tools/list。
+`project_control(action=open, projectRef, operationId)` 默认把逻辑 execution 绑定到已批准
+Project 的原目录。对 Git 顶层 Project，可显式传 `checkoutKind:"worktree"` 创建受管
+Thread worktree；每个活动 worktree Thread 独占一个可写目录。优先使用 `action=pause`、
+`archive` 或 `complete`，这些动作保留 checkout。dirty worktree 不会被自动删除；旧的
+`action=close` 仅保留兼容用途。非 Git Project 继续使用 checkout。
+相同请求重试返回同一个 execution，不会重复创建 worktree。
 
-## 启动和停止时发生了什么
+`executionRef` 不属于某个 ChatGPT 对话。重连或服务重启后可继续把它传给普通工具，
+也可用 `project_control({"action":"hydrate","executionRef":"..."})` 显式恢复。它只能由创建它的原始 grant
+使用；其他账号/连接即使拿到引用也不能访问。原始 grant 被撤销或过期、Project 被取消
+授权或 Project 路径失效时，该 execution 会被拒绝。grant 撤销也会终止该 execution
+中仍受跟踪的进程，并清理进程输出和 review 临时状态；它不会删除 Project 文件，也
+不会改动 Git branch、commit 或 worktree。
 
-`devspace serve` 的启动顺序是：
+`save_progress` 不保存完整聊天记录，而是为当前私有 Thread 保存一个最多 8 KiB 的模型摘要。
+标题与进度的 JSON 序列化结果还必须小于 12,000 字节，避免大量转义字符让恢复响应
+超过上下文预算。首次保存不带 `ifMatch`；更新时必须带当前 Thread `version`。
+`project_control(action=resolve)` 可解析同一 ChatGPT session 已绑定的 Thread；新对话仍需
+`action=list` 后明确 `resume`。继续任务总会创建一个受当前 grant 授权的新 execution。
+Thread 归属于匿名 Actor，而不是一次 grant；重新授权后只有当前 grant 仍批准对应 Project
+时才能恢复。checkpoint 中的服务器观测字段具有 `server_observed` provenance，
+模型摘要仍标记为 `untrusted`，恢复后必须重新读取相关文件。
 
-1. 按 `package.json#engines.node` 检查 Node 版本。
-2. 检查配置是否存在。环境变量优先于 `config.json` 和 `auth.json`，后者再覆盖默认值。
-3. 试加载 `better-sqlite3`，提前发现 Node ABI 不匹配。
-4. 获取本地状态目录的单实例租约，避免两个后端同时写同一份状态。
-5. 打开并迁移 canonical v17 数据库；上次异常中断的 `pending` 操作会恢复为
-   `outcome_unknown`，不会被假装成“没执行”。
-6. 初始化 OAuth、Workspace、进程、输出、审计和本次进程的唯一 generation。
-7. `/readyz` 只有在服务未关闭、Workspace 数据库和 OAuth 数据库都就绪时才返回 `200`。
-8. `/internal/*` 只挂载在 `127.0.0.1:DEVSPACE_CONTROL_PORT`；公网 MCP listener 对这些路径返回 404。
+DevSpace 另行保存 append-only Task Journal 和 Task Snapshot，只记录服务器可验证的补丁、
+命令结果、生命周期与工作状态，不伪造 ChatGPT 用户消息、助手消息、reasoning 或 compaction。
 
-`/healthz` 只表示进程活着；排障和服务管理应优先检查 `/readyz`。
+`show_changes` 只在 Project 根本身就是 Git 顶层目录时读取当前 Git 工作区差异，并且
+不会写 index、object 或 ref；嵌套在更大仓库中的 Project 按非 Git 处理，避免越过
+批准根。非 Git 结果是当前逻辑 context 中成功 `apply_patch` 原始请求的有界、持久化
+日志，不包含命令或外部编辑；日志达到上限时，新建逻辑 context 即可继续，共享目录
+不会变化。
 
-收到 `SIGINT` 或 `SIGTERM` 后，DevSpace 先停止接收新工作，再等待 HTTP 请求排空、关闭进程和
-数据库。macOS 受控重启还会验证 **PID 和 readiness generation 都发生变化**，而不是只看命令
-有没有返回成功。重启不是零中断：旧 receipt 和内存 binding 必然失效，因此应先在本地诊断中
-确认没有其他活跃请求、运行进程、root lease 或待清理任务，再执行受控重启。
+## 模型可见工具
 
-## 对话中的工作流程
-
-第一次处理项目时，可以直接说：
+公开工具词汇固定为 11 个名字；未授权 scope 对应的工具不会可用：
 
 ```text
-使用 DevSpace。
-把 /Users/alice/code/my-app 打开为别名 my-app，并允许修改。
-读取项目指令，找出失败测试并修复，运行最小范围验证，最后总结改动。
+list_projects
+project_control
+save_progress
+read_files
+inspect
+skills
+apply_patch
+show_changes
+exec_command
+write_stdin
+read_process_output
 ```
 
-实际流程是：
+`exec_command` 只有同时授予 `project:write` 和显式高信任
+`process:execute` 时才出现。它使用 Codex 风格输入：
 
-1. `open_workspace` 只接受本次 OAuth grant 允许的根目录。只是选项目时返回 metadata；
-   立即分析或编辑时使用 full context。
-2. `get_workspace_context` 加载 Workspace 清单和版本，不自动把所有项目指令与 Skill 正文塞进对话。
-3. 处理具体文件前，`load_workspace_instructions(paths)` 只加载对目标路径生效的指令；
-   大文件使用签名的 UTF-8 安全 8 KiB 片段，最后一页才返回 instruction token。
-4. `read` 返回内容和版本；`apply_patch` 必须带 `ifMatch`，防止覆盖外部编辑。
-5. 每个写操作使用唯一 `operationId`。响应丢失时先查状态，不要直接重做。
-6. 命令优先使用 `program + args`；只有管道、重定向等 shell 语法才使用
-   `shell: true + command`。
-7. 长命令可以后台运行，输出和操作状态持久化保存。日志优先使用 `read_process_output` 的
-   小页、tail、search 或 errors 模式，不要把几十 MiB 一次塞进上下文。
-8. `show_changes` 按不超过 12 KiB 的签名 diff 页提供正文；读到 EOF 后把最终
-   `reviewToken` 交给 `advanceCheckpoint=true`，不要在未读完整 diff 时假装已审核。
-
-默认 MCP HTTP 是 stateless。ChatGPT 对话结束或服务重启后，网络连接、内存 binding 和旧 receipt
-会失效，但下面的信息仍在 SQLite 中：
-
-- alias 和 `workspaceRef`；
-- checkout/worktree 类型和写权限；
-- 项目指纹、generation、操作状态与进程输出元数据。
-
-新对话或重启后这样恢复：
-
-```text
-使用 DevSpace。先列出已保存的 Workspace，再恢复别名 my-app。
-不要重新打开本地路径，也不要自动选择最近使用的 Workspace。
+```json
+{
+  "executionRef": "pex1_...",
+  "operationId": "command-2026-07-30-001",
+  "program": "npm",
+  "args": ["test", "--", "--runInBand"],
+  "workingDirectory": ".",
+  "environment": {"CI": "1"},
+  "yieldTimeMs": 10000,
+  "maxOutputTokens": 12000,
+  "tty": false
+}
 ```
 
-也就是 `list_workspaces → resume_workspace`。恢复会签发新的 context 和 receipt；旧连接失效不代表
-项目记录丢失。
+`workingDirectory` 必须解析到该 execution 所绑定的 checkout/worktree 内。只有确实需要
+管道、重定向或循环等 Shell 语法时才传 `shell:true`、`command` 和 `approvalReason`。
+命令仍拥有 DevSpace OS 用户的完整文件和
+网络权限。`write_stdin` 只用于输入、关闭、终止或调整交互进程，是必须带
+`operationId` 的变更操作；实时轮询和保留输出读取都使用只读的
+`read_process_output`。
 
-## Checkout 还是 Worktree
+工具 schema 定义的变更操作使用 `operationId` 防重放；文件编辑使用版本前置条件
+`ifMatch` 防止陈旧写入。根锁协调并发写入和命令。工具与进程输出都有大小限制，
+保留的进程状态会按服务限制清理。工具返回 continuation cursor 时，后续调用继续传
+同一个 `executionRef` 和 cursor，但不重复初始查询或分页参数。
 
-| 场景 | 建议 |
-| --- | --- |
-| 只读检查当前目录 | `checkout` + `read_only` |
-| 明确修改当前目录 | `checkout` + `read_write` |
-| 并行任务、实验性修改 | managed `worktree` |
-| 两个 principal 同时写同一仓库 | 每个 principal 使用独立 worktree |
+## 本地管理
 
-一个长期任务使用一个清楚的 alias，例如 `billing-api-auth-fix`。ChatGPT 的“对话分支”不是 Git
-分支；需要文件隔离时必须使用真正的 worktree。
-
-## 权限与安全
-
-OAuth grant 可以分别授予：
-
-| Scope | 能力 |
-| --- | --- |
-| `workspace:read` | 打开、读取、搜索、查看指令和改动 |
-| `workspace:write` | 修改文件和推进 review checkpoint |
-| `process:execute` | 启动和操作本地进程 |
-| `network:access` | 让命令继承主机网络 |
-| `worktree:create` | 创建 managed worktree |
-| `workspace:revoke` | 关闭或撤销 Workspace |
-
-每个 OAuth grant 还绑定允许根目录；全局允许列表不是所有账户共享的通行证。
-
-> [!WARNING]
-> `exec_command` 仍以运行 DevSpace 的系统用户身份执行。命令策略是防误操作护栏，不是操作系统沙箱。
-
-默认没有进程 sandbox，也不能可靠地逐进程断网。高风险项目应使用专用系统账号、容器或虚拟机。
-DevSpace 会阻止明显的自我终止和自我重启命令；后端重启只能由本地 Admin control plane 发起。
-
-## 管理和长期运行
+启动仅回环地址可访问的管理面板：
 
 ```bash
 node dist/cli.js admin
 ```
 
-管理面板只监听 localhost，可以管理根目录、配额、Widget、诊断、Token 撤销和受控重启。
-后端诊断与安全控制也使用独立的 loopback control listener；两者都不能放进公网 tunnel。
-允许根目录可以热更新；大多数其他运行参数需要重启。
-
-长期运行需要同时托管：
-
-```text
-DevSpace 服务 + HTTPS Tunnel
-```
-
-建议使用 launchd、systemd 或其他服务管理器，并使用固定域名。macOS 受控重启需要给 Admin
-进程配置同一个固定 label：
+常用命令：
 
 ```bash
-DEVSPACE_LAUNCHD_SERVICE_LABEL=com.example.devspace node dist/cli.js admin
-```
-
-常用检查：
-
-```bash
-curl http://127.0.0.1:7676/readyz
-curl https://devspace.example.com/readyz
 node dist/cli.js doctor
-node dist/cli.js audit --limit 50
+node dist/cli.js config get
+node dist/cli.js audit --limit 100
 ```
 
-## 开发和验证
+管理面板显示 Project execution 的状态诊断。`doctor` 以只读方式输出状态库中的
+execution 总数和 open/terminal 状态。Thread/checkpoint 使用独立的
+`project-threads.sqlite`；受管 worktree 位于 DevSpace 私有状态目录下。
+
+`GET /healthz` 用于存活检查，`GET /readyz` 用于就绪检查。不要把凭据、
+`auth.json`、内部控制 token 或隧道凭据写入仓库或日志。
+
+## 开发
 
 ```bash
 npm ci
-npm run typecheck
-npm test
-npm run test:browser
 npm run build
-npm run test:pack
+npm test
+npm run typecheck
 ```
 
-`npm test` 会递归发现全部 `src/**/*.test.ts`，当前为 **59 个测试文件**。运行器会打印发现数量，
-并在任何已发现测试没有完成时失败，不再依赖容易漏文件的手写名单。
-
-浏览器测试单独运行。`test:pack` 会构建 npm 包、安装到干净临时项目、检查中英文 README、
-运行 CLI/SQLite/服务烟测，并执行生产依赖审计。
-
-## 常见问题
-
-**本地 `/readyz` 失败**：查看 DevSpace 日志，运行 `doctor`，确认没有第二个后端占用同一状态目录。
-
-**本地正常，公网失败**：检查 Tunnel、域名和 ingress；公网 URL 应指向 DevSpace 服务端口。
-
-**`better-sqlite3` 无法加载**：安装和运行使用了不同 Node ABI。切回正确 Node 后执行：
-
-```bash
-npm rebuild better-sqlite3
-node dist/cli.js doctor
-```
-
-**新 App 看不到旧 Workspace**：先检查授权时是否复用了正确 principal；再用
-`devspace auth principals` 和 dry-run 的迁移命令处理历史 orphan principal，不要重新打开路径碰运气。
-
-## 升级
-
-升级前先停止 DevSpace，并备份整个状态目录，默认是 `~/.local/share/devspace`。不要只复制主 SQLite
-文件，因为进程输出和其他持久化元数据也属于状态。启动新版本后等待 canonical v17 迁移完成，
-再检查 `/readyz` 并刷新 ChatGPT App 工具。
+以 `package.json` 中的仓库脚本为准。
 
 ## 更多文档
 
+- [ChatGPT 编程工作流](./docs/chatgpt-coding-workflow.md)
+- [ChatGPT 工具契约](./docs/chatgpt-tool-contract.md)
 - [配置参考](./docs/configuration.md)
 - [安全模型](./docs/security.md)
-- [ChatGPT 编码工作流](./docs/chatgpt-coding-workflow.md)
-- [真实宿主验收矩阵](./docs/chatgpt-host-acceptance.md)
-- [故障排查](./docs/gotchas.md)
-
-DevSpace 由 [Waishnav](https://github.com/Waishnav) 创建。本分支保留原项目历史和
-[MIT 许可证](./LICENSE)。
+- [常见问题](./docs/gotchas.md)
+- [真实 ChatGPT host 验收](./docs/chatgpt-host-acceptance.md)

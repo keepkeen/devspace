@@ -49,7 +49,7 @@ assert.equal(partialFailure.items[1]?.result, "Batch item failed.");
 assert.match(partialFailure.items[2]?.result ?? "", /Duplicate batch item skipped/);
 
 const oversized = await runBoundedBatch(
-  Array.from({ length: 4 }, (_, index) => ({ operation: "read", path: String(index) })),
+  Array.from({ length: 4 }, (_, index) => ({ operation: "grep", path: String(index) })),
   async () => ({ ok: true, result: "x".repeat(BATCH_ITEM_MAX_CHARACTERS + 100) }),
 );
 assert.equal(oversized.truncated, true);
@@ -57,6 +57,29 @@ assert.ok(oversized.items.every((item) => item.result.length <= BATCH_ITEM_MAX_C
 assert.ok(oversized.items.reduce((sum, item) => sum + item.result.length, 0) <= BATCH_TOTAL_MAX_CHARACTERS);
 assert.ok(oversized.result.length <= BATCH_TOTAL_MAX_CHARACTERS);
 assert.ok(oversized.items.every((item) => item.result.length >= BATCH_ITEM_MIN_CHARACTERS));
+
+await assert.rejects(
+  runBoundedBatch(
+    [{ operation: "read", path: "large.txt" }],
+    async () => ({
+      ok: true,
+      result: `${"visible\n".repeat(BATCH_ITEM_MAX_CHARACTERS)}[Use offset=20001 to continue.]`,
+    }),
+  ),
+  /continuation after its visible content was truncated/u,
+);
+
+await assert.rejects(
+  runBoundedBatch(
+    [
+      { operation: "read", path: "first.txt" },
+      { operation: "read", path: "second.txt" },
+    ],
+    async () => ({ ok: true, result: "line\n".repeat(200) }),
+    { totalMaxCharacters: 1_000, minItemCharacters: 100 },
+  ),
+  /continuation after its visible content was truncated/u,
+);
 
 const fairlyAllocated = await runBoundedBatch(
   Array.from({ length: 8 }, (_, index) => ({ operation: "grep", path: String(index) })),
@@ -98,13 +121,13 @@ const publicRecoveryError = await runBoundedBatch(
   async () => {
     throw Object.assign(new Error("private diagnostic"), {
       code: "skill_not_loaded",
-      publicText: "Call load_skill for this workspace, then retry.",
+      publicText: "Call skills with action=load for the selected Project, then retry.",
     });
   },
 );
 assert.equal(
   publicRecoveryError.items[0]?.result,
-  "skill_not_loaded: Call load_skill for this workspace, then retry.",
+  "skill_not_loaded: Call skills with action=load for the selected Project, then retry.",
 );
 assert.doesNotMatch(publicRecoveryError.items[0]?.result ?? "", /private diagnostic/);
 

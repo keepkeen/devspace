@@ -1,4 +1,4 @@
-import { timingSafeEqual, randomBytes, randomUUID, createHash } from "node:crypto";
+import { timingSafeEqual, randomBytes, createHash } from "node:crypto";
 import { isIP } from "node:net";
 import type { Request, Response } from "express";
 import type { OAuthRegisteredClientsStore } from "@modelcontextprotocol/sdk/server/auth/clients.js";
@@ -14,19 +14,16 @@ import { checkResourceAllowed, resourceUrlFromServerUrl } from "@modelcontextpro
 import {
   SqliteOAuthClientsStore,
   SqliteOAuthStore,
-  PrincipalReconnectError,
-  OAuthGrantIdentityError,
   type OAuthAuthorizationLimitInput,
   type OAuthDiagnosticSnapshot,
   type OAuthCleanupCounts,
   type OAuthGrantRecord,
   type OAuthRefreshTokenTombstone,
   type OAuthRevocationCounts,
-  type ConnectionPrincipalSummary,
+  type OAuthAuthorizationTuple,
+  type PersistedAuthorizationCodeRecord,
 } from "./oauth-store.js";
-import type { HashedHostIdentity } from "./host-identity.js";
 import { requestIp } from "./logger.js";
-import type { RuntimeCapabilities } from "./runtime-capabilities.js";
 import {
   ALL_AUTHORIZED_ROOTS_ID,
   type AuthorizationRoot,
@@ -57,7 +54,6 @@ export interface OAuthConfig {
   scopes: string[];
   allowedRedirectHosts: string[];
   trustProxy?: boolean;
-  runtimeCapabilities?: RuntimeCapabilities;
   resourceRoots?: () => readonly AuthorizationRoot[];
 }
 
@@ -66,7 +62,6 @@ export type OAuthAuditEventName =
   | "oauth_authorization_succeeded"
   | "oauth_authorization_failed"
   | "oauth_authorization_rate_limited"
-  | "oauth_principal_linked"
   | "oauth_token_issued"
   | "oauth_token_refreshed"
   | "oauth_refresh_token_replay_detected";
@@ -76,28 +71,12 @@ export interface OAuthAuditEvent {
   clientId: string;
   grantId?: string;
   connectionPrincipalId?: string;
-  subjectHash?: string;
-  organizationHash?: string;
 }
 
 export interface OAuthAuthorizationBoundaryChange {
   connectionPrincipalId: string;
-  reason: "principal_created" | "principal_relinked" | "refresh_token_replay";
-}
-
-interface AuthorizationCodeRecord {
-  clientId: string;
-  grantId: string;
-  connectionPrincipalId: string;
-  authorizationEpoch: number;
-  params: AuthorizationParams;
-  expiresAtMs: number;
-}
-
-interface AuthorizationSelectionRecord {
-  clientId: string;
-  authorizationSessionKey: string;
-  expiresAtMs: number;
+  reason: "refresh_token_replay";
+  revokedAuthorizations: OAuthAuthorizationTuple[];
 }
 
 export interface OAuthRequestAuthorization {
@@ -107,16 +86,12 @@ export interface OAuthRequestAuthorization {
   authorizationEpoch: number;
   scopes: string[];
   allowedRootIds: string[];
-  subjectHash?: string;
-  organizationHash?: string;
 }
 
 const AUTH_EXTRA_GRANT_ID = "devspace/grant-id";
 const AUTH_EXTRA_PRINCIPAL_ID = "devspace/principal-id";
 const AUTH_EXTRA_AUTHORIZATION_EPOCH = "devspace/authorization-epoch";
 
-const CODE_TTL_MS = 5 * 60 * 1000;
-const SELECTION_TTL_MS = 5 * 60 * 1000;
 const AUTHORIZATION_LIMIT_TTL_MS = 24 * 60 * 60_000;
 const OWNER_PASSWORD_VERIFY_CONCURRENCY = 3;
 const OWNER_PASSWORD_VERIFY_QUEUE = 32;
@@ -174,9 +149,7 @@ function formHtml(params: {
   scopes: string[];
   resource?: URL;
   fields: Record<string, string | undefined>;
-  runtimeCapabilities?: RuntimeCapabilities;
   selectionToken?: string;
-  principals?: readonly ConnectionPrincipalSummary[];
   roots?: readonly AuthorizationRoot[];
 }): string {
   const scopes = params.scopes.length > 0 ? params.scopes : [...DEFAULT_AUTHORIZATION_SCOPES];
@@ -192,40 +165,13 @@ function formHtml(params: {
     .filter((entry): entry is [string, string] => entry[1] !== undefined)
     .map(([name, value]) => `        <input type="hidden" name="${htmlEscape(name)}" value="${htmlEscape(value)}" />`)
     .join("\n");
-  const runtimeWarnings = authorizationRuntimeWarnings(
-    scopes,
-    params.runtimeCapabilities,
-  );
-  const runtimePosture = runtimeWarnings.length > 0
-    ? `<section class="risk"><strong>Runtime security posture</strong><ul>${runtimeWarnings
-        .map((warning) => `<li>${htmlEscape(warning)}</li>`)
-        .join("")}</ul></section>`
-    : "";
   const selectionStage = Boolean(params.selectionToken);
-  const principalOptions = (params.principals ?? [])
-    .map((principal) => {
-      const aliases = principal.aliases.length > 0
-        ? ` — ${principal.aliases.slice(0, 4).join(", ")}`
-        : "";
-      const label = `${principal.principalId} (${principal.retainedWorkspaces} workspaces)${aliases}`;
-      return `<option value="${htmlEscape(principal.principalId)}">${htmlEscape(label)}</option>`;
-    })
-    .join("");
   const rootChoices = (params.roots ?? []).map((root) =>
     `<label class="choice"><input type="checkbox" name="root_id" value="${htmlEscape(root.id)}" checked /><strong>${htmlEscape(root.label)}</strong><span>${htmlEscape(root.path)}</span></label>`
   ).join("");
   const authorizationControls = selectionStage
     ? `
         <input type="hidden" name="selection_token" value="${htmlEscape(params.selectionToken!)}" />
-        <fieldset>
-          <legend>Local connection</legend>
-          <label class="choice"><input type="radio" name="connection_mode" value="new" checked /><strong>Create a new isolated local connection</strong></label>
-          ${principalOptions
-            ? `<label class="choice"><input type="radio" name="connection_mode" value="reuse" /><strong>Reuse an existing local connection</strong></label>
-          <select name="reuse_principal_id">${principalOptions}</select>
-          <p class="help">Reusing preserves that connection's Workspace aliases. This choice is made only after Owner-password approval.</p>`
-            : ""}
-        </fieldset>
         <fieldset>
           <legend>Authorized project roots</legend>
           ${rootChoices || "<p>No approved roots are currently configured.</p>"}
@@ -259,23 +205,20 @@ function formHtml(params: {
       legend { padding: 0 8px; font-weight: 700; }
       .choice { display: grid; grid-template-columns: auto 1fr; gap: 4px 8px; align-items: start; padding: 8px 0; font-weight: 500; }
       .choice input { width: auto; margin-top: 3px; }
+      .choice span { grid-column: 2; color: #94a3b8; font-size: 13px; font-weight: 400; }
       .choice span { grid-column: 2; color: #94a3b8; font-size: 12px; word-break: break-all; }
       .optional { margin-top: 22px; padding-top: 18px; border-top: 1px solid #334155; }
       .help { margin: 6px 0 0; color: #94a3b8; font-size: 13px; }
       button { margin-top: 18px; width: 100%; border: 0; border-radius: 10px; padding: 12px 14px; font-weight: 700; color: #020617; background: #38bdf8; cursor: pointer; }
       .error { color: #fecaca; background: #7f1d1d; border-radius: 10px; padding: 10px 12px; }
       .warning { color: #fde68a; }
-      .risk { margin: 16px 0; padding: 14px; color: #fde68a; background: #422006; border: 1px solid #a16207; border-radius: 12px; }
-      .risk strong { display: block; margin-bottom: 6px; }
-      .risk ul { margin-bottom: 0; }
     </style>
   </head>
   <body>
     <main>
       <h1>Connect DevSpace</h1>
-      <p class="warning">Only approve this if you are intentionally connecting your own ChatGPT or MCP client to this local machine.</p>
+      <p class="warning">Only approve this if you are intentionally connecting your own ChatGPT account to this local machine.</p>
       ${error}
-      ${runtimePosture}
       <dl>
         <dt>Client</dt><dd>${htmlEscape(params.clientName)}</dd>
         <dt>Capabilities</dt><dd><ul>${scopeItems}</ul></dd>
@@ -289,33 +232,6 @@ ${authorizationControls}
     </main>
   </body>
 </html>`;
-}
-
-function authorizationRuntimeWarnings(
-  scopes: readonly string[],
-  capabilities: RuntimeCapabilities | undefined,
-): string[] {
-  if (!capabilities) return [];
-  const warnings: string[] = [];
-  if (scopes.includes("process:execute") && !capabilities.processSandbox) {
-    warnings.push(
-      "Executed commands run with the local operating-system user's permissions; DevSpace command checks are guardrails, not a process sandbox.",
-    );
-  }
-  if (
-    scopes.includes("process:execute") &&
-    capabilities.filesystemIsolation === "guardrail_only"
-  ) {
-    warnings.push(
-      "Dedicated file tools are workspace-confined, but executed programs may access files outside the workspace that the local user can access.",
-    );
-  }
-  if (scopes.includes("network:access") && !capabilities.networkIsolation) {
-    warnings.push(
-      "Executed programs can use the host network; this runtime cannot enforce per-process network denial.",
-    );
-  }
-  return warnings;
 }
 
 function requestedScopesAllowed(requested: string[], supported: string[]): boolean {
@@ -395,7 +311,6 @@ function sendAuthorizationRateLimit(
   retryAfterMs: number,
   client: OAuthClientInformationFull,
   params: AuthorizationParams,
-  runtimeCapabilities?: RuntimeCapabilities,
 ): void {
   res.status(429).setHeader("Retry-After", String(Math.max(1, Math.ceil(retryAfterMs / 1_000))));
   res.setHeader("Content-Type", "text/html; charset=utf-8");
@@ -406,7 +321,6 @@ function sendAuthorizationRateLimit(
       scopes: params.scopes ?? [],
       resource: params.resource,
       fields: authorizationFormFields(client, params),
-      runtimeCapabilities,
     }),
   );
 }
@@ -431,8 +345,6 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
   readonly clientsStore: OAuthRegisteredClientsStore;
   readonly ownerCredentialChanged: boolean;
   readonly ownerCredentialUpgraded: boolean;
-  private readonly codes = new Map<string, AuthorizationCodeRecord>();
-  private readonly selections = new Map<string, AuthorizationSelectionRecord>();
   private readonly oauthStore: SqliteOAuthStore;
   private readonly resourceServerUrl: URL;
   private readonly ownerPasswordHash: string;
@@ -448,7 +360,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     private readonly onAuditEvent?: (event: OAuthAuditEvent) => void,
     private readonly onAuthorizationBoundaryChanged?: (
       change: OAuthAuthorizationBoundaryChange,
-    ) => void,
+    ) => void | Promise<void>,
   ) {
     this.resourceServerUrl = resourceUrlFromServerUrl(resourceServerUrl);
     this.oauthStore = new SqliteOAuthStore(stateDir);
@@ -458,7 +370,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
           config.keys.source === "auth_file" &&
           config.ownerCredential.password === undefined &&
           config.ownerCredential.passwordHash !== undefined
-        ? { legacyVerifierSecret: config.keys.hostIdentity }
+        ? { legacyVerifierSecret: config.keys.legacyOwnerVerifier }
         : {}),
     });
     this.ownerCredentialChanged = credential.changed;
@@ -496,7 +408,6 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
           scopes,
           resource: authorizedParams.resource,
           fields: authorizationFormFields(client, authorizedParams),
-          runtimeCapabilities: this.config.runtimeCapabilities,
         }),
       );
       return;
@@ -504,14 +415,14 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
 
     const selectionToken = String(res.req.body?.selection_token ?? "").trim();
     if (selectionToken) {
-      const selection = this.selections.get(selectionToken);
-      if (
-        !selection ||
-        selection.clientId !== client.client_id ||
-        selection.authorizationSessionKey !== authorizationSessionKey(client, authorizedParams) ||
-        selection.expiresAtMs < Date.now()
-      ) {
-        this.selections.delete(selectionToken);
+      const sessionKey = authorizationSessionKey(client, authorizedParams);
+      const selectionHash = hashToken(selectionToken);
+      const selection = this.oauthStore.getAuthorizationSelection(
+        selectionHash,
+        client.client_id,
+        sessionKey,
+      );
+      if (!selection) {
         res.status(400).setHeader("Content-Type", "text/html; charset=utf-8");
         res.send(formHtml({
           error: "The local connection selection expired. Enter the Owner password again.",
@@ -519,7 +430,6 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
           scopes,
           resource: authorizedParams.resource,
           fields: authorizationFormFields(client, authorizedParams),
-          runtimeCapabilities: this.config.runtimeCapabilities,
         }));
         return;
       }
@@ -534,37 +444,37 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
       const allowedRootIds = [...new Set(
         submittedRoots.filter((rootId) => availableRootIds.has(rootId)),
       )];
-      const principalCandidates = this.oauthStore.listConnectionPrincipals();
-      const mode = String(res.req.body?.connection_mode ?? "new");
-      const reusePrincipalId = mode === "reuse"
-        ? String(res.req.body?.reuse_principal_id ?? "").trim()
-        : undefined;
-      if (
-        allowedRootIds.length === 0 ||
-        (mode === "reuse" &&
-          !principalCandidates.some((principal) => principal.principalId === reusePrincipalId))
-      ) {
+      if (allowedRootIds.length === 0) {
         res.status(400).setHeader("Content-Type", "text/html; charset=utf-8");
         res.send(formHtml({
-          error: allowedRootIds.length === 0
-            ? "Select at least one currently approved project root."
-            : "Select a current local connection to reuse.",
+          error: "Select at least one currently approved project root.",
           clientName: client.client_name ?? client.client_id,
           scopes,
           resource: authorizedParams.resource,
           fields: authorizationFormFields(client, authorizedParams),
-          runtimeCapabilities: this.config.runtimeCapabilities,
           selectionToken,
-          principals: principalCandidates,
           roots,
         }));
         return;
       }
-      this.selections.delete(selectionToken);
+      if (!this.oauthStore.consumeAuthorizationSelection(
+        selectionHash,
+        client.client_id,
+        sessionKey,
+      )) {
+        res.status(400).setHeader("Content-Type", "text/html; charset=utf-8");
+        res.send(formHtml({
+          error: "The local connection selection expired. Enter the Owner password again.",
+          clientName: client.client_name ?? client.client_id,
+          scopes,
+          resource: authorizedParams.resource,
+          fields: authorizationFormFields(client, authorizedParams),
+        }));
+        return;
+      }
       await this.completeAuthorization(client, authorizedParams, res, {
         scopes,
         allowedRootIds,
-        ...(reusePrincipalId ? { reusePrincipalId } : {}),
       });
       return;
     }
@@ -584,7 +494,6 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
         preflight.retryAfterMs,
         client,
         authorizedParams,
-        this.config.runtimeCapabilities,
       );
       return;
     }
@@ -606,7 +515,6 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
         scopes,
         resource: authorizedParams.resource,
         fields: authorizationFormFields(client, authorizedParams),
-        runtimeCapabilities: this.config.runtimeCapabilities,
       }));
       return;
     }
@@ -620,7 +528,6 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
           failure.retryAfterMs,
           client,
           authorizedParams,
-          this.config.runtimeCapabilities,
         );
         return;
       }
@@ -632,7 +539,6 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
           scopes,
           resource: authorizedParams.resource,
           fields: authorizationFormFields(client, authorizedParams),
-          runtimeCapabilities: this.config.runtimeCapabilities,
         }),
       );
       return;
@@ -651,15 +557,13 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
           scopes,
           resource: authorizedParams.resource,
           fields: authorizationFormFields(client, authorizedParams),
-          runtimeCapabilities: this.config.runtimeCapabilities,
         }));
         return;
       }
       const token = randomToken();
-      this.selections.set(token, {
+      this.oauthStore.saveAuthorizationSelection(hashToken(token), {
         clientId: client.client_id,
         authorizationSessionKey: authorizationSessionKey(client, authorizedParams),
-        expiresAtMs: Date.now() + SELECTION_TTL_MS,
       });
       res.status(200).setHeader("Content-Type", "text/html; charset=utf-8");
       res.send(formHtml({
@@ -667,9 +571,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
         scopes,
         resource: authorizedParams.resource,
         fields: authorizationFormFields(client, authorizedParams),
-        runtimeCapabilities: this.config.runtimeCapabilities,
         selectionToken: token,
-        principals: this.oauthStore.listConnectionPrincipals(),
         roots,
       }));
       return;
@@ -688,61 +590,31 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     input: {
       scopes: string[];
       allowedRootIds: string[];
-      reusePrincipalId?: string;
     },
   ): Promise<void> {
-    let grant;
-    try {
-      grant = this.oauthStore.createAuthorizationGrant({
-        clientId: client.client_id,
-        scopes: input.scopes,
-        allowedRootIds: input.allowedRootIds,
-        ...(this.config.grantMaxLifetimeSeconds
-          ? {
-              absoluteExpiresAt:
-                Math.floor(Date.now() / 1_000) + this.config.grantMaxLifetimeSeconds,
-            }
-          : {}),
-        ...(input.reusePrincipalId ? { reusePrincipalId: input.reusePrincipalId } : {}),
-      });
-    } catch (error) {
-      if (!(error instanceof PrincipalReconnectError)) throw error;
-      res.status(400).setHeader("Content-Type", "text/html; charset=utf-8");
-      res.send(
-        formHtml({
-          error: error.message,
-          clientName: client.client_name ?? client.client_id,
-          scopes: input.scopes,
-          resource: authorizedParams.resource,
-          fields: authorizationFormFields(client, authorizedParams),
-          runtimeCapabilities: this.config.runtimeCapabilities,
-        }),
-      );
-      return;
-    }
-    const boundaryChangeReason: OAuthAuthorizationBoundaryChange["reason"] =
-      grant.reconnected || grant.principalReused
-      ? "principal_relinked"
-      : "principal_created";
-    if (grant.reconnected || grant.principalReused) {
-      this.emitAudit("oauth_principal_linked", client.client_id, grant);
-    }
-    if (grant.principalCreated || grant.reconnected || grant.principalReused) {
-      this.onAuthorizationBoundaryChanged?.({
-        connectionPrincipalId: grant.principalId,
-        reason: boundaryChangeReason,
-      });
-    }
+    const grant = this.oauthStore.createAuthorizationGrant({
+      clientId: client.client_id,
+      scopes: input.scopes,
+      allowedRootIds: input.allowedRootIds,
+      ...(this.config.grantMaxLifetimeSeconds
+        ? {
+            absoluteExpiresAt:
+              Math.floor(Date.now() / 1_000) + this.config.grantMaxLifetimeSeconds,
+          }
+        : {}),
+    });
     this.emitAudit("oauth_authorization_succeeded", client.client_id, grant);
 
-    const code = `code-${randomUUID()}`;
-    this.codes.set(code, {
+    const code = randomToken();
+    this.oauthStore.saveAuthorizationCode(hashToken(code), {
       clientId: client.client_id,
       grantId: grant.grantId,
-      connectionPrincipalId: grant.principalId,
+      principalId: grant.principalId,
       authorizationEpoch: grant.authorizationEpoch,
-      params: authorizedParams,
-      expiresAtMs: Date.now() + CODE_TTL_MS,
+      redirectUri: authorizedParams.redirectUri,
+      codeChallenge: authorizedParams.codeChallenge,
+      scopes: authorizedParams.scopes ?? this.config.scopes,
+      ...(authorizedParams.resource ? { resource: authorizedParams.resource.href } : {}),
     });
 
     const redirectUrl = new URL(authorizedParams.redirectUri);
@@ -756,7 +628,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     authorizationCode: string,
   ): Promise<string> {
     const record = this.validCodeRecord(client, authorizationCode);
-    return record.params.codeChallenge;
+    return record.codeChallenge;
   }
 
   async exchangeAuthorizationCode(
@@ -767,24 +639,28 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     resource?: URL,
   ): Promise<OAuthTokens> {
     const record = this.validCodeRecord(client, authorizationCode);
-    if (redirectUri && redirectUri !== record.params.redirectUri) {
+    if (redirectUri && redirectUri !== record.redirectUri) {
       throw new InvalidGrantError("redirect_uri does not match the authorization request");
     }
     if (resource && !checkResourceAllowed({ requestedResource: resource, configuredResource: this.resourceServerUrl })) {
       throw new InvalidGrantError("Invalid resource");
     }
 
-    this.codes.delete(authorizationCode);
+    const consumed = this.oauthStore.consumeAuthorizationCode(
+      hashToken(authorizationCode),
+      client.client_id,
+    );
+    if (!consumed) throw new InvalidGrantError("Invalid authorization code");
     const grant = this.requireActiveGrant({
       clientId: client.client_id,
-      grantId: record.grantId,
-      principalId: record.connectionPrincipalId,
-      authorizationEpoch: record.authorizationEpoch,
+      grantId: consumed.grantId,
+      principalId: consumed.principalId,
+      authorizationEpoch: consumed.authorizationEpoch,
     });
-    const tokens = this.issueTokens(
+    const tokens = await this.issueTokens(
       grant,
-      record.params.scopes ?? this.config.scopes,
-      record.params.resource,
+      consumed.scopes,
+      consumed.resource ? new URL(consumed.resource) : undefined,
     );
     this.oauthStore.touchPrincipal(grant.principalId);
     this.emitAudit("oauth_token_issued", client.client_id, grant);
@@ -801,7 +677,9 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     const record = this.oauthStore.getRefreshToken(refreshTokenHash);
     if (!record) {
       const tombstone = this.oauthStore.getRefreshTokenTombstone(refreshTokenHash);
-      if (tombstone?.clientId === client.client_id) this.handleRefreshTokenReplay(tombstone);
+      if (tombstone?.clientId === client.client_id) {
+        await this.handleRefreshTokenReplay(tombstone);
+      }
       throw new InvalidGrantError("Invalid refresh token");
     }
     if (record.clientId !== client.client_id || record.expiresAt < Math.floor(Date.now() / 1000)) {
@@ -825,7 +703,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
       principalId: record.principalId,
       authorizationEpoch: record.authorizationEpoch,
     });
-    const tokens = this.issueTokens(
+    const tokens = await this.issueTokens(
       grant,
       requestedScopes,
       resource ?? (record.resource ? new URL(record.resource) : undefined),
@@ -860,11 +738,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     };
   }
 
-  authorizeRequest(
-    authInfo: AuthInfo,
-    hostIdentity: HashedHostIdentity = {},
-    options: { requireHostIdentity?: boolean } = {},
-  ): OAuthRequestAuthorization {
+  authorizeRequest(authInfo: AuthInfo): OAuthRequestAuthorization {
     const grantId = authInfo.extra?.[AUTH_EXTRA_GRANT_ID];
     const principalId = authInfo.extra?.[AUTH_EXTRA_PRINCIPAL_ID];
     const authorizationEpoch = authInfo.extra?.[AUTH_EXTRA_AUTHORIZATION_EPOCH];
@@ -876,28 +750,14 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     ) {
       throw new InvalidTokenError("Access token authorization context is missing");
     }
-    let grant: OAuthGrantRecord;
-    try {
-      grant = this.oauthStore.bindOrValidateGrantHostIdentity({
-        grantId,
-        clientId: authInfo.clientId,
-        authorizationEpoch: authorizationEpoch as number,
-        ...(hostIdentity.subjectHash ? { subjectHash: hostIdentity.subjectHash } : {}),
-        ...(hostIdentity.organizationHash
-          ? { organizationHash: hostIdentity.organizationHash }
-          : {}),
-        requireSubject: options.requireHostIdentity === true,
-      });
-    } catch (error) {
-      if (error instanceof OAuthGrantIdentityError) {
-        throw new InvalidTokenError(error.message);
-      }
-      throw error;
-    }
-    if (
-      grant.principalId !== principalId ||
-      authInfo.scopes.some((scope) => !grant.grantedScopes.includes(scope))
-    ) {
+    const grant = this.oauthStore.validateAndTouchAuthorizationGrant({
+      grantId,
+      clientId: authInfo.clientId,
+      principalId,
+      authorizationEpoch: authorizationEpoch as number,
+      scopes: authInfo.scopes,
+    });
+    if (!grant) {
       throw new InvalidTokenError("Access token does not match its authorization grant");
     }
     return {
@@ -907,8 +767,6 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
       authorizationEpoch: grant.authorizationEpoch,
       scopes: [...authInfo.scopes],
       allowedRootIds: [...grant.allowedRootIds],
-      ...(grant.subjectHash ? { subjectHash: grant.subjectHash } : {}),
-      ...(grant.organizationHash ? { organizationHash: grant.organizationHash } : {}),
     };
   }
 
@@ -916,41 +774,22 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     return this.oauthStore.principalForClient(clientId);
   }
 
-  async revokeToken(_client: OAuthClientInformationFull, request: OAuthTokenRevocationRequest): Promise<void> {
+  async revokeToken(client: OAuthClientInformationFull, request: OAuthTokenRevocationRequest): Promise<void> {
     const hashed = hashToken(request.token);
-    this.oauthStore.deleteAccessToken(hashed);
-    this.oauthStore.deleteRefreshToken(hashed);
+    this.oauthStore.deleteAccessToken(hashed, client.client_id);
+    this.oauthStore.deleteRefreshToken(hashed, client.client_id);
   }
 
   revokeAll(): OAuthRevocationCounts {
-    this.codes.clear();
-    this.selections.clear();
     return this.oauthStore.revokeAll();
-  }
-
-  queueOrphanedWorkspaceCleanup(): number {
-    return this.oauthStore.queueOrphanedWorkspaceCleanup();
   }
 
   diagnosticSnapshot(): OAuthDiagnosticSnapshot {
     return this.oauthStore.diagnosticSnapshot();
   }
 
-  cleanupExpired(nowSeconds = Math.floor(Date.now() / 1_000)): OAuthCleanupCounts & {
-    authorizationCodes: number;
-  } {
-    let authorizationCodes = 0;
-    const nowMs = nowSeconds * 1_000;
-    for (const [code, record] of this.codes) {
-      if (record.expiresAtMs >= nowMs) continue;
-      this.codes.delete(code);
-      authorizationCodes += 1;
-    }
-    for (const [token, record] of this.selections) {
-      if (record.expiresAtMs >= nowMs) continue;
-      this.selections.delete(token);
-    }
-    return { ...this.oauthStore.cleanupExpired(nowSeconds), authorizationCodes };
+  cleanupExpired(nowSeconds = Math.floor(Date.now() / 1_000)): OAuthCleanupCounts {
+    return this.oauthStore.cleanupExpired(nowSeconds);
   }
 
   close(): void {
@@ -964,15 +803,18 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
   private validCodeRecord(
     client: OAuthClientInformationFull,
     authorizationCode: string,
-  ): AuthorizationCodeRecord {
-    const record = this.codes.get(authorizationCode);
-    if (!record || record.clientId !== client.client_id || record.expiresAtMs < Date.now()) {
+  ): PersistedAuthorizationCodeRecord {
+    const record = this.oauthStore.getAuthorizationCode(
+      hashToken(authorizationCode),
+      client.client_id,
+    );
+    if (!record) {
       throw new InvalidGrantError("Invalid authorization code");
     }
     return record;
   }
 
-  private issueTokens(
+  private async issueTokens(
     grant: Pick<
       OAuthGrantRecord,
       "grantId" | "clientId" | "principalId" | "authorizationEpoch" | "absoluteExpiresAt"
@@ -981,7 +823,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     resource?: URL,
     consumedRefreshTokenHash?: string,
     refreshFamilyId?: string,
-  ): OAuthTokens {
+  ): Promise<OAuthTokens> {
     const now = Math.floor(Date.now() / 1000);
     const remainingGrantSeconds = grant.absoluteExpiresAt === undefined
       ? Number.POSITIVE_INFINITY
@@ -1030,7 +872,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
       consumedRefreshTokenHash,
     );
     if (rotation.status === "replay") {
-      this.handleRefreshTokenReplay(rotation.tombstone);
+      await this.handleRefreshTokenReplay(rotation.tombstone);
     }
     if (rotation.status !== "saved") {
       throw new InvalidGrantError("Invalid refresh token");
@@ -1045,16 +887,23 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     };
   }
 
-  private handleRefreshTokenReplay(tombstone: OAuthRefreshTokenTombstone): never {
+  private async handleRefreshTokenReplay(
+    tombstone: OAuthRefreshTokenTombstone,
+  ): Promise<never> {
     const revoked = this.oauthStore.revokeRefreshTokenFamilyOnReplay(tombstone);
     this.emitAudit("oauth_refresh_token_replay_detected", tombstone.clientId, {
       grantId: tombstone.grantId,
       principalId: tombstone.principalId,
     });
     if (revoked.changed) {
-      this.onAuthorizationBoundaryChanged?.({
+      await this.onAuthorizationBoundaryChanged?.({
         connectionPrincipalId: revoked.connectionPrincipalId,
         reason: "refresh_token_replay",
+        revokedAuthorizations: [{
+          principalId: tombstone.principalId,
+          grantId: tombstone.grantId,
+          authorizationEpoch: tombstone.authorizationEpoch,
+        }],
       });
     }
     throw new InvalidGrantError("Refresh token replay detected; authorization grant revoked");
@@ -1081,10 +930,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
   private emitAudit(
     event: OAuthAuditEventName,
     clientId: string,
-    grant?: Pick<
-      OAuthGrantRecord,
-      "grantId" | "principalId" | "subjectHash" | "organizationHash"
-    >,
+    grant?: Pick<OAuthGrantRecord, "grantId" | "principalId">,
   ): void {
     try {
       this.onAuditEvent?.({
@@ -1094,10 +940,6 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
           ? {
               grantId: grant.grantId,
               connectionPrincipalId: grant.principalId,
-              ...(grant.subjectHash ? { subjectHash: grant.subjectHash } : {}),
-              ...(grant.organizationHash
-                ? { organizationHash: grant.organizationHash }
-                : {}),
             }
           : {}),
       });

@@ -1,5 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -11,6 +18,19 @@ test("doctor OAuth inspection is read-only across legacy and current schemas", (
   try {
     assert.deepEqual(inspectDoctorOAuthState(join(root, "missing")), {
       databasePresent: false,
+    });
+    const backupOnlyState = join(root, "backup-only");
+    mkdirSync(backupOnlyState);
+    writeFileSync(
+      join(backupOnlyState, "devspace.sqlite.pre-v22.2026-07-30T00-00-00-000Z.bak"),
+      "backup",
+    );
+    assert.deepEqual(inspectDoctorOAuthState(backupOnlyState), {
+      databasePresent: false,
+      migrationBackups: {
+        count: 1,
+        latest: "devspace.sqlite.pre-v22.2026-07-30T00-00-00-000Z.bak",
+      },
     });
 
     const legacyState = join(root, "legacy");
@@ -67,12 +87,26 @@ test("doctor OAuth inspection is read-only across legacy and current schemas", (
         ('wildcard-active', '["*"]', 200, null),
         ('wildcard-expired', '["*"]', 50, null),
         ('explicit-active', '["root-a"]', null, null);
+      create table project_executions (
+        execution_id text primary key,
+        status text not null,
+        worktree_root text
+      );
+      insert into project_executions values
+        ('active', 'active', '/tmp/worktrees/active'),
+        ('revoked', 'revoked', '/tmp/worktrees/revoked'),
+        ('closed-without-worktree', 'closed', null);
     `);
     current.close();
     assert.deepEqual(inspectDoctorOAuthState(currentState, 100), {
       databasePresent: true,
       schemaVersion: 17,
       legacyWildcardGrants: 1,
+      projectExecutions: {
+        total: 3,
+        open: 1,
+        terminal: 2,
+      },
     });
   } finally {
     rmSync(root, { recursive: true, force: true });

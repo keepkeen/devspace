@@ -1,15 +1,11 @@
 import type { AppliedPatchFile, PatchOperation } from "./apply-patch.js";
 import type { FileVersion } from "./file-version.js";
 import type { ProcessSnapshot } from "./process-sessions.js";
-import type { ReviewSince } from "./review-checkpoints.js";
 
 export interface ToolEffects {
   observedAt: string;
   files?: FileEffect[];
   process?: ProcessEffect;
-  network?: NetworkEffect;
-  workspace?: WorkspaceEffect;
-  reviewCheckpoint?: ReviewCheckpointEffect;
 }
 
 export interface FileEffect {
@@ -54,66 +50,10 @@ export interface ProcessEffect {
   untrackedSideEffects: true;
 }
 
-export interface NetworkEffect {
-  confidence: "declared";
-  allowed: boolean;
-  observed: false;
-}
-
-export type WorkspaceWorktreeEffect =
-  | "not_managed"
-  | "created"
-  | "reused"
-  | "removed"
-  | "retained";
-
-export interface WorkspaceEffect {
-  confidence: "observed";
-  action: "open" | "close" | "revoke";
-  result: "opened" | "reused" | "closed" | "revoked" | "retained";
-  worktree: WorkspaceWorktreeEffect;
-  processesTerminated: number;
-}
-
-export interface ReviewCheckpointEffect {
-  confidence: "observed";
-  since: ReviewSince;
-  advanced: boolean;
-}
-
 export interface ProcessEffectsInput {
   observedAt: string;
   submitted: ProcessSubmittedEffect;
   snapshot: ProcessSnapshot;
-  networkAllowed?: boolean;
-}
-
-export interface WorkspaceOpenEffectsInput {
-  observedAt: string;
-  reused: boolean;
-  managedWorktree: boolean;
-}
-
-export interface WorkspaceCloseEffectsInput {
-  observedAt: string;
-  closed: boolean;
-  managedWorktree: boolean;
-  worktreeRemoved: boolean;
-  processesTerminated: number;
-}
-
-export interface WorkspaceRevokeEffectsInput {
-  observedAt: string;
-  revoked: boolean;
-  managedWorktree: boolean;
-  worktreeRemoved: boolean;
-  processesTerminated: number;
-}
-
-export interface ReviewEffectsInput {
-  observedAt: string;
-  since: ReviewSince;
-  advanced: boolean;
 }
 
 export function createApplyPatchEffects(
@@ -163,64 +103,6 @@ export function createProcessInteractEffects(input: ProcessEffectsInput): ToolEf
   return createProcessEffects("interact", input);
 }
 
-export function createWorkspaceOpenEffects(input: WorkspaceOpenEffectsInput): ToolEffects {
-  return {
-    observedAt: input.observedAt,
-    workspace: {
-      confidence: "observed",
-      action: "open",
-      result: input.reused ? "reused" : "opened",
-      worktree: input.managedWorktree
-        ? input.reused ? "reused" : "created"
-        : "not_managed",
-      processesTerminated: 0,
-    },
-  };
-}
-
-export function createWorkspaceCloseEffects(input: WorkspaceCloseEffectsInput): ToolEffects {
-  return {
-    observedAt: input.observedAt,
-    workspace: {
-      confidence: "observed",
-      action: "close",
-      result: input.closed ? "closed" : "retained",
-      worktree: workspaceEndState(
-        input.managedWorktree,
-        input.worktreeRemoved,
-      ),
-      processesTerminated: input.processesTerminated,
-    },
-  };
-}
-
-export function createWorkspaceRevokeEffects(input: WorkspaceRevokeEffectsInput): ToolEffects {
-  return {
-    observedAt: input.observedAt,
-    workspace: {
-      confidence: "observed",
-      action: "revoke",
-      result: input.revoked ? "revoked" : "retained",
-      worktree: workspaceEndState(
-        input.managedWorktree,
-        input.worktreeRemoved,
-      ),
-      processesTerminated: input.processesTerminated,
-    },
-  };
-}
-
-export function createReviewEffects(input: ReviewEffectsInput): ToolEffects {
-  return {
-    observedAt: input.observedAt,
-    reviewCheckpoint: {
-      confidence: "observed",
-      since: input.since,
-      advanced: input.advanced,
-    },
-  };
-}
-
 function createProcessEffects(
   action: ProcessEffect["action"],
   input: ProcessEffectsInput,
@@ -258,24 +140,7 @@ function createProcessEffects(
       },
       untrackedSideEffects: true,
     },
-    ...(input.networkAllowed === undefined
-      ? {}
-      : {
-          network: {
-            confidence: "declared" as const,
-            allowed: input.networkAllowed,
-            observed: false as const,
-          },
-        }),
   };
-}
-
-function workspaceEndState(
-  managedWorktree: boolean,
-  worktreeRemoved: boolean,
-): WorkspaceWorktreeEffect {
-  if (!managedWorktree) return "not_managed";
-  return worktreeRemoved ? "removed" : "retained";
 }
 
 function cloneFileVersion<T extends { hash: string; mtimeNs: string } | null>(version: T): T {

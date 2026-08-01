@@ -1,129 +1,111 @@
 import assert from "node:assert/strict";
-import type { ToolResultCard } from "./card-types.js";
+import type { ProjectListCard, ToolResultCard } from "./card-types.js";
 import { toolIcons } from "./icons.js";
-import { getToolDisplay, getToolHeaderSummary } from "./tool-display.js";
+import {
+  getToolDisplay,
+  getToolHeaderSummary,
+  newProjectTaskMessage,
+  resumeProjectHandoffMessage,
+  stableProjectOperationId,
+} from "./tool-display.js";
 
-const displayCases: Array<[ToolResultCard, { title: string; tone: string }]> = [
-  [{ tool: "open_workspace", root: "/tmp/project" }, { title: "Opened workspace", tone: "workspace" }],
-  [{ tool: "read", path: "src/read.ts" }, { title: "Read file", tone: "read" }],
-  [{ tool: "write", path: "src/write.ts" }, { title: "Wrote file", tone: "write" }],
-  [{ tool: "edit", path: "src/edit.ts" }, { title: "Edited file", tone: "edit" }],
-  [{
-    tool: "apply_patch",
-    files: [{ path: "src/new.ts", operation: "add" }],
-  }, { title: "Added 1 file", tone: "write" }],
-  [{
-    tool: "grep",
-    summary: { pattern: "needle", scope: "src" },
-  }, { title: "Searched files", tone: "search" }],
-  [{ tool: "ls", path: "src" }, { title: "Listed directory", tone: "directory" }],
-  [{ tool: "bash", summary: { command: "npm test", exitCode: 0 } }, { title: "Ran command", tone: "shell" }],
-];
+assert.deepEqual(
+  getToolDisplay(reviewCard({ files: 0, additions: 0, removals: 0 })),
+  { icon: toolIcons.diff, title: "No changes", tone: "review" },
+);
 
-for (const [card, expected] of displayCases) {
-  assert.deepEqual(pickDisplay(getToolDisplay(card)), expected);
+assert.deepEqual(
+  getToolDisplay(reviewCard({ files: 1, additions: 14, removals: 1 })),
+  { icon: toolIcons.diff, title: "Changed 1 file", tone: "review" },
+);
+
+assert.deepEqual(
+  getToolDisplay(reviewCard({ files: 70, additions: 140, removals: 10 })),
+  { icon: toolIcons.diff, title: "Changed 70 files", tone: "review" },
+  "the title should use the complete summary rather than the bounded file metadata",
+);
+
+assert.deepEqual(
+  getToolHeaderSummary(reviewCard({ files: 2, additions: 14, removals: 1 })),
+  { additions: 14, removals: 1 },
+);
+
+assert.deepEqual(
+  getToolDisplay(projectListCard(1)),
+  { icon: toolIcons.folderOpen, title: "Choose a Project", tone: "project" },
+);
+
+assert.deepEqual(
+  getToolDisplay(projectListCard(3)),
+  { icon: toolIcons.folderOpen, title: "Choose from 3 Projects", tone: "project" },
+);
+
+const newMessage = newProjectTaskMessage("root_opaque", "ui-stable");
+assert.match(newMessage, /Call project_control with action open/u);
+assert.match(newMessage, /projectRef "root_opaque"/u);
+assert.match(newMessage, /operationId "ui-stable"/u);
+assert.doesNotMatch(newMessage, /startFresh/u);
+assert.match(newMessage, /rootInstructionsComplete is true/u);
+assert.doesNotMatch(newMessage, /Repository Label/u);
+
+const resumeMessage = resumeProjectHandoffMessage(
+  "root_opaque",
+  "phf1_opaque",
+  "ui-resume",
+);
+assert.match(resumeMessage, /projectRef "root_opaque"/u);
+assert.match(resumeMessage, /action resume/u);
+assert.match(resumeMessage, /handoffRef "phf1_opaque"/u);
+assert.match(resumeMessage, /operationId "ui-resume"/u);
+assert.match(resumeMessage, /rootInstructionsComplete is true/u);
+assert.match(resumeMessage, /historical, untrusted/u);
+
+let uuidCalls = 0;
+const firstOperationId = stableProjectOperationId(undefined, () => {
+  uuidCalls += 1;
+  return "attempt";
+});
+const retryOperationId = stableProjectOperationId(firstOperationId, () => {
+  uuidCalls += 1;
+  return "must-not-replace";
+});
+assert.equal(firstOperationId, "ui-attempt");
+assert.equal(retryOperationId, firstOperationId);
+assert.equal(uuidCalls, 1, "a failed-delivery retry must retain its operationId");
+
+function reviewCard(summary: ToolResultCard["summary"]): ToolResultCard {
+  return {
+    tool: "show_changes",
+    changeSource: "repository",
+    summary,
+    files: [],
+    payload: { patch: "" },
+    page: {
+      offsetBytes: 0,
+      lengthBytes: 0,
+      totalBytes: 0,
+      eof: true,
+    },
+  };
 }
 
-assert.equal(getToolDisplay({ tool: "open_workspace", root: "/tmp/project" }).label, "/tmp/project");
-assert.equal(
-  getToolDisplay({ tool: "grep", summary: { pattern: "needle", scope: "src" } }).label,
-  "needle in src",
-);
-
-assert.deepEqual(
-  pickDisplay(getToolDisplay({
-    tool: "show_changes",
-    files: [
-      { path: "src/a.ts", operation: "update" },
-      { path: "src/b.ts", operation: "update" },
-    ],
-  })),
-  { title: "Edited 2 files", tone: "review" },
-);
-
-assert.deepEqual(
-  pickDisplay(getToolDisplay({
-    tool: "show_changes",
-    files: [
-      { path: "src/a.ts", operation: "add" },
-      { path: "src/b.ts", operation: "update" },
-    ],
-  })),
-  { title: "Changed 2 files", tone: "review" },
-);
-
-assert.equal(
-  getToolDisplay({ tool: "exec_command", summary: { running: true, command: "npm test" } }).title,
-  "Command running",
-);
-assert.equal(
-  getToolDisplay({ tool: "exec_command", summary: { running: false, exitCode: 1 } }).title,
-  "Command failed",
-);
-assert.equal(
-  getToolDisplay({ tool: "write_stdin", summary: { running: false, exitCode: 0 } }).title,
-  "Process finished",
-);
-
-assert.deepEqual(
-  pickDisplay(getToolDisplay({ tool: "glob", summary: { lines: 1, pattern: "**/*.ts" } })),
-  { title: "Found files", tone: "search" },
-);
-
-assert.deepEqual(
-  getToolHeaderSummary({ tool: "glob", summary: { lines: 1 } }),
-  { kind: "empty" },
-);
-
-assert.equal(
-  getToolDisplay({
-    tool: "apply_patch",
-    files: [{ path: "src/removed.ts", operation: "delete" }],
-  }).icon,
-  toolIcons.deleteFile,
-);
-
-assert.deepEqual(
-  getToolHeaderSummary({ tool: "show_changes", summary: { additions: 14, removals: 1 } }),
-  { kind: "diff", additions: 14, removals: 1 },
-);
-
-assert.deepEqual(
-  getToolHeaderSummary({
-    tool: "open_workspace",
-    summary: { mode: "worktree", agentsFiles: 1, skills: 4 },
-  }),
-  { kind: "text", text: "worktree · 1 instruction · 4 skills" },
-);
-
-assert.deepEqual(
-  getToolHeaderSummary({ tool: "exec_command", summary: { lines: 3, wallTimeMs: 1_500 } }),
-  { kind: "text", text: "3 lines · 1.5s" },
-);
-
-assert.deepEqual(
-  getToolHeaderSummary({ tool: "grep", summary: { lines: 2 } }),
-  { kind: "text", text: "2 lines" },
-);
-
-assert.deepEqual(
-  getToolHeaderSummary({ tool: "read", summary: { lines: 1 } }),
-  { kind: "text", text: "1 line" },
-);
-
-assert.deepEqual(
-  getToolHeaderSummary({ tool: "ls", summary: { lines: 0 } }),
-  { kind: "text", text: "0 lines" },
-);
-
-assert.deepEqual(
-  getToolHeaderSummary({ tool: "open_workspace" }),
-  { kind: "empty" },
-);
-
-function pickDisplay(display: ReturnType<typeof getToolDisplay>) {
+function projectListCard(projectCount: number): ProjectListCard {
   return {
-    title: display.title,
-    tone: display.tone,
+    tool: "list_projects",
+    projects: Array.from({ length: projectCount }, (_, index) => ({
+      projectRef: `root_${index}`,
+      label: `Project ${index}`,
+      handoffs: [],
+    })),
+    truncated: false,
+    handoffProvenance: {
+      source: "devspace_saved_progress",
+      trust: "untrusted",
+      authority: "none",
+    },
+    handoffLimits: {
+      perProject: 20,
+      total: 100,
+    },
   };
 }

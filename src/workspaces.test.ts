@@ -1,43 +1,45 @@
-import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
+import {
+  mkdtemp,
+  mkdir,
+  realpath,
+  rename,
+  rm,
+  stat,
+  symlink,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { platform, tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import { promisify } from "node:util";
 import assert from "node:assert/strict";
 import Database from "better-sqlite3";
 import { loadConfig } from "./config.js";
 import { databasePath, openDatabase } from "./db/client.js";
-import { GitWorktreeError, removeManagedWorktree } from "./git-worktrees.js";
 import { MAX_PROJECT_INSTRUCTION_BYTES } from "./project-instructions.js";
 import { SqliteWorkspaceStore, type WorkspaceStore } from "./workspace-store.js";
 import {
-  ensureCheckoutWorkspaceRoot,
   InstructionBudgetError,
   UnknownWorkspaceError,
-  WorkspaceQuotaError,
-  WorkspaceRecoveryRequiredError,
   WorkspaceRegistry,
-  WorkspaceSelectionRequiredError,
 } from "./workspaces.js";
 import { formatPathForPrompt } from "./skills.js";
 
-const execFileAsync = promisify(execFile);
 const root = await mkdtemp(join(tmpdir(), "devspace-workspace-test-"));
 const outsideRoot = await mkdtemp(join(tmpdir(), "devspace-workspace-outside-test-"));
 const canonicalRoot = await realpath(root);
-const connectionPrincipalId = "client-a";
+const connectionPrincipalId = "owner";
+const originalHome = process.env.HOME;
+const originalUserProfile = process.env.USERPROFILE;
 
 assert.equal(
   new UnknownWorkspaceError("ws_old").message,
-  "The workspace is no longer available.",
-);
-assert.equal(
-  new WorkspaceQuotaError("managed_worktree_quota", "Safe quota message").code,
-  "managed_worktree_quota",
+  "The Project execution runtime is no longer available.",
 );
 assert.equal(new InstructionBudgetError("internal path details").publicText.includes("path"), false);
 
 try {
+  process.env.HOME = canonicalRoot;
+  process.env.USERPROFILE = canonicalRoot;
   const agentDir = join(root, ".pi", "agent");
   await mkdir(agentDir, { recursive: true });
   if (platform() === "win32") {
@@ -73,20 +75,6 @@ try {
     mutableOpenAiMetadata,
     "interface:\n  display_name: Before discovery\npolicy:\n  allow_implicit_invocation: false\n",
   );
-  await mkdir(join(root, ".devspace", "agents"), { recursive: true });
-  await writeFile(
-    join(root, ".devspace", "agents", "reviewer.md"),
-    [
-      "---",
-      "name: reviewer",
-      "description: Read-only project reviewer.",
-      "provider: codex",
-      "---",
-      "",
-      "Review only.",
-      "",
-    ].join("\n"),
-  );
   await mkdir(join(root, "nested"));
   await writeFile(join(root, "nested", "AGENTS.md"), "nested instructions\n");
   await writeFile(join(root, "nested", "file.txt"), "hello\n");
@@ -94,10 +82,8 @@ try {
   const config = loadConfig({
     DEVSPACE_CONFIG_DIR: join(root, ".devspace-home"),
     DEVSPACE_ALLOWED_ROOTS: root,
-    DEVSPACE_WORKTREE_ROOT: join(root, ".devspace", "worktrees"),
     DEVSPACE_SKILL_PATHS: join(agentDir, "skills"),
     DEVSPACE_USER_INSTRUCTIONS_PATH: userInstructionsPath,
-    DEVSPACE_SUBAGENTS: "1",
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
     PORT: "1",
   });
@@ -110,6 +96,45 @@ try {
   assert.deepEqual(
     [pendingCreator.reused, pendingWaiter.reused].sort(),
     [false, true],
+  );
+
+  const managedWorktreeRoot = join(
+    config.stateDir,
+    "worktrees",
+    "project-test",
+    "thread-test",
+  );
+  await mkdir(managedWorktreeRoot, { recursive: true });
+  await writeFile(join(managedWorktreeRoot, "AGENTS.md"), "managed worktree instructions\n");
+  const managedRegistry = new WorkspaceRegistry(config);
+  const managedContext = await managedRegistry.openManagedProjectExecution(
+    connectionPrincipalId,
+    {
+      executionId: "managed-execution",
+      sourceRoot: root,
+      worktreeRoot: managedWorktreeRoot,
+      writeAccess: "read_write",
+    },
+    [root],
+  );
+  assert.equal(managedContext.workspace.root, await realpath(managedWorktreeRoot));
+  assert.equal(managedContext.workspace.writeAccess, "read_write");
+  assert.deepEqual(
+    managedContext.agentsFiles.map((file) => file.content),
+    ["global override instructions\n", "managed worktree instructions\n"],
+  );
+  await assert.rejects(
+    managedRegistry.openManagedProjectExecution(
+      connectionPrincipalId,
+      {
+        executionId: "escaped-managed-execution",
+        sourceRoot: root,
+        worktreeRoot: outsideRoot,
+        writeAccess: "read_write",
+      },
+      [root],
+    ),
+    /outside the trusted state root/,
   );
 
   const pendingAliasStore = createTestWorkspaceStore(join(root, ".pending-alias-state"));
@@ -128,16 +153,19 @@ try {
   ]);
   assert.equal(
     pendingAliasResults.filter((result) => result.status === "fulfilled").length,
-    1,
+    2,
+  );
+  const pendingAliasContexts = pendingAliasResults.flatMap((result) =>
+    result.status === "fulfilled" ? [result.value] : []
+  );
+  assert.notEqual(
+    pendingAliasContexts[0]?.workspace.id,
+    pendingAliasContexts[1]?.workspace.id,
   );
   assert.equal(
-    pendingAliasResults.filter((result) => result.status === "rejected").length,
-    1,
+    pendingAliasContexts[0]?.workspace.root,
+    pendingAliasContexts[1]?.workspace.root,
   );
-  const pendingAliasRejection = pendingAliasResults.find((result) => result.status === "rejected");
-  assert.match(String(
-    pendingAliasRejection?.status === "rejected" ? pendingAliasRejection.reason : "",
-  ), /alias/i);
   pendingAliasStore.close();
 
   const pendingAccessStore = createTestWorkspaceStore(join(root, ".pending-access-state"));
@@ -187,10 +215,6 @@ try {
   assert.equal(concurrentCheckoutB.workspace.id, workspace.id);
   assert.equal(concurrentCheckoutA.reused, true);
   assert.equal(concurrentCheckoutB.reused, true);
-  const otherOwnerCheckout = await registry.openWorkspace("client-b", root);
-  assert.notEqual(otherOwnerCheckout.workspace.id, workspace.id);
-  assert.equal(otherOwnerCheckout.skillRevision, skillRevision);
-
   const generationRegistry = new WorkspaceRegistry({ ...config, allowedRoots: [root] });
   const generationWorkspace = (await generationRegistry.openWorkspace(connectionPrincipalId, root)).workspace;
   const generationBeforeRootChange = generationWorkspace.stateGeneration;
@@ -202,7 +226,7 @@ try {
       generationWorkspace.id,
       generationBeforeRootChange,
     ),
-    /generation is stale/,
+    /Project execution runtime is stale/,
   );
 
   const rediscoveredSkills = await new WorkspaceRegistry(config).openWorkspace(connectionPrincipalId, root);
@@ -351,7 +375,7 @@ try {
   assert.equal(hotReloadStore.getSession(revokedWorkspace.id, connectionPrincipalId), undefined);
   assert.throws(
     () => hotReloadRegistry.getWorkspace(connectionPrincipalId, revokedWorkspace.id),
-    /workspace is no longer available/,
+    /Project execution runtime is no longer available/,
   );
   await assert.rejects(
     hotReloadRegistry.openWorkspace(connectionPrincipalId, root),
@@ -359,8 +383,8 @@ try {
       const message = error instanceof Error ? error.message : String(error);
       assert.match(message, /outside allowed roots/);
       assert.match(message, /original approved project path/);
-      assert.match(message, /mode="worktree"/);
-      assert.match(message, /do not open DevSpace's internal worktree directory/);
+      assert.match(message, /add its project root/);
+      assert.doesNotMatch(message, /worktree/);
       return true;
     },
   );
@@ -417,7 +441,7 @@ try {
   assert.equal(retryStore.getSession(retryWorkspace.id, connectionPrincipalId), undefined);
   assert.throws(
     () => retryRegistry.getWorkspace(connectionPrincipalId, retryWorkspace.id),
-    /workspace is no longer available/,
+    /Project execution runtime is no longer available/,
   );
   retryStore.close();
 
@@ -448,13 +472,17 @@ try {
   leasedHotReloadRegistry.applyAllowedRoots([outsideRoot]);
   assert.throws(
     () => leasedHotReloadRegistry.getWorkspace(connectionPrincipalId, leasedHotReloadWorkspace.id),
-    /workspace is no longer available/,
+    /Project execution runtime is no longer available/,
   );
   releaseHotReloadOperation();
   assert.equal(await leasedHotReloadOperation, "finished");
 
   const lifecycleRegistry = new WorkspaceRegistry(config);
   const lifecycleWorkspace = (await lifecycleRegistry.openWorkspace(connectionPrincipalId, root)).workspace;
+  assert.equal(
+    lifecycleRegistry.workspaceBusy(connectionPrincipalId, lifecycleWorkspace.id),
+    false,
+  );
   let releaseOperation!: () => void;
   let operationStarted!: () => void;
   const operationStartedPromise = new Promise<void>((resolve) => {
@@ -474,6 +502,10 @@ try {
     },
   );
   await operationStartedPromise;
+  assert.equal(
+    lifecycleRegistry.workspaceBusy(connectionPrincipalId, lifecycleWorkspace.id),
+    true,
+  );
   const exclusiveClosePromise = lifecycleRegistry.acquireExclusiveClose(connectionPrincipalId, lifecycleWorkspace.id);
   await assert.rejects(
     lifecycleRegistry.withWorkspaceOperation(
@@ -512,7 +544,7 @@ try {
   assert.equal(committedClose.commit(), true);
   assert.throws(
     () => lifecycleRegistry.getWorkspace(connectionPrincipalId, lifecycleWorkspace.id),
-    /workspace is no longer available/,
+    /Project execution runtime is no longer available/,
   );
   const leaseDeleteStore = createTestWorkspaceStore(join(root, ".lease-delete-state"));
   const leaseDeleteRegistry = new WorkspaceRegistry(config, leaseDeleteStore);
@@ -526,7 +558,6 @@ try {
   assert.equal(leaseDeleteStore.deleteSession(leaseDeleteWorkspace.id, connectionPrincipalId), false);
   leaseDeleteStore.close();
 
-  assert.equal(workspace.mode, "checkout");
   assert.deepEqual(
     agentsFiles.map((file) => file.content),
     ["global override instructions\n", "root instructions\n"],
@@ -548,7 +579,7 @@ try {
       "code" in error &&
       error.code === "skill_not_loaded" &&
       "publicText" in error &&
-      error.publicText === "Call load_skill for this workspace, then retry.",
+      error.publicText === "Call skills with action=load for the selected Project, then retry.",
   );
   const workspaceSkillReference = join(workspaceSkill.baseDir, "reference.md");
   const workspaceSkillUri = `skill://${workspaceSkill.skillId}/reference.md`;
@@ -634,7 +665,7 @@ try {
   const priorityInstructions = await registry.loadApplicableAgentsFiles(
     workspace,
     ["instruction-priority/file.txt"],
-    { contextSessionId: instructionContextId },
+    { instructionContextId },
   );
   assert.deepEqual(
     priorityInstructions.map((file) => ({ path: file.path, content: file.content })),
@@ -647,7 +678,7 @@ try {
   const priorityFallbackInstructions = await registry.loadApplicableAgentsFiles(
     workspace,
     ["instruction-priority/file.txt"],
-    { contextSessionId: instructionContextId },
+    { instructionContextId },
   );
   assert.deepEqual(
     priorityFallbackInstructions.map((file) => ({ path: file.path, content: file.content })),
@@ -655,6 +686,17 @@ try {
       path: join(canonicalRoot, "instruction-priority", "AGENTS.md"),
       content: "ordinary instructions\n",
     }],
+  );
+  const claudeOnlyDirectory = join(root, "claude-only-instructions");
+  await mkdir(claudeOnlyDirectory);
+  await writeFile(join(claudeOnlyDirectory, "CLAUDE.md"), "must remain ordinary repository data\n");
+  assert.deepEqual(
+    await registry.loadApplicableAgentsFiles(
+      workspace,
+      ["claude-only-instructions/file.txt"],
+      { instructionContextId },
+    ),
+    [],
   );
 
   const fallbackProject = join(root, "fallback-project");
@@ -693,7 +735,7 @@ try {
   const nestedFallback = await fallbackRegistry.loadApplicableAgentsFiles(
     fallbackOpen.workspace,
     ["nested/file.txt"],
-    { contextSessionId: fallbackInstructionContextId },
+    { instructionContextId: fallbackInstructionContextId },
   );
   assert.deepEqual(
     nestedFallback.map((file) => ({ path: file.path, content: file.content })),
@@ -782,24 +824,28 @@ try {
     ),
     MAX_PROJECT_INSTRUCTION_BYTES,
   );
-  await assert.rejects(
-    budgetRegistry.openWorkspace(connectionPrincipalId, beyondBudgetProject),
-    new RegExp(`instruction chain exceeds the ${MAX_PROJECT_INSTRUCTION_BYTES}-byte UTF-8 limit`),
+  const beyondBudgetOpen = await budgetRegistry.openWorkspace(
+    connectionPrincipalId,
+    beyondBudgetProject,
+  );
+  assert.equal(
+    beyondBudgetOpen.agentsFiles.reduce(
+      (bytes, file) => bytes + Buffer.byteLength(file.content, "utf8"),
+      0,
+    ),
+    MAX_PROJECT_INSTRUCTION_BYTES + 1,
   );
 
   const nestedRootContent = "p".repeat(17);
-  const nestedContent = "n".repeat(
-    MAX_PROJECT_INSTRUCTION_BYTES -
-      Buffer.byteLength(globalBudgetContent, "utf8") -
-      Buffer.byteLength(nestedRootContent, "utf8"),
-  );
+  const instructionDeltaBytes = 12 * 1024;
+  const nestedContent = "n".repeat(instructionDeltaBytes);
   await writeFile(join(nestedBudgetProject, "AGENTS.md"), nestedRootContent);
   await writeFile(join(nestedBudgetProject, "nested", "AGENTS.md"), nestedContent);
   const nestedBudgetOpen = await budgetRegistry.openWorkspace(connectionPrincipalId, nestedBudgetProject);
   const nestedBudgetContextId = budgetRegistry.createInstructionContext(
     nestedBudgetOpen.workspace,
   );
-  await budgetRegistry.markAgentsFilesDelivered(
+  await budgetRegistry.markRootAgentsFilesAcknowledged(
     nestedBudgetOpen.workspace,
     nestedBudgetContextId,
     nestedBudgetOpen.agentsFiles,
@@ -807,7 +853,7 @@ try {
   const exactNestedInstructions = await budgetRegistry.loadApplicableAgentsFiles(
     nestedBudgetOpen.workspace,
     ["nested/file.txt"],
-    { contextSessionId: nestedBudgetContextId },
+    { instructionContextId: nestedBudgetContextId },
   );
   assert.deepEqual(exactNestedInstructions.map((file) => file.content), [nestedContent]);
   await budgetRegistry.markAgentsFilesDelivered(
@@ -818,40 +864,35 @@ try {
   const exactNestedAcknowledgement = await budgetRegistry.loadApplicableAgentsFiles(
     nestedBudgetOpen.workspace,
     ["nested/file.txt"],
-    { contextSessionId: nestedBudgetContextId, requireAcknowledged: true },
+    { instructionContextId: nestedBudgetContextId, requireAcknowledged: true },
   );
-  const exactNestedToken = await budgetRegistry.createInstructionAcknowledgement(
+  await budgetRegistry.markAgentsFilesAcknowledged(
     nestedBudgetOpen.workspace,
     nestedBudgetContextId,
     exactNestedAcknowledgement,
-  );
-  await budgetRegistry.acknowledgeInstructions(
-    nestedBudgetOpen.workspace,
-    nestedBudgetContextId,
-    exactNestedToken,
   );
   await writeFile(join(nestedBudgetProject, "nested", "AGENTS.md"), `${nestedContent}x`);
   await assert.rejects(
     budgetRegistry.loadApplicableAgentsFiles(
       nestedBudgetOpen.workspace,
       ["nested/file.txt"],
-      { contextSessionId: nestedBudgetContextId },
+      { instructionContextId: nestedBudgetContextId },
     ),
-    new RegExp(`instruction chain exceeds the ${MAX_PROJECT_INSTRUCTION_BYTES}-byte UTF-8 limit`),
+    new RegExp(`instruction response exceeds the ${instructionDeltaBytes}-byte UTF-8 limit`),
   );
   await assert.rejects(
     budgetRegistry.loadApplicableAgentsFiles(
       nestedBudgetOpen.workspace,
       ["nested/file.txt"],
-      { contextSessionId: nestedBudgetContextId, requireAcknowledged: true },
+      { instructionContextId: nestedBudgetContextId, requireAcknowledged: true },
     ),
-    /nested[/\\]AGENTS\.md requires .*total 32769 bytes/,
+    new RegExp(`instruction response exceeds the ${instructionDeltaBytes}-byte UTF-8 limit`),
   );
 
   const nestedInstructions = await registry.loadApplicableAgentsFiles(
     workspace,
     ["nested/file.txt"],
-    { contextSessionId: instructionContextId },
+    { instructionContextId },
   );
   assert.deepEqual(nestedInstructions.map(({ path, content }) => ({ path, content })), [{
     path: join(canonicalRoot, "nested", "AGENTS.md"),
@@ -862,7 +903,7 @@ try {
     await registry.loadApplicableAgentsFiles(
       workspace,
       ["nested/file.txt"],
-      { contextSessionId: instructionContextId },
+      { instructionContextId },
     ),
     [],
   );
@@ -870,7 +911,7 @@ try {
   const updatedNestedInstructions = await registry.loadApplicableAgentsFiles(
     workspace,
     ["nested/file.txt"],
-    { contextSessionId: instructionContextId },
+    { instructionContextId },
   );
   assert.deepEqual(
     updatedNestedInstructions.map((file) => file.content),
@@ -884,19 +925,18 @@ try {
   const mutationInstructions = await registry.loadApplicableAgentsFiles(
     workspace,
     ["nested/file.txt"],
-    { contextSessionId: instructionContextId, requireAcknowledged: true },
+    { instructionContextId, requireAcknowledged: true },
   );
   assert.equal(mutationInstructions.length, 3);
   const generationBeforeAcknowledgement = registry.instructionAcknowledgementGeneration(
     workspace,
     instructionContextId,
   );
-  const instructionToken = await registry.createInstructionAcknowledgement(
+  await registry.markAgentsFilesAcknowledged(
     workspace,
     instructionContextId,
     mutationInstructions,
   );
-  await registry.acknowledgeInstructions(workspace, instructionContextId, instructionToken);
   assert.equal(
     registry.instructionAcknowledgementGeneration(workspace, instructionContextId),
     generationBeforeAcknowledgement + 1,
@@ -905,32 +945,13 @@ try {
     await registry.loadApplicableAgentsFiles(
       workspace,
       ["nested/file.txt"],
-      { contextSessionId: instructionContextId, requireAcknowledged: true },
+      { instructionContextId, requireAcknowledged: true },
     ),
     [],
   );
-  await assert.rejects(
-    registry.acknowledgeInstructions(workspace, instructionContextId, instructionToken),
-    /instruction token is no longer valid/,
-  );
-  const currentWorkspace = registry.getWorkspace(connectionPrincipalId, workspace.id);
-  const expiringToken = await registry.createInstructionAcknowledgement(
-    currentWorkspace,
-    instructionContextId,
-    [],
-  );
-  currentWorkspace.instructionContexts
-    .get(instructionContextId)!
-    .pendingAcknowledgements
-    .get(expiringToken)!.createdAt = 0;
   assert.deepEqual(registry.cleanupLifecycleState(), {
-    expiredInstructionTokens: 1,
     deletedClosedWorkspaceSessions: 0,
   });
-  await assert.rejects(
-    registry.acknowledgeInstructions(currentWorkspace, instructionContextId, expiringToken),
-    /instruction token is no longer valid/,
-  );
 
   const lateInstructionDir = join(root, "late-instructions");
   await mkdir(lateInstructionDir);
@@ -938,7 +959,7 @@ try {
     await registry.loadApplicableAgentsFiles(
       workspace,
       ["late-instructions/new.txt"],
-      { contextSessionId: instructionContextId },
+      { instructionContextId },
     ),
     [],
   );
@@ -946,7 +967,7 @@ try {
   const lateInstructions = await registry.loadApplicableAgentsFiles(
     workspace,
     ["late-instructions/new.txt"],
-    { contextSessionId: instructionContextId },
+    { instructionContextId },
   );
   assert.deepEqual(lateInstructions.map(({ path, content }) => ({ path, content })), [
     { path: join(canonicalRoot, "late-instructions", "AGENTS.md"), content: "late instructions\n" },
@@ -955,34 +976,18 @@ try {
   const lateMutationInstructions = await registry.loadApplicableAgentsFiles(
     workspace,
     ["late-instructions/new.txt"],
-    { contextSessionId: instructionContextId, requireAcknowledged: true },
+    { instructionContextId, requireAcknowledged: true },
   );
   await writeFile(join(lateInstructionDir, "AGENTS.md"), "changed before token\n");
   await assert.rejects(
-    registry.createInstructionAcknowledgement(
+    registry.markAgentsFilesAcknowledged(
       workspace,
       instructionContextId,
       lateMutationInstructions,
     ),
-    /changed while preparing instructionToken/,
+    /changed while acknowledging context/,
   );
-  assert.throws(() => registry.getWorkspace("client-b", workspace.id), /workspace is no longer available/);
-  assert.deepEqual(
-    workspace.agentProfiles.map((profile) => ({
-      name: profile.name,
-      description: profile.description,
-      provider: profile.provider,
-      body: profile.body,
-    })),
-    [
-      {
-        name: "reviewer",
-        description: "Read-only project reviewer.",
-        provider: "codex",
-        body: "Review only.",
-      },
-    ],
-  );
+  assert.throws(() => registry.getWorkspace("not-owner", workspace.id), /Project execution runtime is no longer available/);
 
   if (platform() !== "win32") {
     const canonicalScope = join(root, "canonical-scope");
@@ -994,7 +999,7 @@ try {
     const symlinkInstructions = await registry.loadApplicableAgentsFiles(
       workspace,
       ["scope-link/file.txt"],
-      { contextSessionId: instructionContextId },
+      { instructionContextId },
     );
     assert.deepEqual(
       symlinkInstructions.map(({ path, content }) => ({ path, content })),
@@ -1003,6 +1008,90 @@ try {
         { path: join(canonicalRoot, "canonical-scope", "deep", "AGENTS.md"), content: "canonical deep instructions\n" },
       ],
     );
+
+    const instructionFileRaceDirectory = join(root, "instruction-file-race");
+    const instructionFileRacePath = join(instructionFileRaceDirectory, "AGENTS.md");
+    const instructionFileRaceOriginal = join(instructionFileRaceDirectory, "AGENTS.original.md");
+    await mkdir(instructionFileRaceDirectory);
+    await writeFile(instructionFileRacePath, "safe file-race instructions\n");
+    await writeFile(join(instructionFileRaceDirectory, "file.txt"), "inside\n");
+    const canonicalInstructionFileRacePath = await realpath(instructionFileRacePath);
+    let instructionFileRaceArmed = false;
+    let instructionFileRaceTriggered = false;
+    const instructionFileRaceConfig = {
+      ...config,
+      instructionIoHooksForTests: {
+        beforeFileOpen: async (path: string) => {
+          if (
+            !instructionFileRaceArmed ||
+            instructionFileRaceTriggered ||
+            path !== canonicalInstructionFileRacePath
+          ) return;
+          instructionFileRaceTriggered = true;
+          await rename(instructionFileRacePath, instructionFileRaceOriginal);
+          await symlink(join(outsideRoot, "secret.txt"), instructionFileRacePath);
+        },
+      },
+    };
+    const instructionFileRaceRegistry = new WorkspaceRegistry(instructionFileRaceConfig);
+    const instructionFileRaceWorkspace = (
+      await instructionFileRaceRegistry.openWorkspace(connectionPrincipalId, root)
+    ).workspace;
+    instructionFileRaceArmed = true;
+    const instructionFileRaceError = await instructionFileRaceRegistry.loadApplicableAgentsFiles(
+      instructionFileRaceWorkspace,
+      ["instruction-file-race/file.txt"],
+    ).then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    assert.equal(instructionFileRaceTriggered, true);
+    assert.ok(instructionFileRaceError instanceof Error);
+    assert.doesNotMatch(String(instructionFileRaceError), /outside secret/u);
+    await unlink(instructionFileRacePath);
+    await rename(instructionFileRaceOriginal, instructionFileRacePath);
+
+    const instructionDirectoryRacePath = join(root, "instruction-directory-race");
+    const instructionDirectoryRaceOriginal = join(root, "instruction-directory-race-original");
+    await mkdir(instructionDirectoryRacePath);
+    await writeFile(join(instructionDirectoryRacePath, "AGENTS.md"), "safe directory-race instructions\n");
+    await writeFile(join(instructionDirectoryRacePath, "file.txt"), "inside\n");
+    const canonicalInstructionDirectoryRacePath = await realpath(instructionDirectoryRacePath);
+    let instructionDirectoryRaceArmed = false;
+    let instructionDirectoryRaceTriggered = false;
+    const instructionDirectoryRaceConfig = {
+      ...config,
+      instructionIoHooksForTests: {
+        beforeDirectoryRead: async (path: string) => {
+          if (
+            !instructionDirectoryRaceArmed ||
+            instructionDirectoryRaceTriggered ||
+            path !== canonicalInstructionDirectoryRacePath
+          ) return;
+          instructionDirectoryRaceTriggered = true;
+          await rename(instructionDirectoryRacePath, instructionDirectoryRaceOriginal);
+          await symlink(outsideRoot, instructionDirectoryRacePath);
+        },
+      },
+    };
+    const instructionDirectoryRaceRegistry = new WorkspaceRegistry(instructionDirectoryRaceConfig);
+    const instructionDirectoryRaceWorkspace = (
+      await instructionDirectoryRaceRegistry.openWorkspace(connectionPrincipalId, root)
+    ).workspace;
+    instructionDirectoryRaceArmed = true;
+    const instructionDirectoryRaceError =
+      await instructionDirectoryRaceRegistry.loadApplicableAgentsFiles(
+        instructionDirectoryRaceWorkspace,
+        ["instruction-directory-race/file.txt"],
+      ).then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+    assert.equal(instructionDirectoryRaceTriggered, true);
+    assert.ok(instructionDirectoryRaceError instanceof Error);
+    assert.doesNotMatch(String(instructionDirectoryRaceError), /outside secret/u);
+    await unlink(instructionDirectoryRacePath);
+    await rename(instructionDirectoryRaceOriginal, instructionDirectoryRacePath);
 
     const missingInstructionsConfig = loadConfig({
       DEVSPACE_CONFIG_DIR: join(root, ".missing-user-instructions-home"),
@@ -1036,215 +1125,19 @@ try {
   }
 
   const missingWorkspaceRoot = join(root, "missing", "workspace");
-  const missingWorkspace = await registry.openWorkspace(connectionPrincipalId, missingWorkspaceRoot);
-  assert.equal(missingWorkspace.workspace.root, await realpath(missingWorkspaceRoot));
-  assert.equal(missingWorkspace.workspace.mode, "checkout");
-  assert.equal((await stat(missingWorkspaceRoot)).isDirectory(), true);
-
-  {
-    let mkdirCalls = 0;
-    const existingStats = await ensureCheckoutWorkspaceRoot(root, {
-      stat: async (path) => {
-        assert.equal(path, root);
-        return await stat(path);
-      },
-      mkdir: async () => {
-        mkdirCalls += 1;
-      },
-    });
-    assert.equal(existingStats.isDirectory(), true);
-    assert.equal(mkdirCalls, 0);
-  }
+  await assert.rejects(
+    registry.openWorkspace(connectionPrincipalId, missingWorkspaceRoot),
+    /ENOENT/,
+  );
+  await assert.rejects(stat(missingWorkspaceRoot), /ENOENT/);
 
   await assert.rejects(
-    () => registry.openWorkspace(connectionPrincipalId, { path: root, mode: "worktree" }),
-    (error: unknown) =>
-      error instanceof GitWorktreeError && error.code === "GIT_REPOSITORY_NOT_FOUND",
+    () => registry.openWorkspace(
+      connectionPrincipalId,
+      { path: root, mode: "worktree" } as never,
+    ),
+    /Project mode selection is not supported/,
   );
-
-  const gitRoot = join(root, "git-project");
-  await mkdir(gitRoot);
-  await writeFile(join(gitRoot, "AGENTS.md"), "git root instructions\n");
-  await writeFile(join(gitRoot, "README.md"), "hello\n");
-  await git(gitRoot, ["init"]);
-  await git(gitRoot, ["config", "user.email", "devspace@example.com"]);
-  await git(gitRoot, ["config", "user.name", "DevSpace Test"]);
-  await git(gitRoot, ["add", "."]);
-  await git(gitRoot, ["commit", "-m", "Initial commit"]);
-  await writeFile(join(gitRoot, "dirty.txt"), "not copied\n");
-
-  const worktreeWorkspace = await registry.openWorkspace(connectionPrincipalId, {
-    path: gitRoot,
-    mode: "worktree",
-  });
-  assert.equal(worktreeWorkspace.workspace.mode, "worktree");
-  assert.notEqual(worktreeWorkspace.workspace.root, gitRoot);
-  assert.match(worktreeWorkspace.workspace.root, /git-project-[a-f0-9]{8}$/);
-  assert.equal(worktreeWorkspace.workspace.sourceRoot, await realpath(gitRoot));
-  assert.equal(worktreeWorkspace.workspace.worktree?.baseRef, "HEAD");
-  assert.equal(worktreeWorkspace.workspace.worktree?.dirtySource, true);
-  assert.equal(worktreeWorkspace.workspace.worktree?.managed, true);
-  assert.equal(worktreeWorkspace.workspace.alias, "git-project");
-  assert.equal((await stat(worktreeWorkspace.workspace.root)).isDirectory(), true);
-  assert.match(worktreeWorkspace.agentsFiles.map((file) => file.content).join("\n"), /global override instructions/);
-  assert.match(worktreeWorkspace.agentsFiles.map((file) => file.content).join("\n"), /git root instructions/);
-
-  await writeFile(join(gitRoot, "head-advanced.txt"), "new source commit\n");
-  await git(gitRoot, ["add", "head-advanced.txt"]);
-  await git(gitRoot, ["commit", "-m", "Advance source head"]);
-  const reopenedAfterHeadMove = await registry.openWorkspace(connectionPrincipalId, {
-    path: gitRoot,
-    mode: "worktree",
-  });
-  assert.equal(reopenedAfterHeadMove.workspace.id, worktreeWorkspace.workspace.id);
-  assert.equal(reopenedAfterHeadMove.workspace.alias, worktreeWorkspace.workspace.alias);
-
-  const secondConversationWorktree = await registry.openWorkspace(connectionPrincipalId, {
-    path: gitRoot,
-    mode: "worktree",
-    alias: "git-project-second",
-    forceNew: true,
-  });
-  assert.notEqual(secondConversationWorktree.workspace.id, worktreeWorkspace.workspace.id);
-  await writeFile(join(gitRoot, "head-advanced-again.txt"), "another source commit\n");
-  await git(gitRoot, ["add", "head-advanced-again.txt"]);
-  await git(gitRoot, ["commit", "-m", "Advance source head again"]);
-  await assert.rejects(
-    registry.openWorkspace(connectionPrincipalId, { path: gitRoot, mode: "worktree" }),
-    (error: unknown) =>
-      error instanceof WorkspaceSelectionRequiredError &&
-      error.aliases.includes("git-project") &&
-      error.aliases.includes("git-project-second"),
-  );
-
-  const cappedConfig = loadConfig({
-    DEVSPACE_CONFIG_DIR: join(root, ".devspace-capped-home"),
-    DEVSPACE_ALLOWED_ROOTS: root,
-    DEVSPACE_WORKTREE_ROOT: join(root, ".devspace", "capped-worktrees"),
-    DEVSPACE_MAX_MANAGED_WORKTREES: "1",
-    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
-    PORT: "1",
-  });
-  const cappedStore = createTestWorkspaceStore(join(root, ".capped-state"));
-  const cappedRegistry = new WorkspaceRegistry(cappedConfig, cappedStore);
-  const concurrentWorktrees = await Promise.allSettled([
-    cappedRegistry.openWorkspace(connectionPrincipalId, { path: gitRoot, mode: "worktree" }),
-    cappedRegistry.openWorkspace(connectionPrincipalId, { path: gitRoot, mode: "worktree" }),
-  ]);
-  assert.equal(concurrentWorktrees.filter((result) => result.status === "fulfilled").length, 2);
-  const cappedContexts = concurrentWorktrees.map((result) => {
-    assert.equal(result.status, "fulfilled");
-    return result.value;
-  });
-  assert.equal(cappedContexts[0]!.workspace.id, cappedContexts[1]!.workspace.id);
-  const cappedWorkspace = cappedContexts[0]!.workspace;
-  await writeFile(join(cappedWorkspace.root, "recoverable-commit.txt"), "persisted commit\n");
-  await git(cappedWorkspace.root, ["add", "recoverable-commit.txt"]);
-  await git(cappedWorkspace.root, ["commit", "-m", "Persist worktree state"]);
-  const recoverableHead = (await execFileAsync(
-    "git",
-    ["rev-parse", "HEAD"],
-    { cwd: cappedWorkspace.root },
-  )).stdout.trim();
-  let releaseRecoveryOperation!: () => void;
-  let markRecoveryOperationStarted!: () => void;
-  const recoveryOperationBarrier = new Promise<void>((resolve) => {
-    releaseRecoveryOperation = resolve;
-  });
-  const recoveryOperationStarted = new Promise<void>((resolve) => {
-    markRecoveryOperationStarted = resolve;
-  });
-  const activeRecoveryOperation = cappedRegistry.withWorkspaceOperation(
-    connectionPrincipalId,
-    cappedWorkspace.id,
-    cappedWorkspace.stateGeneration,
-    async () => {
-      markRecoveryOperationStarted();
-      await recoveryOperationBarrier;
-    },
-    "write",
-  );
-  await recoveryOperationStarted;
-  await assert.rejects(
-    cappedRegistry.openWorkspace(connectionPrincipalId, { path: gitRoot, mode: "worktree", forceNew: true }),
-    /Managed worktree limit reached/,
-  );
-  await rm(cappedConfig.worktreeRoot, { recursive: true, force: true });
-  const recoverableSummary = cappedRegistry.listWorkspaces(connectionPrincipalId)
-    .find((summary) => summary.alias === cappedWorkspace.alias);
-  assert.equal(recoverableSummary?.hydrationStatus, "recovery_required");
-  await assert.rejects(
-    cappedRegistry.resumeWorkspace(connectionPrincipalId, cappedWorkspace.alias),
-    (error: unknown) => error instanceof WorkspaceRecoveryRequiredError,
-  );
-  releaseRecoveryOperation();
-  await activeRecoveryOperation;
-  await mkdir(cappedWorkspace.root, { recursive: true });
-  assert.equal(
-    cappedRegistry.listWorkspaces(connectionPrincipalId)
-      .find((summary) => summary.alias === cappedWorkspace.alias)
-      ?.hydrationStatus,
-    "recovery_required",
-  );
-  await assert.rejects(
-    cappedRegistry.resumeWorkspace(connectionPrincipalId, cappedWorkspace.alias),
-    (error: unknown) =>
-      error instanceof WorkspaceRecoveryRequiredError &&
-      /no longer registered as the original Git worktree/.test(error.message),
-  );
-  await rm(cappedWorkspace.root, { recursive: true, force: true });
-  assert.equal(cappedStore.countManagedWorktrees(), 1);
-  const recoveredCapped = await cappedRegistry.resumeWorkspace(
-    connectionPrincipalId,
-    cappedWorkspace.alias,
-  );
-  assert.equal(recoveredCapped.workspace.id, cappedWorkspace.id);
-  assert.equal(recoveredCapped.workspace.alias, cappedWorkspace.alias);
-  assert.deepEqual(recoveredCapped.recovery, {
-    kind: "managed_worktree_recreated",
-    dataLossPossible: true,
-  });
-  assert.equal((await stat(recoveredCapped.workspace.root)).isDirectory(), true);
-  assert.equal(
-    await readFile(join(recoveredCapped.workspace.root, "recoverable-commit.txt"), "utf8"),
-    "persisted commit\n",
-  );
-  assert.equal(recoveredCapped.workspace.worktree?.baseSha, recoverableHead);
-  assert.equal(
-    cappedStore.getSession(cappedWorkspace.id, connectionPrincipalId)?.baseSha,
-    recoverableHead,
-  );
-  assert.equal((await removeManagedWorktree({
-    sourceRoot: gitRoot,
-    worktreePath: recoveredCapped.workspace.root,
-    config: cappedConfig,
-  })).removed, true);
-  assert.equal(cappedRegistry.deleteWorkspace(connectionPrincipalId, cappedWorkspace.id), true);
-  assert.equal(cappedStore.countManagedWorktrees(), 0);
-  cappedStore.close();
-
-  const worktreesBeforeRollback = (await execFileAsync("git", ["worktree", "list", "--porcelain"], { cwd: gitRoot })).stdout;
-  const failingStore: WorkspaceStore = {
-    createSession() {
-      throw new Error("store failed");
-    },
-    getSession: () => undefined,
-    touchSession: () => undefined,
-    closeSession: () => false,
-    deleteSession: () => false,
-    countManagedWorktrees: () => 0,
-    listExpiredSessions: () => [],
-    isReady: () => true,
-  };
-  await assert.rejects(
-    new WorkspaceRegistry(config, failingStore).openWorkspace(connectionPrincipalId, {
-      path: gitRoot,
-      mode: "worktree",
-    }),
-    /store failed/,
-  );
-  const worktreesAfterRollback = (await execFileAsync("git", ["worktree", "list", "--porcelain"], { cwd: gitRoot })).stdout;
-  assert.equal(worktreesAfterRollback, worktreesBeforeRollback);
 
   const hydrationSession = {
     id: "ws-hydration-race",
@@ -1252,9 +1145,6 @@ try {
     alias: "hydration-race",
     root: canonicalRoot,
     status: "active" as const,
-    mode: "checkout" as const,
-    dirtySource: false,
-    managed: false,
     writeAccess: "read_only" as const,
     stateGeneration: 1,
     createdAt: "2026-01-01T00:00:00.000Z",
@@ -1282,7 +1172,6 @@ try {
       return true;
     },
     deleteSession: () => false,
-    countManagedWorktrees: () => 0,
     listExpiredSessions: () => [{ ...hydrationSession }],
     isReady: () => true,
   };
@@ -1322,28 +1211,14 @@ try {
     disappearingSession.alias,
   );
   disappearingActive = false;
-  await assert.rejects(disappearingHydration, /workspace alias is unavailable/);
+  await assert.rejects(disappearingHydration, /Project execution runtime is unavailable/);
   assert.equal(disappearingRegistry.usageSnapshot(connectionPrincipalId).resident, 0);
   assert.equal(disappearingRegistry.usageSnapshot(connectionPrincipalId).leased, 0);
-
-  const worktreeReadmePath = registry.resolvePath(worktreeWorkspace.workspace, "README.md");
-  assert.equal(worktreeReadmePath.startsWith(worktreeWorkspace.workspace.root), true);
 
   const stateDir = join(root, ".state");
   const firstStore = createTestWorkspaceStore(stateDir);
   const persistentRegistry = new WorkspaceRegistry(config, firstStore);
   const persistentWorkspace = await persistentRegistry.openWorkspace(connectionPrincipalId, root);
-  const persistentWorktree = await persistentRegistry.openWorkspace(connectionPrincipalId, {
-    path: gitRoot,
-    mode: "worktree",
-  });
-  assert.notEqual(persistentWorktree.workspace.id, worktreeWorkspace.workspace.id);
-  const reusedPersistentWorktree = await persistentRegistry.openWorkspace(connectionPrincipalId, {
-    path: join(gitRoot, "."),
-    mode: "worktree",
-  });
-  assert.equal(reusedPersistentWorktree.workspace.id, persistentWorktree.workspace.id);
-  assert.equal(reusedPersistentWorktree.reused, true);
   const repeatedPersistentWorkspace = await persistentRegistry.openWorkspace(connectionPrincipalId, root);
   assert.equal(repeatedPersistentWorkspace.workspace.id, persistentWorkspace.workspace.id);
   assert.equal(persistentWorkspace.workspace.writeAccess, "read_only");
@@ -1357,7 +1232,7 @@ try {
   assert.equal(writablePersistentWorkspace.workspace.stateGeneration, readOnlyGeneration + 1);
   assert.throws(
     () => persistentRegistry.getWorkspace(connectionPrincipalId, persistentWorkspace.workspace.id, readOnlyGeneration),
-    /generation is stale/,
+    /Project execution runtime is stale/,
   );
   const preservedWritableWorkspace = await persistentRegistry.openWorkspace(connectionPrincipalId, root);
   assert.equal(preservedWritableWorkspace.workspace.writeAccess, "read_write");
@@ -1369,38 +1244,13 @@ try {
   assert.equal(downgradedPersistentWorkspace.workspace.writeAccess, "read_only");
   assert.equal(downgradedPersistentWorkspace.workspace.stateGeneration, readOnlyGeneration + 2);
 
-  const activityDatabase = new Database(databasePath(stateDir));
-  activityDatabase.prepare("update workspace_sessions set last_used_at = ? where id = ?")
-    .run("2026-01-01T00:00:00.000Z", persistentWorktree.workspace.id);
-  persistentWorktree.workspace.lastUsedAt = 0;
-  const activeManagedReuse = await persistentRegistry.openWorkspace(connectionPrincipalId, {
-    path: gitRoot,
-    mode: "worktree",
-  });
-  assert.equal(activeManagedReuse.workspace, persistentWorktree.workspace);
-  assert.equal(activeManagedReuse.workspace.lastUsedAt > 0, true);
-  const refreshedManagedActivity = activityDatabase.prepare(
-    "select last_used_at as lastUsedAt from workspace_sessions where id = ?",
-  ).get(persistentWorktree.workspace.id) as { lastUsedAt: string };
-  assert.equal(refreshedManagedActivity.lastUsedAt > "2026-01-01T00:00:00.000Z", true);
-  activityDatabase.close();
-
-  await writeFile(join(persistentWorktree.workspace.root, "resume-head.txt"), "latest head\n");
-  await git(persistentWorktree.workspace.root, ["add", "resume-head.txt"]);
-  await git(persistentWorktree.workspace.root, ["commit", "-m", "Advance persisted worktree"]);
-  const persistedWorktreeHead = (await execFileAsync(
-    "git",
-    ["rev-parse", "HEAD"],
-    { cwd: persistentWorktree.workspace.root },
-  )).stdout.trim();
-  const persistentWorktreeSummary = persistentRegistry.listWorkspaces(connectionPrincipalId)
-    .find((summary) => summary.alias === persistentWorktree.workspace.alias);
-  assert.equal(persistentWorktreeSummary?.workspaceRef, persistentWorktree.workspace.id);
+  const persistentSummary = persistentRegistry.listWorkspaces(connectionPrincipalId)
+    .find((summary) => summary.alias === persistentWorkspace.workspace.alias);
+  assert.equal(persistentSummary?.workspaceRef, persistentWorkspace.workspace.id);
   assert.match(
-    persistentWorktreeSummary?.projectFingerprint ?? "",
+    persistentSummary?.projectFingerprint ?? "",
     /^proj_[A-Za-z0-9_-]{22}$/u,
   );
-
   const activeSnapshot = persistentRegistry.activeSessionsSnapshot();
   assert.equal(activeSnapshot.some((session) => session.id === persistentWorkspace.workspace.id), true);
   const snapshottedCheckout = activeSnapshot.find((session) => session.id === persistentWorkspace.workspace.id)!;
@@ -1415,136 +1265,57 @@ try {
 
   const secondStore = createTestWorkspaceStore(stateDir);
   const restoredRegistry = new WorkspaceRegistry(config, secondStore);
-  const reopenedWorkspace = await restoredRegistry.openWorkspace(connectionPrincipalId, root);
-  assert.equal(reopenedWorkspace.workspace.id, persistentWorkspace.workspace.id);
-  const restoredWorkspace = restoredRegistry.getWorkspace(connectionPrincipalId, persistentWorkspace.workspace.id);
-  assert.equal(restoredWorkspace.root, canonicalRoot);
-  assert.equal(restoredWorkspace.mode, "checkout");
-  assert.deepEqual(
-    secondStore.listExpiredSessions(new Date(Date.now() + 1_000).toISOString(), 10)
-      .filter((session) => !session.managed)
-      .map((session) => session.id),
-    [persistentWorkspace.workspace.id],
-  );
-
   assert.throws(
-    () => restoredRegistry.getWorkspace("client-b", persistentWorkspace.workspace.id),
-    /workspace is no longer available/,
+    () => restoredRegistry.getWorkspace("not-owner", persistentWorkspace.workspace.id),
+    /Project execution runtime is no longer available/,
   );
-  const persistedOtherOwner = await restoredRegistry.openWorkspace("client-b", root);
-  assert.notEqual(persistedOtherOwner.workspace.id, persistentWorkspace.workspace.id);
-  assert.equal(restoredRegistry.closeWorkspace("client-b", persistedOtherOwner.workspace.id), true);
   assert.throws(
-    () => restoredRegistry.getWorkspace(connectionPrincipalId, persistentWorktree.workspace.id),
-    /must be resumed before use/,
+    () => restoredRegistry.getWorkspace(connectionPrincipalId, persistentWorkspace.workspace.id),
+    /Project execution runtime must be loaded again/,
   );
-  const worktreeAlias = persistentWorktree.workspace.alias;
   const coldSummary = restoredRegistry.listWorkspaces(connectionPrincipalId).find(
-    (summary) => summary.alias === worktreeAlias,
+    (summary) => summary.alias === persistentWorkspace.workspace.alias,
   );
   assert.equal(coldSummary?.hydrationStatus, "requires_resume");
-  assert.equal(coldSummary?.workspaceRef, persistentWorktree.workspace.id);
+  assert.equal(coldSummary?.workspaceRef, persistentWorkspace.workspace.id);
   assert.equal(
     coldSummary?.projectFingerprint,
-    persistentWorktreeSummary?.projectFingerprint,
+    persistentSummary?.projectFingerprint,
     "project fingerprints must remain stable across server restarts",
   );
-  assert.equal(coldSummary?.displayPath, `…/${basename(gitRoot)}`);
+  assert.equal(coldSummary?.displayPath, `…/${basename(root)}`);
   assert.equal(coldSummary?.displayPath.includes("~"), false);
   await assert.rejects(
-    restoredRegistry.resumeWorkspaceByReference("client-b", coldSummary!.workspaceRef),
-    /workspace alias is unavailable/,
+    restoredRegistry.resumeWorkspaceByReference("not-owner", coldSummary!.workspaceRef),
+    /Project execution runtime is unavailable/,
   );
-  const resumedWorktree = await restoredRegistry.resumeWorkspaceByReference(
+  const resumedCheckout = await restoredRegistry.resumeWorkspaceByReference(
     connectionPrincipalId,
     coldSummary!.workspaceRef,
   );
-  const restoredWorktree = resumedWorktree.workspace;
-  assert.equal(restoredWorktree.mode, "worktree");
-  assert.equal(restoredWorktree.sourceRoot, await realpath(gitRoot));
-  assert.equal(restoredWorktree.root, persistentWorktree.workspace.root);
-  assert.equal(restoredWorktree.worktree?.managed, true);
-  assert.equal(restoredWorktree.worktree?.dirtySource, true);
-  assert.equal(restoredWorktree.worktree?.baseSha, persistedWorktreeHead);
-  assert.equal(
-    secondStore.getSession(persistentWorktree.workspace.id, connectionPrincipalId)?.baseSha,
-    persistedWorktreeHead,
-  );
-  assert.equal(restoredWorktree.stateGeneration, persistentWorktree.workspace.stateGeneration + 1);
-  assert.deepEqual(
-    restoredWorktree.agentProfiles.map((profile) => profile.name),
-    persistentWorktree.workspace.agentProfiles.map((profile) => profile.name),
-  );
-  assert.equal(restoredRegistry.closeWorkspace("client-b", persistentWorkspace.workspace.id), false);
+  const restoredWorkspace = resumedCheckout.workspace;
+  assert.equal(restoredWorkspace.root, canonicalRoot);
+  assert.equal(restoredWorkspace.stateGeneration, persistentWorkspace.workspace.stateGeneration + 1);
+  assert.equal(restoredRegistry.closeWorkspace("not-owner", persistentWorkspace.workspace.id), false);
   assert.equal(restoredRegistry.closeWorkspace(connectionPrincipalId, persistentWorkspace.workspace.id), true);
   assert.deepEqual(restoredRegistry.cleanupLifecycleState(Date.now() + 31 * 24 * 60 * 60_000), {
-    expiredInstructionTokens: 0,
-    deletedClosedWorkspaceSessions: 2,
+    deletedClosedWorkspaceSessions: 1,
   });
   assert.throws(
     () => restoredRegistry.getWorkspace(connectionPrincipalId, persistentWorkspace.workspace.id),
-    /workspace is no longer available/,
+    /Project execution runtime is no longer available/,
   );
-  const removal = await removeManagedWorktree({
-    sourceRoot: gitRoot,
-    worktreePath: restoredWorktree.root,
-    config,
-  });
-  assert.equal(removal.removed, true);
-  assert.equal(restoredRegistry.deleteWorkspace(connectionPrincipalId, persistentWorktree.workspace.id), true);
-  await assert.rejects(stat(restoredWorktree.root));
   const expired = restoredRegistry.closeExpiredSessions(-1, () => false);
   assert.deepEqual(expired, []);
   secondStore.close();
 
-  const expiryStateDir = join(root, ".managed-expiry-state");
   const expiryConfig = loadConfig({
-    DEVSPACE_CONFIG_DIR: join(root, ".managed-expiry-home"),
+    DEVSPACE_CONFIG_DIR: join(root, ".expiry-home"),
     DEVSPACE_ALLOWED_ROOTS: root,
-    DEVSPACE_WORKTREE_ROOT: join(root, ".devspace", "expiry-worktrees"),
     DEVSPACE_MAX_RESIDENT_WORKSPACES: "1",
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
     PORT: "1",
   });
-  const expiryStore = createTestWorkspaceStore(expiryStateDir);
-  const expiryRegistry = new WorkspaceRegistry(expiryConfig, expiryStore);
-  const dirtyExpiredWorktree = (await expiryRegistry.openWorkspace(connectionPrincipalId, {
-    path: gitRoot,
-    mode: "worktree",
-  })).workspace;
-  await writeFile(join(dirtyExpiredWorktree.root, "dirty-local.txt"), "preserve me\n");
-  const cleanExpiredWorktree = (await expiryRegistry.openWorkspace(connectionPrincipalId, {
-    path: gitRoot,
-    mode: "worktree",
-    forceNew: true,
-  })).workspace;
-  const expiryDatabase = new Database(databasePath(expiryStateDir));
-  expiryDatabase.prepare("update workspace_sessions set last_used_at = ? where id = ?")
-    .run("2026-01-01T00:00:00.000Z", dirtyExpiredWorktree.id);
-  expiryDatabase.prepare("update workspace_sessions set last_used_at = ? where id = ?")
-    .run("2026-01-01T00:00:01.000Z", cleanExpiredWorktree.id);
-  expiryDatabase.close();
-  assert.deepEqual(
-    expiryRegistry.closeExpiredSessions(-1, () => false),
-    [cleanExpiredWorktree.id],
-  );
-  await assert.rejects(stat(cleanExpiredWorktree.root));
-  assert.equal((await stat(dirtyExpiredWorktree.root)).isDirectory(), true);
-  assert.equal(expiryStore.countManagedWorktrees(), 1);
-  const dirtyExpiryRemoval = await removeManagedWorktree({
-    sourceRoot: gitRoot,
-    worktreePath: dirtyExpiredWorktree.root,
-    config: expiryConfig,
-  });
-  assert.equal(dirtyExpiryRemoval.reason, "dirty");
-  await rm(join(dirtyExpiredWorktree.root, "dirty-local.txt"));
-  assert.equal((await removeManagedWorktree({
-    sourceRoot: gitRoot,
-    worktreePath: dirtyExpiredWorktree.root,
-    config: expiryConfig,
-  })).removed, true);
-  assert.equal(expiryRegistry.deleteWorkspace(connectionPrincipalId, dirtyExpiredWorktree.id), true);
-  expiryStore.close();
 
   const rotationStateDir = join(root, ".expiry-rotation-state");
   const rotationStore = createTestWorkspaceStore(rotationStateDir);
@@ -1613,7 +1384,7 @@ try {
     insert into devspace_schema_migrations values
       (1, 'workspace-state', '2026-01-01T00:00:00.000Z'),
       (2, 'oauth-state', '2026-01-01T00:00:00.000Z'),
-      (3, 'local-agent-sessions', '2026-01-01T00:00:00.000Z'),
+      (3, 'legacy-v3', '2026-01-01T00:00:00.000Z'),
       (4, 'workspace-oauth-ownership', '2026-01-01T00:00:00.000Z');
     create table oauth_clients (
       client_id text primary key,
@@ -1652,7 +1423,7 @@ try {
     ).get(),
     {
       id: "ws_legacy",
-      status: "active",
+      status: "closed",
       canonicalRoot,
       alias: basename(canonicalRoot),
       writeAccess: "read_write",
@@ -1660,9 +1431,9 @@ try {
   );
   assert.equal(
     migratedLegacyDatabase.prepare(
-      "select count(*) from sqlite_master where type = 'index' and name = 'workspace_sessions_active_checkout_principal_canonical_root_uq'",
+      "select count(*) from sqlite_master where type = 'index' and name = 'workspace_sessions_active_principal_canonical_root_uq'",
     ).pluck().get(),
-    1,
+    0,
   );
   migratedLegacyDatabase.close();
   const migratedLegacyStore = new SqliteWorkspaceStore(legacyStateDir);
@@ -1687,21 +1458,20 @@ try {
       id: "ws_escaped_checkout",
       connectionPrincipalId,
       root: escapedCheckoutRoot,
-      mode: "checkout",
     });
     assert.throws(
       () => new WorkspaceRegistry(config, escapedStore).getWorkspace(
         connectionPrincipalId,
         "ws_escaped_checkout",
       ),
-      /must be resumed before use/,
+      /Project execution runtime must be loaded again/,
     );
     await assert.rejects(
       new WorkspaceRegistry(config, escapedStore).resumeWorkspace(
         connectionPrincipalId,
         escapedSession.alias,
       ),
-      /workspace alias is unavailable/,
+      /Project execution runtime is unavailable/,
     );
     escapedStore.close();
 
@@ -1709,17 +1479,10 @@ try {
     await symlink(root, aliasRoot, "dir");
     const aliasConfig = loadConfig({
       DEVSPACE_ALLOWED_ROOTS: aliasRoot,
-      DEVSPACE_WORKTREE_ROOT: join(aliasRoot, ".devspace", "alias-worktrees"),
       DEVSPACE_USER_INSTRUCTIONS_PATH: userInstructionsPath,
       DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
       PORT: "1",
     });
-    const aliasWorkspace = await new WorkspaceRegistry(aliasConfig).openWorkspace(connectionPrincipalId, {
-      path: join(aliasRoot, "git-project"),
-      mode: "worktree",
-    });
-    assert.equal(aliasWorkspace.workspace.sourceRoot, await realpath(gitRoot));
-
     const aliasCheckout = await new WorkspaceRegistry(aliasConfig).openWorkspace(connectionPrincipalId, aliasRoot);
     assert.deepEqual(
       aliasCheckout.agentsFiles.map((file) => file.content),
@@ -1737,7 +1500,7 @@ try {
     const restoredAliasRegistry = new WorkspaceRegistry(aliasConfig, restoredAliasStore);
     assert.throws(
       () => restoredAliasRegistry.getWorkspace(connectionPrincipalId, realCheckout.workspace.id),
-      /must be resumed before use/,
+      /Project execution runtime must be loaded again/,
     );
     const restoredAlias = (
       await restoredAliasRegistry.resumeWorkspace(connectionPrincipalId, realCheckout.workspace.alias)
@@ -1746,6 +1509,10 @@ try {
     restoredAliasStore.close();
   }
 } finally {
+  if (originalHome === undefined) delete process.env.HOME;
+  else process.env.HOME = originalHome;
+  if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+  else process.env.USERPROFILE = originalUserProfile;
   await rm(root, { recursive: true, force: true });
   await rm(outsideRoot, { recursive: true, force: true });
 }
@@ -1766,10 +1533,5 @@ function seedConnectionPrincipal(stateDir: string, principalId: string): void {
 
 function createTestWorkspaceStore(stateDir: string): SqliteWorkspaceStore {
   seedConnectionPrincipal(stateDir, connectionPrincipalId);
-  seedConnectionPrincipal(stateDir, "client-b");
   return new SqliteWorkspaceStore(stateDir);
-}
-
-async function git(cwd: string, args: string[]): Promise<void> {
-  await execFileAsync("git", args, { cwd });
 }

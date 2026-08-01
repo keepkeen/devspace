@@ -320,12 +320,12 @@ function isPublicRelativePath(path: string): boolean {
 
 async function resolveConfinedPath(rootPath: string, input: string): Promise<string> {
   if (!input || input.includes("\0") || isAbsolute(input)) {
-    throw patchError("path must be relative to the workspace and non-empty");
+    throw patchError("path must be relative to the Project and non-empty");
   }
 
   const target = resolve(rootPath, input);
   if (!isInside(rootPath, target)) {
-    throw patchError(`path escapes the workspace: ${input}`, input);
+    throw patchError(`path escapes the Project: ${input}`, input);
   }
 
   let existing = target;
@@ -333,7 +333,7 @@ async function resolveConfinedPath(rootPath: string, input: string): Promise<str
     try {
       const resolved = await realpath(existing);
       if (!isInside(rootPath, resolved)) {
-        throw patchError(`path resolves outside the workspace through a symbolic link: ${input}`, input);
+        throw patchError(`path resolves outside the Project through a symbolic link: ${input}`, input);
       }
       break;
     } catch (error) {
@@ -946,7 +946,7 @@ async function captureExistingParent(
       const canonicalPath = await realpath(current);
       if (!isInside(rootPath, canonicalPath)) {
         throw patchError(
-          `destination parent resolves outside the workspace: ${displayPath}`,
+          `destination parent resolves outside the Project: ${displayPath}`,
           displayPath,
         );
       }
@@ -967,7 +967,7 @@ async function captureExistingParent(
     }
   }
 
-  throw patchError(`destination parent escapes the workspace: ${displayPath}`, displayPath);
+  throw patchError(`destination parent escapes the Project: ${displayPath}`, displayPath);
 }
 
 async function revalidateDestinationParent(

@@ -163,13 +163,15 @@ test("retries bootstrap after the browser comes online", async ({ page }) => {
 
 test("links numeric validation errors to their fields", async ({ page }) => {
   await page.goto(fixture.admin.url);
-  await page.locator("#maxMcpSessions").fill("1");
+  await page.locator("#maxProcessSessions").fill("1");
   await page.getByRole("button", { name: "保存", exact: true }).click();
 
-  const field = page.locator("#maxMcpSessionsPerClient");
+  const field = page.locator("#maxProcessSessionsPerWorkspace");
   await expect(field).toHaveAttribute("aria-invalid", "true");
-  await expect(field).toHaveAttribute("aria-describedby", /maxMcpSessionsPerClient-errors/);
-  await expect(page.locator("#maxMcpSessionsPerClient-errors")).toContainText("Per-client MCP sessions");
+  await expect(field).toHaveAttribute("aria-describedby", /maxProcessSessionsPerWorkspace-errors/);
+  await expect(page.locator("#maxProcessSessionsPerWorkspace-errors")).toContainText(
+    "Per-Project process sessions",
+  );
 });
 
 test("distinguishes saved widget settings from the active backend configuration", async ({ page }) => {

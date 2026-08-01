@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { authorizationRootId } from "./authorization-roots.js";
-import { hostIdentityDigest } from "./host-identity.js";
 import { internalDiagnosticsToken } from "./internal-auth.js";
 import {
   createSecurityKeyring,
@@ -52,10 +51,9 @@ test("password rotation is independent from the persistent HMAC master key", () 
     source: "auth_file",
   });
   assert.equal(before.masterKeyFingerprint, after.masterKeyFingerprint);
-  assert.deepEqual(before.hostIdentity, after.hostIdentity);
+  assert.deepEqual(before.legacyOwnerVerifier, after.legacyOwnerVerifier);
   assert.deepEqual(before.authorizationRoot, after.authorizationRoot);
   assert.deepEqual(before.cursor, after.cursor);
-  assert.deepEqual(before.receipt, after.receipt);
   assert.deepEqual(before.auditReference, after.auditReference);
 });
 
@@ -71,11 +69,10 @@ test("HKDF purpose keys are domain separated and master-key rotation changes all
     source: "auth_file",
   });
   const firstKeys = [
-    first.hostIdentity,
+    first.legacyOwnerVerifier,
     first.authorizationRoot,
     first.projectFingerprint,
     first.cursor,
-    first.receipt,
     first.auditReference,
     first.internalDiagnostics,
     first.internalConfigReload,
@@ -83,11 +80,10 @@ test("HKDF purpose keys are domain separated and master-key rotation changes all
   ];
   assert.equal(new Set(firstKeys.map((key) => key.toString("hex"))).size, firstKeys.length);
   const secondKeys = [
-    second.hostIdentity,
+    second.legacyOwnerVerifier,
     second.authorizationRoot,
     second.projectFingerprint,
     second.cursor,
-    second.receipt,
     second.auditReference,
     second.internalDiagnostics,
     second.internalConfigReload,
@@ -108,13 +104,9 @@ test("legacy-direct migration preserves pre-v2 HMAC identifiers", () => {
   });
   assert.equal(keyring.legacyCompatibility, true);
   assert.equal(
-    verifyOwnerPassword(ownerPasswordHash, keyring.hostIdentity),
+    verifyOwnerPassword(ownerPasswordHash, keyring.legacyOwnerVerifier),
     true,
     "legacy key bytes must prove they describe the same password as the v2 verifier",
-  );
-  assert.equal(
-    hostIdentityDigest("session", "conversation-a", keyring.hostIdentity),
-    hostIdentityDigest("session", "conversation-a", ownerPassword),
   );
   assert.equal(
     authorizationRootId(process.cwd(), keyring.authorizationRoot),
