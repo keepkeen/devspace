@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import Database from "better-sqlite3";
 import { authorizationRootId } from "./authorization-roots.js";
 import { loadConfig } from "./config.js";
 import { SqliteOAuthClientsStore, SqliteOAuthStore } from "./oauth-store.js";
@@ -27,6 +28,14 @@ const stateDir = join(root, "state");
 const publicBaseUrl = "http://127.0.0.1:7676";
 const ownerToken = "instruction-pagination-owner-token-long-enough";
 const accessToken = "instruction-pagination-access-token";
+const mainHostMeta = {
+  "openai/subject": "instruction-pagination-subject",
+  "openai/session": "instruction-pagination-main-session",
+};
+const mutationHostMeta = {
+  "openai/subject": "instruction-pagination-subject",
+  "openai/session": "instruction-pagination-mutation-session",
+};
 const execFileAsync = promisify(execFile);
 
 await mkdir(deep, { recursive: true });
@@ -87,6 +96,7 @@ try {
   const selected = await client.callTool({
     name: "project_control",
     arguments: { action: "open", projectRef, operationId: "instruction-read-execution" },
+    _meta: mainHostMeta,
   });
   assertSucceeded(selected);
   assert.match(JSON.stringify(selected.structuredContent), /ROOT_PAGE/u);
@@ -94,20 +104,40 @@ try {
     (selected.structuredContent as { schemaVersion?: unknown } | undefined)?.schemaVersion,
     PROJECT_CONTEXT_SCHEMA_VERSION,
   );
-  const executionRef = String(
-    (selected.structuredContent as {
-      project?: { executionRef?: unknown };
-    } | undefined)?.project?.executionRef ?? "",
-  );
-  assert.match(executionRef, /^pex1_/u);
+  assert.equal(PROJECT_CONTEXT_SCHEMA_VERSION, 8);
+  assert.doesNotMatch(JSON.stringify(selected.structuredContent), /executionRef/u);
   assertNoLegacyContextProtocol(selected);
   assert.equal(rootInstructionsComplete(selected), false);
   assert.equal(typeof rootInstructionCursor(selected), "string");
   assert.ok(serializedBytes(selected) < 16_000);
 
+  const stateBeforeInvalidCursor = selectedSessionRuntimeTimestamps();
+  await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+  const invalidCursor = await client.callTool({
+    name: "project_control",
+    arguments: {
+      action: "hydrate",
+      cursor: `${rootInstructionCursor(selected)!}x`,
+    },
+    _meta: mainHostMeta,
+  });
+  assert.equal(invalidCursor.isError, true);
+  assert.equal(
+    (invalidCursor.structuredContent as {
+      error?: { code?: unknown };
+    } | undefined)?.error?.code,
+    "invalid_root_instruction_cursor",
+  );
+  assert.deepEqual(
+    selectedSessionRuntimeTimestamps(),
+    stateBeforeInvalidCursor,
+    "an invalid hydrate cursor must not touch execution or Thread runtime timestamps",
+  );
+
   const gatedRead = await client.callTool({
     name: "read_files",
-    arguments: { executionRef, files: [{ path: "nested/deep/payload.txt" }] },
+    arguments: { files: [{ path: "nested/deep/payload.txt" }] },
+    _meta: mainHostMeta,
   });
   assert.equal(gatedRead.isError, true);
   assert.equal(errorCode(gatedRead), "root_instructions_required");
@@ -119,17 +149,19 @@ try {
 
   const restarted = await client.callTool({
     name: "project_control",
-    arguments: { action: "hydrate", executionRef },
+    arguments: { action: "hydrate" },
+    _meta: mainHostMeta,
   });
   assertSucceeded(restarted);
   assert.equal(rootInstructionsComplete(restarted), false);
   assert.equal(typeof rootInstructionCursor(restarted), "string");
-  const rootContent = await finishRootInstructions(client, executionRef, restarted);
+  const rootContent = await finishRootInstructions(client, mainHostMeta, restarted);
   assert.equal(rootContent, expectedInstructions.get("AGENTS.md"));
 
   const read = await client.callTool({
     name: "read_files",
-    arguments: { executionRef, files: [{ path: "nested/deep/payload.txt" }] },
+    arguments: { files: [{ path: "nested/deep/payload.txt" }] },
+    _meta: mainHostMeta,
   });
   assertSucceeded(read);
   assertInstructionDelta(read);
@@ -144,18 +176,18 @@ try {
   const rejectedProgress = await client.callTool({
     name: "save_progress",
     arguments: {
-      executionRef,
       operationId: "instruction-save-progress",
       title: "Paged instruction task",
       progress: escapeHeavyProgress,
     },
+    _meta: mainHostMeta,
   });
   assert.equal(rejectedProgress.isError, true);
   assert.equal(
     (rejectedProgress.structuredContent as {
       error?: { code?: unknown };
     } | undefined)?.error?.code,
-    "handoff_context_too_large",
+    "task_context_too_large",
   );
 
   const escapedPrefix = "\\".repeat(3_750);
@@ -175,17 +207,17 @@ try {
   const savedProgress = await client.callTool({
     name: "save_progress",
     arguments: {
-      executionRef,
       operationId: "instruction-save-progress",
       title: "Paged instruction task",
       progress: maximumHandoffProgress,
     },
+    _meta: mainHostMeta,
   });
   assertSucceeded(savedProgress);
   const savedThreadRef = String(
     (savedProgress.structuredContent as {
-      thread?: { ref?: unknown };
-    } | undefined)?.thread?.ref ?? "",
+      thread?: { threadRef?: unknown };
+    } | undefined)?.thread?.threadRef ?? "",
   );
   assert.match(savedThreadRef, /^pth1_/u);
 
@@ -205,6 +237,7 @@ try {
       threadRef: savedThreadRef,
       operationId: "instruction-mutation-execution",
     },
+    _meta: mutationHostMeta,
   });
   assertSucceeded(mutationSelection);
   assert.ok(
@@ -223,15 +256,15 @@ try {
     }).thread?.checkpoint?.modelSummaryTrust,
     "untrusted",
   );
-  const mutationExecutionRef = String(
+  assert.equal(
     (mutationSelection.structuredContent as {
-      project?: { executionRef?: unknown };
-    } | undefined)?.project?.executionRef ?? "",
+      thread?: { checkpoint?: { observedStateTrust?: unknown } };
+    }).thread?.checkpoint?.observedStateTrust,
+    "server_observed",
   );
-  assert.match(mutationExecutionRef, /^pex1_/u);
-  await finishRootInstructions(mutationClient, mutationExecutionRef, mutationSelection);
+  assert.doesNotMatch(JSON.stringify(mutationSelection.structuredContent), /executionRef/u);
+  await finishRootInstructions(mutationClient, mutationHostMeta, mutationSelection);
   const patchArguments = {
-    executionRef: mutationExecutionRef,
     operationId: "instruction-delta-patch",
     ifMatch: { "nested/deep/payload.txt": String(payload?.contentHash) },
     patch: "*** Begin Patch\n*** Update File: nested/deep/payload.txt\n@@\n-before\n+after\n*** End Patch",
@@ -239,6 +272,7 @@ try {
   const gated = await mutationClient.callTool({
     name: "apply_patch",
     arguments: patchArguments,
+    _meta: mutationHostMeta,
   });
   assert.equal(gated.isError, true);
   assert.equal(
@@ -251,6 +285,7 @@ try {
   const patched = await mutationClient.callTool({
     name: "apply_patch",
     arguments: patchArguments,
+    _meta: mutationHostMeta,
   });
   assertSucceeded(patched);
 } finally {
@@ -341,15 +376,21 @@ function assertInstructionDelta(
 function assertNoLegacyContextProtocol(
   result: Awaited<ReturnType<Client["callTool"]>>,
 ): void {
+  const structuredContent = result.structuredContent as {
+    thread?: Record<string, unknown> & { checkpoint?: Record<string, unknown> };
+  } | undefined;
   assert.doesNotMatch(
-    JSON.stringify(result.structuredContent ?? {}),
-    /"(?:workspace|receipt|continuation|contextChanged|state|instructionToken)"\s*:/iu,
+    JSON.stringify(structuredContent ?? {}),
+    /"(?:workspace|receipt|continuation|contextChanged|state|instructionToken|handoff|mustRevalidate|provenance|offsetBytes|lengthBytes|totalBytes|complete)"\s*:/iu,
   );
+  if (structuredContent?.thread) {
+    assert.equal("ref" in structuredContent.thread, false);
+  }
 }
 
 async function finishRootInstructions(
   activeClient: Client,
-  executionRef: string,
+  hostMeta: Readonly<Record<string, string>>,
   firstPage: Awaited<ReturnType<Client["callTool"]>>,
 ): Promise<string> {
   let page = firstPage;
@@ -359,6 +400,7 @@ async function finishRootInstructions(
     pages += 1;
     assert.ok(pages < 20, "root instruction paging must make bounded progress");
     assert.ok(serializedBytes(page) < 16_000, "project_control pages must remain below 16 KiB");
+    assertNoLegacyContextProtocol(page);
     if (pages > 1) {
       assert.equal(
         (page.structuredContent as {
@@ -374,19 +416,14 @@ async function finishRootInstructions(
           path?: unknown;
           content?: unknown;
           fragment?: {
-            offsetBytes?: unknown;
-            lengthBytes?: unknown;
-            totalBytes?: unknown;
-            complete?: unknown;
+            partial?: unknown;
           };
         }>;
       };
     } | undefined)?.contextDelta?.instructions ?? [];
     for (const item of items) {
       assert.equal(item.path, "AGENTS.md");
-      assert.equal(typeof item.fragment?.offsetBytes, "number");
-      assert.equal(typeof item.fragment?.lengthBytes, "number");
-      assert.equal(item.fragment?.totalBytes, Buffer.byteLength(expectedInstructions.get("AGENTS.md")!, "utf8"));
+      assert.equal(item.fragment?.partial, true);
       combined += String(item.content ?? "");
     }
     const cursor = rootInstructionCursor(page);
@@ -397,7 +434,8 @@ async function finishRootInstructions(
     assert.equal(rootInstructionsComplete(page), false);
     page = await activeClient.callTool({
       name: "project_control",
-      arguments: { action: "hydrate", executionRef, cursor },
+      arguments: { action: "hydrate", cursor },
+      _meta: hostMeta,
     });
     assertSucceeded(page);
   }
@@ -445,6 +483,63 @@ function errorSemantics(
 
 function serializedBytes(value: unknown): number {
   return Buffer.byteLength(JSON.stringify(value), "utf8");
+}
+
+function selectedSessionRuntimeTimestamps(): {
+  executionLastUsedAt: string;
+  executionUpdatedAt: string;
+  workspaceLastUsedAt: string;
+  threadUpdatedAt: string;
+  threadLastActivityAt: string;
+} {
+  const continuity = new Database(join(stateDir, "project-task-continuity.sqlite"), {
+    readonly: true,
+  });
+  const state = new Database(join(stateDir, "devspace.sqlite"), { readonly: true });
+  const threads = new Database(join(stateDir, "project-threads.sqlite"), { readonly: true });
+  try {
+    const binding = continuity.prepare(`
+      select execution_id, thread_id
+      from project_task_session_bindings
+      where binding_status = 'active'
+      order by bound_at desc
+      limit 1
+    `).get() as { execution_id: string; thread_id: string } | undefined;
+    assert.ok(binding?.execution_id);
+    const execution = state.prepare(`
+      select workspace_id, last_used_at, updated_at
+      from project_executions where execution_id = ?
+    `).get(binding.execution_id) as {
+      workspace_id: string;
+      last_used_at: string;
+      updated_at: string;
+    } | undefined;
+    const workspace = execution
+      ? state.prepare(`
+          select last_used_at from workspace_sessions where id = ?
+        `).get(execution.workspace_id) as { last_used_at: string } | undefined
+      : undefined;
+    const thread = threads.prepare(`
+      select updated_at, last_activity_at from project_threads where thread_id = ?
+    `).get(binding.thread_id) as {
+      updated_at: string;
+      last_activity_at: string;
+    } | undefined;
+    assert.ok(execution);
+    assert.ok(workspace);
+    assert.ok(thread);
+    return {
+      executionLastUsedAt: execution.last_used_at,
+      executionUpdatedAt: execution.updated_at,
+      workspaceLastUsedAt: workspace.last_used_at,
+      threadUpdatedAt: thread.updated_at,
+      threadLastActivityAt: thread.last_activity_at,
+    };
+  } finally {
+    threads.close();
+    state.close();
+    continuity.close();
+  }
 }
 
 function assertSucceeded(result: Awaited<ReturnType<Client["callTool"]>>): void {

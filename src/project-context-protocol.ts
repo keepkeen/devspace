@@ -1,4 +1,4 @@
-export const PROJECT_CONTEXT_SCHEMA_VERSION = 6 as const;
+export const PROJECT_CONTEXT_SCHEMA_VERSION = 8 as const;
 export const PROJECT_CONTEXT_TEXT = "Project context ready.";
 
 export type ProjectInstructionSource = "repository" | "user" | "admin" | "bundled";
@@ -13,10 +13,7 @@ interface ProjectInstructionItemBase {
   path: string;
   content: string;
   fragment?: {
-    offsetBytes: number;
-    lengthBytes: number;
-    totalBytes: number;
-    complete: boolean;
+    partial: true;
   };
 }
 
@@ -33,12 +30,11 @@ export type ProjectInstructionItem = ProjectInstructionItemBase & (
 
 export interface ProjectDescriptor {
   ref: string;
-  executionRef: string;
   writeAccess: "read_only" | "read_write";
 }
 
 export interface ProjectThreadContext {
-  ref: string;
+  threadRef: string;
   title: string;
   status: "active" | "paused" | "archived" | "completed" | "closed";
   version: number;
@@ -52,14 +48,10 @@ export interface ProjectThreadContext {
       | "thread_left"
       | "manual";
     observedState: Record<string, unknown>;
+    observedStateTrust: "server_observed";
     modelSummary?: string;
     modelSummaryTrust?: "untrusted";
     createdAt: string;
-    provenance: {
-      source: "devspace_checkpoint";
-      trust: "server_observed";
-      authority: "none";
-    };
   };
 }
 
@@ -78,21 +70,6 @@ export interface ProjectContextDiagnostics {
   };
 }
 
-export interface ProjectHandoffContext {
-  ref: string;
-  title: string;
-  progress: string;
-  status: "resumable";
-  version: number;
-  updatedAt: string;
-  mustRevalidate: true;
-  provenance: {
-    source: "devspace_saved_progress";
-    trust: "untrusted";
-    authority: "none";
-  };
-}
-
 /**
  * Server-held progressive-loading state. This state is bound to one Project
  * execution and must never be copied into model-visible structured content.
@@ -106,8 +83,8 @@ export interface ProjectContextRevisionState {
 }
 
 /**
- * Request-local Project execution. Only the opaque `executionRef` is public;
- * the durable execution id and backing checkout identity remain private.
+ * Request-local Project execution. Its opaque capability and durable backing
+ * identities remain server-held and must not enter model-visible context.
  */
 export interface ProjectExecutionRecord {
   executionId: string;
@@ -127,7 +104,6 @@ export interface ProjectContextProtocolInput {
   project: ProjectDescriptor;
   thread?: ProjectThreadContext;
   contextDelta: ProjectContextDelta;
-  handoff?: ProjectHandoffContext;
   diagnostics?: ProjectContextDiagnostics;
 }
 
@@ -143,7 +119,6 @@ export interface ProjectContextProtocolResult {
     project: ProjectDescriptor;
     thread?: ProjectThreadContext;
     contextDelta: ProjectContextDelta;
-    handoff?: ProjectHandoffContext;
     diagnostics?: ProjectContextDiagnostics;
   };
 }
@@ -164,10 +139,7 @@ export function copyProjectInstruction(
     ...(instruction.fragment
       ? {
           fragment: {
-            offsetBytes: instruction.fragment.offsetBytes,
-            lengthBytes: instruction.fragment.lengthBytes,
-            totalBytes: instruction.fragment.totalBytes,
-            complete: instruction.fragment.complete,
+            partial: true,
           },
         }
       : {}),
@@ -215,12 +187,10 @@ export function serializeProjectContext(
       ok: true,
       project: {
         ref: input.project.ref,
-        executionRef: input.project.executionRef,
         writeAccess: input.project.writeAccess,
       },
       ...(input.thread ? { thread: copyProjectThread(input.thread) } : {}),
       contextDelta: copyProjectContextDelta(input.contextDelta),
-      ...(input.handoff ? { handoff: copyProjectHandoff(input.handoff) } : {}),
       ...(input.diagnostics
         ? { diagnostics: copyProjectContextDiagnostics(input.diagnostics) }
         : {}),
@@ -230,7 +200,7 @@ export function serializeProjectContext(
 
 function copyProjectThread(thread: ProjectThreadContext): ProjectThreadContext {
   return {
-    ref: thread.ref,
+    threadRef: thread.threadRef,
     title: thread.title,
     status: thread.status,
     version: thread.version,
@@ -240,6 +210,7 @@ function copyProjectThread(thread: ProjectThreadContext): ProjectThreadContext {
           checkpoint: {
             cause: thread.checkpoint.cause,
             observedState: structuredClone(thread.checkpoint.observedState),
+            observedStateTrust: "server_observed",
             ...(thread.checkpoint.modelSummary
               ? {
                   modelSummary: thread.checkpoint.modelSummary,
@@ -247,33 +218,9 @@ function copyProjectThread(thread: ProjectThreadContext): ProjectThreadContext {
                 }
               : {}),
             createdAt: thread.checkpoint.createdAt,
-            provenance: {
-              source: "devspace_checkpoint",
-              trust: "server_observed",
-              authority: "none",
-            },
           },
         }
       : {}),
-  };
-}
-
-function copyProjectHandoff(
-  handoff: ProjectHandoffContext,
-): ProjectHandoffContext {
-  return {
-    ref: handoff.ref,
-    title: handoff.title,
-    progress: handoff.progress,
-    status: "resumable",
-    version: handoff.version,
-    updatedAt: handoff.updatedAt,
-    mustRevalidate: true,
-    provenance: {
-      source: "devspace_saved_progress",
-      trust: "untrusted",
-      authority: "none",
-    },
   };
 }
 

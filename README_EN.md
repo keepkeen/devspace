@@ -9,7 +9,7 @@
 <h1 align="center">DevSpace</h1>
 
 <p align="center">
-  Let ChatGPT read, edit, and test local projects that you approve.
+  Let ChatGPT read, edit, run, and continuously maintain local projects within boundaries you explicitly approve.
 </p>
 
 <p align="center">
@@ -24,50 +24,71 @@
 > commit [`80423b5`](https://github.com/Waishnav/devspace/commit/80423b5), and
 > maintained independently at [keepkeen/devspace](https://github.com/keepkeen/devspace).
 
-## What DevSpace does
+## What DevSpace is
 
-ChatGPT runs in the cloud and cannot directly open a local checkout. DevSpace
-runs on your computer and exposes approved Projects to ChatGPT web through a
-local MCP server and a public HTTPS endpoint.
+ChatGPT runs in the cloud and cannot directly open your local projects. DevSpace
+runs on your computer as the local MCP backend for a ChatGPT App, exposing only
+Projects you approve to ChatGPT web through tool calls.
 
 ```text
-ChatGPT web → HTTPS tunnel → DevSpace on 127.0.0.1:7676 → approved Projects
-                                  └→ local-only admin panel
+ChatGPT web
+    │
+    ▼
+Public HTTPS tunnel ──► MCP / OAuth service (127.0.0.1:7676) ──► approved Projects
+
+Local browser ────────► loopback-only administration / control service
 ```
 
-DevSpace does not upload an entire repository in advance and is not a second
-coding model. ChatGPT receives only content returned by the tools it calls.
+DevSpace does not upload an entire repository in advance and is not a second,
+hidden coding model. ChatGPT receives only bounded content returned by actual
+tool calls. The current implementation supports ChatGPT web only and does not
+provide compatibility modes for other MCP hosts.
 
-DevSpace is designed for ChatGPT web. It does not provide compatibility modes
-for other MCP hosts.
+Core capabilities include:
+
+- Project-centric persistent executions constrained by OAuth grants;
+- concurrent accounts and grants, with authorization state, Threads, processes, and cursors isolated;
+- version-preconditioned reads and patches, paginated diffs, idempotent operations, and cross-process root locks;
+- resumable Threads, compact progress summaries, activity logs, and retained process output;
+- on-demand discovery and loading of AGENTS instructions and Skills;
+- the original approved directory by default, with optional managed worktrees for Git top-level Projects.
 
 ## Security boundary
 
 Approve narrow project roots. Do not approve your home directory, filesystem
 root, cloud-drive root, or a directory containing unrelated private data.
 
-DevSpace validates Project selection, file paths, and command working
-directories against the configured roots. File writes also preserve
-`ifMatch`, `operationId`, and root-lock invariants.
+DevSpace constrains Project selection, tool paths, and command working
+directories. It uses server-held session bindings, signed cursors,
+`operationId`, `ifMatch`, persistent tombstones, and root locks to address
+unauthorized access, replay, stale writes, and concurrent races. Repository
+files, instructions, Skills, logs, and model-authored summaries remain
+untrusted input and cannot expand an OAuth grant.
 
-This boundary is not operating-system isolation. `exec_command` starts a local
-process with the authority of the OS user running DevSpace. That process may
-read or modify anything that user can access and may use the network. DevSpace
-does not provide a process sandbox, a command allow/deny policy, protected-path
-enforcement for child processes, or per-command network controls. Run DevSpace
-as a dedicated OS user, in a container, or in a VM if stronger isolation is
-required.
+When ChatGPT supplies opaque `openai/subject` or `openai/session` metadata,
+DevSpace stores only HMAC-derived references for Actor ownership and same-chat
+Thread resolution. It does not store the raw identifiers and cannot access the
+full chat transcript, hidden reasoning, token usage, or ChatGPT compaction
+history.
+
+> [!WARNING]
+> `exec_command` is not a sandbox. Child processes have the authority of the
+> local OS user running DevSpace and inherit network access, so they may reach
+> content outside approved Projects. DevSpace does not provide a command
+> allowlist, child-process filesystem isolation, or per-command network control.
+> Use a dedicated OS user, container, or VM for high-risk environments.
 
 ## Quick start
 
-The examples use the repository-local CLI. After an optional `npm link`, you
-may replace `node dist/cli.js` with `devspace`.
+See the [setup and connection guide](./docs/setup.md) for complete instructions.
+The commands below use the repository-local CLI; after `npm link`, you may use
+`devspace` instead of `node dist/cli.js`.
 
 ### 1. Install
 
-You need Node.js `>=22.19 <27`, npm, Git, and a way to expose an HTTPS endpoint,
-such as
-[cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/).
+You need Node.js `>=22.19 <27`, npm, Git, Bash (Git Bash or WSL on Windows), and
+a tool that exposes the local service through public HTTPS, such as
+[cloudflared](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/).
 
 ```bash
 git clone https://github.com/keepkeen/devspace.git ~/tools/devspace
@@ -77,20 +98,20 @@ npm run build
 node dist/cli.js --help
 ```
 
-Use the same Node installation for install, build, and serving because
-`better-sqlite3` is tied to the Node ABI.
+Use the same Node installation for install, build, and long-running service
+startup because `better-sqlite3` depends on the Node ABI.
 
 ### 2. Start an HTTPS tunnel
 
-For a temporary test, keep this running in a second terminal:
+For temporary testing, keep this command running in a second terminal:
 
 ```bash
 cloudflared tunnel --url http://127.0.0.1:7676
 ```
 
-Copy the HTTPS origin it prints, for example
-`https://random-name.trycloudflare.com`. Do not append `/mcp` when entering the
-origin during initialization.
+Record the HTTPS origin it prints, for example
+`https://random-name.trycloudflare.com`. Enter the origin during initialization;
+do not append `/mcp` there.
 
 ### 3. Initialize and serve
 
@@ -100,16 +121,11 @@ node dist/cli.js init
 node dist/cli.js serve
 ```
 
-The initializer asks for:
+Initialization asks for narrow Project roots, the local port, and the public
+HTTPS origin. Save the Owner password shown by the wizard. The OAuth approval
+page requires it, and the stored verifier cannot recover the plaintext value.
 
-- narrow roots containing the Projects you want to approve;
-- the local port, normally `7676`;
-- the public HTTPS origin, without `/mcp`.
-
-Save the Owner password shown by the initializer. It is required to approve a
-ChatGPT OAuth connection and cannot be recovered from the stored verifier.
-
-Default configuration and state locations are:
+Default configuration and state locations:
 
 ```text
 ~/.devspace/config.json
@@ -117,188 +133,189 @@ Default configuration and state locations are:
 ~/.local/share/devspace/
 ```
 
-### 4. Check readiness
+### 4. Check the service
 
 ```bash
+curl http://127.0.0.1:7676/healthz
 curl http://127.0.0.1:7676/readyz
 curl https://random-name.trycloudflare.com/readyz
 node dist/cli.js doctor
 ```
 
-Both readiness requests should return HTTP `200` while the service is ready.
+`healthz` means the process is alive; `readyz` means the service is ready to
+accept requests.
 
-### 5. Connect ChatGPT web
+### 5. Connect ChatGPT
 
-Enable Developer mode in ChatGPT and create a custom MCP app:
+Enable developer mode in ChatGPT and create a custom MCP App:
 
-1. Use the public origin plus `/mcp`, for example
+1. Set Endpoint to the public origin plus `/mcp`, for example
    `https://random-name.trycloudflare.com/mcp`.
-2. Choose OAuth and review the requested capabilities.
-3. Enter the Owner password and choose the Projects this connection may use.
-4. Complete authorization, scan the tools, and select the app in a conversation.
+2. Select OAuth and enter the Owner password on the DevSpace approval page.
+3. Select the Projects and capabilities this grant may access.
+4. Complete authorization, scan the tools, and enable the App in a chat.
 
-The public OAuth scopes are:
+Multiple OAuth grants may remain valid concurrently. A new account or
+reauthorization does not replace other grants. Each bearer resolves only to its
+own capabilities, approved Projects, and executions. ChatGPT may retain an old
+snapshot after a tool schema change; rescan the tools or recreate the App.
 
-- `project:read` for Project discovery, instructions, Skills, reads,
-  inspection, and change review;
-- `project:write` for patches;
-- `process:execute` for local command and process interaction.
-
-DevSpace has one hidden local Owner, but multiple OAuth grants may remain active
-at the same time, including multiple grants for one OAuth client. Each bearer
-resolves only its own grant, scopes, and approved Projects. A new authorization
-does not replace grants belonging to other accounts or connections.
-
-If a temporary tunnel URL changes, update the public origin and restart the
-service:
+If a temporary tunnel URL changes, override only that service launch:
 
 ```bash
-node dist/cli.js config set publicBaseUrl https://new-random-name.trycloudflare.com
-node dist/cli.js serve
+DEVSPACE_PUBLIC_BASE_URL="https://new-tunnel.example.com" node dist/cli.js serve
 ```
 
-Then update the ChatGPT app endpoint and authorize again. Use a stable hostname
-for regular use. Tunnel only the DevSpace service port, never the local admin
-or control listener.
+Use a stable domain for long-running deployments. The tunnel must forward only
+the MCP/OAuth service port, never the administration or internal control ports.
 
-ChatGPT may cache a tool snapshot. Rescan or rebuild the app after DevSpace
-tool definitions change.
+## Projects, Tasks, Threads, and executions
 
-## Conversation workflow
+| Concept | Meaning |
+| --- | --- |
+| Project | A local root explicitly approved by the current OAuth grant. The model sees only an opaque reference and label. |
+| Task | A shared bounded Project-level summary resumable across chats and reauthorization; `list_projects` lists it. |
+| Thread | The current Actor's private runtime record; the model receives its `threadRef` and checkpoint only in bootstrap context. |
+| execution | An active environment selected server-side for the trusted `openai/session` and Actor; its identity is never exposed to the model. |
+| checkout | The default mode, using the original approved directory directly; logical state is isolated, but the filesystem is shared. |
+| managed worktree | An explicit optional per-Task Git branch/worktree, available only for a Git top-level Project. |
 
-Calls depend only on the OAuth bearer grant carried by that request. DevSpace neither reads nor
-stores ChatGPT account, conversation, `openai/subject`, or `openai/session`
-identity.
+Recommended chat workflow:
 
-1. With one approved Project, call
-   `project_control({"action":"open","operationId":"..."})` directly; do not call `list_projects`
-   first.
-2. With multiple Projects, call `list_projects`. The default full card groups
-   Projects with actions to start fresh or continue a resumable Project task.
-   A click sends the intent to the
-   model, which calls `project_control`. Use `action=list` for private resumable
-   Threads and `action=resume` with an explicit `threadRef`; no recency guess is made.
-   when cards are disabled or limited to changes.
-3. Keep the returned `executionRef` and pass it explicitly to every subsequent
-   Project tool.
-4. Read the compact root instruction delta; use `read_files` or `inspect` for
-   target content and newly applicable nested instructions.
-5. Lazily load one Skill when relevant, make a small patch, review it with
-   `show_changes`, and run the smallest relevant check. For a long task or
-   before moving to a new conversation, save one compact snapshot with
-   `save_progress`.
+1. A single Project can use `project_control(action=open)` directly. With
+   multiple Projects or when resuming work, call `list_projects` for an explicit
+   `projectRef` and `tasks[].taskRef`.
+2. Use `open` for a new task, or `resume` with an explicit `taskRef` for saved
+   work. DevSpace does not guess by recency. The Project App shows Actor-private
+   Thread listings and lifecycle controls.
+3. Successful `open` or `resume` selects the execution for the trusted
+   `openai/session` and Actor. If root instructions are long, continue `hydrate`
+   with each returned cursor until `rootInstructionsComplete` is `true`.
+   Thereafter call Project tools directly, without an execution reference.
+4. Use `read_files`, `inspect`, and `skills` to acquire only needed context. If
+   new nested instructions appear, read the returned instruction delta before
+   retrying a change.
+5. Finish work with `apply_patch`, `show_changes` with required `source`, and
+   the smallest relevant verification commands. Use `save_progress` for compact
+   long-task summaries and `read_process_output` for process output.
+6. Use the Project App for Actor-private Thread pause, archive, complete, or
+   close instead of asking the model to call lifecycle actions. Complete a
+   shared saved Task and release capacity with in-execution
+   `save_progress(status:"completed")`.
 
-`project_control(action=open, projectRef, operationId)` uses the approved
-Project directory by default. For a Project whose root is the Git top level,
-`checkoutKind:"worktree"` explicitly creates a managed per-Thread worktree.
-An active worktree Thread owns one writable directory; dirty worktrees are not
-removed by `action=close`. Non-Git Projects continue to use checkout mode, and
-an identical retry never creates a second worktree.
+`open` and `resume` use `operationId` for safe retries and atomically replace the
+current session+Actor selection. Selection, hydrate, and lifecycle operations
+for one session+Actor are serialized in request order, so a slower older request
+cannot overwrite a newer selection. A host session that remains stable across a
+transport reconnect, service restart, or conversation change can call `hydrate`;
+the server resolves and revalidates the bound execution under the current OAuth
+principal, client, grant, authorization epoch, scopes, approved roots, and
+Project identity. Concurrent
+sessions may select different Projects, and neither a different Actor nor a
+different session can reuse another binding. If the binding is missing or stale,
+call `project_control(action=open)` or explicitly select a `tasks[].taskRef` and
+call `resume`; never guess a recent or sole Project. Reauthorization creates a
+fresh execution with no inherited process, command-replay, or
+execution-private change state.
 
-An `executionRef` is not owned by a ChatGPT conversation. It remains usable
-across transport reconnects and service restarts, and
-`project_control({"action":"hydrate","executionRef":"..."})` explicitly resumes it. Only the original
-grant can use it; another account or connection cannot cross that boundary even
-if it learns the reference. Revoking or expiring the original grant, Project
-deauthorization, or an unavailable Project path rejects the execution.
-Grant revocation also terminates processes still tracked for that execution and
-cleans up retained process output and review state. It does not delete Project
-files or alter Git branches, commits, or worktrees.
+### Checkout modes
 
-`save_progress` persists an at-most-8-KiB model summary for the current private Thread, not the full
-chat transcript. Its title/progress JSON must also fit 12,000 serialized bytes,
-so escape-heavy text cannot make recovery exceed the context budget. Each
-Omit `ifMatch` on the first save; updates require the current Thread `version`.
-Use `project_control(action=list)` to discover Threads visible to the active
-grant and `action=resume` with an explicit `threadRef`. Continuing creates a new
-execution for that grant. Different grants do not see each other's Threads or
-checkpoints by default, even when both approve the same Project. Server-observed
-checkpoint fields are labeled accordingly; the model summary remains untrusted
-and relevant files must be reread.
+The default `checkoutKind:"checkout"` creates no branch or worktree. Two
+executions bound to the same original Project directory see the same files; Git
+management and concurrency coordination remain the responsibility of the user
+and tools.
 
-`show_changes` reads the current Git working-tree diff only when the Project
-root is itself the repository top level, and it never writes the index, objects,
-or refs. A Project nested inside a larger repository uses the non-Git path so
-review cannot cross the approved root. Non-Git results are a bounded, durable
-log of the exact successful `apply_patch` requests in that logical context;
-command and external edits are excluded. Start a new logical context when that
-journal reaches its limit—the shared directory is unchanged.
+For a Project whose root is exactly the Git top level, a grant with
+`project:write` may explicitly request `checkoutKind:"worktree"`. DevSpace
+creates a managed branch/worktree under its private state directory, and
+idempotent retries do not create duplicates. Project App Thread pause, archive,
+and complete retain it; an ordinary close will not automatically delete a dirty
+worktree. These actions do not complete the shared saved Task.
 
-## Model-visible tools
+## Instructions, Skills, and context
 
-The public vocabulary has exactly eleven tool names. Tools whose scopes were not
-approved are unavailable:
+- Root AGENTS instructions are returned in pages; other Project tools remain gated until the final page is acknowledged.
+- Nested AGENTS instructions are discovered on demand for target paths rather than injecting the entire directory tree.
+- `project_control` does not inject the complete Skill catalog. The model calls `skills(action=search)` for a small matching set, then `skills(action=load)` for one Skill's `SKILL.md`; its `skill://` resources remain lazy-loaded.
+- User, administrator, and DevSpace Skills may be implicitly invoked. Repository Skills always remain untrusted repository content and cannot grant themselves implicit model invocation or broader authorization.
+- Bootstrap context uses schema v8: execution identity stays server-side; `thread.threadRef` identifies the private Thread; scalar trust fields distinguish server-observed checkpoint state from an untrusted model summary; a truncated instruction has only `fragment.partial:true`.
+- `save_progress` stores a bounded Project-level model summary, not the full chat. A later grant for the same Project can explicitly select that Task. Resumed progress appears only in `thread.checkpoint`, not as a duplicate Task object.
 
-```text
-list_projects
-project_control
-save_progress
-read_files
-inspect
-skills
-apply_patch
-show_changes
-exec_command
-write_stdin
-read_process_output
-```
+## OAuth capabilities and tools
 
-`exec_command` appears only when both `project:write` and the explicit,
-high-trust `process:execute` scope are granted. It follows the Codex-style
-input shape:
+| Scope | Capability |
+| --- | --- |
+| `project:read` | Discover Projects and Tasks, read instructions and Skills, and inspect files and changes. |
+| `project:write` | Apply version-protected patches and explicitly request a managed worktree. |
+| `process:execute` | Interact with processes; starting a command also requires `project:write`. |
 
-```json
-{
-  "executionRef": "pex1_...",
-  "operationId": "command-2026-07-30-001",
-  "program": "npm",
-  "args": ["test", "--", "--runInBand"],
-  "workingDirectory": ".",
-  "environment": {"CI": "1"},
-  "yieldTimeMs": 10000,
-  "maxOutputTokens": 12000,
-  "tty": false
-}
-```
+Raw `tools/list` contains 12 tools. `project_thread_control` is marked Project
+App-only, leaving exactly 11 model-visible tools; grant scopes further filter
+that model-visible subset:
 
-`workingDirectory` must resolve inside that execution's checkout or worktree.
-Only use `shell:true` with `command` and `approvalReason` when shell syntax such
-as pipes, redirection, or loops is actually required. The command still has the
-full file and network authority of the DevSpace OS user. `write_stdin` only
-sends input, closes, interrupts, or resizes an interactive process and is a
-mutation requiring `operationId`. Use read-only `read_process_output` for both
-live polling and retained, bounded output.
+| Tool | Required scope | Purpose |
+| --- | --- | --- |
+| `list_projects` | read | Return approved Projects plus bounded `tasks`, `taskTrust`, and `taskLimits`. |
+| `project_control` | read | Model bootstrap: open/resume/hydrate/interrupt; interrupt additionally requires execute. |
+| `project_thread_control` | read; App-only | Manage Actor-private Thread resolve/list/status/activity/pause/archive/complete/close; it does not manage saved Tasks. |
+| `save_progress` | read | Store a bounded Project-level Task and return `task.taskRef`; `status:"completed"` completes it and releases capacity. |
+| `read_files` | read | Batch-read known files and their versions. |
+| `inspect` | read | Batch grep, glob, or list directories. |
+| `skills` | read | Search Skill metadata or load one Skill. |
+| `apply_patch` | read + write | Apply patches with per-path version preconditions. |
+| `show_changes` | read | Read a paginated Git diff or execution patch journal from an explicit `source`. |
+| `exec_command` | read + write + execute | Start a direct argv command or a shell command with an explicit reason. |
+| `write_stdin` | read + execute | Write, close, interrupt, or resize a tracked process. |
+| `read_process_output` | read + execute | Poll an active process, or page, tail, and search retained output. |
 
-Mutating operations use `operationId` replay protection where defined by their
-tool schema. File edits use version preconditions (`ifMatch`) to prevent stale
-writes. Root locks coordinate concurrent writes and commands. Tool and process
-output is bounded, and retained process state is cleaned up according to server
-limits. When a tool returns a continuation cursor, pass the same `executionRef`
-and the cursor, but omit the initial query and paging parameters.
+For exact actions, fields, limits, cursors, and recovery rules, see the
+[ChatGPT tool contract](./docs/chatgpt-tool-contract.md), which is normative.
 
-## Administration
+## Files, changes, and processes
 
-Run the loopback-only admin panel with:
+`read_files` returns file versions. `apply_patch` requires `ifMatch` for every
+touched path and uses `operationId` to prevent duplicate side effects.
+`show_changes` requires an explicit source. `source:"repository"` reads the
+working-tree diff only when the Project root is itself a Git top level.
+`source:"apply_patch_history"` is available for every Project and returns the
+bounded, persistent journal of successful `apply_patch` operations for the
+current execution; it does not pretend to record command-driven or external edits.
+
+`exec_command` has two mutually exclusive forms: direct `program` + `args`, or
+`shell:true` + `command` + `approvalReason` when pipes, redirection, or other
+shell syntax is truly required. Its working directory must remain inside the
+current checkout, but the child process still has the OS user's authority.
+
+A long-running command retains the Project root lease, so other file or command
+operations may return `project_busy`. `read_process_output` bypasses that root
+lock and can continue reading stdout/stderr for an existing session. It does not
+automatically read logs redirected to other files or produced by workers on a
+remote machine.
+
+## Local administration and deployment
 
 ```bash
 node dist/cli.js admin
-```
-
-Useful commands include:
-
-```bash
+node dist/cli.js admin --no-open
 node dist/cli.js doctor
 node dist/cli.js config get
+node dist/cli.js config set widgets full
 node dist/cli.js audit --limit 100
+node dist/cli.js audit health --json
+node dist/cli.js --version
 ```
 
-The Admin panel reports Project-execution diagnostics. `doctor` reads the same
-SQLite state without mutating it and reports total, open, and terminal
-execution counts. DevSpace does not manage Git worktrees.
+The administration UI binds to loopback only and enforces capability,
+Host/Origin, CSRF, and ETag checks. Currently, only allowed roots support hot
+reload. User instructions, fallback filenames, widgets, resource limits, and
+other settings require a backend restart.
 
-`GET /healthz` is the liveness check. `GET /readyz` is the readiness check.
-Keep credentials, `auth.json`, internal control tokens, and tunnel credentials
-out of repositories and logs.
+The administration restart action controls only an explicitly registered macOS
+user LaunchAgent and refuses to restart while processes are active. The
+repository also contains a one-shot
+[macOS deployment helper](./docs/macos-launchd-deployment.md) with locking,
+readiness verification, rollback, and recovery planning. It is not a
+cross-platform `devspace deploy` command.
 
 ## Development
 
@@ -309,13 +326,22 @@ npm test
 npm run typecheck
 ```
 
-Use the repository scripts in `package.json` as the source of truth.
+When working on the browser UI or packaging, also run:
 
-## More documentation
+```bash
+npm run test:browser
+npm run test:pack
+```
 
+Treat the scripts in [`package.json`](./package.json) as authoritative.
+
+## Documentation
+
+- [Setup and connection](./docs/setup.md)
 - [ChatGPT coding workflow](./docs/chatgpt-coding-workflow.md)
 - [ChatGPT tool contract](./docs/chatgpt-tool-contract.md)
 - [Configuration reference](./docs/configuration.md)
 - [Security model](./docs/security.md)
-- [Troubleshooting](./docs/gotchas.md)
+- [Common gotchas](./docs/gotchas.md)
 - [Real ChatGPT host acceptance](./docs/chatgpt-host-acceptance.md)
+- [macOS LaunchAgent deployment](./docs/macos-launchd-deployment.md)

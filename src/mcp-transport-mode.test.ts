@@ -29,6 +29,14 @@ async function runMode(mode: McpHttpTransportMode, index: number): Promise<void>
   const stateDir = join(modeRoot, "state");
   const publicBaseUrl = `http://127.0.0.1:${7676 + index}`;
   const accessToken = `transport-${mode}-access-token`;
+  const mainHostMeta = {
+    "openai/subject": `transport-${mode}-subject`,
+    "openai/session": `transport-${mode}-main-session`,
+  };
+  const otherHostMeta = {
+    "openai/subject": `transport-${mode}-subject`,
+    "openai/session": `transport-${mode}-other-session`,
+  };
   await mkdir(projectRoot, { recursive: true });
   await writeFile(
     join(projectRoot, "AGENTS.md"),
@@ -81,6 +89,7 @@ async function runMode(mode: McpHttpTransportMode, index: number): Promise<void>
         "inspect",
         "list_projects",
         "project_control",
+        "project_thread_control",
         "read_files",
         "read_process_output",
         "save_progress",
@@ -97,15 +106,17 @@ async function runMode(mode: McpHttpTransportMode, index: number): Promise<void>
     const selected = await first.callTool({
       name: "project_control",
       arguments: { action: "open", operationId: `${mode}-first-execution` },
+      _meta: mainHostMeta,
     });
     assertSucceeded(selected);
     assert.match(JSON.stringify(selected.structuredContent), new RegExp(`${mode} Project`, "u"));
     assertProjectOnly(selected);
-    const executionRef = projectExecutionRef(selected);
+    assert.doesNotMatch(JSON.stringify(selected.structuredContent), /executionRef/u);
     assertReadText(
       await first.callTool({
         name: "read_files",
-        arguments: { executionRef, files: [{ path: "payload.txt" }] },
+        arguments: { files: [{ path: "payload.txt" }] },
+        _meta: mainHostMeta,
       }),
       `${mode}-ready`,
     );
@@ -120,7 +131,8 @@ async function runMode(mode: McpHttpTransportMode, index: number): Promise<void>
     assertReadText(
       await reconnected.callTool({
         name: "read_files",
-        arguments: { executionRef, files: [{ path: "payload.txt" }] },
+        arguments: { files: [{ path: "payload.txt" }] },
+        _meta: mainHostMeta,
       }),
       `${mode}-ready`,
     );
@@ -135,20 +147,22 @@ async function runMode(mode: McpHttpTransportMode, index: number): Promise<void>
       await otherConversation.callTool({
         name: "read_files",
         arguments: { files: [{ path: "payload.txt" }] },
+        _meta: otherHostMeta,
       }),
-      "invalid_tool_input",
+      "project_execution_required",
     );
     const otherSelected = await otherConversation.callTool({
       name: "project_control",
       arguments: { action: "open", operationId: `${mode}-other-execution` },
+      _meta: otherHostMeta,
     });
     assertSucceeded(otherSelected);
-    const otherExecutionRef = projectExecutionRef(otherSelected);
-    assert.notEqual(otherExecutionRef, executionRef);
+    assert.doesNotMatch(JSON.stringify(otherSelected.structuredContent), /executionRef/u);
     assertReadText(
       await otherConversation.callTool({
         name: "read_files",
-        arguments: { executionRef: otherExecutionRef, files: [{ path: "payload.txt" }] },
+        arguments: { files: [{ path: "payload.txt" }] },
+        _meta: otherHostMeta,
       }),
       `${mode}-ready`,
     );
@@ -243,18 +257,6 @@ function assertProjectOnly(
     serialized,
     /"(?:workspace|receipt|continuation|contextChanged|state|phase|instructionToken)"\s*:/iu,
   );
-}
-
-function projectExecutionRef(
-  result: Awaited<ReturnType<Client["callTool"]>>,
-): string {
-  const executionRef = String(
-    (result.structuredContent as {
-      project?: { executionRef?: unknown };
-    } | undefined)?.project?.executionRef ?? "",
-  );
-  assert.match(executionRef, /^pex1_/u);
-  return executionRef;
 }
 
 function assertReadText(

@@ -120,22 +120,22 @@ files or commands.
 
 ## `project_selection_required`
 
-More than one Project is approved, so `use_project` cannot use a default.
-Call `list_projects`, let the user choose, then retry creation with its returned
-`projectRef` and the intended `operationId`.
+More than one Project is approved, so `project_control(action=open)` cannot use
+a default. Call `list_projects`, let the user choose, then retry creation with
+its returned `projectRef` and the intended `operationId`.
 
-With exactly one approved Project, call `use_project` directly with
-`operationId`; listing first is unnecessary.
+With exactly one approved Project, call `project_control(action=open)` directly
+with `operationId`; listing first is unnecessary.
 
 ## `project_execution_required` or `project_execution_not_found`
 
-Every Project-scoped tool requires the opaque `executionRef` returned by
-`use_project`. DevSpace never infers it from a ChatGPT account, conversation,
-transport, or most-recent selection.
-
-If the reference is missing, pass the known value. If it is invalid, closed, or
-belongs to a replaced grant, create a new execution. Do not send an absolute
-path or guess/edit the opaque reference.
+No usable execution is selected for the trusted ChatGPT session and Actor, or
+the saved binding is stale. Call `project_control(action=open)` for a new task,
+or call `list_projects`, select an explicit `tasks[].taskRef`, and call
+`project_control(action=resume)`. Do not send an absolute path, internal
+identifier, or infer a recent or sole Project. After a stable-session reconnect,
+try `project_control(action=hydrate)`; if it reports the binding is missing or
+stale, reselect explicitly.
 
 ## `project_execution_recovery_required`
 
@@ -168,21 +168,21 @@ After adding a root:
 1. verify the root in the local admin panel or `config get`;
 2. call `list_projects`;
 3. if the Project is not authorized, approve a new grant and select it;
-4. call `use_project` directly for one Project, or `list_projects → use_project`
-   when several are approved.
+4. call `project_control(action=open)` directly for one Project, or
+   `list_projects → project_control(action=open)` when several are approved.
 
 Never approve a broad parent directory merely to make discovery easier.
 
 ## Project path rejected
 
-File paths and command `workdir` values must resolve inside the referenced
+File paths and command `workingDirectory` values must resolve inside the referenced
 Project.
 Common causes are:
 
 - an absolute path instead of a Project-relative path;
 - `..` traversal outside the checkout;
 - a symlink whose canonical target is outside the approved root;
-- a `workdir` that names a file or missing directory;
+- a `workingDirectory` that names a file or missing directory;
 - the root was removed after the Project was selected.
 
 Use a path relative to the selected Project. Do not weaken the approved-root
@@ -190,8 +190,9 @@ configuration to accommodate an unrelated path.
 
 ## Instructions are missing or unexpected
 
-`use_project` returns a compact bounded root instruction delta. `read_files`
-and `inspect` return a newly applicable nested `instructionsDelta` with the
+Project open, resume, and hydrate return compact bounded root instruction
+pages. `read_files` and `inspect` return a newly applicable nested
+`instructionsDelta` with the
 target result. A mutation or command may instead return
 `instructions_required` and start no effect; review that delta before retrying.
 
@@ -205,7 +206,8 @@ Check:
   intended;
 - the file fits the configured instruction limits;
 - `DEVSPACE_USER_INSTRUCTIONS_PATH`, if set, points to the intended file;
-- the call uses the intended `executionRef`.
+- the current trusted session+Actor selected the intended Project with
+  `project_control`.
 
 ## Skills do not appear
 
@@ -230,7 +232,7 @@ Recovery:
 1. read the current file;
 2. reconcile the intended edit with the new content;
 3. create a new patch using the current version;
-4. review with `show_changes`.
+4. review with `show_changes` and an explicit `source`.
 
 Do not remove the precondition or blindly overwrite the newer file.
 
@@ -240,6 +242,10 @@ Effectful calls use operation replay protection. Reusing an operation identifier
 with a different request body is rejected.
 
 - Retry an identical lost-response request with the same identifier.
+- For a saved-Task revision conflict from `save_progress`, first call
+  `list_projects(projectRef)` and reconcile the latest Task, then retry with the
+  same `operationId` and current `ifMatch`; that rejected attempt did not start
+  an effect.
 - Use a new identifier for a logically new effect.
 - If the server reports an uncertain outcome, inspect files or process output
   before deciding what to do next.
@@ -257,24 +263,25 @@ by this lock, so file-version checks still matter.
 ## A command can access paths outside the Project
 
 That is the documented security boundary. DevSpace validates the declared
-`workdir`, but it does not sandbox the child process. The command has the
+`workingDirectory`, but it does not sandbox the child process. The command has the
 authority of the OS user running DevSpace and can use absolute paths and the
 network.
 
 Use a dedicated low-privilege OS user, container, or VM when stronger isolation
 is required. Treat `process:execute` as high-trust access.
 
-## Windows shell command fails
+## Windows command fails
 
-`exec_command.cmd` is interpreted by the platform runtime. Shell syntax and
-program names differ across operating systems. Use commands valid for the OS
-running DevSpace and set `workdir` separately.
+Direct `exec_command` uses `program` and `args`; explicit shell mode uses
+`shell:true`, `command`, and `approvalReason`. Program names and shell syntax
+differ across operating systems. Use values valid for the OS running DevSpace
+and set `workingDirectory` separately.
 
 Do not assume a Unix shell is present on Windows.
 
 ## Command output is truncated
 
-`max_output_tokens` bounds the output returned by `exec_command`. A long-running
+`maxOutputTokens` bounds the output returned by `exec_command`. A long-running
 command may return a process handle instead of waiting for completion.
 
 Use:
@@ -301,8 +308,11 @@ mutation-only.
 
 Signed cursors are self-contained and bound to the active grant, Project
 generation, resource revision, query, and paging parameters. On continuation,
-pass the same `executionRef` and cursor. Do not repeat or change the original
-`outputId`, mode, query, offset, or limit beside it.
+use the same session+Actor selection and pass the cursor. Do not repeat or change
+the original `outputId`, mode, query, offset, or limit beside it.
+
+For `show_changes`, also repeat the same required `source`; changing it makes
+the cursor stale.
 
 If the resource or Project changed, restart the read without the stale cursor.
 
@@ -310,14 +320,15 @@ If the resource or Project changed, restart the read without the stale cursor.
 
 Confirm:
 
-- `executionRef` identifies the logical context you intended;
+- the trusted session+Actor selected the Project context you intended;
+- `source` is explicitly set to `repository` or `apply_patch_history`;
 - the edit succeeded rather than failing an `ifMatch` check;
 - the execution is still active under the current grant.
 
-When the Project root is the Git top level, also confirm that the change is
-visible to the current repository diff. A Project nested inside a larger Git
-repository intentionally uses the non-Git source. That source includes only the
-exact successful DevSpace `apply_patch` requests recorded under that execution;
+With `source:"repository"`, confirm that the Project root is the exact Git top
+level and that the change is visible to the current repository diff. Nested and
+non-Git Projects reject this source. `source:"apply_patch_history"` includes only
+the exact successful DevSpace `apply_patch` requests recorded under that execution;
 it excludes command writes, external edits, and patches from other executions,
 even though those files are visible in the shared directory. It is a bounded
 chronological operation log, not a net filesystem diff. If it is full, create a
@@ -342,13 +353,14 @@ Before restarting:
 2. stop or finish interactive work when practical;
 3. restart only the DevSpace service;
 4. confirm local and public `/readyz`;
-5. reuse the existing `executionRef`, or call
-   `use_project({"executionRef":"..."})` to explicitly resume it.
+5. in the same stable host session, call
+   `project_control({"action":"hydrate"})`; if the binding is unavailable,
+   explicitly open or resume the intended Project.
 
 Restarting may clean up running or retained process state, but persisted
-executions are revalidated when their references are used again. DevSpace
-termination covers only process groups it started and still tracks, on a
-best-effort basis; detached or untracked descendants may survive. Restart does
+executions are revalidated when their trusted session bindings are used again.
+DevSpace termination covers only process groups it started and still tracks, on
+a best-effort basis; detached or untracked descendants may survive. Restart does
 not delete Project files or change Git state.
 
 ## Different executions see the same files

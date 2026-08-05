@@ -36,6 +36,8 @@ export interface ReviewChangesResult {
   revision: string;
 }
 
+export type ReviewSource = "repository" | "apply_patch_history";
+
 /**
  * A page sequence asked to continue a diff that is no longer retained.
  *
@@ -47,6 +49,15 @@ export class ReviewPagingExpiredError extends Error {
   constructor() {
     super("The reviewed diff is no longer retained for paging.");
     this.name = "ReviewPagingExpiredError";
+  }
+}
+
+export class RepositoryReviewUnavailableError extends Error {
+  readonly code = "repository_review_unavailable";
+
+  constructor() {
+    super("Repository review requires the Project root to be an exact Git top level.");
+    this.name = "RepositoryReviewUnavailableError";
   }
 }
 
@@ -117,13 +128,10 @@ interface WorkspaceReviewState {
 export interface ReviewCheckpointManager {
   activeWorkspaceIds(): string[];
   initializeWorkspace(input: { workspaceId: string; root: string }): Promise<void>;
-  reviewSource(input: {
-    workspaceId: string;
-    root: string;
-  }): Promise<"repository" | "apply_patch_history">;
   reviewChanges(input: {
     workspaceId: string;
     root: string;
+    source: ReviewSource;
     pagingScope?: ReviewPagingScope;
     /**
      * Continue an established paging session: serve the retained diff for this
@@ -131,11 +139,7 @@ export interface ReviewCheckpointManager {
      * the revision is not retained.
      */
     continueRevision?: string;
-    /**
-     * Successful DevSpace apply_patch history for a non-Git Project. It is
-     * ignored for Git Projects, whose repository snapshot remains authoritative
-     * for this tool.
-     */
+    /** Successful DevSpace apply_patch history for the selected execution. */
     observedChanges?: ReviewChangesResult;
   }): Promise<ReviewChangesResult>;
   cleanupWorkspace(input: { workspaceId: string; root?: string }): Promise<void>;
@@ -499,19 +503,10 @@ export function createReviewCheckpointManager(
     initializeWorkspace({ workspaceId, root }) {
       return initializeWorkspace(workspaceId, root);
     },
-    async reviewSource({ workspaceId, root }) {
-      await initializeWorkspace(workspaceId, root);
-      const state = states.get(workspaceId);
-      if (state?.diagnostic) throw new Error(state.diagnostic);
-      if (!state || state.closing) {
-        throw new Error(`Review state for Project runtime ${workspaceId} is unavailable.`);
-      }
-      return state.gitRoot ? "repository" : "apply_patch_history";
-    },
-
     async reviewChanges({
       workspaceId,
       root,
+      source,
       continueRevision,
       observedChanges,
       pagingScope = { principalRef: "local", workspaceGeneration: 0 },
@@ -538,15 +533,17 @@ export function createReviewCheckpointManager(
           return retained;
         }
 
-        if (!state.gitRoot) {
+        if (source === "apply_patch_history") {
           if (!observedChanges) {
             throw new Error(
-              "show_changes requires server-observed apply_patch history for a non-Git Project.",
+              "show_changes requires server-observed apply_patch history when that source is selected.",
             );
           }
           await retainReview(workspaceId, pagingScope, observedChanges);
           return observedChanges;
         }
+
+        if (!state.gitRoot) throw new RepositoryReviewUnavailableError();
 
         const { head, patch, files } = await currentRepositoryChanges(state.gitRoot);
         const summary = summarizeFiles(files);

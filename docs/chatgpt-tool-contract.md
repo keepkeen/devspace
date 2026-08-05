@@ -17,63 +17,60 @@ The public scopes are:
 
 | Scope | Authority |
 | --- | --- |
-| `project:read` | Discover Projects, manage private Threads, receive instructions, use Skills, read, inspect, and review. |
+| `project:read` | Discover Projects and saved Tasks, receive instructions, use Skills, read, inspect, and review. |
 | `project:write` | Apply guarded patches and request managed worktrees. |
 | `process:execute` | Interact with processes and, with `project:write`, start commands. |
 
-`executionRef`, `threadRef`, cursors, and Project references are opaque,
-authenticated values. A bearer from another grant cannot reuse an execution.
-Thread ownership uses the anonymous ChatGPT Actor when `openai/subject` is
-available and otherwise falls back to the legacy grant profile. OAuth grants
-still decide which Projects and capabilities are currently authorized.
+`taskRef`, `threadRef`, cursors, and Project references are opaque, authenticated
+values. Execution identity is server-held and never enters model tool schemas or
+results. A successful open, resume, or hydrate binds it to exactly the trusted
+`openai/session` and Actor. Every later Project call resolves that binding and
+revalidates it against the current principal, OAuth client, grant, authorization
+epoch, scopes, approved roots, Project fingerprint/path, and workspace identity.
+Different Actors and different sessions cannot reuse one another's binding;
+concurrent sessions may select different Projects. A host session that remains
+stable across reconnects or conversations may continue by hydrating its binding.
+Selection, hydration, and lifecycle requests for the same session+Actor are
+serialized in request order so an older slow request cannot replace newer state.
+Missing host session metadata or a missing/stale binding fails closed and
+requires explicit open or resume selection. DevSpace never falls back to a
+recent, sole, or caller-supplied execution. Old process, replay, workspace, and
+execution-private change state do not transfer across reauthorization.
 
 ## Public tool surface
 
-The complete surface contains eleven names:
+Raw `tools/list` contains twelve names. `project_thread_control` carries
+`_meta.ui.visibility:["app"]`, so ChatGPT exposes eleven tools to the model and
+reserves that one tool for the Project App:
 
 | Tool | Availability | Purpose |
 | --- | --- | --- |
-| `list_projects` | `project:read` | Discover grant-approved Projects. |
-| `project_control` | `project:read` | Resolve session binding; list, open, resume, hydrate, inspect, read activity, interrupt processes, pause, archive, complete, or legacy-close Threads. `interrupt` additionally requires `process:execute`. |
-| `save_progress` | `project:read` | Save a bounded model summary for the current Thread. |
+| `list_projects` | `project:read` | Discover grant-approved Projects and bounded resumable Task metadata. |
+| `project_control` | `project:read` | Model-visible bootstrap actions: open, resume, hydrate, or interrupt. `interrupt` additionally requires `process:execute`. |
+| `project_thread_control` | `project:read`; App-only | Resolve/list Actor-private Threads, read status/activity, or pause/archive/complete/close from the Project App. It does not manage saved Tasks. |
+| `save_progress` | `project:read` | Save a bounded Project Task and update the current private Thread projection. |
 | `read_files` | `project:read` | Read one to eight known files with versions. |
 | `inspect` | `project:read` | Run one to eight grep, glob, or directory-list operations. |
 | `skills` | `project:read` | Search Skill metadata or load one selected Skill. |
 | `apply_patch` | `project:read project:write` | Apply a version-guarded Project-relative patch. |
-| `show_changes` | `project:read` | Read a bounded repository diff or execution patch journal. |
+| `show_changes` | `project:read` | Read a bounded repository diff or execution patch journal selected by `source`. |
 | `exec_command` | all three scopes | Start a direct program or an explicitly approved shell command. |
 | `write_stdin` | `project:read process:execute` | Send input, close, interrupt, or resize a tracked process. |
 | `read_process_output` | `project:read process:execute` | Poll a process or read retained output without mutating it. |
 
-All Project-scoped tools after `project_control` require the `executionRef`
-returned by an open, resume, or hydrate action.
+After `project_control` selects an execution, model-facing file, process, patch,
+review, Skill, and progress tools are called without an execution reference.
 
-## Project and Thread lifecycle
+## Project bootstrap and App task controls
 
-`list_projects` returns only opaque references and labels for approved roots.
-It does not select a current Project and does not expose local paths.
+`list_projects` returns only opaque references and labels for approved roots;
+it never exposes local paths. Each Project entry includes a bounded `tasks`
+array whose entries contain `taskRef`, title, timestamps, status, and version.
+The top-level `taskTrust:"untrusted"` marks all saved labels as historical
+model input, and `taskLimits` reports the per-Project and total listing bounds.
+Passing `projectRef` requests the complete bounded Task list for that Project.
 
-`project_control` uses one explicit action:
-
-```json
-{"action":"resolve"}
-```
-
-Uses the anonymous `openai/session` binding when available. It never selects a
-Thread by recency. A resolved binding returns bounded Thread metadata and the
-latest Task Snapshot, but creating or recovering an execution still requires
-`resume` or `hydrate` and full current OAuth/Project validation.
-
-```json
-{"action":"list","projectRef":"project_..."}
-```
-
-Lists private Threads owned by the current Actor and visible through the
-current grant. Legacy grant-owned Threads are migrated lazily after the same
-anonymous Actor is observed. Results contain bounded
-metadata such as `threadRef`, title, status, version, checkout kind, and update
-time. They do not contain checkpoint bodies, local paths, profile IDs, grant
-IDs, worktree IDs, or execution references.
+The model-facing `project_control` accepts exactly four actions:
 
 ```json
 {
@@ -84,7 +81,8 @@ IDs, worktree IDs, or execution references.
 }
 ```
 
-Creates a fresh Thread and execution. With exactly one approved Project,
+Creates a fresh Thread and execution and binds it only after bootstrap context
+construction succeeds. With exactly one approved Project,
 `projectRef` may be omitted. `checkoutKind` defaults to `checkout`. For a Git
 top-level Project and a grant with `project:write`, `checkoutKind:"worktree"`
 creates a managed per-Thread worktree under the private DevSpace state
@@ -94,53 +92,26 @@ directory. Identical retries reuse the same execution and worktree.
 {
   "action":"resume",
   "projectRef":"project_...",
-  "threadRef":"pth1_...",
+  "taskRef":"task_...",
   "operationId":"resume-001"
 }
 ```
 
-Creates a new execution bound to one explicitly selected private Thread.
-Exactly one of `threadRef` or the legacy migration-only `handoffRef` is
-accepted. DevSpace never chooses a Thread by recency or because it is the only
-one.
+Creates and binds a new execution from one explicitly selected saved Task after
+bootstrap context construction succeeds. `resume` accepts exactly one `taskRef`
+or current Actor-private `threadRef`; the public
+cross-chat and reauthorization recovery flow uses `tasks[].taskRef`. DevSpace
+never chooses a Task by recency or because it is the only one.
 
 ```json
-{"action":"hydrate","executionRef":"pex1_..."}
+{"action":"hydrate"}
 ```
 
-Rehydrates an existing execution and returns the next bounded root instruction
-page. Continue with the same action, `executionRef`, and returned cursor until
-`rootInstructionsComplete` is true. If a cursor is lost, hydrate without it to
-restart the sequence safely.
-
-```json
-{"action":"status","threadRef":"pth1_..."}
-```
-
-Returns bounded Thread metadata and the latest checkpoint. Server-observed
-checkpoint state has `server_observed` provenance; any model-written summary
-is separately marked `untrusted`.
-
-```json
-{
-  "action":"activity",
-  "threadRef":"pth1_...",
-  "cursor":"42",
-  "waitMs":15000,
-  "limit":50
-}
-```
-
-Reads the durable DevSpace activity journal after a monotonic Thread sequence.
-When no event is immediately available, `waitMs` enables bounded long polling;
-the request wakes only after an event is durably committed. The response
-contains a rebuildable projection, bounded events, `nextCursor`, `hasMore`, and
-`timedOut`. Large command output remains in `read_process_output`; activity
-events contain only the opaque output ID and retained byte range.
-
-DevSpace reports only facts it can observe. It explicitly marks model
-reasoning, model token usage, context compaction, and pre-tool model deltas as
-host-unavailable rather than fabricating those states.
+Resolves the execution selected for this trusted session+Actor, revalidates it,
+refreshes the binding after successful context construction, and returns the
+next bounded root instruction page. Continue with the same action and returned
+cursor until `rootInstructionsComplete` is true. If a cursor is lost, hydrate
+without it to restart the sequence safely.
 
 ```json
 {
@@ -155,21 +126,36 @@ Thread. This action additionally requires `process:execute`. The journal
 distinguishes the request event from the later authoritative process terminal
 event.
 
-```json
-{
-  "action":"pause",
-  "threadRef":"pth1_...",
-  "operationId":"pause-001",
-  "ifMatch":3
-}
-```
+The separate `project_thread_control` is an App-only control-plane tool. Its
+`resolve`, `list`, `status`, `activity`, `pause`, `archive`, `complete`, and
+`close` actions use strict action-specific fields. They are not part of the
+model's tool vocabulary and model instructions must not ask ChatGPT to call
+them. The Project App can use session resolution and private Thread listings,
+show status and durable activity, and apply lifecycle transitions. Activity
+returns only the bounded projection and events it can observe; it does not
+repeat an inventory of unavailable host internals.
 
-`pause` releases active executions but preserves the Thread and checkout.
-`archive` hides a task from the normal active workflow while preserving state.
-`complete` marks the task finished and also retains its checkout. Active
-operations make these actions fail as busy. The legacy `close` action remains
-for migration compatibility and may remove a clean managed worktree; dirty
-worktrees are never removed automatically.
+Pause, archive, and complete preserve the Actor-private Thread and checkout.
+Close checks active operations and may remove a clean managed worktree; dirty
+worktrees are never removed automatically. These lifecycle actions do not
+complete or release capacity for the shared `tasks[].taskRef` record. The model
+does that from an active execution with `save_progress(status:"completed")`.
+
+## Bootstrap context schema v8
+
+Open, resume, and hydrate return `schemaVersion:8`, `project`, optional `thread`,
+and `contextDelta`. No execution identity appears in the bootstrap object.
+`thread.threadRef` is the only Thread reference there. If a checkpoint exists,
+`observedStateTrust` is the scalar `"server_observed"`; an optional model summary
+has the separate scalar
+`modelSummaryTrust:"untrusted"`.
+
+Each instruction contains only `source`, its matching trust value, `scope`,
+`path`, and `content`. A page that cuts an instruction adds only
+`fragment:{"partial":true}`. Internal range and paging metadata are
+not model-visible. A resumed saved Task is projected once into
+`thread.checkpoint.modelSummary`; bootstrap does not duplicate it in a second
+Task object.
 
 ## Task continuity, events, snapshots, and checkpoints
 
@@ -185,6 +171,10 @@ saves, and lifecycle transitions. Model summaries remain explicitly
 `untrusted`; DevSpace does not claim to persist the full ChatGPT transcript,
 assistant reasoning, or ChatGPT's internal compaction history.
 
+Only rows keyed by both trusted session and Actor can authorize implicit model
+execution. Existing thread-only continuity rows remain available to the App for
+private Thread UX but cannot select a model execution.
+
 Each activity event has a Thread-local monotonic sequence and an idempotent
 `eventKey`, with optional operation and item identifiers. A rebuildable
 projection summarizes the current phase, active command or patch items, latest
@@ -199,22 +189,33 @@ transcripts, credentials, or hidden reasoning. Checkpoint persistence failure
 is logged but does not turn an already successful filesystem or process effect
 into a false failure.
 
+The MCP server instruction also asks write-enabled, non-trivial Project work to
+write or update a concise Project-file handoff after each meaningful phase.
+Use `.agent/handoffs/` unless the Project instructions specify another
+location. Keep the objective, completed work, verification, blockers, and exact
+next steps current. When the task is complete, update the same handoff with its
+final status and verification. This file remains visible in the Project and is
+distinct from DevSpace saved progress.
+
 `save_progress` stores a title and at-most-8-KiB model summary:
 
 ```json
 {
-  "executionRef":"pex1_...",
   "operationId":"progress-001",
   "title":"Finish parser cleanup",
   "progress":"Re-read src/parser.ts and its focused tests, then run typecheck."
 }
 ```
 
-The first semantic save omits `ifMatch`; later saves require the current Thread
-version. The result returns `threadRef`, title, status, version, and update time
-without echoing the summary. A stale writer receives
-`thread_revision_conflict`. `status:"completed"` marks the Thread completed
-without deleting its checkout.
+The first semantic save omits `ifMatch`; later saves require the current saved
+Task version. The result returns a `task` object containing `taskRef`, title,
+status, version, and update time, plus optional private `thread` metadata when
+that projection is available. It never echoes the saved summary. On a Task
+revision conflict, call `list_projects(projectRef)`, reconcile the latest Task,
+then retry with the same `operationId` and current `ifMatch`; the rejected
+attempt did not start an effect. `status:"completed"` removes the Task from
+resumable selection, releases resumable capacity, and does not delete Project
+files.
 
 ## Worktree isolation
 
@@ -242,9 +243,12 @@ OAuth scopes or approved roots.
 
 ## Versioned and idempotent effects
 
-New patches, commands, process input, Thread close, and semantic saves use a
-fresh `operationId`. Identical lost-response retries replay their result;
-reusing an ID with changed arguments conflicts.
+New patches, commands, process input, App lifecycle changes, and semantic saves
+start with a fresh `operationId`. Identical lost-response retries replay their
+result; reusing an ID after an accepted or recorded operation with changed
+arguments conflicts. A saved-Task revision rejection is the explicit exception:
+after list/reconcile, retry that unstarted operation with the same ID and current
+`ifMatch`.
 
 `apply_patch` requires an `ifMatch` value for every touched path. Existing
 files use the latest `contentHash`; a path expected not to exist uses `null`.
@@ -256,13 +260,11 @@ Direct argv mode is the default:
 
 ```json
 {
-  "executionRef":"pex1_...",
   "operationId":"command-001",
   "program":"npm",
   "args":["run","typecheck"],
   "workingDirectory":".",
   "environment":{"CI":"1"},
-  "network":"inherit",
   "yieldTimeMs":10000,
   "maxOutputTokens":12000,
   "tty":false
@@ -273,7 +275,6 @@ Shell syntax is explicit:
 
 ```json
 {
-  "executionRef":"pex1_...",
   "operationId":"command-002",
   "shell":true,
   "command":"npm test | tee test.log",
@@ -282,29 +283,55 @@ Shell syntax is explicit:
 ```
 
 Exactly one mode is allowed. `workingDirectory` must stay inside the bound
-checkout or worktree. The current runtime supports `network:"inherit"` only.
-Commands still have the full file and network authority of the DevSpace OS
-user; there is no process sandbox or per-command network policy.
+checkout or worktree. Commands have the full file and inherited network
+authority of the DevSpace OS user; there is no process sandbox or per-command
+network policy.
 
 All process fields use camelCase: `sessionId`, `closeStdin`, `expectedRevision`,
 `yieldTimeMs`, `timeoutMs`, and `maxOutputTokens`. `read_process_output` performs
 read-only polling. `write_stdin` requires an operation ID only when it mutates
 the process.
 
+For long work, prefer one fixed foreground Project runner in direct argv mode.
+Give it a short initial `yieldTimeMs`, then poll the returned session with
+`read_process_output` across turns. Increase `yieldTimeMs` when the process is
+expected to remain quiet for longer and a longer bounded wait is useful. Let
+that runner own preflight, fan-out, PID/log verification, and completion instead
+of constructing repeated shell, background, detach, or renamed launcher
+wrappers merely to survive a host turn.
+
+## Change review
+
+`show_changes` requires one explicit source:
+
+```json
+{"source":"repository"}
+```
+
+- `repository` reads staged, unstaged, and untracked changes only when the
+  Project root exactly equals its Git top level. Otherwise the tool returns
+  `repository_review_unavailable` and recommends `apply_patch_history`.
+- `apply_patch_history` is available for Git and non-Git Projects. It contains
+  only successful DevSpace `apply_patch` requests from this execution, not
+  command writes, external edits, or patches from another execution.
+
+Continuation cursors are bound to the selected source. Keep the same `source`
+when paging.
+
 ## Recovery principles
 
-- Never guess a Project, Thread, execution, or path.
-- Use `project_control action=resolve` in the same ChatGPT conversation before
-  asking the model to select a Thread.
-- Use `project_control action=list` after losing a `threadRef` or in a new
-  ChatGPT conversation.
-- Use `action=hydrate` after losing execution-local instruction state.
-- Use `action=status` to obtain the current Thread version after a conflict.
-- Use `action=activity` with the returned cursor to observe durable command,
-  patch, and lifecycle progress without replaying the entire journal.
+- Never guess a Project, Thread, or path.
+- Use `list_projects(projectRef)` to select a saved `taskRef` in a new ChatGPT
+  conversation or after reauthorization.
+- Use `action=hydrate` after a reconnect while the trusted host session remains
+  stable. If the binding is missing or stale, explicitly open or resume instead.
+- Use `list_projects(projectRef)` to obtain the current saved Task version
+  after a save conflict.
+- Use the Project App—not model instructions—for Actor-private Thread listings,
+  status, activity, and lifecycle transitions. Use
+  `save_progress(status:"completed")` for the shared saved Task.
 - Reauthorize the Project when its grant or root authorization changed.
-- Prefer `pause`, `archive`, or `complete`; review or hand off a dirty worktree
-  before any explicit checkout disposal or legacy close.
+- Review or hand off a dirty worktree before any explicit checkout disposal.
 - Reread repository files after resuming because the model summary is untrusted.
 
 No lifecycle operation deploys, restarts, or replaces the DevSpace backend.

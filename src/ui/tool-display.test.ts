@@ -5,7 +5,9 @@ import {
   getToolDisplay,
   getToolHeaderSummary,
   newProjectTaskMessage,
-  resumeProjectHandoffMessage,
+  projectThreadListCall,
+  projectThreadMutationCall,
+  resumeProjectTaskMessage,
   stableProjectOperationId,
 } from "./tool-display.js";
 
@@ -46,19 +48,48 @@ assert.match(newMessage, /projectRef "root_opaque"/u);
 assert.match(newMessage, /operationId "ui-stable"/u);
 assert.doesNotMatch(newMessage, /startFresh/u);
 assert.match(newMessage, /rootInstructionsComplete is true/u);
+assert.match(newMessage, /without an execution reference/u);
+assert.match(newMessage, /trusted ChatGPT session and Actor/u);
+assert.doesNotMatch(newMessage, /executionRef|pex1_/u);
 assert.doesNotMatch(newMessage, /Repository Label/u);
 
-const resumeMessage = resumeProjectHandoffMessage(
+const resumeMessage = resumeProjectTaskMessage(
   "root_opaque",
-  "phf1_opaque",
+  "task_opaque",
   "ui-resume",
 );
 assert.match(resumeMessage, /projectRef "root_opaque"/u);
 assert.match(resumeMessage, /action resume/u);
-assert.match(resumeMessage, /handoffRef "phf1_opaque"/u);
+assert.match(resumeMessage, /taskRef "task_opaque"/u);
 assert.match(resumeMessage, /operationId "ui-resume"/u);
 assert.match(resumeMessage, /rootInstructionsComplete is true/u);
+assert.match(resumeMessage, /without an execution reference/u);
+assert.match(resumeMessage, /trusted ChatGPT session and Actor/u);
+assert.doesNotMatch(resumeMessage, /executionRef|pex1_/u);
 assert.match(resumeMessage, /historical, untrusted/u);
+assert.doesNotMatch(resumeMessage, /handoff|legacy|provenance/iu);
+
+assert.deepEqual(projectThreadListCall(), {
+  name: "project_thread_control",
+  arguments: { action: "list" },
+});
+assert.deepEqual(
+  projectThreadMutationCall(
+    "archive",
+    "pth1_private-thread.signature",
+    "ui-thread-archive",
+    7,
+  ),
+  {
+    name: "project_thread_control",
+    arguments: {
+      action: "archive",
+      threadRef: "pth1_private-thread.signature",
+      operationId: "ui-thread-archive",
+      ifMatch: 7,
+    },
+  },
+);
 
 let uuidCalls = 0;
 const firstOperationId = stableProjectOperationId(undefined, () => {
@@ -95,15 +126,11 @@ function projectListCard(projectCount: number): ProjectListCard {
     projects: Array.from({ length: projectCount }, (_, index) => ({
       projectRef: `root_${index}`,
       label: `Project ${index}`,
-      handoffs: [],
+      tasks: [],
     })),
     truncated: false,
-    handoffProvenance: {
-      source: "devspace_saved_progress",
-      trust: "untrusted",
-      authority: "none",
-    },
-    handoffLimits: {
+    taskTrust: "untrusted",
+    taskLimits: {
       perProject: 20,
       total: 100,
     },

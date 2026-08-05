@@ -448,6 +448,10 @@ assert.deepEqual(requiredOAuthScopesForToolCall({
   method: "tools/call",
   params: { name: "show_changes", arguments: {} },
 }), ["project:read"]);
+assert.deepEqual(requiredOAuthScopesForToolCall({
+  method: "tools/call",
+  params: { name: "project_thread_control", arguments: { action: "list" } },
+}), ["project:read"]);
 assert.equal(projectToolRootLockMode({
   method: "tools/call",
   params: { name: "show_changes", arguments: {} },
@@ -483,7 +487,7 @@ assert.equal(jsonRpcRequestId({ jsonrpc: "2.0", id: "call-1" }), "call-1");
 assert.equal(jsonRpcRequestId([{ jsonrpc: "2.0", id: 42 }]), null);
 assert.match(
   recoverableProjectExecutionError(new UnknownWorkspaceError("ws_stale")) ?? "",
-  /^project_execution_required: Call project_control with action=hydrate and the same executionRef\./,
+  /^project_execution_required: Call project_control with action=hydrate in this ChatGPT session\./,
 );
 assert.doesNotMatch(
   recoverableProjectExecutionError(new UnknownWorkspaceError("ws_stale")) ?? "",
@@ -493,7 +497,7 @@ assert.equal(recoverableProjectExecutionError(new Error("database failure")), un
 
 const commonTools = [
   "apply_patch", "exec_command", "inspect", "list_projects", "read_files",
-  "project_control", "read_process_output", "save_progress", "show_changes", "skills",
+  "project_control", "project_thread_control", "read_process_output", "save_progress", "show_changes", "skills",
   "write_stdin",
 ];
 assert.deepEqual(toolSurface(), commonTools.sort());

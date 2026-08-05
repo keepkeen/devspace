@@ -22,6 +22,14 @@ const changedOwnerToken = "oauth-http-test-changed-owner-token-long-enough";
 const redirectUri = "https://chatgpt.com/connector/oauth/devspace-test";
 const codeVerifier = "oauth-http-test-verifier-0123456789-abcdefghijklmnopqrstuvwxyz";
 const codeChallenge = createHash("sha256").update(codeVerifier).digest("base64url");
+const earlierHostMeta = {
+  "openai/subject": "oauth-http-earlier-subject",
+  "openai/session": "oauth-http-earlier-session",
+};
+const renewedHostMeta = {
+  "openai/subject": "oauth-http-renewed-subject",
+  "openai/session": "oauth-http-renewed-session",
+};
 const execFileAsync = promisify(execFile);
 await mkdir(workspaceRoot, { recursive: true });
 await writeFile(join(workspaceRoot, "README.md"), "OAuth HTTP fixture\n", "utf8");
@@ -125,18 +133,14 @@ try {
   const selectedProject = await mcpClient.callTool({
     name: "project_control",
     arguments: { action: "open", operationId: "oauth-project-execution" },
+    _meta: earlierHostMeta,
   });
   assert.notEqual(selectedProject.isError, true, JSON.stringify(selectedProject.content));
   const projectRef = String(
     (selectedProject.structuredContent as { project?: { ref?: unknown } } | undefined)?.project?.ref ?? "",
   );
   assert.ok(projectRef);
-  const executionRef = String(
-    (selectedProject.structuredContent as {
-      project?: { executionRef?: unknown };
-    } | undefined)?.project?.executionRef ?? "",
-  );
-  assert.match(executionRef, /^pex1_/u);
+  assert.doesNotMatch(JSON.stringify(selectedProject.structuredContent), /executionRef/u);
   assert.doesNotMatch(
     JSON.stringify(selectedProject.structuredContent),
     /workspace|receipt|continuation|contextChanged|phase/iu,
@@ -144,12 +148,12 @@ try {
   const backgroundProcess = await mcpClient.callTool({
     name: "exec_command",
     arguments: {
-      executionRef,
       operationId: "oauth-background-process",
       program: process.execPath,
       args: ["-e", "setInterval(() => {}, 1000)"],
       yieldTimeMs: 0,
     },
+    _meta: earlierHostMeta,
   });
   assert.notEqual(backgroundProcess.isError, true, JSON.stringify(backgroundProcess.content));
   assert.equal(
@@ -201,28 +205,24 @@ try {
   const renewedProject = await renewedClient.callTool({
     name: "project_control",
     arguments: { action: "open", operationId: "oauth-renewed-project-execution" },
+    _meta: renewedHostMeta,
   });
   assert.notEqual(renewedProject.isError, true, JSON.stringify(renewedProject.content));
-  const renewedExecutionRef = String(
-    (renewedProject.structuredContent as {
-      project?: { executionRef?: unknown };
-    } | undefined)?.project?.executionRef ?? "",
-  );
-  assert.match(renewedExecutionRef, /^pex1_/u);
+  assert.doesNotMatch(JSON.stringify(renewedProject.structuredContent), /executionRef/u);
   const renewedProgress = await renewedClient.callTool({
     name: "save_progress",
     arguments: {
-      executionRef: renewedExecutionRef,
       operationId: "oauth-renewed-save-progress",
       title: "Shared OAuth handoff",
       progress: "Historical progress saved by the renewed grant.",
     },
+    _meta: renewedHostMeta,
   });
   assert.notEqual(renewedProgress.isError, true, JSON.stringify(renewedProgress.content));
   const renewedThreadRef = String(
     (renewedProgress.structuredContent as {
-      thread?: { ref?: unknown };
-    } | undefined)?.thread?.ref ?? "",
+      thread?: { threadRef?: unknown };
+    } | undefined)?.thread?.threadRef ?? "",
   );
   assert.match(renewedThreadRef, /^pth1_/u);
 
@@ -236,12 +236,14 @@ try {
     },
   }));
   const earlierGrantListing = await earlierGrantClient.callTool({
-    name: "project_control",
+    name: "project_thread_control",
     arguments: { action: "list" },
+    _meta: earlierHostMeta,
   });
   const renewedGrantListing = await renewedClient.callTool({
-    name: "project_control",
+    name: "project_thread_control",
     arguments: { action: "list" },
+    _meta: renewedHostMeta,
   });
   const earlierGrantThreads = (
     earlierGrantListing.structuredContent as {
@@ -271,6 +273,7 @@ try {
       threadRef: renewedThreadRef,
       operationId: "oauth-earlier-resume-shared-handoff",
     },
+    _meta: earlierHostMeta,
   });
   assert.equal(crossGrantHandoffResume.isError, true);
   assert.equal(
@@ -278,15 +281,6 @@ try {
       error?: { code?: unknown };
     } | undefined)?.error?.code,
     "project_thread_not_found",
-  );
-  const crossGrantResume = await earlierGrantClient.callTool({
-    name: "project_control",
-    arguments: { action: "hydrate", executionRef: renewedExecutionRef },
-  });
-  assert.equal(
-    crossGrantResume.isError,
-    true,
-    "an opaque execution reference must not cross the bearer grant boundary",
   );
   await earlierGrantClient.close();
 
@@ -301,12 +295,12 @@ try {
   const heldTool = renewedClient.callTool({
     name: "exec_command",
     arguments: {
-      executionRef: renewedExecutionRef,
       operationId: "oauth-revocation-held-command",
       program: process.execPath,
       args: ["-e", "setTimeout(() => {}, 750)"],
       yieldTimeMs: 2_000,
     },
+    _meta: renewedHostMeta,
   }).then(
     () => "fulfilled" as const,
     () => "rejected" as const,
@@ -571,25 +565,6 @@ function listen(server: HttpServer): Promise<URL> {
 
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
-}
-
-function listedHandoffRefs(structuredContent: unknown): string[] {
-  const projects = (
-    structuredContent &&
-      typeof structuredContent === "object" &&
-      !Array.isArray(structuredContent)
-      ? (structuredContent as {
-          projects?: Array<{
-            handoffs?: Array<{ handoffRef?: unknown }>;
-          }>;
-        }).projects
-      : undefined
-  ) ?? [];
-  return projects.flatMap((project) =>
-    project.handoffs?.flatMap((handoff) =>
-      typeof handoff.handoffRef === "string" ? [handoff.handoffRef] : []
-    ) ?? []
-  );
 }
 
 function closeHttpServer(server: HttpServer): Promise<void> {

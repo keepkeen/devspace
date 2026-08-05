@@ -16,6 +16,7 @@ import { promisify } from "node:util";
 import assert from "node:assert/strict";
 import {
   createReviewCheckpointManager,
+  RepositoryReviewUnavailableError,
   UnsafeGitReviewConfigurationError,
   type ReviewChangesResult,
 } from "./review-checkpoints.js";
@@ -50,10 +51,6 @@ try {
     manager.initializeWorkspace({ workspaceId: "ws_review", root }),
     manager.initializeWorkspace({ workspaceId: "ws_review", root }),
   ]);
-  assert.equal(
-    await manager.reviewSource({ workspaceId: "ws_review", root }),
-    "repository",
-  );
   assert.deepEqual(
     await gitStateSnapshot(root),
     gitStateBeforeReview,
@@ -63,6 +60,7 @@ try {
   const firstReview = await manager.reviewChanges({
     workspaceId: "ws_review",
     root,
+    source: "repository",
     pagingScope: { principalRef: "principal", workspaceGeneration: 1 },
   });
   assert.deepEqual(
@@ -91,6 +89,7 @@ try {
   const continued = await manager.reviewChanges({
     workspaceId: "ws_review",
     root,
+    source: "repository",
     continueRevision: firstReview.revision,
     pagingScope: { principalRef: "principal", workspaceGeneration: 1 },
   });
@@ -102,6 +101,7 @@ try {
   const continuedAfterRestart = await restartedManager.reviewChanges({
     workspaceId: "ws_review",
     root,
+    source: "repository",
     continueRevision: firstReview.revision,
     pagingScope: { principalRef: "principal", workspaceGeneration: 1 },
   });
@@ -110,6 +110,7 @@ try {
   const currentReview = await manager.reviewChanges({
     workspaceId: "ws_review",
     root,
+    source: "repository",
     pagingScope: { principalRef: "principal", workspaceGeneration: 1 },
   });
   assert.notEqual(currentReview.revision, firstReview.revision);
@@ -117,6 +118,7 @@ try {
   const stillCurrent = await manager.reviewChanges({
     workspaceId: "ws_review",
     root,
+    source: "repository",
   });
   assert.equal(
     stillCurrent.revision,
@@ -170,19 +172,20 @@ try {
   const projectRoot = join(parentRoot, "approved-project");
   const parentGitState = await gitStateSnapshot(parentRoot);
   const nestedManager = createReviewCheckpointManager();
-  assert.equal(
-    await nestedManager.reviewSource({ workspaceId: "ws_nested", root: projectRoot }),
-    "apply_patch_history",
-  );
   await assert.rejects(
-    nestedManager.reviewChanges({ workspaceId: "ws_nested", root: projectRoot }),
-    /server-observed apply_patch history/iu,
+    nestedManager.reviewChanges({
+      workspaceId: "ws_nested",
+      root: projectRoot,
+      source: "repository",
+    }),
+    RepositoryReviewUnavailableError,
   );
 
   const observed = observedReview();
   const nestedReview = await nestedManager.reviewChanges({
     workspaceId: "ws_nested",
     root: projectRoot,
+    source: "apply_patch_history",
     observedChanges: observed,
   });
   assert.deepEqual(nestedReview.files.map((file) => file.path), ["inside.txt"]);
@@ -220,16 +223,10 @@ try {
   await writeFile(join(executableConfigRoot, "filtered.txt"), "modified\n");
 
   const safeGitManager = createReviewCheckpointManager();
-  assert.equal(
-    await safeGitManager.reviewSource({
-      workspaceId: "ws_executable",
-      root: executableConfigRoot,
-    }),
-    "repository",
-  );
   const fsmonitorSafeReview = await safeGitManager.reviewChanges({
     workspaceId: "ws_executable",
     root: executableConfigRoot,
+    source: "repository",
   });
   assert.match(fsmonitorSafeReview.patch, /modified/u);
   assert.equal(await pathExists(executableMarker), false, "core.fsmonitor was not executed");
@@ -240,6 +237,7 @@ try {
     safeGitManager.reviewChanges({
       workspaceId: "ws_executable",
       root: executableConfigRoot,
+      source: "repository",
     }),
     (error: unknown) =>
       error instanceof UnsafeGitReviewConfigurationError &&
@@ -261,13 +259,10 @@ try {
   await writeFile(join(unbornRoot, "untracked.txt"), "untracked version\n");
   const unbornStateBefore = await gitStateSnapshot(unbornRoot);
   const unbornManager = createReviewCheckpointManager();
-  assert.equal(
-    await unbornManager.reviewSource({ workspaceId: "ws_unborn", root: unbornRoot }),
-    "repository",
-  );
   const unbornReview = await unbornManager.reviewChanges({
     workspaceId: "ws_unborn",
     root: unbornRoot,
+    source: "repository",
   });
   assert.deepEqual(
     new Set(unbornReview.files.map((file) => file.path)),
@@ -282,6 +277,15 @@ try {
     unbornStateBefore,
     "unborn repository review must not write Git state",
   );
+
+  const explicitHistory = observedReview();
+  const gitProjectHistory = await manager.reviewChanges({
+    workspaceId: "ws_review",
+    root,
+    source: "apply_patch_history",
+    observedChanges: explicitHistory,
+  });
+  assert.equal(gitProjectHistory.patch, explicitHistory.patch);
 } finally {
   await Promise.all([
     rm(root, { recursive: true, force: true }),

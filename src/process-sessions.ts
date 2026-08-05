@@ -15,7 +15,7 @@ import type { WorkspaceRootLease } from "./workspace-root-locks.js";
 
 const DEFAULT_EXEC_YIELD_MS = 10_000;
 const DEFAULT_INTERACTIVE_YIELD_MS = 250;
-const DEFAULT_POLL_YIELD_MS = 5_000;
+const DEFAULT_POLL_YIELD_MS = 8_000;
 // Allow long foreground waits (Claude Code default timeout is 2 minutes;
 // max is 10 minutes). Background/session mode still returns early via yieldTimeMs=0.
 const MAX_COMMAND_YIELD_MS = 600_000;
@@ -515,7 +515,7 @@ export class ProcessSessionManager {
     this.completedSessionTtlMs = options.completedSessionTtlMs ?? COMPLETED_SESSION_TTL_MS;
     this.maxSessions = options.maxSessions ?? Number.POSITIVE_INFINITY;
     this.maxSessionsPerWorkspace = options.maxSessionsPerWorkspace ?? Number.POSITIVE_INFINITY;
-    this.maxRuntimeMs = options.maxRuntimeMs ?? 60 * 60 * 1_000;
+    this.maxRuntimeMs = options.maxRuntimeMs ?? 6 * 60 * 60 * 1_000;
     this.terminationGraceMs = options.terminationGraceMs ?? 5_000;
     this.durableOutputFlushBytes = positiveBoundedInteger(
       options.durableOutputFlushBytes,

@@ -101,6 +101,16 @@ export interface ProjectHostIdentity {
   sessionRef?: string;
 }
 
+export interface ProjectTaskSessionBinding {
+  sessionRef: string;
+  actorId: string;
+  organizationRef?: string;
+  threadId: string;
+  executionId?: string;
+  boundAt: string;
+  lastSeenAt: string;
+}
+
 interface EventRow {
   event_id: string;
   event_key: string | null;
@@ -132,6 +142,16 @@ interface SnapshotRow {
   observed_state_json: string;
   model_summary: string | null;
   created_at: string;
+}
+
+interface SessionBindingRow {
+  session_ref: string;
+  actor_id: string;
+  organization_ref: string | null;
+  thread_id: string;
+  execution_id: string | null;
+  bound_at: string;
+  last_seen_at: string;
 }
 
 const MAX_ID_BYTES = 1_024;
@@ -206,52 +226,89 @@ export class ProjectTaskContinuityStore {
     sessionRef: string;
     actorId: string;
     threadId: string;
+    executionId: string;
     organizationRef?: string;
   }): void {
     this.assertOpen();
     const timestamp = this.timestamp();
     this.database.prepare(`
       insert into project_task_session_bindings (
-        session_ref, actor_id, organization_ref, thread_id,
+        session_ref, actor_id, organization_ref, thread_id, execution_id,
         binding_status, bound_at, last_seen_at
-      ) values (?, ?, ?, ?, 'active', ?, ?)
+      ) values (?, ?, ?, ?, ?, 'active', ?, ?)
       on conflict(session_ref, actor_id) do update set
         organization_ref = excluded.organization_ref,
         thread_id = excluded.thread_id,
+        execution_id = excluded.execution_id,
         binding_status = 'active',
+        bound_at = excluded.bound_at,
         last_seen_at = excluded.last_seen_at
     `).run(
       bounded(input.sessionRef, "sessionRef", MAX_ID_BYTES),
       bounded(input.actorId, "actorId", MAX_ID_BYTES),
       optionalBounded(input.organizationRef, "organizationRef", MAX_ID_BYTES),
       bounded(input.threadId, "threadId", MAX_ID_BYTES),
+      bounded(input.executionId, "executionId", MAX_ID_BYTES),
       timestamp,
       timestamp,
     );
   }
 
-  resolveSession(sessionRef: string, actorId: string): string | undefined {
+  resolveSession(sessionRef: string, actorId: string): ProjectTaskSessionBinding | undefined {
     this.assertOpen();
-    return this.database.prepare(`
-      select thread_id
+    const row = this.database.prepare(`
+      select session_ref, actor_id, organization_ref, thread_id, execution_id,
+        bound_at, last_seen_at
       from project_task_session_bindings
       where session_ref = ? and actor_id = ? and binding_status = 'active'
-    `).pluck().get(
+    `).get(
       bounded(sessionRef, "sessionRef", MAX_ID_BYTES),
       bounded(actorId, "actorId", MAX_ID_BYTES),
-    ) as string | undefined;
+    ) as SessionBindingRow | undefined;
+    return row ? mapSessionBinding(row) : undefined;
   }
 
-  unbindSession(sessionRef: string, actorId: string): boolean {
+  touchSession(input: {
+    sessionRef: string;
+    actorId: string;
+    threadId: string;
+    executionId: string;
+  }): boolean {
     this.assertOpen();
     const result = this.database.prepare(`
       update project_task_session_bindings
-      set binding_status = 'released', last_seen_at = ?
-      where session_ref = ? and actor_id = ? and binding_status = 'active'
+      set last_seen_at = ?
+      where session_ref = ? and actor_id = ? and thread_id = ?
+        and execution_id = ? and binding_status = 'active'
     `).run(
       this.timestamp(),
-      bounded(sessionRef, "sessionRef", MAX_ID_BYTES),
-      bounded(actorId, "actorId", MAX_ID_BYTES),
+      bounded(input.sessionRef, "sessionRef", MAX_ID_BYTES),
+      bounded(input.actorId, "actorId", MAX_ID_BYTES),
+      bounded(input.threadId, "threadId", MAX_ID_BYTES),
+      bounded(input.executionId, "executionId", MAX_ID_BYTES),
+    );
+    return result.changes === 1;
+  }
+
+  releaseSession(input: {
+    sessionRef: string;
+    actorId: string;
+    threadId: string;
+    executionId?: string;
+  }): boolean {
+    this.assertOpen();
+    const executionId = optionalBounded(input.executionId, "executionId", MAX_ID_BYTES);
+    const result = this.database.prepare(`
+      update project_task_session_bindings
+      set binding_status = 'released', last_seen_at = ?
+      where session_ref = ? and actor_id = ? and thread_id = ?
+        and execution_id is ? and binding_status = 'active'
+    `).run(
+      this.timestamp(),
+      bounded(input.sessionRef, "sessionRef", MAX_ID_BYTES),
+      bounded(input.actorId, "actorId", MAX_ID_BYTES),
+      bounded(input.threadId, "threadId", MAX_ID_BYTES),
+      executionId,
     );
     return result.changes === 1;
   }
@@ -457,6 +514,7 @@ export class ProjectTaskContinuityStore {
         actor_id text not null references project_task_actors(actor_id) on delete cascade,
         organization_ref text,
         thread_id text not null,
+        execution_id text,
         binding_status text not null check (binding_status in ('active', 'released')),
         bound_at text not null,
         last_seen_at text not null,
@@ -498,6 +556,7 @@ export class ProjectTaskContinuityStore {
       create index if not exists project_task_snapshots_thread_idx
         on project_task_snapshots(thread_id, through_sequence desc, created_at desc);
     `);
+    ensureColumn(this.database, "project_task_session_bindings", "execution_id", "text");
     ensureColumn(this.database, "project_task_events", "event_key", "text");
     ensureColumn(this.database, "project_task_events", "visibility", "text");
     ensureColumn(this.database, "project_task_events", "run_id", "text");
@@ -547,6 +606,18 @@ export class ProjectTaskContinuityStore {
   private assertOpen(): void {
     if (this.closed) throw new Error("ProjectTaskContinuityStore is closed.");
   }
+}
+
+function mapSessionBinding(row: SessionBindingRow): ProjectTaskSessionBinding {
+  return {
+    sessionRef: row.session_ref,
+    actorId: row.actor_id,
+    ...(row.organization_ref ? { organizationRef: row.organization_ref } : {}),
+    threadId: row.thread_id,
+    ...(row.execution_id ? { executionId: row.execution_id } : {}),
+    boundAt: row.bound_at,
+    lastSeenAt: row.last_seen_at,
+  };
 }
 
 function mapEvent(row: EventRow): ProjectTaskEvent {

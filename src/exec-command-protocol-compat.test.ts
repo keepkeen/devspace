@@ -19,6 +19,18 @@ const nestedRoot = join(workspaceRoot, "nested");
 const stateDir = join(fixtureRoot, "state");
 const accessToken = "exec-protocol-compat-access-token";
 const publicBaseUrl = "http://127.0.0.1:7777";
+const mainHostMeta = {
+  "openai/subject": "exec-protocol-subject",
+  "openai/session": "exec-protocol-main-session",
+};
+const otherHostMeta = {
+  "openai/subject": "exec-protocol-subject",
+  "openai/session": "exec-protocol-other-session",
+};
+const replacementHostMeta = {
+  "openai/subject": "exec-protocol-replacement-subject",
+  "openai/session": "exec-protocol-replacement-session",
+};
 await mkdir(nestedRoot, { recursive: true });
 await writeFile(join(nestedRoot, "fixture.txt"), "fixture\n");
 await execFileAsync("git", ["init", "-q"], { cwd: workspaceRoot });
@@ -57,6 +69,7 @@ try {
   const toolsPayload = await rawRequest(origin, 1, "tools/list", {});
   const tools = resultOf(toolsPayload).tools as Array<{
     name?: unknown;
+    description?: unknown;
     inputSchema?: {
       required?: unknown;
       properties?: Record<string, unknown>;
@@ -65,26 +78,34 @@ try {
   const toolsByName = new Map(tools.map((tool) => [String(tool.name), tool]));
   const execTool = toolsByName.get("exec_command");
   const writeStdinTool = toolsByName.get("write_stdin");
+  const readProcessOutputTool = toolsByName.get("read_process_output");
   assert.ok(execTool);
   assert.ok(writeStdinTool);
-  assert.deepEqual(execTool.inputSchema?.required, ["operationId", "executionRef"]);
+  assert.ok(readProcessOutputTool);
+  assert.match(String(execTool.description), /one fixed foreground Project runner/u);
+  assert.match(String(execTool.description), /increase yieldTimeMs/u);
+  assert.match(String(execTool.description), /unmanaged background or detach wrappers/u);
+  assert.match(String(readProcessOutputTool.description), /use a larger yieldTimeMs/u);
+  assert.deepEqual(execTool.inputSchema?.required, ["operationId"]);
   assert.deepEqual(
     writeStdinTool.inputSchema?.required,
-    ["operationId", "sessionId", "executionRef"],
+    ["operationId", "sessionId"],
   );
+  assert.equal(writeStdinTool.inputSchema?.properties?.executionRef, undefined);
+  assert.equal(readProcessOutputTool.inputSchema?.properties?.executionRef, undefined);
   for (const name of ["poll_process", "write_process_input"]) {
     assert.equal(toolsByName.has(name), false);
   }
   for (const removed of [
-    "invocation", "cmd", "workdir", "env", "close_stdin",
-    "yield_time_ms", "timeout_ms", "max_output_tokens",
+    "executionRef", "invocation", "cmd", "workdir", "env", "close_stdin",
+    "yield_time_ms", "timeout_ms", "max_output_tokens", "network",
   ]) {
     assert.equal(execTool.inputSchema?.properties?.[removed], undefined, removed);
   }
   for (const current of [
     "program", "args", "shell", "command", "approvalReason",
     "workingDirectory", "stdin", "closeStdin", "tty", "columns", "rows",
-    "environment", "network", "yieldTimeMs", "timeoutMs", "maxOutputTokens",
+    "environment", "yieldTimeMs", "timeoutMs", "maxOutputTokens",
   ]) {
     assert.ok(execTool.inputSchema?.properties?.[current], current);
   }
@@ -94,11 +115,10 @@ try {
     operationId: "exec-protocol-execution",
   }));
   assert.notEqual(opened.isError, true, JSON.stringify(opened));
-  const executionRef = projectExecutionRef(opened);
+  assert.doesNotMatch(JSON.stringify(opened.structuredContent), /executionRef/u);
 
   const marker = join(nestedRoot, "codex-exec.txt");
   const executed = resultOf(await rawToolCall(origin, 3, "exec_command", {
-    executionRef,
     operationId: "codex-exec",
     shell: true,
     command: "printf '%s' \"$CODEX_TEST_VALUE\" > codex-exec.txt",
@@ -111,14 +131,12 @@ try {
   assert.notEqual(executed.isError, true, JSON.stringify(executed));
   assert.equal(await readFile(marker, "utf8"), "codex-style");
   const sharedRead = resultOf(await rawToolCall(origin, 30, "read_files", {
-    executionRef,
     files: [{ path: "nested/codex-exec.txt" }],
   }));
   assert.notEqual(sharedRead.isError, true, JSON.stringify(sharedRead));
   assert.match(JSON.stringify(sharedRead.structuredContent), /codex-style/u);
 
   const replay = resultOf(await rawToolCall(origin, 4, "exec_command", {
-    executionRef,
     operationId: "codex-exec",
     shell: true,
     command: "printf '%s' \"$CODEX_TEST_VALUE\" > codex-exec.txt",
@@ -131,7 +149,6 @@ try {
   assert.notEqual(replay.isError, true, JSON.stringify(replay));
 
   const conflictingReplay = resultOf(await rawToolCall(origin, 31, "exec_command", {
-    executionRef,
     operationId: "codex-exec",
     shell: true,
     command: "printf changed > codex-exec.txt",
@@ -152,7 +169,6 @@ try {
 
   const formerlyProtected = join(fixtureRoot, "shell-policy-removed.txt");
   const outsideWrite = resultOf(await rawToolCall(origin, 5, "exec_command", {
-    executionRef,
     operationId: "outside-write",
     shell: true,
     command: `printf policy-removed > ${shellQuote(formerlyProtected)}`,
@@ -163,7 +179,6 @@ try {
   assert.equal(await readFile(formerlyProtected, "utf8"), "policy-removed");
 
   const interactive = resultOf(await rawToolCall(origin, 6, "exec_command", {
-    executionRef,
     operationId: "interactive",
     shell: true,
     command: "while IFS= read -r line; do printf 'seen:%s\\n' \"$line\"; [ \"$line\" = quit ] && break; done",
@@ -178,7 +193,6 @@ try {
   assert.ok(Number.isSafeInteger(sessionId) && sessionId > 0);
 
   const firstWrite = resultOf(await rawToolCall(origin, 7, "write_stdin", {
-    executionRef,
     operationId: "stdin-1",
     sessionId,
     chars: "hello\n",
@@ -196,7 +210,6 @@ try {
   );
 
   const staleWrite = resultOf(await rawToolCall(origin, 8, "write_stdin", {
-    executionRef,
     operationId: "stdin-stale",
     sessionId,
     chars: "quit\n",
@@ -211,7 +224,6 @@ try {
   );
 
   const finalWrite = resultOf(await rawToolCall(origin, 9, "write_stdin", {
-    executionRef,
     operationId: "stdin-2",
     sessionId,
     chars: "quit\n",
@@ -230,7 +242,6 @@ try {
   );
 
   const polling = resultOf(await rawToolCall(origin, 10, "exec_command", {
-    executionRef,
     operationId: "polling",
     shell: true,
     command: "sleep 0.1; printf done",
@@ -243,7 +254,6 @@ try {
   );
   assert.ok(Number.isSafeInteger(pollingSessionId) && pollingSessionId > 0);
   const emptyInteraction = resultOf(await rawToolCall(origin, 11, "write_stdin", {
-    executionRef,
     operationId: "poll-empty",
     sessionId: pollingSessionId,
     chars: "",
@@ -257,7 +267,6 @@ try {
     "process_interaction_required",
   );
   const polled = resultOf(await rawToolCall(origin, 12, "read_process_output", {
-    executionRef,
     sessionId: pollingSessionId,
     yieldTimeMs: 1_000,
   }));
@@ -284,7 +293,7 @@ try {
     origin,
     13,
     "read_process_output",
-    { executionRef, outputId: pollingOutputId, mode: "page", limit: 2 },
+    { outputId: pollingOutputId, mode: "page", limit: 2 },
   ));
   const retainedCursor = String(
     (retainedFirstPage.structuredContent as {
@@ -297,18 +306,19 @@ try {
     14,
     "project_control",
     { action: "open", operationId: "exec-protocol-other-execution" },
+    { hostMeta: otherHostMeta },
   ));
   assert.notEqual(
     otherExecutionSelected.isError,
     true,
     JSON.stringify(otherExecutionSelected),
   );
-  const otherExecutionRef = projectExecutionRef(otherExecutionSelected);
   const otherExecutionCursor = resultOf(await rawToolCall(
     origin,
     15,
     "read_process_output",
-    { executionRef: otherExecutionRef, cursor: retainedCursor },
+    { cursor: retainedCursor },
+    { hostMeta: otherHostMeta },
   ));
   assert.equal(otherExecutionCursor.isError, true);
   assert.equal(
@@ -321,7 +331,7 @@ try {
     origin,
     16,
     "read_process_output",
-    { executionRef, cursor: retainedCursor, outputId: pollingOutputId },
+    { cursor: retainedCursor, outputId: pollingOutputId },
   ));
   assert.equal(repeatedCursorIdentity.isError, true);
   assert.equal(
@@ -334,7 +344,7 @@ try {
     origin,
     17,
     "read_process_output",
-    { executionRef, cursor: retainedCursor },
+    { cursor: retainedCursor },
   ));
   assert.notEqual(retainedSecondPage.isError, true, JSON.stringify(retainedSecondPage));
   assert.match(
@@ -347,7 +357,6 @@ try {
   );
 
   const escapedWorkdir = resultOf(await rawToolCall(origin, 18, "exec_command", {
-    executionRef,
     operationId: "escaped-workdir",
     program: "pwd",
     args: [],
@@ -357,7 +366,6 @@ try {
 
   const legacyMarker = join(workspaceRoot, "legacy-must-not-exist.txt");
   const legacy = resultOf(await rawToolCall(origin, 19, "exec_command", {
-    executionRef,
     operationId: "legacy-rejected",
     invocation: {
       mode: "direct",
@@ -369,17 +377,15 @@ try {
   await assertMissing(legacyMarker);
 
   const networkOption = resultOf(await rawToolCall(origin, 20, "exec_command", {
-    executionRef,
     operationId: "network-option-removed",
     program: "true",
     args: [],
-    network: "deny",
+    network: "inherit",
   }));
   assertInvalidInput(networkOption);
 
   const oversizedInput = "x".repeat(1024 * 1024 + 1);
   const oversized = resultOf(await rawToolCall(origin, 21, "exec_command", {
-    executionRef,
     operationId: "oversized-stdin",
     program: "cat",
     args: [],
@@ -394,16 +400,15 @@ try {
     22,
     "project_control",
     { action: "open", operationId: "exec-protocol-replacement-execution" },
-    { accessToken: replacementAccessToken },
+    { accessToken: replacementAccessToken, hostMeta: replacementHostMeta },
   ));
   assert.notEqual(replacementSelected.isError, true, JSON.stringify(replacementSelected));
-  const replacementExecutionRef = projectExecutionRef(replacementSelected);
   const replacementGrantCursor = resultOf(await rawToolCall(
     origin,
     23,
     "read_process_output",
-    { executionRef: replacementExecutionRef, cursor: retainedCursor },
-    { accessToken: replacementAccessToken },
+    { cursor: retainedCursor },
+    { accessToken: replacementAccessToken, hostMeta: replacementHostMeta },
   ));
   assert.equal(replacementGrantCursor.isError, true);
   assert.equal(
@@ -434,16 +439,6 @@ function assertInvalidInput(result: Record<string, unknown>): void {
   );
 }
 
-function projectExecutionRef(result: Record<string, unknown>): string {
-  const executionRef = String(
-    (result.structuredContent as {
-      project?: { executionRef?: unknown };
-    } | undefined)?.project?.executionRef ?? "",
-  );
-  assert.match(executionRef, /^pex1_/u);
-  return executionRef;
-}
-
 async function assertMissing(path: string): Promise<void> {
   await assert.rejects(access(path), (error: unknown) => (
     error instanceof Error &&
@@ -459,11 +454,13 @@ async function rawToolCall(
   args: Record<string, unknown>,
   options: {
     accessToken?: string;
+    hostMeta?: Readonly<Record<string, string>>;
   } = {},
 ): Promise<JsonRpcResponse> {
   return rawRequest(origin, id, "tools/call", {
     name,
     arguments: args,
+    _meta: options.hostMeta ?? mainHostMeta,
   }, options.accessToken);
 }
 
