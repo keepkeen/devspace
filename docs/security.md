@@ -2,8 +2,8 @@
 
 DevSpace is a single-owner bridge between ChatGPT web and approved local
 Projects. Its primary controls are narrow Project approval, OAuth capabilities,
-grant-bound execution references, path and version validation, effect replay
-protection, bounded Project handoffs, bounded output, and root locking.
+grant-validated session bindings, path and version validation, effect replay
+protection, bounded saved Tasks, bounded output, and root locking.
 
 It is not an operating-system security boundary.
 
@@ -18,7 +18,7 @@ The trusted operator is the person who:
 - decides which commands ChatGPT may run.
 
 Repository files, `AGENTS.md`, Skills, build scripts, command output, saved
-handoff text, and model text are untrusted input. They cannot grant capabilities
+Task text, and model text are untrusted input. They cannot grant capabilities
 or expand an approved root.
 
 ## Approved roots and Projects
@@ -32,12 +32,13 @@ approving:
 - a parent containing unrelated work and personal data.
 
 `list_projects` exposes only Projects selected for the active OAuth grant and
-does not need to reveal absolute local paths. `use_project` validates the
-returned Project reference, binds a logical context to that approved directory,
-and returns an opaque `executionRef`. Git is not required.
+does not reveal absolute local paths. `project_control(action=open)` validates
+the returned Project reference, binds a logical context to that approved
+directory, and selects it for the trusted ChatGPT session and Actor. The internal
+execution identity is not returned to the model. Git is not required.
 
 File tools resolve Project-relative paths and verify that canonical targets
-remain inside the approved root. Command `workdir` receives the same containment
+remain inside the approved root. Command `workingDirectory` receives the same containment
 check. These checks prevent accidental or model-supplied path traversal through
 the DevSpace tool arguments.
 
@@ -45,27 +46,36 @@ They do not constrain what an already-started local process can access.
 
 ## Project execution binding
 
-The OAuth bearer grant is the request identity. DevSpace does not consume or
-persist ChatGPT account or conversation identifiers.
+The OAuth bearer grant is the authorization identity. When ChatGPT supplies
+anonymous host metadata, DevSpace stores only HMAC-derived Actor/session
+references; those assist private Thread ownership and session resolution but do
+not grant Project or tool authority.
 
 Creating an execution requires a caller-chosen `operationId` and, when more than
-one Project is approved, a `projectRef`. The result is an HMAC-authenticated
-`executionRef`. Every Project-scoped tool requires that reference explicitly.
-Before the tool handler runs, DevSpace verifies that the execution still belongs
-to the active principal, OAuth client, grant, authorization epoch, approved
-Project, and expected shared directory.
+one Project is approved, a `projectRef`. Successful open, resume, and hydrate
+bind it to exactly the HMAC-derived trusted `openai/session` and Actor. Model tool
+schemas and results never expose the internal execution identity. Before every
+Project tool handler runs, DevSpace resolves that binding and verifies the
+execution still belongs to the active principal, OAuth client, grant,
+authorization epoch, current scopes, approved root, Project fingerprint/path,
+and expected workspace.
 
-The reference is durable across MCP transports, ChatGPT conversations, and
-service restarts. It is not reusable under any different grant, including a
-second grant issued to the same OAuth client. Removing the
-source Project from authorization closes the execution before a new effect can
-start.
+A stable host session can hydrate its binding across MCP reconnects, service
+restarts, and conversation changes for which the host preserves that same
+session value. Different Actors and different sessions cannot reuse it,
+including sessions under the same OAuth client or grant; concurrent sessions may
+select different Projects. Missing session metadata or a missing/stale binding
+fails closed and requires explicit open or resume selection. Removing the source
+Project from authorization closes the execution before a new effect can start.
+Selection, hydration, and lifecycle operations for one session+Actor are FIFO;
+a slower earlier request cannot overwrite or release the result of a later one.
 
 Each new operation creates a different logical context on the same approved
-directory. Retrying the identical `use_project` request replays the same
-execution, which makes a lost response safe without creating another context.
-DevSpace never selects an execution by recency and has no process-global
-“current Project.”
+directory. Retrying the identical `project_control(action=open)` request replays
+the same execution, which makes a lost response safe without creating another
+context.
+DevSpace never selects an execution by recency, a sole candidate, caller input,
+or process-global “current Project.”
 
 Logical contexts isolate references, instruction state, idempotency records,
 process handles, patch journals, and grant authorization—not files. Any two
@@ -74,37 +84,43 @@ can observe one another's writes. DevSpace root locks coordinate tracked
 DevSpace writers, but cannot serialize external programs or edits outside
 DevSpace.
 
-## Project handoffs
+## Saved Project Tasks
 
-A Project handoff is a bounded semantic progress snapshot for continuing work
+A saved Task is a bounded semantic progress snapshot for continuing work
 in a later ChatGPT conversation. It is not a ChatGPT account/session record,
 chat transcript, command log, diff, file snapshot, or source of authorization.
 
-Handoffs are keyed by the approved Project's stable fingerprint rather than by
+Tasks are keyed by the approved Project's stable fingerprint rather than by
 an OAuth grant. Any active grant that currently authorizes that same Project
-may list and continue its resumable handoffs. Continuing one always creates a
+may list and continue its resumable Tasks. Continuing one always creates a
 new execution bound to the calling grant; it never transfers or reuses another
-grant's `executionRef`, process handles, instruction acknowledgement, mutation
-replay records, or non-Git patch journal. Knowing a `handoffRef` alone cannot
+grant's execution, process handles, instruction acknowledgement, mutation replay
+records, or apply-patch history. Knowing a `taskRef` alone cannot
 bypass Project authorization.
 
-Each handoff has a title of at most 256 UTF-8 bytes and progress text of at most
+Each Task has a title of at most 256 UTF-8 bytes and progress text of at most
 8 KiB. Their JSON-serialized model text must also fit 12,000 bytes. A Project
-may have at most 20 resumable handoffs and retains at most the newest 80
+may have at most 20 resumable Tasks and retains at most the newest 80
 completed records; selection output is also bounded. `save_progress` uses a
 caller-stable `operationId` and an integer `ifMatch` revision for replay-safe,
 optimistic updates. Save responses and Project lists omit the progress body to
 avoid duplicating it in model context.
 
+Saved Tasks are distinct from Actor-private Threads. The Project App may list a
+caller's private Threads and apply Thread lifecycle controls through the
+App-only `project_thread_control`, but those actions do not complete or release
+capacity for a shared saved Task. Only
+`save_progress(status:"completed")` from the Task's active execution does that.
+
 Do not place secrets, credentials, hidden reasoning, complete file contents,
-full diffs, transcripts, or raw logs in a handoff. Handoff text is durable state
-and should be treated as sensitive. On resume, DevSpace returns it only on the
-first Project-context page with explicit `untrusted` historical provenance and
-`mustRevalidate: true`; the model must reread relevant files and Git state
-before acting on it. A completed handoff is removed from resume selection but
+full diffs, transcripts, or raw logs in a Task. Task text is durable state and
+should be treated as sensitive. On resume, DevSpace returns it once as
+`thread.checkpoint.modelSummary` with the scalar
+`modelSummaryTrust:"untrusted"`; the model must reread relevant files and Git
+state before acting on it. A completed Task is removed from resume selection but
 its bounded record remains until it ages out of the per-Project completed
 retention set. Pruning replaces obsolete execution links with a terminal marker
-so those executions cannot create a new handoff; it removes metadata only,
+so those executions cannot create a new Task; it removes metadata only,
 never Project files.
 
 ## Owner and OAuth
@@ -129,7 +145,7 @@ intentional global emergency actions.
 DevSpace does not claim to identify a ChatGPT account: it stores no ChatGPT
 account or conversation key. Independent OAuth grants are the multi-user
 security boundaries, even when the host reuses one OAuth client ID.
-Executions and processes remain grant-local. Project handoffs are the deliberate
+Executions and processes remain grant-local. Saved Tasks are the deliberate
 exception: they are shared only among grants that currently authorize the same
 Project, as described above.
 
@@ -137,7 +153,7 @@ The public OAuth scopes are fixed:
 
 | Scope | Authority |
 | --- | --- |
-| `project:read` | Select approved Projects; load and save Project handoffs; load instructions and Skills; read, inspect, and review changes. |
+| `project:read` | Select approved Projects; load and save Tasks; load instructions and Skills; read, inspect, and review changes. |
 | `project:write` | Apply file patches. |
 | `process:execute` | Explicit high-trust opt-in for process I/O and, together with `project:write`, command creation. |
 
@@ -191,20 +207,21 @@ root lock, so a checkpoint can be recorded while a tracked command still holds
 the filesystem lease.
 
 Signed continuation cursors bind the grant, authorization epoch, execution,
-resource, revision, query, and paging parameters. Continue with the same
-`executionRef` plus the cursor and omit the initial paging fields. A cursor is
-not Project authority and cannot be transferred to another grant or execution.
+resource, revision, query, and paging parameters. Continue with the cursor under
+the same trusted session+Actor selection and omit the initial paging fields. A
+cursor is not Project authority and cannot be transferred to another session,
+grant, or execution.
 
 ## Command execution
 
 `exec_command` is intentionally a full local command facility. It accepts:
 
-```text
-executionRef, operationId, cmd, workdir, env, yield_time_ms,
-max_output_tokens, tty
-```
+Direct mode accepts `program` and `args`; shell mode instead requires
+`shell:true`, `command`, and `approvalReason`. Both modes use camelCase common
+fields such as `operationId`, `workingDirectory`, `environment`,
+`yieldTimeMs`, `maxOutputTokens`, and `tty`.
 
-DevSpace validates that `workdir` is inside the Project bound to the execution and bounds
+DevSpace validates that `workingDirectory` is inside the Project bound to the execution and bounds
 returned output. `write_stdin` is mutation-only and requires `operationId` to
 send input, close stdin, interrupt, or resize a terminal.
 `read_process_output` performs live polling and retained-output reads without
@@ -221,7 +238,7 @@ with the privileges of the OS user running DevSpace and can:
 
 DevSpace provides no process sandbox, command allow/deny list, risk
 classification, child-process protected-path policy, or network egress policy.
-Project and `workdir` validation must not be described as shell isolation.
+Project and `workingDirectory` validation must not be described as process isolation.
 
 Shutdown and interrupt cover only process groups that DevSpace started and
 still tracks, and termination is best effort. Detached, daemonized,
@@ -233,7 +250,7 @@ high-trust authority.
 
 ## Instructions and Skills
 
-`use_project` returns a compact bounded root instruction delta without an eager
+Project open, resume, and hydrate return compact bounded root instruction pages without an eager
 Skill catalog. `read_files` and `inspect` return newly applicable nested
 `instructionsDelta` only when target paths require it. The `skills` tool
 searches bounded metadata and lazily loads one selected Skill.
@@ -255,20 +272,22 @@ scripts.
 
 ## Shared Project directories and change review
 
-The approved Project root is the mutable execution directory. `use_project`
-accepts any existing approved directory and never creates, switches, removes,
-or validates Git branches or worktrees. Users may ask the model to manage Git
+Checkout mode uses the approved Project root as the mutable execution directory.
+For a Project whose root exactly equals its Git top level, an authorized caller
+may explicitly request a managed worktree during open. Authorization remains
+anchored to the source Project. Users may also ask the model to manage Git
 through ordinary commands, subject to the full command-security boundary above.
 
-When the approved Project root is exactly the Git top level, `show_changes`
-reads the current staged, unstaged, and untracked repository diff without
-writing the index, objects, or refs. A Project nested inside a larger repository
-uses the non-Git source so review cannot expose paths above the approved root.
+With `source:"repository"`, `show_changes` reads the current staged, unstaged,
+and untracked diff only when the approved Project root is exactly the Git top
+level, without writing the index, objects, or refs. A nested or non-Git Project
+rejects that source so review cannot expose paths above the approved root.
 This includes repositories with no first commit. DevSpace disables Git
 fsmonitor for review and rejects executable clean/process filters that apply to
 Project files, because a `project:read` tool must not run repository-configured
 programs.
-The non-Git source is a bounded durable journal containing the exact successful
+The explicitly selected `source:"apply_patch_history"` is available in Git and
+non-Git Projects. It is a bounded durable journal containing the exact successful
 DevSpace `apply_patch` requests for the current logical execution. It is not a
 filesystem monitor or net diff: command writes, external edits, failed or
 unknown-outcome patches, and patches from another execution are excluded. A
@@ -286,7 +305,7 @@ Truncation is expected for large data; callers should narrow their request.
 
 Running and completed process records are subject to configured limits and
 cleanup. Do not use retained output as permanent storage.
-Project handoffs are also bounded but intentionally durable; they are continuity
+Saved Tasks are also bounded but intentionally durable; they are continuity
 metadata, not a backup of Project files or chat history.
 
 ## Logs and secrets

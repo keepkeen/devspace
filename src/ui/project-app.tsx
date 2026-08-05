@@ -4,14 +4,18 @@ import {
   applyHostFonts,
   applyHostStyleVariables,
 } from "@modelcontextprotocol/ext-apps";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import {
   isExpandableCard,
+  parsePrivateThreadList,
   toolResultCard,
   type HostContext,
+  type PrivateProjectThread,
+  type PrivateThreadStatus,
   type ProjectAppCard,
   type ProjectCardEntry,
   type ProjectListCard,
-  type ResumableHandoffCard,
+  type ResumableTaskCard,
   type ToolResultCard,
 } from "./card-types.js";
 import { renderIcon, toolIcons } from "./icons.js";
@@ -19,8 +23,11 @@ import {
   getToolDisplay,
   getToolHeaderSummary,
   newProjectTaskMessage,
-  resumeProjectHandoffMessage,
+  projectThreadListCall,
+  projectThreadMutationCall,
+  resumeProjectTaskMessage,
   stableProjectOperationId,
+  type ProjectThreadMutationAction,
 } from "./tool-display.js";
 import "./project-app.css";
 
@@ -42,8 +49,15 @@ let receivedUnknownResult = false;
 let currentPayload: MountedPayload | null = null;
 let pendingActionKey: string | null = null;
 let deliveryStatus: { key: string; message: string; error: boolean } | null = null;
+let privateThreads: PrivateProjectThread[] = [];
+let privateThreadsLoaded = false;
+let privateThreadsLoading = false;
+let privateThreadStatus: { message: string; error: boolean } | null = null;
+let pendingThreadActionKey: string | null = null;
+let privateThreadRequestGeneration = 0;
 const deliveredActionKeys = new Set<string>();
 const taskOperationIds = new Map<string, string>();
+const threadOperationIds = new Map<string, string>();
 
 const maybeAppRoot = document.querySelector<HTMLElement>("#app");
 if (!maybeAppRoot) throw new Error("Missing #app root element.");
@@ -61,9 +75,11 @@ async function boot(): Promise<void> {
 
   app.ontoolresult = (result) => {
     card = toolResultCard(result) ?? null;
+    resetPrivateThreadState();
     expanded = card ? isExpandableCard(card) : false;
     receivedUnknownResult = !card;
     render();
+    if (card?.tool === "list_projects" && connected) void refreshPrivateThreads();
   };
 
   app.onhostcontextchanged = (ctx) => {
@@ -97,6 +113,7 @@ async function boot(): Promise<void> {
   }
 
   render();
+  if (card?.tool === "list_projects" && connected) void refreshPrivateThreads();
 }
 
 function applyHostContext(): void {
@@ -237,51 +254,152 @@ function renderProjectSection(
   header.append(newButton);
   section.append(header);
 
-  const handoffs = element("div", {
+  const tasks = element("div", {
     className: "handoff-list",
     ariaLabel: `Saved tasks for ${project.label}`,
   });
-  if (project.handoffs.length === 0) {
-    handoffs.append(element("p", {
+  if (project.tasks.length === 0) {
+    tasks.append(element("p", {
       className: "no-handoffs",
       text: "No resumable saved tasks.",
     }));
   } else {
-    for (const handoff of project.handoffs) {
-      handoffs.append(renderHandoffRow(project, handoff, messageSupported));
+    for (const task of project.tasks) {
+      tasks.append(renderTaskRow(project, task, messageSupported));
     }
   }
-  section.append(handoffs);
+  section.append(tasks);
+  section.append(renderPrivateThreadControls(project));
   return section;
 }
 
-function renderHandoffRow(
+function renderPrivateThreadControls(project: ProjectCardEntry): HTMLElement {
+  const controls = element("section", {
+    className: "private-thread-controls",
+    ariaLabel: `Private thread controls for ${project.label}`,
+  });
+  const header = element("div", { className: "private-thread-header" });
+  header.append(element("h4", {
+    className: "private-thread-heading",
+    text: "Private thread controls",
+  }));
+  const refresh = element("button", {
+    className: "thread-action",
+    type: "button",
+    text: privateThreadsLoading ? "Refreshing…" : "Refresh",
+    disabled: privateThreadsLoading || pendingThreadActionKey !== null,
+  });
+  refresh.addEventListener("click", () => {
+    void refreshPrivateThreads();
+  });
+  header.append(refresh);
+  controls.append(header);
+
+  if (privateThreadStatus) {
+    controls.append(element("div", {
+      className: privateThreadStatus.error
+        ? "private-thread-message error"
+        : "private-thread-message",
+      role: privateThreadStatus.error ? "alert" : "status",
+      text: privateThreadStatus.message,
+    }));
+  }
+
+  if (!privateThreadsLoaded) {
+    controls.append(element("p", {
+      className: "private-thread-empty",
+      text: privateThreadsLoading
+        ? "Loading private Threads…"
+        : "Private Threads have not been loaded.",
+    }));
+    return controls;
+  }
+
+  const projectThreads = privateThreads.filter((thread) =>
+    thread.projectRef === project.projectRef
+  );
+  if (projectThreads.length === 0) {
+    controls.append(element("p", {
+      className: "private-thread-empty",
+      text: "No private Threads for this Project.",
+    }));
+    return controls;
+  }
+
+  const list = element("div", { className: "private-thread-list" });
+  for (const thread of projectThreads) list.append(renderPrivateThreadRow(thread));
+  controls.append(list);
+  return controls;
+}
+
+function renderPrivateThreadRow(thread: PrivateProjectThread): HTMLElement {
+  const row = element("div", { className: "private-thread-row" });
+  const details = element("div", { className: "private-thread-details" });
+  details.append(
+    element("span", { className: "private-thread-title", text: thread.title }),
+    element("span", {
+      className: "private-thread-meta",
+      text: `${threadStatusLabel(thread.status)} · ${thread.checkoutKind} · Updated ${formatTimestamp(thread.updatedAt)} · Version ${thread.version}`,
+    }),
+  );
+  row.append(details);
+
+  const actions = element("div", {
+    className: "private-thread-actions",
+    ariaLabel: `Controls for ${thread.title}`,
+  });
+  for (const action of availableThreadActions(thread.status)) {
+    const actionKey = threadActionKey(thread, action);
+    const button = element("button", {
+      className: action === "close" ? "thread-action danger" : "thread-action",
+      type: "button",
+      text: pendingThreadActionKey === actionKey
+        ? `${threadActionLabel(action)}…`
+        : threadActionLabel(action),
+      disabled: privateThreadsLoading || pendingThreadActionKey !== null,
+    });
+    button.addEventListener("click", () => {
+      if (
+        action === "close" &&
+        !window.confirm("Close this private Thread? A clean managed worktree may be removed.")
+      ) {
+        return;
+      }
+      void mutatePrivateThread(thread, action);
+    });
+    actions.append(button);
+  }
+  if (actions.childElementCount > 0) row.append(actions);
+  return row;
+}
+
+function renderTaskRow(
   project: ProjectCardEntry,
-  handoff: ResumableHandoffCard,
+  task: ResumableTaskCard,
   messageSupported: boolean,
 ): HTMLElement {
-  const actionKey = `continue:${handoff.handoffRef}`;
+  const actionKey = `continue:${task.taskRef}`;
   const row = element("button", {
     className: "handoff-row",
     type: "button",
-    ariaLabel: `Continue ${handoff.title} for ${project.label}, updated ${formatTimestamp(handoff.updatedAt)}`,
+    ariaLabel: `Continue ${task.title} for ${project.label}, updated ${formatTimestamp(task.updatedAt)}`,
     disabled:
       !messageSupported ||
       pendingActionKey !== null ||
       deliveredActionKeys.has(actionKey),
   });
   row.addEventListener("click", () => {
-    void deliverHandoff(project.projectRef, handoff.handoffRef);
+    void deliverTask(project.projectRef, task.taskRef);
   });
   const details = element("span", { className: "handoff-details" });
   details.append(
     element("span", {
       className: "handoff-title",
-      text: deliveredActionKeys.has(actionKey) ? "Continue request sent" : handoff.title,
+      text: deliveredActionKeys.has(actionKey) ? "Continue request sent" : task.title,
     }),
     element("span", {
       className: "handoff-time",
-      text: `Updated ${formatTimestamp(handoff.updatedAt)} · Version ${handoff.version}`,
+      text: `Updated ${formatTimestamp(task.updatedAt)} · Version ${task.version}`,
     }),
   );
   row.append(
@@ -310,11 +428,11 @@ async function deliverFreshTask(projectRef: string): Promise<void> {
   );
 }
 
-async function deliverHandoff(
+async function deliverTask(
   projectRef: string,
-  handoffRef: string,
+  taskRef: string,
 ): Promise<void> {
-  const actionKey = `continue:${handoffRef}`;
+  const actionKey = `continue:${taskRef}`;
   const operationId = stableProjectOperationId(
     taskOperationIds.get(actionKey),
     () => crypto.randomUUID(),
@@ -322,7 +440,7 @@ async function deliverHandoff(
   taskOperationIds.set(actionKey, operationId);
   await deliverMessage(
     actionKey,
-    resumeProjectHandoffMessage(projectRef, handoffRef, operationId),
+    resumeProjectTaskMessage(projectRef, taskRef, operationId),
     () => {
       taskOperationIds.delete(actionKey);
     },
@@ -369,6 +487,150 @@ async function deliverMessage(
     pendingActionKey = null;
     render();
   }
+}
+
+function resetPrivateThreadState(): void {
+  privateThreadRequestGeneration += 1;
+  privateThreads = [];
+  privateThreadsLoaded = false;
+  privateThreadsLoading = false;
+  privateThreadStatus = null;
+  pendingThreadActionKey = null;
+  threadOperationIds.clear();
+}
+
+async function refreshPrivateThreads(): Promise<boolean> {
+  if (
+    !app ||
+    !connected ||
+    card?.tool !== "list_projects" ||
+    privateThreadsLoading ||
+    pendingThreadActionKey !== null
+  ) {
+    return false;
+  }
+
+  const generation = ++privateThreadRequestGeneration;
+  privateThreadsLoading = true;
+  privateThreadStatus = null;
+  render();
+  try {
+    const result = await app.callServerTool(projectThreadListCall());
+    if (generation !== privateThreadRequestGeneration || card?.tool !== "list_projects") {
+      return false;
+    }
+    const parsed = parsePrivateThreadList(result);
+    if (!parsed) throw new Error(serverToolErrorMessage(result, "Invalid private Thread list response."));
+    privateThreads = parsed;
+    privateThreadsLoaded = true;
+    return true;
+  } catch (error) {
+    if (generation !== privateThreadRequestGeneration || card?.tool !== "list_projects") {
+      return false;
+    }
+    privateThreadStatus = {
+      message: boundedErrorMessage(error, "Private Threads could not be loaded."),
+      error: true,
+    };
+    return false;
+  } finally {
+    if (generation === privateThreadRequestGeneration && card?.tool === "list_projects") {
+      privateThreadsLoading = false;
+      render();
+    }
+  }
+}
+
+async function mutatePrivateThread(
+  thread: PrivateProjectThread,
+  action: ProjectThreadMutationAction,
+): Promise<void> {
+  if (!app || !connected || pendingThreadActionKey !== null || privateThreadsLoading) return;
+  const actionKey = threadActionKey(thread, action);
+  const operationId = stableProjectOperationId(
+    threadOperationIds.get(actionKey),
+    () => crypto.randomUUID(),
+  );
+  threadOperationIds.set(actionKey, operationId);
+  pendingThreadActionKey = actionKey;
+  privateThreadStatus = null;
+  render();
+  try {
+    const result = await app.callServerTool(projectThreadMutationCall(
+      action,
+      thread.threadRef,
+      operationId,
+      thread.version,
+    ));
+    if (!successfulServerMutation(result)) {
+      throw new Error(serverToolErrorMessage(result, `The Thread could not be ${action}d.`));
+    }
+    threadOperationIds.delete(actionKey);
+    pendingThreadActionKey = null;
+    const refreshed = await refreshPrivateThreads();
+    if (refreshed) {
+      privateThreadStatus = {
+        message: `Private Thread ${threadActionPastTense(action)}.`,
+        error: false,
+      };
+    }
+  } catch (error) {
+    privateThreadStatus = {
+      message: boundedErrorMessage(error, `The private Thread could not be ${action}d.`),
+      error: true,
+    };
+  } finally {
+    pendingThreadActionKey = null;
+    render();
+  }
+}
+
+function availableThreadActions(status: PrivateThreadStatus): ProjectThreadMutationAction[] {
+  if (status === "active") return ["pause", "archive", "complete", "close"];
+  if (status === "paused") return ["archive", "complete", "close"];
+  if (status === "archived") return ["complete", "close"];
+  if (status === "completed") return ["close"];
+  return [];
+}
+
+function threadActionKey(
+  thread: PrivateProjectThread,
+  action: ProjectThreadMutationAction,
+): string {
+  return `${action}:${thread.threadRef}:v${thread.version}`;
+}
+
+function threadActionLabel(action: ProjectThreadMutationAction): string {
+  return action[0]!.toUpperCase() + action.slice(1);
+}
+
+function threadActionPastTense(action: ProjectThreadMutationAction): string {
+  if (action === "complete") return "completed";
+  if (action === "close") return "closed";
+  return `${action}d`;
+}
+
+function threadStatusLabel(status: PrivateThreadStatus): string {
+  return status[0]!.toUpperCase() + status.slice(1);
+}
+
+function successfulServerMutation(result: CallToolResult): boolean {
+  return result.isError !== true &&
+    Boolean(result.structuredContent) &&
+    typeof result.structuredContent === "object" &&
+    result.structuredContent.ok === true;
+}
+
+function serverToolErrorMessage(result: CallToolResult, fallback: string): string {
+  for (const block of result.content) {
+    if (block.type === "text" && block.text.trim()) return block.text.trim().slice(0, 512);
+  }
+  return fallback;
+}
+
+function boundedErrorMessage(error: unknown, fallback: string): string {
+  return (error instanceof Error && error.message.trim() ? error.message.trim() : fallback)
+    .slice(0, 512);
 }
 
 function canSendMessage(): boolean {
@@ -421,7 +683,13 @@ function renderReviewCard(reviewCard: ToolResultCard): void {
     section.append(element("div", {
       className: "picker-notice",
       role: "note",
-      text: "Project-scoped journal: this Project is non-Git or nested inside a larger Git repository. Only successful DevSpace apply_patch requests from this context are included; command and external edits are not.",
+      text: "Apply-patch history selected: only successful DevSpace apply_patch requests from this execution are included; command and external edits are not.",
+    }));
+  } else {
+    section.append(element("div", {
+      className: "picker-notice",
+      role: "note",
+      text: "Repository diff selected: staged, unstaged, and untracked changes from the exact Project Git root are included.",
     }));
   }
 

@@ -109,6 +109,16 @@ function testReservationActivationAndExactAuthorization(stateDir: string): void 
       store.resolveActive(replacement.execution.executionId, authorization()),
       undefined,
     );
+    assert.deepEqual(
+      store.findRecoveryIdentity(replacement.execution.executionId),
+      {
+        projectRef: "project-a",
+        projectFingerprint: "fingerprint-a",
+        canonicalSourceRoot: "/tmp/shared-project",
+      },
+      "recovery may retain only Project identity after the old grant becomes unusable",
+    );
+    assert.equal(store.findRecoveryIdentity("missing-execution"), undefined);
     assert.equal(store.touch(replacement.execution.executionId, authorization()), undefined);
   } finally {
     store.close();
@@ -192,6 +202,15 @@ function testStartupAuthorizationReconciliation(stateDir: string): void {
     assert.equal(
       restartedExecutions.listByAuthorization(authorization())[0]?.status,
       "revoked",
+    );
+    assert.deepEqual(
+      restartedExecutions.findRecoveryIdentity("execution-orphaned"),
+      {
+        projectRef: "project-a",
+        projectFingerprint: "fingerprint-a",
+        canonicalSourceRoot: "/tmp/shared-project",
+      },
+      "Project-only recovery identity must survive a service restart",
     );
     assert.deepEqual(
       restartedWorkspaces.listRevocationCleanupJobs().map((job) => ({

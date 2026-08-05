@@ -220,6 +220,114 @@ body {
   padding: 5px 0 1px;
 }
 
+.private-thread-controls {
+  display: grid;
+  gap: 8px;
+  margin-top: 4px;
+  padding-top: 12px;
+  border-top: 1px solid var(--review-divider);
+}
+
+.private-thread-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.private-thread-heading {
+  margin: 0;
+  color: var(--color-text-secondary, #b6b6bd);
+  font-size: var(--font-text-xs-size, 12px);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.private-thread-list {
+  display: grid;
+  gap: 7px;
+}
+
+.private-thread-row {
+  display: grid;
+  gap: 8px;
+  padding: 9px 11px;
+  border: 1px solid var(--review-divider);
+  border-radius: var(--border-radius-md, 9px);
+  background: var(--review-header-bg);
+}
+
+.private-thread-details {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.private-thread-title {
+  overflow: hidden;
+  color: var(--color-text-primary, #f5f5f6);
+  font-size: var(--font-text-sm-size, 13px);
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.private-thread-meta,
+.private-thread-empty,
+.private-thread-message {
+  color: var(--color-text-secondary, #b6b6bd);
+  font-size: var(--font-text-xs-size, 12px);
+  line-height: 1.4;
+}
+
+.private-thread-empty,
+.private-thread-message {
+  margin: 0;
+}
+
+.private-thread-message.error {
+  color: var(--color-danger-text, #ee7676);
+}
+
+.private-thread-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.thread-action {
+  min-height: 28px;
+  padding: 5px 8px;
+  border: 1px solid var(--review-divider);
+  border-radius: var(--border-radius-sm, 7px);
+  background: transparent;
+  color: var(--color-text-secondary, #b6b6bd);
+  cursor: pointer;
+  font: inherit;
+  font-size: var(--font-text-xs-size, 12px);
+  font-weight: 600;
+}
+
+.thread-action:hover:not(:disabled) {
+  background: var(--review-hover-bg);
+  color: var(--color-text-primary, #f5f5f6);
+}
+
+.thread-action.danger {
+  color: var(--color-danger-text, #ee7676);
+}
+
+.thread-action:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.thread-action:focus-visible {
+  outline: 2px solid var(--color-ring-info, #6aa9fa);
+  outline-offset: 2px;
+}
+
 .picker-empty,
 .picker-notice,
 .delivery-status {

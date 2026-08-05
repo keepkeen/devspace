@@ -35,8 +35,8 @@ export interface ToolResultCard {
   page: DiffPage;
 }
 
-export interface ResumableHandoffCard {
-  handoffRef: string;
+export interface ResumableTaskCard {
+  taskRef: string;
   title: string;
   createdAt: string;
   updatedAt: string;
@@ -47,7 +47,7 @@ export interface ResumableHandoffCard {
 export interface ProjectCardEntry {
   projectRef: string;
   label: string;
-  handoffs: ResumableHandoffCard[];
+  tasks: ResumableTaskCard[];
 }
 
 export interface ProjectListCard {
@@ -55,15 +55,28 @@ export interface ProjectListCard {
   projects: ProjectCardEntry[];
   defaultProjectRef?: string;
   truncated: boolean;
-  handoffProvenance: {
-    source: "devspace_saved_progress";
-    trust: "untrusted";
-    authority: "none";
-  };
-  handoffLimits: {
+  taskTrust: "untrusted";
+  taskLimits: {
     perProject: number;
     total: number;
   };
+}
+
+export type PrivateThreadStatus =
+  | "active"
+  | "paused"
+  | "archived"
+  | "completed"
+  | "closed";
+
+export interface PrivateProjectThread {
+  threadRef: string;
+  projectRef: string;
+  title: string;
+  status: PrivateThreadStatus;
+  version: number;
+  checkoutKind: "checkout" | "worktree";
+  updatedAt: string;
 }
 
 export type ProjectAppCard = ToolResultCard | ProjectListCard;
@@ -74,10 +87,14 @@ const MAX_PATH_LENGTH = 4_096;
 const MAX_PROJECTS = 100;
 const MAX_PROJECT_LABEL_LENGTH = 512;
 const MAX_PROJECT_REF_LENGTH = 128;
-const MAX_HANDOFF_REF_LENGTH = 512;
-const MAX_HANDOFF_TITLE_LENGTH = 256;
-const MAX_HANDOFFS_PER_PROJECT = 20;
-const MAX_TOTAL_HANDOFFS = 100;
+const MAX_TASK_REF_LENGTH = 512;
+const MAX_TASK_TITLE_LENGTH = 256;
+const MAX_TASKS_PER_PROJECT = 20;
+const MAX_TOTAL_TASKS = 100;
+const MAX_PRIVATE_THREADS = 100;
+const MAX_THREAD_REF_LENGTH = 512;
+const MIN_THREAD_REF_LENGTH = 16;
+const MAX_THREAD_TITLE_LENGTH = 512;
 
 export function toolResultCard(result: CallToolResult): ProjectAppCard | undefined {
   const meta = objectRecord(result._meta);
@@ -156,22 +173,72 @@ export function isExpandableCard(card: ProjectAppCard): boolean {
   return card.tool === "show_changes" && card.payload.patch.length > 0;
 }
 
+export function parsePrivateThreadList(
+  result: CallToolResult,
+): PrivateProjectThread[] | undefined {
+  const structured = objectRecord(result.structuredContent);
+  if (
+    result.isError === true ||
+    structured?.ok !== true ||
+    !Array.isArray(structured.threads) ||
+    structured.threads.length > MAX_PRIVATE_THREADS
+  ) {
+    return undefined;
+  }
+
+  const threads: PrivateProjectThread[] = [];
+  const threadRefs = new Set<string>();
+  for (const value of structured.threads) {
+    const thread = objectRecord(value);
+    const threadRef = boundedString(thread?.threadRef, MAX_THREAD_REF_LENGTH);
+    const projectRef = boundedString(thread?.projectRef, MAX_PROJECT_REF_LENGTH);
+    const title = boundedString(thread?.title, MAX_THREAD_TITLE_LENGTH);
+    const version = safePositiveInteger(thread?.version);
+    const updatedAt = isoTimestamp(thread?.updatedAt);
+    const status = privateThreadStatus(thread?.status);
+    const checkoutKind = thread?.checkoutKind === "checkout" || thread?.checkoutKind === "worktree"
+      ? thread.checkoutKind
+      : undefined;
+    if (
+      !threadRef ||
+      threadRef.length < MIN_THREAD_REF_LENGTH ||
+      threadRefs.has(threadRef) ||
+      !projectRef ||
+      !title ||
+      !status ||
+      version === undefined ||
+      !checkoutKind ||
+      !updatedAt
+    ) {
+      return undefined;
+    }
+    threadRefs.add(threadRef);
+    threads.push({
+      threadRef,
+      projectRef,
+      title,
+      status,
+      version,
+      checkoutKind,
+      updatedAt,
+    });
+  }
+  return threads;
+}
+
 function projectListCard(result: CallToolResult): ProjectListCard | undefined {
   const structured = objectRecord(result.structuredContent);
-  const limits = objectRecord(structured?.handoffLimits);
-  const provenance = objectRecord(structured?.handoffProvenance);
+  const limits = objectRecord(structured?.taskLimits);
   const perProject = safePositiveInteger(limits?.perProject);
   const total = safePositiveInteger(limits?.total);
   if (
     structured?.ok !== true ||
     typeof structured.truncated !== "boolean" ||
-    provenance?.source !== "devspace_saved_progress" ||
-    provenance.trust !== "untrusted" ||
-    provenance.authority !== "none" ||
+    structured.taskTrust !== "untrusted" ||
     perProject === undefined ||
     total === undefined ||
-    perProject > MAX_HANDOFFS_PER_PROJECT ||
-    total > MAX_TOTAL_HANDOFFS ||
+    perProject > MAX_TASKS_PER_PROJECT ||
+    total > MAX_TOTAL_TASKS ||
     !Array.isArray(structured.projects) ||
     structured.projects.length > MAX_PROJECTS
   ) {
@@ -180,8 +247,8 @@ function projectListCard(result: CallToolResult): ProjectListCard | undefined {
 
   const projects: ProjectCardEntry[] = [];
   const projectRefs = new Set<string>();
-  const handoffRefs = new Set<string>();
-  let handoffCount = 0;
+  const taskRefs = new Set<string>();
+  let taskCount = 0;
   for (const value of structured.projects) {
     const project = objectRecord(value);
     const projectRef = boundedString(project?.projectRef, MAX_PROJECT_REF_LENGTH);
@@ -190,38 +257,38 @@ function projectListCard(result: CallToolResult): ProjectListCard | undefined {
       !projectRef ||
       !label ||
       projectRefs.has(projectRef) ||
-      !Array.isArray(project?.handoffs) ||
-      project.handoffs.length > perProject
+      !Array.isArray(project?.tasks) ||
+      project.tasks.length > perProject
     ) {
       return undefined;
     }
     projectRefs.add(projectRef);
 
-    const handoffs: ResumableHandoffCard[] = [];
-    for (const handoffValue of project.handoffs) {
-      const handoff = objectRecord(handoffValue);
-      const handoffRef = boundedString(
-        handoff?.handoffRef,
-        MAX_HANDOFF_REF_LENGTH,
+    const tasks: ResumableTaskCard[] = [];
+    for (const taskValue of project.tasks) {
+      const task = objectRecord(taskValue);
+      const taskRef = boundedString(
+        task?.taskRef,
+        MAX_TASK_REF_LENGTH,
       );
-      const title = boundedString(handoff?.title, MAX_HANDOFF_TITLE_LENGTH);
-      const createdAt = isoTimestamp(handoff?.createdAt);
-      const updatedAt = isoTimestamp(handoff?.updatedAt);
-      const version = safePositiveInteger(handoff?.version);
+      const title = boundedString(task?.title, MAX_TASK_TITLE_LENGTH);
+      const createdAt = isoTimestamp(task?.createdAt);
+      const updatedAt = isoTimestamp(task?.updatedAt);
+      const version = safePositiveInteger(task?.version);
       if (
-        !handoffRef ||
-        handoffRefs.has(handoffRef) ||
+        !taskRef ||
+        taskRefs.has(taskRef) ||
         !title ||
         !createdAt ||
         !updatedAt ||
         version === undefined ||
-        handoff?.status !== "resumable"
+        task?.status !== "resumable"
       ) {
         return undefined;
       }
-      handoffRefs.add(handoffRef);
-      handoffs.push({
-        handoffRef,
+      taskRefs.add(taskRef);
+      tasks.push({
+        taskRef,
         title,
         createdAt,
         updatedAt,
@@ -229,9 +296,9 @@ function projectListCard(result: CallToolResult): ProjectListCard | undefined {
         version,
       });
     }
-    handoffCount += handoffs.length;
-    if (handoffCount > total) return undefined;
-    projects.push({ projectRef, label, handoffs });
+    taskCount += tasks.length;
+    if (taskCount > total) return undefined;
+    projects.push({ projectRef, label, tasks });
   }
 
   const defaultProjectRef = structured.defaultProjectRef === undefined
@@ -249,13 +316,19 @@ function projectListCard(result: CallToolResult): ProjectListCard | undefined {
     projects,
     ...(defaultProjectRef ? { defaultProjectRef } : {}),
     truncated: structured.truncated,
-    handoffProvenance: {
-      source: "devspace_saved_progress",
-      trust: "untrusted",
-      authority: "none",
-    },
-    handoffLimits: { perProject, total },
+    taskTrust: "untrusted",
+    taskLimits: { perProject, total },
   };
+}
+
+function privateThreadStatus(value: unknown): PrivateThreadStatus | undefined {
+  return value === "active" ||
+      value === "paused" ||
+      value === "archived" ||
+      value === "completed" ||
+      value === "closed"
+    ? value
+    : undefined;
 }
 
 function reviewSummary(value: unknown): ReviewSummary | undefined {

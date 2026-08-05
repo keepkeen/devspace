@@ -23,6 +23,9 @@ const tokens = {
   accountC: "multi-grant-shared-account-c-token",
 };
 const clients: Client[] = [];
+const accountAHostMeta = hostMeta("account-a", "main");
+const accountBHostMeta = hostMeta("account-b", "main");
+const accountCHostMeta = hostMeta("account-c", "main");
 
 await Promise.all([
   mkdir(projectRoot, { recursive: true }),
@@ -76,6 +79,7 @@ try {
       projectRef,
       operationId: "account-a-shared-project",
     },
+    _meta: accountAHostMeta,
   });
   const selectedB = await accountB.callTool({
     name: "project_control",
@@ -84,44 +88,74 @@ try {
       projectRef,
       operationId: "account-b-shared-project",
     },
+    _meta: accountBHostMeta,
   });
   assertSucceeded(selectedA);
   assertSucceeded(selectedB);
-  const executionRefA = projectExecutionRef(selectedA);
-  const executionRefB = projectExecutionRef(selectedB);
-  assert.notEqual(executionRefA, executionRefB);
-
-  assertErrorCode(
-    await accountB.callTool({
-      name: "read_files",
-      arguments: {
-        executionRef: executionRefA,
-        files: [{ path: "shared.txt" }],
-      },
-    }),
-    "project_execution_not_found",
-  );
+  assert.doesNotMatch(JSON.stringify(selectedA.structuredContent), /executionRef/u);
+  assert.doesNotMatch(JSON.stringify(selectedB.structuredContent), /executionRef/u);
 
   const savedByA = await accountA.callTool({
     name: "save_progress",
     arguments: {
-      executionRef: executionRefA,
       operationId: "account-a-save-shared-progress",
       title: "Shared Project task",
       progress: "Account A prepared the shared Project; revalidate shared.txt.",
     },
+    _meta: accountAHostMeta,
   });
   assertSucceeded(savedByA);
   const threadRef = String(
     (savedByA.structuredContent as {
-      thread?: { ref?: unknown };
-    } | undefined)?.thread?.ref ?? "",
+      thread?: { threadRef?: unknown };
+    } | undefined)?.thread?.threadRef ?? "",
   );
   assert.match(threadRef, /^pth1_/u);
+  const savedTaskRef = String(
+    (savedByA.structuredContent as {
+      task?: { taskRef?: unknown };
+    } | undefined)?.task?.taskRef ?? "",
+  );
+  assert.match(savedTaskRef, /^phf1_/u);
+  const updatedByA = await accountA.callTool({
+    name: "save_progress",
+    arguments: {
+      operationId: "account-a-update-shared-progress",
+      title: "Shared Project task",
+      progress: "Account A updated the Project handoff; revalidate shared.txt.",
+      ifMatch: 1,
+    },
+    _meta: accountAHostMeta,
+  });
+  assertSucceeded(updatedByA);
+  assert.equal(
+    String(
+      (updatedByA.structuredContent as {
+        task?: { taskRef?: unknown; version?: unknown };
+      } | undefined)?.task?.taskRef ?? "",
+    ),
+    savedTaskRef,
+  );
+  assert.equal(
+    (updatedByA.structuredContent as {
+      task?: { version?: unknown };
+    } | undefined)?.task?.version,
+    2,
+  );
 
+  const projectHandoffsVisibleToB = await accountB.callTool({
+    name: "list_projects",
+    arguments: { projectRef },
+  });
+  assertSucceeded(projectHandoffsVisibleToB);
+  assert.deepEqual(
+    listedTaskRefs(projectHandoffsVisibleToB.structuredContent),
+    [savedTaskRef],
+  );
   const listedByB = await accountB.callTool({
-    name: "project_control",
+    name: "project_thread_control",
     arguments: { action: "list", projectRef },
+    _meta: accountBHostMeta,
   });
   assertSucceeded(listedByB);
   const threadsVisibleToB = (
@@ -153,12 +187,187 @@ try {
       threadRef,
       operationId: "account-b-resume-shared-progress",
     },
+    _meta: accountBHostMeta,
   });
   assertErrorCode(resumedByB, "project_thread_not_found");
+  const resumedHandoffByB = await accountB.callTool({
+    name: "project_control",
+    arguments: {
+      action: "resume",
+      projectRef,
+      taskRef: savedTaskRef,
+      operationId: "account-b-resume-project-handoff",
+    },
+    _meta: accountBHostMeta,
+  });
+  assertSucceeded(resumedHandoffByB);
+  assert.doesNotMatch(JSON.stringify(resumedHandoffByB.structuredContent), /executionRef/u);
+  const resumedThreadRefB = String(
+    (resumedHandoffByB.structuredContent as {
+      thread?: { threadRef?: unknown };
+    } | undefined)?.thread?.threadRef ?? "",
+  );
+  assert.match(resumedThreadRefB, /^pth1_/u);
+  const resumedThreadBeforeConflict = await accountB.callTool({
+    name: "project_thread_control",
+    arguments: { action: "status", threadRef: resumedThreadRefB },
+    _meta: accountBHostMeta,
+  });
+  assertSucceeded(resumedThreadBeforeConflict);
+  const resumedThreadVersionBeforeConflict = threadVersion(
+    resumedThreadBeforeConflict.structuredContent,
+  );
+  const advancedByA = await accountA.callTool({
+    name: "save_progress",
+    arguments: {
+      operationId: "account-a-advance-shared-progress",
+      title: "Shared Project task",
+      progress: "Account A advanced the Project handoff beyond Account B's snapshot.",
+      ifMatch: 2,
+    },
+    _meta: accountAHostMeta,
+  });
+  assertSucceeded(advancedByA);
+  const staleSaveByB = await accountB.callTool({
+    name: "save_progress",
+    arguments: {
+      operationId: "account-b-stale-project-handoff",
+      title: "Stale shared task",
+      progress: "This stale writer must not overwrite Account A's newer handoff.",
+      ifMatch: 2,
+    },
+    _meta: accountBHostMeta,
+  });
+  assertErrorCode(staleSaveByB, "project_task_revision_conflict");
+  assert.equal(errorCurrentVersion(staleSaveByB.structuredContent), 3);
+  assert.doesNotMatch(JSON.stringify(staleSaveByB.structuredContent), /requiresNewOperationId/u);
+  const resumedThreadAfterConflict = await accountB.callTool({
+    name: "project_thread_control",
+    arguments: { action: "status", threadRef: resumedThreadRefB },
+    _meta: accountBHostMeta,
+  });
+  assertSucceeded(resumedThreadAfterConflict);
+  assert.equal(
+    threadVersion(resumedThreadAfterConflict.structuredContent),
+    resumedThreadVersionBeforeConflict,
+    "a rejected shared-Handoff update must not mutate the private Thread projection",
+  );
+  const reconciledSaveByB = await accountB.callTool({
+    name: "save_progress",
+    arguments: {
+      operationId: "account-b-stale-project-handoff",
+      title: "Reconciled shared task",
+      progress: "Account B reconciled Account A's newer handoff before updating.",
+      ifMatch: 3,
+    },
+    _meta: accountBHostMeta,
+  });
+  assertSucceeded(reconciledSaveByB);
+  assert.equal(
+    (reconciledSaveByB.structuredContent as {
+      task?: { version?: unknown };
+    } | undefined)?.task?.version,
+    4,
+    "a preflight conflict must release the operationId for a corrected retry",
+  );
+
+  const capacityHostMetas = Array.from(
+    { length: 19 },
+    (_, index) => hostMeta("account-b", `capacity-${index}`),
+  );
+  for (const [index, capacityHostMeta] of capacityHostMetas.entries()) {
+    const opened = await accountB.callTool({
+      name: "project_control",
+      arguments: {
+        action: "open",
+        projectRef,
+        operationId: `account-b-capacity-open-${index}`,
+      },
+      _meta: capacityHostMeta,
+    });
+    assertSucceeded(opened);
+    assert.doesNotMatch(JSON.stringify(opened.structuredContent), /executionRef/u);
+  }
+  for (const [index, capacityHostMeta] of capacityHostMetas.entries()) {
+    assertSucceeded(await accountB.callTool({
+      name: "save_progress",
+      arguments: {
+        operationId: `account-b-capacity-save-${index}`,
+        title: `Capacity task ${index}`,
+        progress: `Bounded capacity fixture ${index}.`,
+      },
+      _meta: capacityHostMeta,
+    }));
+  }
+  const overflowHostMeta = hostMeta("account-b", "capacity-overflow");
+  const overflowExecution = await accountB.callTool({
+    name: "project_control",
+    arguments: {
+      action: "open",
+      projectRef,
+      operationId: "account-b-capacity-overflow-open",
+    },
+    _meta: overflowHostMeta,
+  });
+  assertSucceeded(overflowExecution);
+  const overflowThreadRef = String(
+    (overflowExecution.structuredContent as {
+      thread?: { threadRef?: unknown };
+    } | undefined)?.thread?.threadRef ?? "",
+  );
+  const overflowThreadBefore = await accountB.callTool({
+    name: "project_thread_control",
+    arguments: { action: "status", threadRef: overflowThreadRef },
+    _meta: accountBHostMeta,
+  });
+  assertSucceeded(overflowThreadBefore);
+  const capacityRejected = await accountB.callTool({
+    name: "save_progress",
+    arguments: {
+      operationId: "account-b-capacity-overflow-save",
+      title: "Overflow task",
+      progress: "This save must wait for Project handoff capacity.",
+    },
+    _meta: overflowHostMeta,
+  });
+  assertErrorCode(capacityRejected, "project_task_capacity");
+  const overflowThreadAfter = await accountB.callTool({
+    name: "project_thread_control",
+    arguments: { action: "status", threadRef: overflowThreadRef },
+    _meta: accountBHostMeta,
+  });
+  assertSucceeded(overflowThreadAfter);
+  assert.equal(
+    threadVersion(overflowThreadAfter.structuredContent),
+    threadVersion(overflowThreadBefore.structuredContent),
+    "a capacity rejection must not mutate the private Thread projection",
+  );
+  assertSucceeded(await accountA.callTool({
+    name: "save_progress",
+    arguments: {
+      operationId: "account-a-complete-shared-progress",
+      title: "Shared Project task",
+      progress: "The shared handoff is complete and can release one capacity slot.",
+      ifMatch: 4,
+      status: "completed",
+    },
+    _meta: accountAHostMeta,
+  }));
+  const capacityRetry = await accountB.callTool({
+    name: "save_progress",
+    arguments: {
+      operationId: "account-b-capacity-overflow-save",
+      title: "Overflow task",
+      progress: "This save must wait for Project handoff capacity.",
+    },
+    _meta: overflowHostMeta,
+  });
+  assertSucceeded(capacityRetry);
 
   const listedByC = await accountC.callTool({
-    name: "project_control",
+    name: "project_thread_control",
     arguments: { action: "list", projectRef: otherProjectRef },
+    _meta: accountCHostMeta,
   });
   assertSucceeded(listedByC);
   assert.deepEqual(
@@ -174,14 +383,22 @@ try {
         threadRef,
         operationId: "account-c-reject-foreign-handoff",
       },
+      _meta: accountCHostMeta,
     }),
     "project_thread_not_found",
+  );
+  assertErrorCode(
+    await accountC.callTool({
+      name: "read_files",
+      arguments: { files: [{ path: "other.txt" }] },
+      _meta: accountCHostMeta,
+    }),
+    "project_execution_required",
   );
 
   assertSucceeded(await accountA.callTool({
     name: "apply_patch",
     arguments: {
-      executionRef: executionRefA,
       operationId: "account-a-patch",
       ifMatch: { "shared-from-a.txt": null },
       patch:
@@ -190,6 +407,7 @@ try {
         "+written by account A\n" +
         "*** End Patch\n",
     },
+    _meta: accountAHostMeta,
   }));
   assert.equal(
     await readFile(join(projectRoot, "shared-from-a.txt"), "utf8"),
@@ -199,16 +417,17 @@ try {
     await accountB.callTool({
       name: "read_files",
       arguments: {
-        executionRef: executionRefB,
         files: [{ path: "shared-from-a.txt" }],
       },
+      _meta: accountBHostMeta,
     }),
     "written by account A",
   );
 
   const changesA = await accountA.callTool({
     name: "show_changes",
-    arguments: { executionRef: executionRefA },
+    arguments: { source: "apply_patch_history" },
+    _meta: accountAHostMeta,
   });
   assertSucceeded(changesA);
   assert.equal(changeSource(changesA), "apply_patch_history");
@@ -217,7 +436,8 @@ try {
 
   const changesB = await accountB.callTool({
     name: "show_changes",
-    arguments: { executionRef: executionRefB },
+    arguments: { source: "apply_patch_history" },
+    _meta: accountBHostMeta,
   });
   assertSucceeded(changesB);
   assert.equal(changeSource(changesB), "apply_patch_history");
@@ -247,17 +467,17 @@ try {
   await assert.rejects(accountA.callTool({
     name: "read_files",
     arguments: {
-      executionRef: executionRefA,
       files: [{ path: "shared-from-a.txt" }],
     },
+    _meta: accountAHostMeta,
   }));
   assertReadText(
     await accountB.callTool({
       name: "read_files",
       arguments: {
-        executionRef: executionRefB,
         files: [{ path: "shared-from-a.txt" }],
       },
+      _meta: accountBHostMeta,
     }),
     "written by account A",
   );
@@ -340,18 +560,12 @@ async function connect(
   return client;
 }
 
-function projectExecutionRef(
-  result: Awaited<ReturnType<Client["callTool"]>>,
-): string {
-  const executionRef = String(
-    (result.structuredContent as {
-      project?: { executionRef?: unknown };
-    } | undefined)?.project?.executionRef ?? "",
-  );
-  assert.match(executionRef, /^pex1_/u);
-  return executionRef;
+function hostMeta(account: string, session: string): Readonly<Record<string, string>> {
+  return {
+    "openai/subject": `multi-grant-${account}-subject`,
+    "openai/session": `multi-grant-${account}-${session}-session`,
+  };
 }
-
 function changeSource(
   result: Awaited<ReturnType<Client["callTool"]>>,
 ): unknown {
@@ -368,17 +582,29 @@ function changeFileCount(
   } | undefined)?.summary?.files;
 }
 
-function listedHandoffRefs(structuredContent: unknown): string[] {
+function listedTaskRefs(structuredContent: unknown): string[] {
   const projects = (structuredContent as {
     projects?: Array<{
-      handoffs?: Array<{ handoffRef?: unknown }>;
+      tasks?: Array<{ taskRef?: unknown }>;
     }>;
   } | undefined)?.projects ?? [];
   return projects.flatMap((project) =>
-    project.handoffs?.flatMap((handoff) =>
-      typeof handoff.handoffRef === "string" ? [handoff.handoffRef] : []
+    project.tasks?.flatMap((task) =>
+      typeof task.taskRef === "string" ? [task.taskRef] : []
     ) ?? []
   );
+}
+
+function threadVersion(structuredContent: unknown): unknown {
+  return (structuredContent as {
+    thread?: { version?: unknown };
+  } | undefined)?.thread?.version;
+}
+
+function errorCurrentVersion(structuredContent: unknown): unknown {
+  return (structuredContent as {
+    error?: { currentVersion?: unknown };
+  } | undefined)?.error?.currentVersion;
 }
 
 function assertReadText(

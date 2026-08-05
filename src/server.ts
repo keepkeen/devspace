@@ -99,6 +99,7 @@ import {
 } from "./process-output-store.js";
 import {
   createReviewCheckpointManager,
+  RepositoryReviewUnavailableError,
   ReviewPagingExpiredError,
   UnsafeGitReviewConfigurationError,
   type ReviewChangesResult,
@@ -137,6 +138,7 @@ import {
 } from "./workspaces.js";
 import { RuntimeDiagnostics } from "./runtime-diagnostics.js";
 import { ActiveRequestBarrier } from "./request-barrier.js";
+import { KeyedOperationQueue } from "./keyed-operation-queue.js";
 import { MAX_PATCH_UTF8_BYTES } from "./resource-limits.js";
 import {
   WorkspaceRootLockTimeoutError,
@@ -167,7 +169,6 @@ import {
   PROJECT_CONTEXT_SCHEMA_VERSION,
   serializeProjectContext,
   type ProjectExecutionRecord,
-  type ProjectHandoffContext,
   type ProjectInstructionItem,
   type ProjectThreadContext,
 } from "./project-context-protocol.js";
@@ -179,9 +180,7 @@ import {
   type ProjectExecutionReservation,
 } from "./project-execution-store.js";
 import {
-  decodeProjectExecutionRef,
   encodeProjectExecutionRef,
-  ProjectExecutionRefError,
 } from "./project-execution-ref.js";
 import {
   MAX_PROJECT_HANDOFF_MODEL_TEXT_JSON_BYTES,
@@ -206,6 +205,7 @@ import {
 import {
   ProjectTaskContinuityStore,
   type ProjectHostIdentity,
+  type ProjectTaskSessionBinding,
 } from "./project-task-continuity-store.js";
 import { ProjectActivityHub } from "./project-activity-hub.js";
 import {
@@ -369,7 +369,7 @@ function publicToolError(error: unknown, toolName: string): PublicToolError | un
   if (error instanceof UnknownWorkspaceError) {
     return {
       code: "project_execution_required",
-      text: "project_execution_required: Call project_control with action=hydrate and the same executionRef.",
+      text: "project_execution_required: Call project_control with action=hydrate in this ChatGPT session.",
       recovery: "project_control_hydrate",
     };
   }
@@ -415,7 +415,7 @@ function publicToolError(error: unknown, toolName: string): PublicToolError | un
   if (error instanceof WorkspaceResumeRequiredError) {
     return {
       code: "project_execution_required",
-      text: "project_execution_required: Call project_control with action=hydrate and the same executionRef.",
+      text: "project_execution_required: Call project_control with action=hydrate in this ChatGPT session.",
       recovery: "project_control_hydrate",
     };
   }
@@ -470,6 +470,19 @@ function publicToolError(error: unknown, toolName: string): PublicToolError | un
       safeToRetry: true,
       recovery: "restart_diff_paging",
       phase: "not_started",
+    };
+  }
+  if (error instanceof RepositoryReviewUnavailableError) {
+    return {
+      code: error.code,
+      text:
+        `${error.code}: The selected Project root is not an exact Git top level. ` +
+        "Call show_changes again with source=apply_patch_history to review successful DevSpace patches from this execution.",
+      retryable: true,
+      safeToRetry: true,
+      recovery: "show_changes_apply_patch_history",
+      phase: "not_started",
+      effectsKnown: true,
     };
   }
   if (error instanceof UnsafeGitReviewConfigurationError) {
@@ -619,11 +632,18 @@ function retainedStructuredToolErrorDetails(
 ): Record<string, unknown> | undefined {
   const details: Record<string, unknown> = {};
   if (
-    typeof error.handoffRef === "string" &&
-    error.handoffRef.length >= 16 &&
-    error.handoffRef.length <= 512
+    typeof error.projectRef === "string" &&
+    error.projectRef.length >= 1 &&
+    error.projectRef.length <= 128
   ) {
-    details.handoffRef = error.handoffRef;
+    details.projectRef = error.projectRef;
+  }
+  if (
+    typeof error.taskRef === "string" &&
+    error.taskRef.length >= 16 &&
+    error.taskRef.length <= 512
+  ) {
+    details.taskRef = error.taskRef;
   }
   if (
     Number.isSafeInteger(error.currentVersion) &&
@@ -633,6 +653,12 @@ function retainedStructuredToolErrorDetails(
   }
   if (Number.isSafeInteger(error.limit) && (error.limit as number) >= 1) {
     details.limit = error.limit;
+  }
+  if (error.requiresNewExecution === true) {
+    details.requiresNewExecution = true;
+  }
+  if (error.requiresNewOperationId === true) {
+    details.requiresNewOperationId = true;
   }
   return Object.keys(details).length > 0 ? details : undefined;
 }
@@ -719,8 +745,10 @@ const RELEASABLE_MUTATION_PREFLIGHT_CODES = new Set([
   "if_match_required",
   "if_match_ambiguous",
   "if_match_unexpected",
-  "handoff_context_too_large",
+  "task_context_too_large",
   "handoff_revision_conflict",
+  "project_task_revision_conflict",
+  "project_task_capacity",
   "review_confirmation_required",
   "invalid_review_token",
   "review_token_stale",
@@ -937,6 +965,7 @@ export function isExpectedPiToolError(error: unknown): boolean {
 const PROJECT_CONTEXT_TOOL_NAMES = new Set<string>([
   "list_projects",
   "project_control",
+  "project_thread_control",
   "save_progress",
 ]);
 const enabledToolsByServer = new WeakMap<McpServer, ReadonlySet<string>>();
@@ -1190,16 +1219,12 @@ function projectToolRegistrar(
       args[handlerIndex] = (...handlerArgs: unknown[]) => {
         const execution = requestContext.getStore()?.projectExecution;
         if (!execution) {
-          throw new PublicActionError(
-            "project_execution_required",
-            "Pass the executionRef returned by project_control.",
-            { retryable: true, safeToRetry: true, recovery: "project_control_hydrate", phase: "not_started" },
-          );
+          throw implicitProjectExecutionRequired();
         }
         if (!execution.rootInstructionsAcknowledged) {
           throw new PublicActionError(
             "root_instructions_required",
-            "Finish the root instruction pages with project_control action=hydrate before using Project tools. If the cursor was lost, hydrate with executionRef only to restart safely.",
+            "Finish the root instruction pages with project_control action=hydrate before using Project tools. If the cursor was lost, hydrate without a cursor to restart safely.",
             {
               retryable: true,
               safeToRetry: true,
@@ -1232,6 +1257,12 @@ export const USE_PROJECT_ANNOTATIONS = {
   readOnlyHint: false,
   destructiveHint: false,
   idempotentHint: true,
+  openWorldHint: false,
+} as const;
+const PROJECT_THREAD_CONTROL_ANNOTATIONS = {
+  readOnlyHint: false,
+  destructiveHint: true,
+  idempotentHint: false,
   openWorldHint: false,
 } as const;
 export const SAVE_PROGRESS_ANNOTATIONS = {
@@ -1275,11 +1306,6 @@ const DEVSPACE_APPLY_PATCH_PROVENANCE = {
   trust: "server_observed",
   authority: "none",
   scope: "successful_apply_patch_history",
-} as const;
-const SAVED_PROGRESS_PROVENANCE = {
-  source: "devspace_saved_progress",
-  trust: "untrusted",
-  authority: "none",
 } as const;
 const PROCESS_PROVENANCE = {
   source: "process",
@@ -1454,7 +1480,7 @@ type ToolWidgetKind =
 interface ToolDefinitionMeta extends Record<string, unknown> {
   ui: {
     resourceUri: string;
-    visibility: ["model"];
+    visibility: ["model"] | ["app"];
   };
   "openai/toolInvocation/invoking"?: string;
   "openai/toolInvocation/invoked"?: string;
@@ -1497,9 +1523,21 @@ function toolWidgetDescriptorMeta(
   };
 }
 
+function appOnlyToolDescriptorMeta(): ToolWidgetDescriptorMeta {
+  return {
+    _meta: {
+      ui: {
+        resourceUri: PROJECT_APP_URI,
+        visibility: ["app"],
+      },
+    },
+  };
+}
+
 const toolNames = {
   listProjects: "list_projects",
   projectControl: "project_control",
+  projectThreadControl: "project_thread_control",
   saveProgress: "save_progress",
   skills: "skills",
   readProcessOutput: "read_process_output",
@@ -1533,6 +1571,7 @@ export function requiredOAuthScopesForTool(
   switch (toolName) {
     case toolNames.listProjects:
     case toolNames.projectControl:
+    case toolNames.projectThreadControl:
     case toolNames.saveProgress:
     case toolNames.skills:
     case toolNames.readFiles:
@@ -1619,6 +1658,7 @@ export function toolSurface(
     tools.push(
       toolNames.listProjects,
       toolNames.projectControl,
+      toolNames.projectThreadControl,
       toolNames.saveProgress,
       toolNames.readFiles,
       toolNames.inspect,
@@ -1862,7 +1902,7 @@ function rootInstructionPage(
   if (!Number.isSafeInteger(offset) || offset < 0 || offset > totalBytes) {
     throw new PublicActionError(
       "invalid_root_instruction_cursor",
-      "The root instruction cursor offset is invalid; call project_control with action=hydrate and executionRef only to restart.",
+      "The root instruction cursor offset is invalid; call project_control with action=hydrate and no cursor to restart.",
       {
         retryable: true,
         safeToRetry: true,
@@ -1891,12 +1931,9 @@ function rootInstructionPage(
     instructions.push({
       ...instruction,
       content: fragment,
-      fragment: {
-        offsetBytes: localOffset,
-        lengthBytes: localEnd - localOffset,
-        totalBytes: content.byteLength,
-        complete: localOffset === 0 && localEnd === content.byteLength,
-      },
+      ...(localOffset === 0 && localEnd === content.byteLength
+        ? {}
+        : { fragment: { partial: true as const } }),
     });
     const consumed = localEnd - localOffset;
     remaining -= consumed;
@@ -1920,11 +1957,9 @@ function utf8PageEnd(content: Buffer, offset: number, maximumBytes: number): num
 function renderProjectContext(
   context: WorkspaceContext,
   projectRef: string,
-  executionRef: string,
   page: RootInstructionPage,
   nextCursor: string | undefined,
   thread?: ProjectThreadContext,
-  handoff?: ProjectHandoffContext,
 ) {
   const {
     workspace,
@@ -1933,7 +1968,6 @@ function renderProjectContext(
   return serializeProjectContext({
     project: {
       ref: projectRef,
-      executionRef,
       writeAccess: workspace.writeAccess,
     },
     ...(thread ? { thread } : {}),
@@ -1942,7 +1976,6 @@ function renderProjectContext(
       nextCursor === undefined,
       nextCursor,
     ),
-    ...(handoff ? { handoff } : {}),
     ...(
       instructionScan.reason
         ? {
@@ -1961,7 +1994,7 @@ function modelProjectThread(
   key: string | Uint8Array,
 ): ProjectThreadContext {
   return {
-    ref: encodeProjectThreadRef(thread.threadId, key),
+    threadRef: encodeProjectThreadRef(thread.threadId, key),
     title: thread.title,
     status: thread.status,
     version: thread.revision,
@@ -1978,32 +2011,10 @@ function modelProjectThread(
                 }
               : {}),
             createdAt: checkpoint.createdAt,
-            provenance: {
-              source: "devspace_checkpoint",
-              trust: "server_observed",
-              authority: "none",
-            },
+            observedStateTrust: "server_observed" as const,
           },
         }
       : {}),
-  };
-}
-
-function modelProjectHandoff(
-  handoff: ProjectHandoff,
-  key: string | Uint8Array,
-): ProjectHandoffContext {
-  return {
-    ref: encodeProjectHandoffRef(handoff.handoffId, key),
-    title: handoff.title,
-    progress: handoff.progress,
-    status: "resumable",
-    version: handoff.revision,
-    updatedAt: handoff.updatedAt,
-    mustRevalidate: true,
-    provenance: {
-      ...SAVED_PROGRESS_PROVENANCE,
-    },
   };
 }
 
@@ -2015,9 +2026,7 @@ const privateProjectExecutionInputSchema = {
   workspaceId: z.string(),
   workspaceGeneration: z.number().int().positive(),
 };
-const publicProjectExecutionInputSchema = {
-  executionRef: z.string().min(16).max(512),
-};
+const publicProjectExecutionInputSchema = {};
 
 const DEFAULT_PROCESS_OUTPUT_READ_BYTES = 40_000;
 const MAX_PROCESS_OUTPUT_READ_BYTES = 256_000;
@@ -2177,6 +2186,11 @@ function sendCallToolErrorResult(
     operationId?: string;
     recovery?: string;
     wwwAuthenticate?: string;
+    retryable?: boolean;
+    safeToRetry?: boolean;
+    phase?: OperationPhase;
+    effectsKnown?: boolean;
+    details?: Record<string, unknown>;
   } = {},
 ): void {
   const structuredError = code
@@ -2186,6 +2200,11 @@ function sendCallToolErrorResult(
         recovery: options.recovery ?? (code === "project_execution_required"
           ? "project_control_hydrate"
           : "list_projects"),
+        ...(options.retryable === undefined ? {} : { retryable: options.retryable }),
+        ...(options.safeToRetry === undefined ? {} : { safeToRetry: options.safeToRetry }),
+        ...(options.phase === undefined ? {} : { phase: options.phase }),
+        ...(options.effectsKnown === undefined ? {} : { effectsKnown: options.effectsKnown }),
+        ...(options.details === undefined ? {} : { details: options.details }),
       })
     : undefined;
   const structuredContent = structuredError
@@ -2357,9 +2376,41 @@ export function toolCallOperationId(body: unknown): string | undefined {
     : undefined;
 }
 
-function toolCallExecutionRef(body: unknown): string | undefined {
-  const executionRef = toolCallRequest(body)?.arguments.executionRef;
-  return typeof executionRef === "string" ? executionRef : undefined;
+function implicitProjectExecutionRequired(): PublicActionError {
+  return new PublicActionError(
+    "project_execution_required",
+    "Open or reselect a Project with project_control in this ChatGPT session.",
+    {
+      retryable: true,
+      safeToRetry: true,
+      recovery: "project_control_open_or_resume",
+      phase: "not_started",
+      effectsKnown: true,
+    },
+  );
+}
+
+function projectSelectionChanged(): PublicActionError {
+  return new PublicActionError(
+    "project_selection_changed",
+    "The Project selected for this ChatGPT session changed concurrently. Hydrate the current Project again before continuing.",
+    {
+      retryable: true,
+      safeToRetry: true,
+      recovery: "project_control_hydrate",
+      phase: "not_started",
+      effectsKnown: true,
+    },
+  );
+}
+
+function invalidatesSessionExecutionBinding(error: unknown): boolean {
+  return error instanceof PublicActionError && new Set([
+    "project_execution_not_found",
+    "project_execution_reauthorization_required",
+    "project_not_authorized",
+    "project_execution_recovery_required",
+  ]).has(error.code);
 }
 
 function correlationLogFields(
@@ -2503,11 +2554,7 @@ function sendStaleOAuthClientPage(res: Response, uiLocales: string | undefined):
 function currentInstructionContextId(): string {
   const instructionContextId = requestContext.getStore()?.projectExecution?.instructionContextId;
   if (!instructionContextId) {
-    throw new PublicActionError(
-      "project_execution_required",
-      "Pass the executionRef returned by project_control.",
-      { retryable: true, safeToRetry: true, recovery: "project_control_hydrate", phase: "not_started" },
-    );
+    throw implicitProjectExecutionRequired();
   }
   return instructionContextId;
 }
@@ -2611,6 +2658,7 @@ interface HydratedProjectExecution {
   record: ProjectExecutionRecord;
   thread: ProjectThread;
   checkpoint?: ProjectCheckpoint;
+  stateUpdatesDeferred?: boolean;
 }
 
 function projectExecutionAuthorizationFromContext(): ProjectExecutionAuthorization {
@@ -2699,13 +2747,14 @@ function recordAutomaticThreadCheckpoint(
 function ensureExecutionThread(input: {
   runtime: ProjectExecutionRuntime;
   authorization: ProjectExecutionAuthorization;
+  profileId: string;
   execution: ProjectExecution;
   context: WorkspaceContext;
   title?: string;
   modelSummary?: string;
   sourceOperationId?: string;
 }): { thread: ProjectThread; checkpoint?: ProjectCheckpoint } {
-  const profileId = projectThreadProfileId(input.authorization);
+  const profileId = input.profileId;
   const boundThreadId = input.runtime.threads.threadIdForExecution(input.execution.executionId);
   let thread = boundThreadId
     ? input.runtime.threads.get(boundThreadId, profileId)
@@ -2742,8 +2791,7 @@ function ensureExecutionThread(input: {
         profileId,
         cause: "manual",
         observedState: {
-          importedFrom: "legacy_handoff",
-          mustRevalidate: true,
+          importedFrom: "saved_task",
         },
         modelSummary: input.modelSummary,
         sourceOperationId: input.sourceOperationId,
@@ -2811,15 +2859,50 @@ async function hydrateActiveProjectExecution(input: {
   grantedScopes: readonly string[];
   executionId: string;
   executionRef: string;
+  deferStateUpdates?: boolean;
+  expectedThreadId?: string;
 }): Promise<HydratedProjectExecution> {
   const execution = input.runtime.store.resolveActive(
     input.executionId,
     input.authorization,
   );
   if (!execution) {
+    const recoveryIdentity = input.runtime.store.findRecoveryIdentity(input.executionId);
+    const recoverableProject = recoveryIdentity
+      ? input.projects.find((candidate) =>
+          candidate.id === recoveryIdentity.projectRef &&
+          candidate.projectFingerprint === recoveryIdentity.projectFingerprint &&
+          candidate.path === recoveryIdentity.canonicalSourceRoot
+        )
+      : undefined;
+    if (
+      recoveryIdentity &&
+      recoverableProject &&
+      pathAllowedByAuthorizationRoots(
+        recoveryIdentity.canonicalSourceRoot,
+        input.authorizedRoots,
+      )
+    ) {
+      throw new PublicActionError(
+        "project_execution_reauthorization_required",
+        "The session-bound execution belongs to an earlier authorization, but the same Project is still authorized. Call list_projects with the returned projectRef, then resume a saved task or open a fresh Project context with a new operationId.",
+        {
+          retryable: true,
+          safeToRetry: true,
+          recovery: "list_project_tasks_then_open_new_execution",
+          phase: "not_started",
+          effectsKnown: true,
+          details: {
+            projectRef: recoverableProject.id,
+            requiresNewExecution: true,
+            requiresNewOperationId: true,
+          },
+        },
+      );
+    }
     throw new PublicActionError(
       "project_execution_not_found",
-      "The executionRef is invalid, expired, or does not belong to this authorization. Call project_control with action=open to create a new Project context.",
+      "The session-bound execution is invalid, expired, or unavailable to this authorization. Open or resume a Project context in this ChatGPT session.",
       {
         retryable: true,
         safeToRetry: true,
@@ -2844,7 +2927,7 @@ async function hydrateActiveProjectExecution(input: {
     );
     throw new PublicActionError(
       "project_not_authorized",
-      "The Project behind this executionRef is no longer authorized. Reauthorize the root before creating a new Project context.",
+      "The session-bound Project is no longer authorized. Reauthorize the root before creating a new Project context.",
       {
         retryable: false,
         safeToRetry: true,
@@ -2860,7 +2943,7 @@ async function hydrateActiveProjectExecution(input: {
   let boundThread = boundThreadId
     ? input.runtime.threads.get(boundThreadId, profileId)
     : undefined;
-  if (boundThreadId && !boundThread) {
+  if (boundThreadId && !boundThread && !input.deferStateUpdates) {
     const legacyProfileId = legacyProjectThreadProfileId(input.authorization);
     if (legacyProfileId !== profileId) {
       boundThread = input.runtime.threads.reassignProfile(
@@ -2869,6 +2952,22 @@ async function hydrateActiveProjectExecution(input: {
         profileId,
       );
     }
+  }
+  if (
+    input.deferStateUpdates &&
+    (!boundThread || !input.expectedThreadId || boundThread.threadId !== input.expectedThreadId)
+  ) {
+    throw new PublicActionError(
+      "project_execution_recovery_required",
+      "The session-bound Project thread no longer matches its execution. Open or resume the Project again in this ChatGPT session.",
+      {
+        retryable: true,
+        safeToRetry: true,
+        recovery: "project_control_open_or_resume",
+        phase: "not_started",
+        effectsKnown: true,
+      },
+    );
   }
 
   let context: WorkspaceContext;
@@ -2940,12 +3039,18 @@ async function hydrateActiveProjectExecution(input: {
       },
     );
   }
-  const threadState = ensureExecutionThread({
-    runtime: input.runtime,
-    authorization: input.authorization,
-    execution: activeExecution,
-    context,
-  });
+  const threadState = input.deferStateUpdates
+    ? {
+        thread: boundThread!,
+        checkpoint: input.runtime.threads.latestCheckpoint(boundThread!.threadId, profileId),
+      }
+    : ensureExecutionThread({
+        runtime: input.runtime,
+        authorization: input.authorization,
+        profileId,
+        execution: activeExecution,
+        context,
+      });
   const record = await createProjectExecutionRecord(
     input.workspaces,
     activeExecution,
@@ -2953,7 +3058,9 @@ async function hydrateActiveProjectExecution(input: {
     context,
     threadState.thread,
   );
-  input.runtime.store.touch(activeExecution.executionId, input.authorization);
+  if (!input.deferStateUpdates) {
+    input.runtime.store.touch(activeExecution.executionId, input.authorization);
+  }
   return {
     execution: activeExecution,
     executionRef: input.executionRef,
@@ -2961,42 +3068,21 @@ async function hydrateActiveProjectExecution(input: {
     record,
     thread: threadState.thread,
     ...(threadState.checkpoint ? { checkpoint: threadState.checkpoint } : {}),
+    ...(input.deferStateUpdates ? { stateUpdatesDeferred: true } : {}),
   };
 }
 
-function decodeExecutionRefOrPublicError(
-  executionRef: string,
+function decodeTaskRefOrPublicError(
+  taskRef: string,
   key: string | Uint8Array,
 ): string {
   try {
-    return decodeProjectExecutionRef(executionRef, key);
-  } catch (error) {
-    if (!(error instanceof ProjectExecutionRefError)) throw error;
-    throw new PublicActionError(
-      "project_execution_not_found",
-      "The executionRef is invalid or unavailable. Call project_control with action=open to create a new Project context.",
-      {
-        retryable: true,
-        safeToRetry: true,
-        recovery: "project_control_open",
-        phase: "not_started",
-        effectsKnown: true,
-      },
-    );
-  }
-}
-
-function decodeHandoffRefOrPublicError(
-  handoffRef: string,
-  key: string | Uint8Array,
-): string {
-  try {
-    return decodeProjectHandoffRef(handoffRef, key);
+    return decodeProjectHandoffRef(taskRef, key);
   } catch (error) {
     if (!(error instanceof ProjectHandoffRefError)) throw error;
     throw new PublicActionError(
-      "project_handoff_not_found",
-      "The handoffRef is invalid or unavailable for this Project. Call list_projects to choose a current handoff.",
+      "project_task_not_found",
+      "The taskRef is invalid or unavailable for this Project. Call list_projects to choose a current saved task.",
       {
         retryable: true,
         safeToRetry: true,
@@ -3018,11 +3104,11 @@ function decodeThreadRefOrPublicError(
     if (!(error instanceof ProjectThreadRefError)) throw error;
     throw new PublicActionError(
       "project_thread_not_found",
-      "The threadRef is invalid or unavailable. Call project_control with action=list.",
+      "The threadRef is invalid or unavailable. Refresh the Project App task list.",
       {
         retryable: true,
         safeToRetry: true,
-        recovery: "project_control_list",
+        recovery: "project_thread_control_list",
         phase: "not_started",
         effectsKnown: true,
       },
@@ -3337,7 +3423,7 @@ function registerProcessInteractionTools(
       description: toolDescription({
         use: "sending input, interrupt, close, or terminal resize to a live exec_command session.",
         avoid: "reusing an operationId for a different interaction.",
-        requires: "executionRef, sessionId, and a fresh operationId for each new interaction.",
+        requires: "a selected Project, sessionId, and a fresh operationId for each new interaction.",
         returns: "the process snapshot after that interaction; use read_process_output to poll.",
       }),
       inputSchema: writeStdinInputSchema,
@@ -3506,9 +3592,9 @@ function registerReadProcessOutputTool(
     {
       title: "Read process output",
       description: toolDescription({
-        use: "polling a live session or paging, tailing, and searching retained output.",
+        use: "polling a live session or paging, tailing, and searching retained output; when a process is expected to remain quiet for longer, use a larger yieldTimeMs for a longer bounded wait.",
         avoid: "sending process input.",
-        requires: "executionRef plus sessionId for a live poll, or outputId/cursor for retained output.",
+        requires: "a selected Project plus sessionId for a live poll, or outputId/cursor for retained output.",
         returns: "one process snapshot, or bounded output/matches with a signed continuation cursor.",
       }),
       inputSchema: {
@@ -3945,7 +4031,6 @@ function registerProcessTools(
     columns: z.number().int().min(1).max(1_000).optional(),
     rows: z.number().int().min(1).max(1_000).optional(),
     environment: z.record(z.string(), z.string().max(65_536)).optional(),
-    network: z.literal("inherit").optional(),
     yieldTimeMs: z.number().int().min(0).max(600_000).optional(),
     timeoutMs: z.number().int().positive().max(config.resources.maxCommandRuntimeMs).optional(),
     maxOutputTokens: z.number().int().positive().max(100_000).optional(),
@@ -3956,9 +4041,9 @@ function registerProcessTools(
     {
       title: "Execute command",
       description: toolDescription({
-        use: "running a direct program with argv, or an explicitly requested shell command in one Project context.",
-        avoid: "reusing an operationId for a different command.",
-        requires: "executionRef, operationId, and either program plus args, or shell=true plus command and approvalReason.",
+        use: "running a direct program with argv, or an explicitly requested shell command in one Project context; for long work, start one fixed foreground Project runner with a short initial yield, then use read_process_output across turns and increase yieldTimeMs when a longer bounded wait is useful.",
+        avoid: "reusing an operationId for a different command, unmanaged background or detach wrappers used only to survive a host turn, or repeatedly renaming and repackaging rejected launch commands; prefer direct argv and let one runner own preflight, fan-out, PID and log verification, and completion.",
+        requires: "a selected Project, operationId, and either program plus args, or shell=true plus command and approvalReason.",
         returns: "process state, structured combined output, and effect limits.",
       }),
       inputSchema: execCommandInputSchema,
@@ -3982,7 +4067,6 @@ function registerProcessTools(
         columns?: number;
         rows?: number;
         environment?: Record<string, string>;
-        network?: "inherit";
         yieldTimeMs?: number;
         timeoutMs?: number;
         maxOutputTokens?: number;
@@ -4003,7 +4087,6 @@ function registerProcessTools(
         columns,
         rows,
         environment,
-        network,
         yieldTimeMs,
         timeoutMs,
         maxOutputTokens,
@@ -4027,9 +4110,6 @@ function registerProcessTools(
           "command_mode_invalid",
           "Shell mode requires command and approvalReason and does not accept program or args.",
         );
-      }
-      if (network !== undefined && network !== "inherit") {
-        throw new PublicActionError("network_mode_invalid", "This runtime currently supports network=inherit only.");
       }
       const processCommand = direct
         ? { program: program!, args: args ?? [] }
@@ -4175,7 +4255,6 @@ function registerProcessTools(
           columns,
           rows,
           environment,
-          network,
           yieldTimeMs,
           timeoutMs,
           maxOutputTokens,
@@ -4200,6 +4279,7 @@ function createMcpServer(
   runtimeDiagnostics: RuntimeDiagnostics,
   activeToolHandlers: ActiveRequestBarrier,
   projectExecutionRuntime: ProjectExecutionRuntime,
+  projectSessionOperations: KeyedOperationQueue,
 ): McpServer {
   const server = new McpServer(
     DEVSPACE_SERVER_INFO,
@@ -4346,53 +4426,29 @@ function createMcpServer(
     hydrated: HydratedProjectExecution,
     startedAt: number,
     cursor?: string,
+    expectedBinding?: ProjectTaskSessionBinding,
   ) => {
     const {
       context,
       execution,
-      executionRef,
       record,
     } = hydrated;
     const { workspace, instructionScan } = context;
-    if (enabledTools.has("show_changes")) {
-      await reviewCheckpoints.initializeWorkspace({ workspaceId: workspace.id, root: workspace.root });
-    }
     const requestState = requestContext.getStore();
     if (!requestState) throw new Error("Request authorization context is unavailable.");
+    const hostIdentity = requestState.hostIdentity;
+    if (!hostIdentity.sessionRef) throw implicitProjectExecutionRequired();
+    // Cursor identity is request-local and must be available for validation;
+    // persistent execution/thread state remains deferred until validation passes.
     requestState.projectExecution = record;
-    if (!cursor) {
-      workspaces.resetRootAgentsFilesAcknowledgement(
-        workspace,
-        record.instructionContextId,
-        context.agentsFiles,
-      );
-      record.rootInstructionsAcknowledged = context.agentsFiles.length === 0;
-      delete record.revisions.acknowledgedRootInstructionRevision;
-      record.revisions.acknowledgedInstructionScopes = [];
-    }
     const principalRef = currentCursorCallerRef(config.oauth.keys.cursor);
     const queryHash = cursorQueryHash({ kind: "root_instructions" });
-    const resumedHandoff = !cursor && execution.handoffId
-      ? projectExecutionRuntime.handoffs.getForProject(
-          execution.projectFingerprint,
-          execution.handoffId,
-          { resumableOnly: true },
-        )
-      : undefined;
-    const modelHandoff = resumedHandoff
-      ? modelProjectHandoff(resumedHandoff, config.oauth.keys.projectFingerprint)
-      : undefined;
-    const modelThread = modelProjectThread(
-      hydrated.thread,
-      cursor ? undefined : hydrated.checkpoint,
-      config.oauth.keys.projectFingerprint,
-    );
     const decoded = cursor
       ? decodedCursorOrError(
           cursor,
           config.oauth.keys.cursor,
           "invalid_root_instruction_cursor",
-          "The root instruction cursor is invalid or expired; call project_control with action=hydrate and executionRef only to restart.",
+          "The root instruction cursor is invalid or expired; call project_control with action=hydrate and no cursor to restart.",
         )
       : undefined;
     if (
@@ -4409,7 +4465,7 @@ function createMcpServer(
     ) {
       throw new PublicActionError(
         "root_instruction_cursor_stale",
-        "The execution or root instructions changed; call project_control with action=hydrate and executionRef only to restart.",
+        "The execution or root instructions changed; call project_control with action=hydrate and no cursor to restart.",
         {
           retryable: true,
           safeToRetry: true,
@@ -4419,6 +4475,52 @@ function createMcpServer(
         },
       );
     }
+    if (
+      expectedBinding &&
+      !projectExecutionRuntime.continuity.touchSession({
+        sessionRef: expectedBinding.sessionRef,
+        actorId: expectedBinding.actorId,
+        threadId: expectedBinding.threadId,
+        executionId: expectedBinding.executionId!,
+      })
+    ) {
+      throw projectSelectionChanged();
+    }
+    let hydratedThread = hydrated.thread;
+    let hydratedCheckpoint = hydrated.checkpoint;
+    if (hydrated.stateUpdatesDeferred) {
+      const threadState = ensureExecutionThread({
+        runtime: projectExecutionRuntime,
+        authorization: projectExecutionAuthorizationFromContext(),
+        profileId: hostIdentity.actorId,
+        execution,
+        context,
+      });
+      projectExecutionRuntime.store.touch(
+        execution.executionId,
+        projectExecutionAuthorizationFromContext(),
+      );
+      hydratedThread = threadState.thread;
+      hydratedCheckpoint = threadState.checkpoint;
+    }
+    if (enabledTools.has("show_changes")) {
+      await reviewCheckpoints.initializeWorkspace({ workspaceId: workspace.id, root: workspace.root });
+    }
+    if (!cursor) {
+      workspaces.resetRootAgentsFilesAcknowledgement(
+        workspace,
+        record.instructionContextId,
+        context.agentsFiles,
+      );
+      record.rootInstructionsAcknowledged = context.agentsFiles.length === 0;
+      delete record.revisions.acknowledgedRootInstructionRevision;
+      record.revisions.acknowledgedInstructionScopes = [];
+    }
+    const modelThread = modelProjectThread(
+      hydratedThread,
+      cursor ? undefined : hydratedCheckpoint,
+      config.oauth.keys.projectFingerprint,
+    );
     let pageContentBudget = ROOT_INSTRUCTION_PAGE_CONTENT_BYTES;
     let rendered: ReturnType<typeof renderProjectContext>;
     let page: RootInstructionPage;
@@ -4443,11 +4545,9 @@ function createMcpServer(
       rendered = renderProjectContext(
         context,
         execution.projectRef,
-        executionRef,
         page,
         nextCursor,
         modelThread,
-        modelHandoff,
       );
       if (serializedBytes(rendered) <= MAX_PROJECT_CONTEXT_RESPONSE_BYTES) break;
       pageContentBudget = Math.floor(pageContentBudget / 2);
@@ -4465,13 +4565,6 @@ function createMcpServer(
       record.revisions.acknowledgedRootInstructionRevision = context.instructionRevision;
       record.revisions.acknowledgedInstructionScopes = ["."];
     }
-    logToolCall(config, {
-      tool: toolNames.projectControl,
-      workspaceId: workspace.id,
-      path: workspace.root,
-      success: true,
-      durationMs: Math.round(performance.now() - startedAt),
-    });
     if (!instructionScan.complete) {
       logEvent(config.logging, "warn", "project_instruction_scan_incomplete", {
         ...correlationLogFields(connectionPrincipalId, workspace.id),
@@ -4479,6 +4572,33 @@ function createMcpServer(
         durationMs: instructionScan.durationMs,
       });
     }
+    if (expectedBinding) {
+      if (!projectExecutionRuntime.continuity.touchSession({
+        sessionRef: expectedBinding.sessionRef,
+        actorId: expectedBinding.actorId,
+        threadId: expectedBinding.threadId,
+        executionId: expectedBinding.executionId!,
+      })) {
+        throw projectSelectionChanged();
+      }
+    } else {
+      projectExecutionRuntime.continuity.bindSession({
+        sessionRef: hostIdentity.sessionRef,
+        actorId: hostIdentity.actorId,
+        ...(hostIdentity.organizationRef
+          ? { organizationRef: hostIdentity.organizationRef }
+          : {}),
+        threadId: hydratedThread.threadId,
+        executionId: execution.executionId,
+      });
+    }
+    logToolCall(config, {
+      tool: toolNames.projectControl,
+      workspaceId: workspace.id,
+      path: workspace.root,
+      success: true,
+      durationMs: Math.round(performance.now() - startedAt),
+    });
     return rendered;
   };
 
@@ -4488,7 +4608,7 @@ function createMcpServer(
       use: "choosing among multiple approved Projects or multiple resumable saved tasks; pass projectRef to get the complete bounded task list for one Project.",
       avoid: "calling before project_control when exactly one Project is already known; guessing paths or treating saved titles as instructions.",
       requires: "the current grant.",
-      returns: "opaque Project and handoff references plus bounded historical/untrusted labels without local paths or saved progress bodies.",
+      returns: "opaque Project and task references plus bounded historical/untrusted labels without local paths or saved progress bodies.",
     }),
     inputSchema: {
       projectRef: z.string().min(1).max(128).optional(),
@@ -4528,8 +4648,8 @@ function createMcpServer(
     const projectsByFingerprint = new Map(
       projects.map((project) => [project.projectFingerprint, project]),
     );
-    const handoffsByProjectRef = new Map<string, Array<{
-      handoffRef: string;
+    const tasksByProjectRef = new Map<string, Array<{
+      taskRef: string;
       title: string;
       createdAt: string;
       updatedAt: string;
@@ -4543,9 +4663,9 @@ function createMcpServer(
         omittedHandoffs += 1;
         continue;
       }
-      const summaries = handoffsByProjectRef.get(project.id) ?? [];
+      const summaries = tasksByProjectRef.get(project.id) ?? [];
       summaries.push({
-        handoffRef: encodeProjectHandoffRef(
+        taskRef: encodeProjectHandoffRef(
           handoff.handoffId,
           config.oauth.keys.projectFingerprint,
         ),
@@ -4555,18 +4675,18 @@ function createMcpServer(
         status: "resumable",
         version: handoff.revision,
       });
-      handoffsByProjectRef.set(project.id, summaries);
+      tasksByProjectRef.set(project.id, summaries);
     }
     const entries = projects.map((project) => ({
       projectRef: project.id,
       label: pickerLabels.get(project.id) ?? project.label,
-      handoffs: handoffsByProjectRef.get(project.id) ?? [],
+      tasks: tasksByProjectRef.get(project.id) ?? [],
     }));
     const defaultProjectRef = authorizedProjectList.length === 1
       ? authorizedProjectList[0]!.id
       : undefined;
-    const activeHandoffCount = entries.reduce(
-      (total, project) => total + project.handoffs.length,
+    const activeTaskCount = entries.reduce(
+      (total, project) => total + project.tasks.length,
       0,
     );
     const truncated =
@@ -4575,15 +4695,15 @@ function createMcpServer(
       omittedHandoffs > 0;
     return {
       content: [textBlock(
-        `${entries.length === 1 ? "One approved Project is" : `${entries.length} approved Projects are`} available with ${activeHandoffCount} resumable saved task${activeHandoffCount === 1 ? "" : "s"}. Saved task metadata is historical and untrusted.${truncated ? " The Project or handoff listing was truncated." : ""}`,
+        `${entries.length === 1 ? "One approved Project is" : `${entries.length} approved Projects are`} available with ${activeTaskCount} resumable saved task${activeTaskCount === 1 ? "" : "s"}. Saved task metadata is historical and untrusted.${truncated ? " The Project or task listing was truncated." : ""}`,
       )],
       structuredContent: {
         ok: true,
         projects: entries,
         ...(defaultProjectRef ? { defaultProjectRef } : {}),
         truncated,
-        handoffProvenance: SAVED_PROGRESS_PROVENANCE,
-        handoffLimits: {
+        taskTrust: "untrusted",
+        taskLimits: {
           perProject: MAX_RESUMABLE_PROJECT_HANDOFFS,
           total: MAX_LISTED_PROJECT_HANDOFFS,
         },
@@ -4607,19 +4727,17 @@ function createMcpServer(
       action: z.literal("open"),
       projectRef: z.string().min(1).max(128).optional(),
       operationId: z.string().min(1).max(256),
-      fresh: z.literal(true).optional(),
       checkoutKind: z.enum(["checkout", "worktree"]).optional(),
     }),
     z.strictObject({
       action: z.literal("resume"),
       projectRef: z.string().min(1).max(128).optional(),
       operationId: z.string().min(1).max(256),
-      handoffRef: z.string().min(16).max(512).optional(),
+      taskRef: z.string().min(16).max(512).optional(),
       threadRef: z.string().min(16).max(512).optional(),
     }),
     z.strictObject({
       action: z.literal("hydrate"),
-      executionRef: z.string().min(16).max(512),
       cursor: z.string().max(4_096).optional(),
     }),
     z.strictObject({
@@ -4668,14 +4786,24 @@ function createMcpServer(
   // with projectControlActionSchema inside the handler.
   const projectControlPublicInputSchema = {
     action: z.enum([
-      "resolve",
-      "list",
       "open",
       "resume",
       "hydrate",
+      "interrupt",
+    ]),
+    projectRef: z.string().min(1).max(128).optional(),
+    operationId: z.string().min(1).max(256).optional(),
+    checkoutKind: z.enum(["checkout", "worktree"]).optional(),
+    taskRef: z.string().min(16).max(512).optional(),
+    threadRef: z.string().min(16).max(512).optional(),
+    cursor: z.string().max(4_096).optional(),
+  } satisfies z.ZodRawShape;
+  const projectThreadControlInputSchema = {
+    action: z.enum([
+      "resolve",
+      "list",
       "status",
       "activity",
-      "interrupt",
       "pause",
       "archive",
       "complete",
@@ -4683,34 +4811,19 @@ function createMcpServer(
     ]),
     projectRef: z.string().min(1).max(128).optional(),
     operationId: z.string().min(1).max(256).optional(),
-    fresh: z.literal(true).optional(),
-    checkoutKind: z.enum(["checkout", "worktree"]).optional(),
-    handoffRef: z.string().min(16).max(512).optional(),
     threadRef: z.string().min(16).max(512).optional(),
-    executionRef: z.string().min(16).max(512).optional(),
     cursor: z.string().max(4_096).optional(),
     waitMs: z.number().int().min(0).max(20_000).optional(),
     limit: z.number().int().min(1).max(100).optional(),
     ifMatch: z.number().int().positive().optional(),
   } satisfies z.ZodRawShape;
 
-  registerAppTool(server, toolNames.projectControl, {
-    title: "Project control",
-    description: toolDescription({
-      use: "listing, opening, resuming, hydrating, inspecting, or explicitly closing Project threads.",
-      avoid: "guessing projectRef, threadRef, handoffRef, or executionRef, or mixing lifecycle modes.",
-      requires: "one explicit action and only that action's fields; resume accepts exactly one threadRef or legacy handoffRef.",
-      returns: "bounded private Thread metadata, or a grant-bound executionRef with one root-instruction page.",
-    }),
-    inputSchema: projectControlPublicInputSchema,
-    _meta: {},
-    annotations: USE_PROJECT_ANNOTATIONS,
-  }, async (rawInput) => {
+  const handleProjectControl = async (rawInput: unknown, toolName: string) => {
     const parsedInput = projectControlActionSchema.safeParse(rawInput);
     if (!parsedInput.success) {
       throw new PublicActionError(
         "invalid_tool_input",
-        toolInputValidationText(toolNames.projectControl, parsedInput.error),
+        toolInputValidationText(toolName, parsedInput.error),
         {
           retryable: true,
           safeToRetry: true,
@@ -4726,13 +4839,21 @@ function createMcpServer(
     const profileId = projectThreadProfileId(authorization);
     const legacyProfileId = legacyProjectThreadProfileId(authorization);
     const authorizedProjectList = authorizedProjects(config);
+    const hostIdentity = requestContext.getStore()?.hostIdentity;
+    if (
+      toolName === toolNames.projectControl &&
+      (input.action === "open" || input.action === "resume" || input.action === "hydrate") &&
+      !hostIdentity?.sessionRef
+    ) {
+      throw implicitProjectExecutionRequired();
+    }
     if (input.action === "resolve") {
       const hostIdentity = requestContext.getStore()?.hostIdentity;
-      const boundThreadId = hostIdentity?.sessionRef
+      const boundSession = hostIdentity?.sessionRef
         ? projectExecutionRuntime.continuity.resolveSession(hostIdentity.sessionRef, hostIdentity.actorId)
         : undefined;
-      const thread = boundThreadId
-        ? projectExecutionRuntime.threads.get(boundThreadId, profileId)
+      const thread = boundSession
+        ? projectExecutionRuntime.threads.get(boundSession.threadId, profileId)
         : undefined;
       const authorized = thread && authorizedProjectList.some((project) =>
         project.id === thread.projectRef &&
@@ -4860,11 +4981,11 @@ function createMcpServer(
       ) {
         throw new PublicActionError(
           "project_thread_not_found",
-          "The threadRef is unavailable for this authorization. Call project_control with action=list.",
+          "The threadRef is unavailable for this authorization. Refresh the Project App task list.",
           {
             retryable: true,
             safeToRetry: true,
-            recovery: "project_control_list",
+            recovery: "project_thread_control_list",
             phase: "not_started",
             effectsKnown: true,
           },
@@ -4951,12 +5072,6 @@ function createMcpServer(
           nextCursor: String(nextSequence),
           hasMore: events.length === limit,
           timedOut,
-          hostUnavailable: [
-            "model_reasoning",
-            "model_token_usage",
-            "context_compaction",
-            "pre_tool_model_deltas",
-          ],
         },
       };
     }
@@ -4988,16 +5103,43 @@ function createMcpServer(
       ) {
         throw new PublicActionError(
           "project_thread_not_found",
-          "The threadRef is unavailable for this authorization. Call project_control with action=list.",
+          "The threadRef is unavailable for this authorization. Refresh the Project App task list.",
           {
             retryable: true,
             safeToRetry: true,
-            recovery: "project_control_list",
+            recovery: "project_thread_control_list",
             phase: "not_started",
             effectsKnown: true,
           },
         );
       }
+      const lifecycleBinding = hostIdentity?.sessionRef
+        ? projectExecutionRuntime.continuity.resolveSession(
+            hostIdentity.sessionRef,
+            hostIdentity.actorId,
+          )
+        : undefined;
+      const releaseLifecycleBinding = (closedExecutionIds?: readonly string[]): void => {
+        if (
+          !lifecycleBinding ||
+          lifecycleBinding.threadId !== thread.threadId ||
+          (
+            closedExecutionIds &&
+            lifecycleBinding.executionId &&
+            !closedExecutionIds.includes(lifecycleBinding.executionId)
+          )
+        ) {
+          return;
+        }
+        projectExecutionRuntime.continuity.releaseSession({
+          sessionRef: lifecycleBinding.sessionRef,
+          actorId: lifecycleBinding.actorId,
+          threadId: lifecycleBinding.threadId,
+          ...(lifecycleBinding.executionId
+            ? { executionId: lifecycleBinding.executionId }
+            : {}),
+        });
+      };
       if (input.action === "status") {
         const checkpoint = projectExecutionRuntime.threads.latestCheckpoint(thread.threadId, profileId);
         return {
@@ -5024,7 +5166,7 @@ function createMcpServer(
             {
               retryable: true,
               safeToRetry: true,
-              recovery: "project_control_status",
+              recovery: "project_thread_control_status",
               phase: "not_started",
               effectsKnown: true,
               details: { currentVersion: thread.revision },
@@ -5064,13 +5206,7 @@ function createMcpServer(
             ? "archived" as const
             : "completed" as const;
         projectExecutionRuntime.threads.setStatus(thread.threadId, profileId, nextStatus);
-        const hostIdentity = requestContext.getStore()?.hostIdentity;
-        if (hostIdentity?.sessionRef) {
-          projectExecutionRuntime.continuity.unbindSession(
-            hostIdentity.sessionRef,
-            hostIdentity.actorId,
-          );
-        }
+        releaseLifecycleBinding(executionIds);
         projectExecutionRuntime.continuity.appendEvent({
           threadId: thread.threadId,
           type: `thread_${nextStatus}`,
@@ -5102,6 +5238,7 @@ function createMcpServer(
         };
       }
       if (thread.status === "closed") {
+        releaseLifecycleBinding();
         return {
           content: [textBlock("Project thread is already closed.")],
           structuredContent: {
@@ -5118,7 +5255,7 @@ function createMcpServer(
           {
             retryable: true,
             safeToRetry: true,
-            recovery: "project_control_status",
+            recovery: "project_thread_control_status",
             phase: "not_started",
             effectsKnown: true,
             details: { currentVersion: thread.revision },
@@ -5163,7 +5300,7 @@ function createMcpServer(
             {
               retryable: true,
               safeToRetry: true,
-              recovery: "review_or_handoff_worktree",
+              recovery: "review_or_finish_task_worktree",
               phase: "not_started",
               effectsKnown: true,
               operationId: input.operationId,
@@ -5226,6 +5363,7 @@ function createMcpServer(
         projectExecutionRuntime.store.close(executionId, "Project thread closed explicitly.");
       }
       projectExecutionRuntime.threads.setStatus(thread.threadId, profileId, "closed");
+      releaseLifecycleBinding(executionIds);
       return {
         content: [textBlock("Project thread closed.")],
         structuredContent: {
@@ -5236,31 +5374,64 @@ function createMcpServer(
       };
     }
     if (input.action === "hydrate") {
-      const executionId = decodeExecutionRefOrPublicError(
-        input.executionRef,
+      const sessionRef = hostIdentity?.sessionRef;
+      if (!sessionRef) throw implicitProjectExecutionRequired();
+      if (input.cursor) {
+        // Reject malformed or expired cursors before opening/touching the
+        // persisted workspace. Context-dependent revision checks still happen
+        // in returnProjectContext after the workspace is read.
+        decodedCursorOrError(
+          input.cursor,
+          config.oauth.keys.cursor,
+          "invalid_root_instruction_cursor",
+          "The root instruction cursor is invalid or expired; call project_control with action=hydrate and no cursor to restart.",
+        );
+      }
+      const binding = projectExecutionRuntime.continuity.resolveSession(
+        sessionRef,
+        hostIdentity.actorId,
+      );
+      if (!binding?.executionId) throw implicitProjectExecutionRequired();
+      const executionRef = encodeProjectExecutionRef(
+        binding.executionId,
         config.oauth.keys.projectFingerprint,
       );
-      const hydrated = await hydrateActiveProjectExecution({
-        runtime: projectExecutionRuntime,
-        workspaces,
-        authorization,
-        projects: authorizedProjects(config),
-        authorizedRoots: currentAuthorizedRoots(),
-        grantedScopes,
-        executionId,
-        executionRef: input.executionRef,
-      });
-      return returnProjectContext(hydrated, startedAt, input.cursor);
+      try {
+        const hydrated = await hydrateActiveProjectExecution({
+          runtime: projectExecutionRuntime,
+          workspaces,
+          profileId: hostIdentity.actorId,
+          authorization,
+          projects: authorizedProjects(config),
+          authorizedRoots: currentAuthorizedRoots(),
+          grantedScopes,
+          executionId: binding.executionId,
+          executionRef,
+          deferStateUpdates: true,
+          expectedThreadId: binding.threadId,
+        });
+        return returnProjectContext(hydrated, startedAt, input.cursor, binding);
+      } catch (error) {
+        if (invalidatesSessionExecutionBinding(error)) {
+          projectExecutionRuntime.continuity.releaseSession({
+            sessionRef: binding.sessionRef,
+            actorId: binding.actorId,
+            threadId: binding.threadId,
+            executionId: binding.executionId,
+          });
+        }
+        throw error;
+      }
     }
 
     const { projectRef, operationId } = input;
     if (
       input.action === "resume" &&
-      (input.handoffRef === undefined) === (input.threadRef === undefined)
+      (input.taskRef === undefined) === (input.threadRef === undefined)
     ) {
       throw new PublicActionError(
         "invalid_tool_input",
-        "Resume requires exactly one of threadRef or handoffRef.",
+        "Resume requires exactly one of taskRef or threadRef.",
       );
     }
     let resumedThread = input.action === "resume" && input.threadRef
@@ -5289,7 +5460,7 @@ function createMcpServer(
     if (input.action === "resume" && input.threadRef && !resumedThread) {
       throw new PublicActionError(
         "project_thread_not_found",
-        "The threadRef is unavailable or closed. Call project_control with action=list.",
+        "The threadRef is unavailable or closed. Choose a saved task from list_projects or open a new task.",
       );
     }
     if (resumedThread && resumedThread.thread.status !== "active") {
@@ -5303,7 +5474,7 @@ function createMcpServer(
         profileId,
       );
     }
-    const handoffRef = input.action === "resume" ? input.handoffRef : undefined;
+    const taskRef = input.action === "resume" ? input.taskRef : undefined;
     const projects = authorizedProjects(config);
     const existingCreation = projectExecutionRuntime.store.findCreation(
       authorization,
@@ -5343,7 +5514,7 @@ function createMcpServer(
         {
           retryable: true,
           safeToRetry: true,
-          recovery: "project_control_list",
+          recovery: "project_thread_control_list",
           phase: "not_started",
           effectsKnown: true,
         },
@@ -5351,9 +5522,9 @@ function createMcpServer(
     }
     let selectedHandoffId = existingCreation?.handoffId;
     if (!existingCreation) {
-      if (handoffRef !== undefined) {
-        const handoffId = decodeHandoffRefOrPublicError(
-          handoffRef,
+      if (taskRef !== undefined) {
+        const handoffId = decodeTaskRefOrPublicError(
+          taskRef,
           config.oauth.keys.projectFingerprint,
         );
         const handoff = projectExecutionRuntime.handoffs.getForProject(
@@ -5363,8 +5534,8 @@ function createMcpServer(
         );
         if (!handoff) {
           throw new PublicActionError(
-            "project_handoff_not_found",
-            "The handoffRef is not resumable for this authorized Project. Call list_projects to choose a current handoff.",
+            "project_task_not_found",
+            "The taskRef is not resumable for this authorized Project. Call list_projects to choose a current saved task.",
             {
               retryable: true,
               safeToRetry: true,
@@ -5380,7 +5551,7 @@ function createMcpServer(
     const createRequestHash = mutationRequestHash({
       action: input.action,
       projectRef: selected.id,
-      ...(handoffRef === undefined ? {} : { handoffRef }),
+      ...(taskRef === undefined ? {} : { taskRef }),
       ...(input.action === "resume" && input.threadRef
         ? { threadRef: input.threadRef }
         : {}),
@@ -5403,7 +5574,7 @@ function createMcpServer(
     } catch (error) {
       if (!(error instanceof ProjectExecutionHandoffUnavailableError)) throw error;
       throw new PublicActionError(
-        "project_handoff_not_found",
+        "project_task_not_found",
         "The selected saved task changed or completed before the new context was created. Call list_projects and choose again.",
         {
           retryable: true,
@@ -5430,8 +5601,8 @@ function createMcpServer(
     }
     if (reservation.execution.handoffRetired) {
       throw new PublicActionError(
-        "handoff_completed",
-        "This creation request refers to a completed saved task whose retained snapshot has expired. Call list_projects and use a new operationId to choose a current handoff or start fresh.",
+        "project_task_completed",
+        "This creation request refers to a completed saved task whose retained snapshot has expired. Call list_projects and use a new operationId to choose a current task or start fresh.",
         {
           retryable: true,
           safeToRetry: true,
@@ -5657,27 +5828,17 @@ function createMcpServer(
     const threadState = ensureExecutionThread({
       runtime: projectExecutionRuntime,
       authorization,
+      profileId: projectThreadProfileId(authorization),
       execution: activated,
       context,
       ...(importedHandoff
         ? {
             title: importedHandoff.title,
             modelSummary: importedHandoff.progress,
-            sourceOperationId: `legacy-handoff:${importedHandoff.handoffId}`,
+            sourceOperationId: `saved-task:${importedHandoff.handoffId}`,
           }
         : {}),
     });
-    const hostIdentity = requestContext.getStore()?.hostIdentity;
-    if (hostIdentity?.sessionRef) {
-      projectExecutionRuntime.continuity.bindSession({
-        sessionRef: hostIdentity.sessionRef,
-        actorId: hostIdentity.actorId,
-        ...(hostIdentity.organizationRef
-          ? { organizationRef: hostIdentity.organizationRef }
-          : {}),
-        threadId: threadState.thread.threadId,
-      });
-    }
     projectExecutionRuntime.continuity.appendEvent({
       threadId: threadState.thread.threadId,
       type: input.action === "resume" ? "thread_resumed" : "thread_created",
@@ -5706,19 +5867,55 @@ function createMcpServer(
       thread: threadState.thread,
       ...(threadState.checkpoint ? { checkpoint: threadState.checkpoint } : {}),
     }, startedAt);
-  });
+  };
+
+  const dispatchProjectControl = (rawInput: unknown, toolName: string) => {
+    const action = rawInput && typeof rawInput === "object" && !Array.isArray(rawInput)
+      ? (rawInput as { action?: unknown }).action
+      : undefined;
+    const serializesSessionSelection = new Set([
+      "open",
+      "resume",
+      "hydrate",
+      "pause",
+      "archive",
+      "complete",
+      "close",
+    ]).has(action as string);
+    const identity = requestContext.getStore()?.hostIdentity;
+    if (!serializesSessionSelection || !identity?.sessionRef) {
+      return handleProjectControl(rawInput, toolName);
+    }
+    return projectSessionOperations.run(
+      `${identity.sessionRef}\0${identity.actorId}`,
+      () => handleProjectControl(rawInput, toolName),
+    );
+  };
+
+  registerAppTool(server, toolNames.projectControl, {
+    description: "Open, resume, hydrate, or interrupt a Project task.",
+    inputSchema: projectControlPublicInputSchema,
+    _meta: {},
+    annotations: USE_PROJECT_ANNOTATIONS,
+  }, async (rawInput) => dispatchProjectControl(rawInput, toolNames.projectControl));
+
+  registerAppTool(server, toolNames.projectThreadControl, {
+    inputSchema: projectThreadControlInputSchema,
+    ...appOnlyToolDescriptorMeta(),
+    annotations: PROJECT_THREAD_CONTROL_ANNOTATIONS,
+  }, async (rawInput) => dispatchProjectControl(rawInput, toolNames.projectThreadControl));
 
   registerProjectTool(
     server,
     toolNames.saveProgress,
     {
       title: "Save progress",
-      description: toolDescription({
-        use: "saving one bounded semantic Thread summary so work can continue in a new conversation.",
-        avoid: "full chat transcripts, raw tool logs, file contents, diffs, credentials, secrets, or hidden reasoning.",
-        requires: `executionRef, operationId, title, progress, and the current Thread version as ifMatch after the first save; title and progress must also fit ${MAX_PROJECT_HANDOFF_MODEL_TEXT_JSON_BYTES} serialized context bytes.`,
-        returns: "an opaque threadRef and its new version without echoing the saved progress.",
-      }),
+    description: toolDescription({
+      use: "saving one bounded semantic Project task summary so work can continue after a new conversation or OAuth reconnection.",
+      avoid: "full chat transcripts, raw tool logs, file contents, diffs, credentials, secrets, or hidden reasoning.",
+      requires: `a selected Project, operationId, title, progress, and the current saved-task version as ifMatch after the first save; title and progress must also fit ${MAX_PROJECT_HANDOFF_MODEL_TEXT_JSON_BYTES} serialized context bytes.`,
+      returns: "opaque taskRef and threadRef values with new versions, without echoing the saved progress.",
+    }),
       inputSchema: {
         ...privateProjectExecutionInputSchema,
         operationId: z.string().min(1).max(128),
@@ -5758,17 +5955,7 @@ function createMcpServer(
       const startedAt = performance.now();
       const execution = requestContext.getStore()?.projectExecution;
       if (!execution) {
-        throw new PublicActionError(
-          "project_execution_required",
-          "Pass the executionRef returned by project_control.",
-          {
-            retryable: true,
-            safeToRetry: true,
-            recovery: "project_control_hydrate",
-            phase: "not_started",
-            effectsKnown: true,
-          },
-        );
+        throw implicitProjectExecutionRequired();
       }
       const execute = async () => {
         if (
@@ -5776,7 +5963,7 @@ function createMcpServer(
             MAX_PROJECT_HANDOFF_MODEL_TEXT_JSON_BYTES
         ) {
           throw new PublicActionError(
-            "handoff_context_too_large",
+            "task_context_too_large",
             `The title and progress require more than ${MAX_PROJECT_HANDOFF_MODEL_TEXT_JSON_BYTES} serialized bytes in resumed model context. Shorten them or remove escape-heavy text, then retry.`,
             {
               retryable: true,
@@ -5788,101 +5975,135 @@ function createMcpServer(
             },
           );
         }
-        if (!execution.threadId) {
-          throw new PublicActionError(
-            "project_thread_not_found",
-            "This execution has no recoverable Project thread. Hydrate it with project_control before saving progress.",
-            {
-              retryable: true,
-              safeToRetry: true,
-              recovery: "project_control_hydrate",
-              phase: "not_started",
-              effectsKnown: true,
-            },
-          );
-        }
-        const profileId = projectThreadProfileId(projectExecutionAuthorizationFromContext());
-        const savedThread = projectExecutionRuntime.threads.saveProgress({
-          threadId: execution.threadId,
-          profileId,
+        const savedHandoff = projectExecutionRuntime.handoffs.saveForExecution({
+          executionId: execution.executionId,
+          projectRef: execution.projectRef,
+          projectFingerprint: execution.projectFingerprint,
           title,
-          modelSummary: progress,
-          sourceOperationId: operationId,
-          observedState: {
-            executionState: "active",
-            workspaceGeneration,
-            semanticSnapshot: true,
-          },
+          progress,
+          status: status ?? "resumable",
           ...(ifMatch === undefined ? {} : { ifMatch }),
         });
-        switch (savedThread.status) {
-          case "thread_unavailable":
+        switch (savedHandoff.status) {
+          case "created":
+          case "updated":
+            break;
+          case "capacity":
             throw new PublicActionError(
-              "project_thread_not_found",
-              "The Project thread is unavailable. Call project_control with action=list.",
+              "project_task_capacity",
+              `This Project already has ${savedHandoff.limit} resumable saved tasks. Complete an existing task before creating another one.`,
+              {
+                retryable: true,
+                safeToRetry: true,
+                recovery: "list_projects_then_complete_or_resume_task",
+                phase: "not_started",
+                effectsKnown: true,
+                details: { limit: savedHandoff.limit },
+              },
             );
           case "if_match_unexpected":
             throw new PublicActionError(
               "if_match_unexpected",
-              "The first save for a fresh Project thread must omit ifMatch.",
+              "The first save for a fresh Project task must omit ifMatch.",
               {
                 retryable: true,
                 safeToRetry: true,
                 recovery: "remove_if_match_and_retry",
                 phase: "not_started",
                 effectsKnown: true,
-                details: { currentVersion: savedThread.current.revision },
               },
             );
           case "if_match_required":
             throw new PublicActionError(
               "if_match_required",
-              "Updating saved progress requires the current Project thread version as ifMatch.",
+              "Updating saved progress requires the current Project task version as ifMatch.",
               {
                 retryable: true,
                 safeToRetry: true,
-                recovery: "project_control_status",
+                recovery: "list_projects",
                 phase: "not_started",
                 effectsKnown: true,
-                details: { currentVersion: savedThread.current.revision },
+                details: { currentVersion: savedHandoff.current.revision },
               },
             );
           case "revision_conflict":
             throw new PublicActionError(
-              "thread_revision_conflict",
-              "Saved progress changed concurrently. Read the current Thread status, reconcile it, then retry.",
+              "project_task_revision_conflict",
+              "The Project task changed concurrently. Call list_projects, reconcile the saved task, then retry with the same operationId and current ifMatch.",
               {
                 retryable: true,
                 safeToRetry: true,
-                recovery: "project_control_status",
+                recovery: "list_projects_then_retry_same_operation_id",
                 phase: "not_started",
                 effectsKnown: true,
-                details: { currentVersion: savedThread.current.revision },
+                details: { currentVersion: savedHandoff.current.revision },
               },
             );
-          case "thread_closed":
+          case "execution_unavailable":
+          case "handoff_completed":
+          case "handoff_retired":
             throw new PublicActionError(
-              "project_thread_closed",
-              "This Project thread is already closed. Open a fresh thread instead.",
+              "project_task_unavailable",
+              "The Project task is no longer writable from this execution. Call list_projects, then resume an available saved task or open a fresh Project context.",
               {
-                retryable: false,
-                safeToRetry: false,
-                recovery: "project_control_open",
+                retryable: true,
+                safeToRetry: true,
+                recovery: "list_projects_then_open_new_execution",
                 phase: "not_started",
                 effectsKnown: true,
+                details: { requiresNewExecution: true },
               },
             );
-          case "saved": {
-            if (status === "completed") {
-              projectExecutionRuntime.threads.setStatus(
-                savedThread.thread.threadId,
-                profileId,
-                "completed",
-              );
+        }
+
+        let outputThread;
+        try {
+          if (execution.threadId) {
+            const profileId = projectThreadProfileId(projectExecutionAuthorizationFromContext());
+            const currentThread = projectExecutionRuntime.threads.get(
+              execution.threadId,
+              profileId,
+            );
+            const projectedThread = currentThread && currentThread.status !== "closed"
+              ? projectExecutionRuntime.threads.saveProgress({
+                  threadId: execution.threadId,
+                  profileId,
+                  title,
+                  modelSummary: progress,
+                  sourceOperationId: operationId,
+                  observedState: {
+                    executionState: "active",
+                    workspaceGeneration,
+                    semanticSnapshot: true,
+                  },
+                  ...(currentThread.revision > 1
+                    ? { ifMatch: currentThread.revision }
+                    : {}),
+                })
+              : undefined;
+            if (projectedThread?.status === "saved") {
+              if (status === "completed") {
+                projectExecutionRuntime.threads.setStatus(
+                  projectedThread.thread.threadId,
+                  profileId,
+                  "completed",
+                );
+              }
+              outputThread = status === "completed"
+                ? projectExecutionRuntime.threads.get(
+                    projectedThread.thread.threadId,
+                    profileId,
+                  ) ?? projectedThread.thread
+                : projectedThread.thread;
+            } else {
+              logEvent(config.logging, "warn", "project_thread_projection_failed", {
+                ...correlationLogFields(connectionPrincipalId, workspaceId),
+                reason: projectedThread?.status ?? "thread_unavailable",
+              });
             }
-            const outputThread = status === "completed"
-              ? projectExecutionRuntime.threads.get(savedThread.thread.threadId, profileId) ?? savedThread.thread
-              : savedThread.thread;
+          }
+
+          if (outputThread) {
             projectExecutionRuntime.continuity.appendEvent({
               threadId: outputThread.threadId,
               type: "progress_saved",
@@ -5890,7 +6111,7 @@ function createMcpServer(
               trust: "untrusted",
               operationId,
               payload: {
-                title: savedThread.thread.title,
+                title,
                 requestedStatus: status ?? "resumable",
                 workspaceGeneration,
               },
@@ -5905,35 +6126,55 @@ function createMcpServer(
               },
               modelSummary: progress,
             });
-            logToolCall(config, {
-              tool: toolNames.saveProgress,
-              workspaceId,
-              success: true,
-              durationMs: Math.round(performance.now() - startedAt),
-            });
-            return {
-              content: [textBlock(
-                outputThread.status === "completed"
-                  ? "Project thread marked complete."
-                  : "Project thread progress saved.",
-              )],
-              structuredContent: {
-                ok: true,
-                thread: {
-                  ref: encodeProjectThreadRef(
-                    outputThread.threadId,
-                    config.oauth.keys.projectFingerprint,
-                  ),
-                  title: outputThread.title,
-                  status: outputThread.status,
-                  version: outputThread.revision,
-                  updatedAt: outputThread.updatedAt,
-                },
-              },
-              _meta: { tool: toolNames.saveProgress },
-            };
           }
+        } catch (error) {
+          outputThread = undefined;
+          logEvent(config.logging, "warn", "project_thread_projection_failed", {
+            ...correlationLogFields(connectionPrincipalId, workspaceId),
+            ...errorFields(error),
+          });
         }
+        logToolCall(config, {
+          tool: toolNames.saveProgress,
+          workspaceId,
+          success: true,
+          durationMs: Math.round(performance.now() - startedAt),
+        });
+        return {
+          content: [textBlock(
+            savedHandoff.handoff.status === "completed"
+              ? "Project task marked complete."
+              : "Project task progress saved.",
+          )],
+          structuredContent: {
+            ok: true,
+            task: {
+              taskRef: encodeProjectHandoffRef(
+                savedHandoff.handoff.handoffId,
+                config.oauth.keys.projectFingerprint,
+              ),
+              title: savedHandoff.handoff.title,
+              status: savedHandoff.handoff.status,
+              version: savedHandoff.handoff.revision,
+              updatedAt: savedHandoff.handoff.updatedAt,
+            },
+            ...(outputThread
+              ? {
+                  thread: {
+                    threadRef: encodeProjectThreadRef(
+                      outputThread.threadId,
+                      config.oauth.keys.projectFingerprint,
+                    ),
+                    title: outputThread.title,
+                    status: outputThread.status,
+                    version: outputThread.revision,
+                    updatedAt: outputThread.updatedAt,
+                  },
+                }
+              : {}),
+          },
+          _meta: { tool: toolNames.saveProgress },
+        };
       };
       return runMutationOperation({
         store: mutationOperations,
@@ -5965,7 +6206,7 @@ function createMcpServer(
       description: toolDescription({
         use: "searching available Skills or loading one selected Skill.",
         avoid: "loading by an ambiguous name.",
-        requires: "executionRef plus action=search, or action=load with skillId or a unique exact name.",
+        requires: "a selected Project plus action=search, or action=load with skillId or a unique exact name.",
         returns: "bounded Skill metadata, or one trusted/untrusted manifest and skill:// root.",
       }),
       inputSchema: {
@@ -6237,7 +6478,7 @@ function createMcpServer(
       description: toolDescription({
         use: `reading one to ${BATCH_MAX_ITEMS} known files with exact per-file continuation.`,
         avoid: "search.",
-        requires: "executionRef and paths.",
+        requires: "a selected Project and paths.",
         returns: "bounded versioned items and any newly applicable instruction delta.",
       }),
       inputSchema: {
@@ -6374,7 +6615,7 @@ function createMcpServer(
       description: toolDescription({
         use: `running one to ${BATCH_MAX_ITEMS} grep, glob, or directory listing operations in one call.`,
         avoid: "known-file reads.",
-        requires: "executionRef.",
+        requires: "a selected Project.",
         returns: "ordered bounded results and any newly applicable instruction delta.",
       }),
       inputSchema: {
@@ -6522,7 +6763,7 @@ function createMcpServer(
         description: toolDescription({
           use: "applying one Project-relative patch.",
           avoid: "blind overwrite after a read.",
-          requires: "executionRef, ifMatch, and an operationId on the first call; use a fresh ID for each new effect.",
+          requires: "a selected Project, ifMatch, and an operationId on the first call; use a fresh ID for each new effect.",
           returns: "file effects with observed versions.",
         }),
         inputSchema: {
@@ -6776,13 +7017,14 @@ function createMcpServer(
       {
         title: "Show changes",
         description: toolDescription({
-          use: "reviewing shared Project changes; only a Project root that equals its Git top level uses a repository diff, otherwise this returns only the current context's successful DevSpace apply_patch history.",
+          use: "reviewing either the repository working-tree diff or this execution's successful DevSpace apply_patch history.",
           avoid: "ordinary file discovery.",
-          requires: "executionRef.",
+          requires: "a selected Project and an explicit source: repository or apply_patch_history.",
           returns: "a read-only bounded patch page, explicit source provenance, signed continuation, and file summary.",
         }),
         inputSchema: {
           ...privateProjectExecutionInputSchema,
+          source: z.enum(["repository", "apply_patch_history"]),
           cursor: z.string().max(4_096).optional(),
         },
         ...toolWidgetDescriptorMeta(config, "show_changes", {
@@ -6793,19 +7035,16 @@ function createMcpServer(
       },
       async ({
         workspaceId,
+        source,
         cursor,
       }) => {
         const startedAt = performance.now();
         const workspace = workspaces.getWorkspace(connectionPrincipalId, workspaceId);
         const execute = async () => {
           const principalRef = currentCursorCallerRef(config.oauth.keys.cursor);
-          const reviewSource = await reviewCheckpoints.reviewSource({
-            workspaceId,
-            root: workspace.root,
-          });
           const queryHash = cursorQueryHash({
             workspaceId,
-            source: reviewSource,
+            source,
           });
           const pagingScope = {
             principalRef,
@@ -6837,7 +7076,7 @@ function createMcpServer(
             );
           }
           let observedChanges: ReviewChangesResult | undefined;
-          if (reviewSource === "apply_patch_history") {
+          if (source === "apply_patch_history") {
             try {
               observedChanges = applyPatchHistoryReview(
                 mutationOperations.listApplyPatchChanges({
@@ -6865,6 +7104,7 @@ function createMcpServer(
           const review = await reviewCheckpoints.reviewChanges({
             workspaceId,
             root: workspace.root,
+            source,
             pagingScope,
             ...(observedChanges ? { observedChanges } : {}),
             ...(decoded ? { continueRevision: decoded.revision } : {}),
@@ -6897,7 +7137,7 @@ function createMcpServer(
             `${review.result} Diff bytes ${page.offset}-${page.nextOffset} of ${page.totalBytes} are in structuredContent.diff.` +
             (page.eof
               ? " Review complete."
-              : " Pass structuredContent.diff.nextCursor as cursor to show_changes."),
+              : " Pass the same source and structuredContent.diff.nextCursor as cursor to show_changes."),
           )];
           logToolCall(config, {
             tool: "show_changes",
@@ -6915,10 +7155,10 @@ function createMcpServer(
               // total, so later pages lose nothing by omitting the list.
               ...modelVisibleReviewFiles(review.files, page.offset === 0),
               summary: review.summary,
-              changeSource: reviewSource,
+              changeSource: source,
               diff: {
                 patch: page.content,
-                provenance: reviewSource === "repository"
+                provenance: source === "repository"
                   ? REPOSITORY_PROVENANCE
                   : DEVSPACE_APPLY_PATCH_PROVENANCE,
                 offsetBytes: page.offset,
@@ -7037,6 +7277,7 @@ function createServerWithStateLease(
   const mutationOperations = new MutationOperationStore(config.stateDir);
   const workspaceStore = createWorkspaceStore(config.stateDir);
   const workspaces = new WorkspaceRegistry(config, workspaceStore);
+  const projectSessionOperations = new KeyedOperationQueue();
   const projectActivityHub = new ProjectActivityHub();
   const projectExecutionRuntime: ProjectExecutionRuntime = {
     store: new ProjectExecutionStore(config.stateDir),
@@ -7905,6 +8146,7 @@ function createServerWithStateLease(
           runtimeDiagnostics,
           activeToolHandlers,
           projectExecutionRuntime,
+          projectSessionOperations,
         );
         mcpServersByTransport.set(transport, statelessServer);
         await statelessServer.connect(transport);
@@ -8013,6 +8255,7 @@ function createServerWithStateLease(
           runtimeDiagnostics,
           activeToolHandlers,
           projectExecutionRuntime,
+          projectSessionOperations,
         );
         mcpServersByTransport.set(transport, server);
         await server.connect(transport);
@@ -8069,33 +8312,6 @@ function createServerWithStateLease(
         );
         return;
       }
-      // Checked before the SDK's own validation so malformed arguments use the
-      // same compact structured contract as every other rejection.
-      const toolInputSchema = toolCall && requestServer
-        ? toolInputSchemasByServer.get(requestServer)?.get(toolCall.name)
-        : undefined;
-      if (toolCall && toolInputSchema) {
-        const parsed = toolInputSchema.safeParse(toolCall.arguments);
-        if (!parsed.success) {
-          logEvent(config.logging, "warn", "tool_input_rejected", {
-            requestId,
-            tool: toolCall.name,
-            issues: parsed.error.issues.length,
-          });
-          sendCallToolErrorResult(
-            res,
-            toolInputValidationText(toolCall.name, parsed.error),
-            jsonRpcRequestId(req.body),
-            "invalid_tool_input",
-            {
-              operationId: toolCallOperationId(req.body),
-              recovery: "correct_and_retry",
-            },
-          );
-          return;
-        }
-      }
-
       const hostIdentity = projectExecutionRuntime.continuity.observeHostIdentity(
         projectHostIdentity({
           meta: toolCall?.meta,
@@ -8111,25 +8327,47 @@ function createServerWithStateLease(
       const lease = projectToolLease(req.body);
       const rootLockMode = projectToolRootLockMode(req.body);
       const lacksRequiredOAuthScope = missingCallScopes.length > 0;
+      const toolInputSchema = toolCall && requestServer
+        ? toolInputSchemasByServer.get(requestServer)?.get(toolCall.name)
+        : undefined;
+      const rejectInvalidToolInput = (): boolean => {
+        if (!toolCall || !toolInputSchema) return false;
+        const parsed = toolInputSchema.safeParse(toolCall.arguments);
+        if (parsed.success) return false;
+        logEvent(config.logging, "warn", "tool_input_rejected", {
+          requestId,
+          tool: toolCall.name,
+          issues: parsed.error.issues.length,
+        });
+        sendCallToolErrorResult(
+          res,
+          toolInputValidationText(toolCall.name, parsed.error),
+          jsonRpcRequestId(req.body),
+          "invalid_tool_input",
+          {
+            operationId: toolCallOperationId(req.body),
+            recovery: "correct_and_retry",
+          },
+        );
+        return true;
+      };
       let projectExecution: ProjectExecutionRecord | undefined;
       if (lease) {
-        const executionRef = toolCallExecutionRef(req.body);
+        const sessionRef = hostIdentity.sessionRef;
+        let binding: ProjectTaskSessionBinding | undefined;
         try {
-          if (!executionRef) {
-            throw new PublicActionError(
-              "project_execution_required",
-              "Pass the executionRef returned by project_control.",
-              {
-                retryable: true,
-                safeToRetry: true,
-                recovery: "project_control_hydrate",
-                phase: "not_started",
-                effectsKnown: true,
-              },
-            );
-          }
-          const executionId = decodeExecutionRefOrPublicError(
-            executionRef,
+          if (!sessionRef) throw implicitProjectExecutionRequired();
+          binding = projectExecutionRuntime.continuity.resolveSession(
+            sessionRef,
+            hostIdentity.actorId,
+          );
+          if (!binding?.executionId) throw implicitProjectExecutionRequired();
+          // Resolve the trusted binding first so callers cannot inspect a Project
+          // tool contract without selecting a Project, but do not hydrate or
+          // update execution state for malformed public arguments.
+          if (rejectInvalidToolInput()) return;
+          const executionRef = encodeProjectExecutionRef(
+            binding.executionId,
             config.oauth.keys.projectFingerprint,
           );
           const hydrated = await hydrateActiveProjectExecution({
@@ -8145,11 +8383,19 @@ function createServerWithStateLease(
             projects: authorizedProjects(config, authorizedRoots),
             authorizedRoots,
             grantedScopes: oauthAuthorization.scopes,
-            executionId,
+            executionId: binding.executionId,
             executionRef,
           });
           projectExecution = hydrated.record;
         } catch (error) {
+          if (binding && invalidatesSessionExecutionBinding(error)) {
+            projectExecutionRuntime.continuity.releaseSession({
+              sessionRef: binding.sessionRef,
+              actorId: binding.actorId,
+              threadId: binding.threadId,
+              ...(binding.executionId ? { executionId: binding.executionId } : {}),
+            });
+          }
           const publicError = publicToolError(error, toolCallName(req.body) ?? "unknown");
           if (!publicError) throw error;
           logEvent(config.logging, "warn", "project_context_rejected", {
@@ -8171,11 +8417,19 @@ function createServerWithStateLease(
             {
               operationId: toolCallOperationId(req.body),
               recovery: publicError.recovery ?? "project_control_hydrate",
+              retryable: publicError.retryable,
+              safeToRetry: publicError.safeToRetry,
+              phase: publicError.phase,
+              effectsKnown: publicError.effectsKnown,
+              details: publicError.details,
             },
           );
           return;
         }
       }
+      // Non-Project tools have no execution binding to resolve first, but still
+      // use the same compact validation contract before reaching the SDK.
+      if (!lease && rejectInvalidToolInput()) return;
       if (projectExecution) {
         correlation.workspaceId = projectExecution.workspaceId;
         correlation.workspaceActivityRef = workspaceActivityRef(

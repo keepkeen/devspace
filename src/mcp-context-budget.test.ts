@@ -91,6 +91,10 @@ const clients: Client[] = [];
 try {
   const origin = await listen(httpServer);
   const first = await connect(origin, "context-budget-first");
+  const firstMeta = {
+    "openai/subject": "context-budget-subject",
+    "openai/session": "context-budget-session-first",
+  };
   const toolsList = await first.listTools();
   const toolNames = toolsList.tools.map((tool) => tool.name).sort();
   assert.deepEqual(toolNames, [
@@ -99,6 +103,7 @@ try {
     "inspect",
     "list_projects",
     "project_control",
+    "project_thread_control",
     "read_files",
     "read_process_output",
     "save_progress",
@@ -125,12 +130,58 @@ try {
     toolsList.tools.find((tool) => tool.name === "project_control")?.inputSchema,
   );
   for (const field of [
-    "action", "projectRef", "operationId", "executionRef", "handoffRef",
-    "threadRef", "cursor", "waitMs", "limit", "ifMatch",
+    "action", "projectRef", "operationId", "taskRef",
+    "threadRef", "cursor", "checkoutKind",
   ]) assert.match(projectControlSchema, new RegExp(field, "u"));
+  assert.doesNotMatch(
+    projectControlSchema,
+    /executionRef|fresh|handoffRef|resolve|list|status|activity|pause|archive|complete|close|waitMs|limit|ifMatch/u,
+  );
+  const projectThreadControl = toolsList.tools.find((tool) => tool.name === "project_thread_control");
+  const projectThreadControlSchema = JSON.stringify(projectThreadControl?.inputSchema);
+  for (const action of [
+    "resolve", "list", "status", "activity", "pause", "archive", "complete", "close",
+  ]) assert.match(projectThreadControlSchema, new RegExp(action, "u"));
+  assert.deepEqual(
+    (projectThreadControl?._meta as { ui?: { visibility?: unknown } } | undefined)?.ui?.visibility,
+    ["app"],
+  );
+  assert.equal(
+    (projectThreadControl?._meta as { ui?: { resourceUri?: unknown } } | undefined)?.ui?.resourceUri,
+    "ui://devspace/project-app.html",
+  );
+  assert.equal(projectThreadControl?.annotations?.idempotentHint, false);
+  const modelVisibleTools = toolsList.tools.filter((tool) =>
+    !((tool._meta as { ui?: { visibility?: unknown } } | undefined)?.ui?.visibility as unknown[] | undefined)
+      ?.includes("app")
+  );
+  assert.equal(modelVisibleTools.length, 11);
+  assert.doesNotMatch(
+    JSON.stringify(modelVisibleTools),
+    /executionRef/u,
+    "the model-facing Project surface must not expose execution capabilities",
+  );
+  for (const toolName of [
+    "apply_patch",
+    "exec_command",
+    "inspect",
+    "read_files",
+    "read_process_output",
+    "save_progress",
+    "show_changes",
+    "skills",
+    "write_stdin",
+  ]) {
+    assert.doesNotMatch(
+      JSON.stringify(toolsList.tools.find((tool) => tool.name === toolName)?.inputSchema),
+      /executionRef/u,
+      `${toolName} must resolve its Project from trusted session state`,
+    );
+  }
   const malformedProjectControl = await first.callTool({
     name: "project_control",
     arguments: { action: "open" },
+    _meta: firstMeta,
   });
   assertErrorCode(malformedProjectControl, "invalid_tool_input");
   const saveProgressSchema = JSON.stringify(
@@ -146,6 +197,12 @@ try {
     "list_projects must support a Project-scoped recovery listing",
   );
   const showChangesTool = toolsList.tools.find((tool) => tool.name === "show_changes");
+  assert.ok(
+    (showChangesTool?.inputSchema as { required?: unknown } | undefined)?.required instanceof Array &&
+      (showChangesTool?.inputSchema as { required: string[] }).required.includes("source"),
+    "show_changes must require an explicit source",
+  );
+  assert.match(JSON.stringify(showChangesTool?.inputSchema), /apply_patch_history/u);
   assert.equal(
     (listProjectsTool?._meta as { ui?: unknown } | undefined)?.ui,
     undefined,
@@ -174,10 +231,15 @@ try {
   const beforeSelection = await first.callTool({
     name: "read_files",
     arguments: { files: [{ path: "payload.txt" }] },
+    _meta: firstMeta,
   });
-  assertErrorCode(beforeSelection, "invalid_tool_input");
+  assertErrorCode(beforeSelection, "project_execution_required");
 
-  const listed = await first.callTool({ name: "list_projects", arguments: {} });
+  const listed = await first.callTool({
+    name: "list_projects",
+    arguments: {},
+    _meta: firstMeta,
+  });
   assertSucceeded(listed);
   assert.equal((listed._meta as { tool?: unknown } | undefined)?.tool, "list_projects");
   const listedSerialized = JSON.stringify(listed.structuredContent);
@@ -188,18 +250,19 @@ try {
   assert.equal(projects.length, 1);
   assert.equal(typeof projects[0]?.projectRef, "string");
   assert.deepEqual(
-    (projects[0] as { handoffs?: unknown }).handoffs,
+    (projects[0] as { tasks?: unknown }).tasks,
     [],
   );
 
   const selected = await first.callTool({
     name: "project_control",
     arguments: { action: "open", operationId: "context-budget-execution" },
+    _meta: firstMeta,
   });
   assertSucceeded(selected);
   assertProjectContext(selected);
   const selectedContent = selected.structuredContent as {
-    project?: { ref?: unknown; executionRef?: unknown; writeAccess?: unknown };
+    project?: { ref?: unknown; writeAccess?: unknown };
     contextDelta?: {
       instructions?: Array<{ path?: unknown; content?: unknown }>;
       rootInstructionsComplete?: unknown;
@@ -207,8 +270,7 @@ try {
   };
   assert.equal(selectedContent.project?.ref, projects[0]?.projectRef);
   assert.equal(selectedContent.project?.writeAccess, "read_write");
-  const executionRef = String(selectedContent.project?.executionRef ?? "");
-  assert.match(executionRef, /^pex1_/u);
+  assert.equal(Object.hasOwn(selectedContent.project ?? {}, "executionRef"), false);
   assert.match(
     String(selectedContent.contextDelta?.instructions?.find(
       (item) => item.path === "AGENTS.md",
@@ -220,14 +282,16 @@ try {
 
   const read = await first.callTool({
     name: "read_files",
-    arguments: { executionRef, files: [{ path: "payload.txt" }] },
+    arguments: { files: [{ path: "payload.txt" }] },
+    _meta: firstMeta,
   });
   assertSucceeded(read);
   assert.match(JSON.stringify(read.structuredContent), /root payload/u);
 
   const nestedRead = await first.callTool({
     name: "read_files",
-    arguments: { executionRef, files: [{ path: "nested/payload.txt" }] },
+    arguments: { files: [{ path: "nested/payload.txt" }] },
+    _meta: firstMeta,
   });
   assertSucceeded(nestedRead);
   assert.match(JSON.stringify(nestedRead.structuredContent), new RegExp(nestedInstruction, "u"));
@@ -239,17 +303,18 @@ try {
   const apply = await first.callTool({
     name: "apply_patch",
     arguments: {
-      executionRef,
       operationId: "context-budget-patch",
       ifMatch: { "nested/created.txt": null },
       patch: "*** Begin Patch\n*** Add File: nested/created.txt\n+created\n*** End Patch",
     },
+    _meta: firstMeta,
   });
   assertSucceeded(apply);
 
   const changes = await first.callTool({
     name: "show_changes",
-    arguments: { executionRef },
+    arguments: { source: "repository" },
+    _meta: firstMeta,
   });
   assertSucceeded(changes);
   assert.equal(
@@ -268,7 +333,8 @@ try {
 
   const listedSkills = await first.callTool({
     name: "skills",
-    arguments: { executionRef, action: "search", query: "context-budget", limit: 1 },
+    arguments: { action: "search", query: "context-budget", limit: 1 },
+    _meta: firstMeta,
   });
   assertSucceeded(listedSkills);
   const skillCursor = (listedSkills.structuredContent as {
@@ -277,7 +343,8 @@ try {
   assert.equal(typeof skillCursor, "string");
   const continuedSkills = await first.callTool({
     name: "skills",
-    arguments: { executionRef, cursor: skillCursor },
+    arguments: { cursor: skillCursor },
+    _meta: firstMeta,
   });
   assertSucceeded(continuedSkills);
   assert.equal(
@@ -288,12 +355,14 @@ try {
   );
   const repeatedSkillFields = await first.callTool({
     name: "skills",
-    arguments: { executionRef, cursor: skillCursor, action: "search" },
+    arguments: { cursor: skillCursor, action: "search" },
+    _meta: firstMeta,
   });
   assertReadCursorRestart(repeatedSkillFields, "skill_cursor_fields_invalid");
   const invalidSkillCursor = await first.callTool({
     name: "skills",
-    arguments: { executionRef, cursor: "not-a-signed-cursor" },
+    arguments: { cursor: "not-a-signed-cursor" },
+    _meta: firstMeta,
   });
   assertReadCursorRestart(invalidSkillCursor, "invalid_skill_cursor");
   const skillId = (listedSkills.structuredContent as {
@@ -302,16 +371,17 @@ try {
   assert.equal(typeof skillId, "string");
   const loadedSkill = await first.callTool({
     name: "skills",
-    arguments: { executionRef, action: "load", skillId },
+    arguments: { action: "load", skillId },
+    _meta: firstMeta,
   });
   assertSucceeded(loadedSkill);
   assert.match(JSON.stringify(loadedSkill.structuredContent), new RegExp(skillBody, "u"));
   const reference = await first.callTool({
     name: "read_files",
     arguments: {
-      executionRef,
       files: [{ path: `skill://${skillId}/references/example.md` }],
     },
+    _meta: firstMeta,
   });
   assertSucceeded(reference);
   assert.match(JSON.stringify(reference.structuredContent), /skill reference/u);
@@ -319,39 +389,70 @@ try {
   const command = await first.callTool({
     name: "exec_command",
     arguments: {
-      executionRef,
       operationId: "context-budget-command",
       program: process.execPath,
       args: ["-e", "console.log('command-ok')"],
     },
+    _meta: firstMeta,
   });
   assertSucceeded(command);
   assert.match(processOutputText(command), /command-ok/u);
 
   const second = await connect(origin, "context-budget-second");
+  const secondMeta = {
+    "openai/subject": "context-budget-subject",
+    "openai/session": "context-budget-session-second",
+  };
   const unboundSecond = await second.callTool({
     name: "read_files",
-    arguments: { files: [{ path: "payload.txt" }] },
+    arguments: {},
+    _meta: secondMeta,
   });
-  assertErrorCode(unboundSecond, "invalid_tool_input");
+  assertErrorCode(unboundSecond, "project_execution_required");
   const secondExecution = await second.callTool({
     name: "project_control",
     arguments: { action: "open", operationId: "context-budget-second-execution" },
+    _meta: secondMeta,
   });
   assertSucceeded(secondExecution);
-  const secondExecutionRef = String((secondExecution.structuredContent as {
-    project?: { executionRef?: unknown };
-  } | undefined)?.project?.executionRef ?? "");
-  assert.match(secondExecutionRef, /^pex1_/u);
   const staleSkillCursor = await second.callTool({
     name: "skills",
-    arguments: { executionRef: secondExecutionRef, cursor: skillCursor },
+    arguments: { cursor: skillCursor },
+    _meta: secondMeta,
   });
   assertReadCursorRestart(staleSkillCursor, "skill_cursor_stale");
   assertSucceeded(await second.callTool({
     name: "read_files",
-    arguments: { executionRef: secondExecutionRef, files: [{ path: "payload.txt" }] },
+    arguments: { files: [{ path: "payload.txt" }] },
+    _meta: secondMeta,
   }));
+  assertSucceeded(await first.callTool({
+    name: "read_files",
+    arguments: {
+      executionRef: "pex1_legacy-explicit-ref-that-must-not-select-an-execution",
+      files: [{ path: "payload.txt" }],
+    },
+    _meta: firstMeta,
+  }));
+  assertSucceeded(await first.callTool({
+    name: "project_control",
+    arguments: { action: "hydrate" },
+    _meta: firstMeta,
+  }));
+  const missingSession = await first.callTool({
+    name: "read_files",
+    arguments: { files: [{ path: "payload.txt" }] },
+  });
+  assertErrorCode(missingSession, "project_execution_required");
+  const differentActor = await first.callTool({
+    name: "read_files",
+    arguments: { files: [{ path: "payload.txt" }] },
+    _meta: {
+      "openai/subject": "context-budget-other-subject",
+      "openai/session": "context-budget-session-first",
+    },
+  });
+  assertErrorCode(differentActor, "project_execution_required");
 
   console.log(`CONTEXT_BUDGET ${JSON.stringify({
     toolsListBytes: utf8Bytes(toolsList),

@@ -169,54 +169,70 @@ ChatGPT discovers OAuth metadata from:
 /.well-known/oauth-authorization-server
 ```
 
-## Project executions and handoffs
+## Project executions and saved Tasks
 
 ChatGPT account and conversation metadata are not configuration inputs.
 Authorization comes from the OAuth bearer grant.
 
-`use_project` creates a durable logical context on the approved Project's
-existing directory and returns an `executionRef`. With one approved Project,
-omit `projectRef`; with multiple Projects, choose a reference returned by
+`project_control(action=open)` creates a durable logical context on the approved
+Project and selects it for the trusted `openai/session` and Actor. Its internal
+identity is not model-visible. With one approved Project, `projectRef` may be
+omitted; with multiple Projects, choose a reference returned by
 `list_projects`. In `widgets=full` mode, that tool renders an interactive card
-with a start-fresh action and bounded resumable handoffs for each Project. Card
-actions send a user message so the model—not the iframe—calls `use_project` and
-receives every root-instruction page.
+with a new-task action and bounded resumable Tasks for each Project. Card
+actions ask the model to call `project_control` with `open` or `resume`, so the
+model receives and acknowledges every root-instruction page.
 
-Every Project-scoped tool requires `executionRef`. The reference survives
-transport reconnects and service restarts and can also be passed alone to
-`use_project` for an explicit resume. It remains bound to the original OAuth
-principal, client, grant, authorization epoch, and approved source Project.
-Creation requires a caller-stable `operationId`, so retrying a lost response
-returns the same execution instead of creating another context.
+Model-facing Project tools are called without an execution reference. DevSpace
+resolves their current execution from the exact trusted session+Actor binding
+and revalidates the current OAuth principal, client, grant, authorization epoch,
+scopes, allowed roots, Project identity, and workspace on every call. A stable
+host session can call `project_control(action=hydrate)` after transport reconnect,
+service restart, or a conversation change that preserves the same host session
+value. Different Actors and sessions cannot share the binding; concurrent
+sessions may select different Projects.
+Successful open or resume atomically replaces the current session+Actor
+selection. Creation requires a caller-stable `operationId`, so retrying a lost
+response returns the same execution instead of creating another context.
 
-`save_progress` records a bounded semantic handoff for the Project. It does not
-persist a chat transcript or ChatGPT account/session identity. With no explicit
-selection, `use_project` starts fresh when the Project has no resumable handoff,
-automatically continues the only handoff when exactly one exists, and asks for
-an explicit `handoffRef` when several exist. In that case, pass the same
-`projectRef` to `list_projects` for the complete bounded choice list.
-`startFresh: true` bypasses recovery. A grant that authorizes the same Project
-can continue its handoffs, but continuation always creates a new execution
-bound to that calling grant.
+Reauthorizing creates a new grant and does not transfer an old execution. If the
+session binding is missing or stale, call `project_control(action=open)` or call
+`list_projects`, explicitly select a resumable `tasks[].taskRef`, and call
+`project_control(action=resume)` with a new `operationId`. There is no latest- or
+sole-Project fallback. No old execution workspace, process session, command
+replay, or execution-private patch history is inherited.
 
-Handoff updates use a caller-stable `operationId` and the current integer
+`save_progress` records a bounded semantic Task for the Project. It does not
+persist a chat transcript or ChatGPT account/session identity. A new task always
+uses explicit `action=open`; recovery always uses explicit `action=resume` with
+one selected `taskRef` (or a current private `threadRef`). DevSpace never
+automatically continues the newest or sole Task. A grant that authorizes the
+same Project can continue its saved Tasks, but continuation always creates a new
+execution bound to that calling grant.
+
+Task updates use a caller-stable `operationId` and the current integer
 `ifMatch` version. Titles are limited to 256 UTF-8 bytes, progress to 8 KiB,
 their JSON-serialized model text to 12,000 bytes, and each Project to 20
-resumable handoffs plus the newest 80 completed records. When several tasks
-need selection, call `list_projects` with that Project's `projectRef` to avoid
-the global listing limit. Resumed progress is historical, untrusted context and
-must be validated against current Project files before use.
+resumable Tasks plus the newest 80 completed records. `list_projects` returns
+`tasks`, `taskTrust`, and `taskLimits`; use its Project-scoped form to avoid the
+global listing limit. Resumed progress is historical, untrusted context and
+must be validated against current Project files before use. `save_progress`
+returns a `task` object containing its opaque `taskRef` and current version.
+If an update reports a Task revision conflict, list and reconcile the current
+Task, then retry with the same `operationId` and current `ifMatch`; do not mint a
+new operation identifier for that rejected attempt.
 
-Git is optional. DevSpace never creates or manages Git branches or worktrees.
-Different logical contexts for the same Project share the same physical
-directory and therefore see one another's file changes. Keep
+Git is optional. Checkout mode uses the approved directory, so different
+logical contexts see one another's file changes. For a Project root that is
+exactly a Git top level, `checkoutKind:"worktree"` can explicitly create a
+managed per-Task worktree. Keep
 `DEVSPACE_STATE_DIR` private and persistent because it stores grant bindings,
-Project handoffs, idempotency records, patch history, cursors, and retained
+saved Tasks, idempotency records, patch history, cursors, and retained
 output.
 
 ## Project instructions
 
-`use_project` returns a compact, bounded effective root instruction delta.
+Open, resume, and hydrate return compact, bounded effective root instruction pages.
 `read_files` and `inspect` return any newly applicable nested
 `instructionsDelta` with the target result; a gated mutation or command can
 return the delta with `instructions_required` before any effect starts.
@@ -243,19 +259,21 @@ roots or OAuth capabilities.
 | `DEVSPACE_DISABLED_SKILL_PATHS` | Optional comma-separated Skill directories or manifests to disable. |
 | `DEVSPACE_ADMIN_SKILLS_DIR` | Admin-managed Skill root. |
 
-`use_project` does not inject the Skill catalog. The single `skills` tool uses
+Project bootstrap does not inject the Skill catalog. The single `skills` tool uses
 `action=search` for bounded discovery and `action=load` with
 a returned `skillId` or exact unique name to load one selected manifest.
 Repository Skills remain untrusted repository content and do not add OAuth
 authority.
 
-## Fixed model-tool surface
+## Fixed tool surface
 
-The complete model-visible surface is:
+Raw `tools/list` contains these twelve names:
 
 ```text
 list_projects
-use_project
+project_control
+project_thread_control
+save_progress
 read_files
 inspect
 skills
@@ -266,11 +284,16 @@ write_stdin
 read_process_output
 ```
 
-There is no tool-profile configuration. OAuth capabilities determine which
-parts of this fixed vocabulary are exposed. `exec_command` is optional and
-requires all three public scopes; a full grant exposes all ten names. After a
-tool schema changes, rescan or rebuild the ChatGPT app so its cached snapshot
-matches the server.
+`project_thread_control` is marked App-only and shows/manages Actor-private
+Threads through resolve/list/status/activity/pause/archive/complete/close. It
+does not manage the shared saved Tasks returned by `list_projects`; completing
+one and releasing capacity requires `save_progress(status:"completed")` from
+its active execution. The control is absent from model instructions, leaving 11
+model-visible names. Model-visible `project_control` has only open, resume,
+hydrate, and interrupt. There is no tool-profile configuration. OAuth
+capabilities determine which tools remain available; `exec_command` requires
+all three public scopes. After a schema change, rescan or rebuild the ChatGPT
+App so its cached snapshot matches the server.
 
 ### `exec_command`
 
@@ -278,17 +301,17 @@ The advertised command fields are:
 
 | Field | Purpose |
 | --- | --- |
-| `executionRef` | Required opaque execution returned by `use_project`. |
 | `operationId` | Required fresh identifier for a new command effect. |
-| `cmd` | Command string. |
-| `workdir` | Working directory inside the Project bound to `executionRef`. |
-| `env` | Explicit environment additions. |
-| `yield_time_ms` | Initial wait before returning a running-process handle. |
-| `max_output_tokens` | Output bound for the call. |
+| `program` / `args` | Preferred direct argv command mode. |
+| `shell` / `command` / `approvalReason` | Explicit shell mode for syntax that requires it. |
+| `workingDirectory` | Working directory inside the Project selected for the trusted session+Actor. |
+| `environment` | Explicit environment additions. |
+| `yieldTimeMs` | Initial wait before returning a running-process handle. |
+| `maxOutputTokens` | Output bound for the call. |
 | `tty` | Allocate a pseudo-terminal. |
 
 DevSpace does not expose command-policy or network-policy configuration.
-`process:execute` must be explicitly approved. `workdir` is checked for Project
+`process:execute` must be explicitly approved. `workingDirectory` is checked for Project
 containment, but the child process itself runs with the full file and network
 authority of the DevSpace OS user.
 
@@ -297,9 +320,9 @@ resizes a terminal, and every call requires `operationId`. Use
 `read_process_output` with `sessionId` for live polling or with `outputId` for
 the first retained-output read.
 
-Signed continuation cursors retain the initial query. A continuation call passes
-the same `executionRef` and returned cursor instead of repeating or changing the
-initial resource, query, offset, mode, or limit fields.
+Signed continuation cursors retain the initial query. A continuation call under
+the same session+Actor selection passes the returned cursor instead of repeating
+or changing the initial resource, query, offset, mode, or limit fields.
 
 DevSpace can attempt shutdown or interrupt only for process groups it started
 and still tracks. Termination is best effort; detached or otherwise untracked
@@ -312,11 +335,11 @@ execution is used. Grant revocation or expiry retires that grant's logical
 contexts, tracked processes, retained output, and temporary review state. It
 does not delete Project files or run Git lifecycle commands.
 
-When the Project root exactly matches the Git top level, `show_changes` reads
-the current repository diff without writing Git state. Nested Projects use the
-non-Git source to preserve the approved-root boundary. That source is a bounded
-durable log of the exact successful DevSpace `apply_patch` requests for the
-current logical execution, rather than a net filesystem diff; command writes,
+`show_changes` requires an explicit source. `source:"repository"` reads the
+current repository diff without writing Git state only when the Project root
+exactly matches the Git top level. `source:"apply_patch_history"` is available
+for every Project and is a bounded durable log of the exact successful DevSpace
+`apply_patch` requests for the current logical execution, rather than a net filesystem diff; command writes,
 external edits, and patches made through another execution are excluded. When
 the journal is full, start a new logical context against the same shared
 Project. The Admin panel and `devspace doctor` report execution diagnostics but
@@ -350,7 +373,7 @@ Common process and request limits include:
 | `DEVSPACE_MAX_PROCESS_OUTPUT_FILE_BYTES` | `67108864` | Maximum retained output for one process. |
 | `DEVSPACE_MAX_PROCESS_OUTPUT_STORAGE_BYTES` | `1073741824` | Total retained process-output storage. |
 | `DEVSPACE_COMPLETED_PROCESS_OUTPUT_TTL_SECONDS` | `86400` | Retention time for completed process output. |
-| `DEVSPACE_MAX_COMMAND_RUNTIME_SECONDS` | `3600` | Hard command runtime limit. |
+| `DEVSPACE_MAX_COMMAND_RUNTIME_SECONDS` | `21600` | Hard command runtime limit. |
 | `DEVSPACE_PROCESS_SHUTDOWN_GRACE_SECONDS` | `5` | Grace period before forced process cleanup. |
 | `DEVSPACE_MAX_REQUEST_BODY_BYTES` | `33554432` | Maximum inbound MCP JSON body. |
 

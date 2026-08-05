@@ -19,6 +19,11 @@ const stateDir = join(fixtureRoot, "state");
 const publicBaseUrl = "http://127.0.0.1:7676";
 const accessToken = "project-thread-access-token";
 const clients: Client[] = [];
+const alphaHostMeta = hostMeta("conversation-a-alpha");
+const betaAHostMeta = hostMeta("conversation-a-beta");
+const betaBHostMeta = hostMeta("conversation-b-beta");
+const resumedAlphaHostMeta = hostMeta("conversation-a-resumed-alpha");
+const freshBetaHostMeta = hostMeta("conversation-a-fresh-beta");
 
 await Promise.all([
   mkdir(alphaRoot, { recursive: true }),
@@ -70,6 +75,7 @@ try {
   assertErrorCode(await conversationA.callTool({
     name: "project_control",
     arguments: { action: "open", operationId: "ambiguous-project" },
+    _meta: alphaHostMeta,
   }), "project_selection_required");
 
   const selectedAlpha = await conversationA.callTool({
@@ -79,12 +85,14 @@ try {
       projectRef: alphaRef,
       operationId: "conversation-a-alpha",
     },
+    _meta: alphaHostMeta,
   });
   assertSucceeded(selectedAlpha);
-  const alphaExecutionRef = projectExecutionRef(selectedAlpha);
+  assert.doesNotMatch(JSON.stringify(selectedAlpha.structuredContent), /executionRef/u);
   assertReadText(await conversationA.callTool({
     name: "read_files",
-    arguments: { executionRef: alphaExecutionRef, files: [{ path: "identity.txt" }] },
+    arguments: { files: [{ path: "identity.txt" }] },
+    _meta: alphaHostMeta,
   }), "alpha");
 
   const conversationB = await connect(origin, "conversation-b");
@@ -95,9 +103,10 @@ try {
       projectRef: betaRef,
       operationId: "conversation-b-beta",
     },
+    _meta: betaBHostMeta,
   });
   assertSucceeded(selectedBetaB);
-  const betaExecutionRefB = projectExecutionRef(selectedBetaB);
+  assert.doesNotMatch(JSON.stringify(selectedBetaB.structuredContent), /executionRef/u);
 
   const selectedBetaA = await conversationA.callTool({
     name: "project_control",
@@ -106,29 +115,29 @@ try {
       projectRef: betaRef,
       operationId: "conversation-a-beta",
     },
+    _meta: betaAHostMeta,
   });
   assertSucceeded(selectedBetaA);
-  const betaExecutionRefA = projectExecutionRef(selectedBetaA);
-  assert.notEqual(betaExecutionRefA, betaExecutionRefB);
+  assert.doesNotMatch(JSON.stringify(selectedBetaA.structuredContent), /executionRef/u);
 
   assertSucceeded(await conversationA.callTool({
     name: "apply_patch",
     arguments: {
-      executionRef: alphaExecutionRef,
       operationId: "alpha-patch",
       ifMatch: { "task-note.txt": null },
       patch: "*** Begin Patch\n*** Add File: task-note.txt\n+shared state\n*** End Patch\n",
     },
+    _meta: alphaHostMeta,
   }));
 
   const alphaSave = await conversationA.callTool({
     name: "save_progress",
     arguments: {
-      executionRef: alphaExecutionRef,
       operationId: "save-alpha",
       title: "Alpha task",
       progress: "Created task-note.txt; re-read it before the next edit.",
     },
+    _meta: alphaHostMeta,
   });
   assertSucceeded(alphaSave);
   assert.doesNotMatch(JSON.stringify(alphaSave.structuredContent), /Created task-note/u);
@@ -136,13 +145,14 @@ try {
   assert.equal(savedThreadVersion(alphaSave), 2);
 
   const alphaActivity = await conversationA.callTool({
-    name: "project_control",
+    name: "project_thread_control",
     arguments: {
       action: "activity",
       threadRef: alphaThreadRef,
       cursor: "0",
       limit: 100,
     },
+    _meta: alphaHostMeta,
   });
   assertSucceeded(alphaActivity);
   const alphaActivityContent = alphaActivity.structuredContent as {
@@ -153,7 +163,6 @@ try {
       lastSequence?: unknown;
     };
     nextCursor?: unknown;
-    hostUnavailable?: unknown[];
   };
   const alphaActivityTypes = new Set(
     (alphaActivityContent.events ?? []).map((event) => event.type),
@@ -171,16 +180,17 @@ try {
     alphaActivityContent.nextCursor,
     String(alphaActivityContent.projection?.lastSequence),
   );
-  assert.ok(alphaActivityContent.hostUnavailable?.includes("model_reasoning"));
+  assert.equal("hostUnavailable" in alphaActivityContent, false);
 
   const noNewAlphaActivity = await conversationA.callTool({
-    name: "project_control",
+    name: "project_thread_control",
     arguments: {
       action: "activity",
       threadRef: alphaThreadRef,
       cursor: String(alphaActivityContent.nextCursor),
       waitMs: 1,
     },
+    _meta: alphaHostMeta,
   });
   assertSucceeded(noNewAlphaActivity);
   assert.equal(
@@ -191,24 +201,24 @@ try {
   const missingVersion = await conversationA.callTool({
     name: "save_progress",
     arguments: {
-      executionRef: alphaExecutionRef,
       operationId: "update-alpha",
       title: "Alpha task",
       progress: "Must provide the current version.",
     },
+    _meta: alphaHostMeta,
   });
   assertErrorCode(missingVersion, "if_match_required");
-  assert.equal(errorCurrentVersion(missingVersion), 2);
+  assert.equal(errorCurrentVersion(missingVersion), 1);
 
   const alphaUpdate = await conversationA.callTool({
     name: "save_progress",
     arguments: {
-      executionRef: alphaExecutionRef,
       operationId: "update-alpha",
       title: "Alpha task",
       progress: "Created task-note.txt; re-read it before the next edit. Version three.",
-      ifMatch: 2,
+      ifMatch: 1,
     },
+    _meta: alphaHostMeta,
   });
   assertSucceeded(alphaUpdate);
   assert.equal(savedThreadVersion(alphaUpdate), 3);
@@ -216,33 +226,33 @@ try {
   const staleUpdate = await conversationA.callTool({
     name: "save_progress",
     arguments: {
-      executionRef: alphaExecutionRef,
       operationId: "stale-alpha",
       title: "Stale alpha",
       progress: "Must not overwrite version three.",
-      ifMatch: 2,
+      ifMatch: 1,
     },
+    _meta: alphaHostMeta,
   });
-  assertErrorCode(staleUpdate, "thread_revision_conflict");
-  assert.equal(errorCurrentVersion(staleUpdate), 3);
+  assertErrorCode(staleUpdate, "project_task_revision_conflict");
+  assert.equal(errorCurrentVersion(staleUpdate), 2);
 
   const betaSaveA = await conversationA.callTool({
     name: "save_progress",
     arguments: {
-      executionRef: betaExecutionRefA,
       operationId: "save-beta-a",
       title: "Beta task A",
       progress: "Context A inspected Beta.",
     },
+    _meta: betaAHostMeta,
   });
   const betaSaveB = await conversationB.callTool({
     name: "save_progress",
     arguments: {
-      executionRef: betaExecutionRefB,
       operationId: "save-beta-b",
       title: "Beta task B",
       progress: "Context B inspected Beta independently.",
     },
+    _meta: betaBHostMeta,
   });
   assertSucceeded(betaSaveA);
   assertSucceeded(betaSaveB);
@@ -251,8 +261,9 @@ try {
   assert.notEqual(betaThreadRefA, betaThreadRefB);
 
   const threadListing = await conversationA.callTool({
-    name: "project_control",
+    name: "project_thread_control",
     arguments: { action: "list" },
+    _meta: alphaHostMeta,
   });
   assertSucceeded(threadListing);
   const threads = listedThreads(threadListing);
@@ -271,8 +282,9 @@ try {
   );
 
   const betaListing = await conversationA.callTool({
-    name: "project_control",
+    name: "project_thread_control",
     arguments: { action: "list", projectRef: betaRef },
+    _meta: alphaHostMeta,
   });
   assertSucceeded(betaListing);
   assert.deepEqual(
@@ -288,40 +300,38 @@ try {
       threadRef: alphaThreadRef,
       operationId: "resume-alpha",
     },
+    _meta: resumedAlphaHostMeta,
   });
   assertSucceeded(resumedAlpha);
-  const resumedExecutionRef = projectExecutionRef(resumedAlpha);
-  assert.notEqual(resumedExecutionRef, alphaExecutionRef);
+  assert.doesNotMatch(JSON.stringify(resumedAlpha.structuredContent), /executionRef/u);
   const resumedThread = (resumedAlpha.structuredContent as {
     thread?: {
-      ref?: unknown;
+      threadRef?: unknown;
       title?: unknown;
       version?: unknown;
       checkpoint?: {
         modelSummary?: unknown;
         modelSummaryTrust?: unknown;
-        provenance?: Record<string, unknown>;
+        observedStateTrust?: unknown;
       };
     };
   }).thread;
-  assert.equal(resumedThread?.ref, alphaThreadRef);
+  assert.equal(resumedThread?.threadRef, alphaThreadRef);
   assert.equal(resumedThread?.title, "Alpha task");
   assert.equal(resumedThread?.version, 3);
   assert.match(String(resumedThread?.checkpoint?.modelSummary), /Version three/u);
   assert.equal(resumedThread?.checkpoint?.modelSummaryTrust, "untrusted");
-  assert.deepEqual(resumedThread?.checkpoint?.provenance, {
-    source: "devspace_checkpoint",
-    trust: "server_observed",
-    authority: "none",
-  });
+  assert.equal(resumedThread?.checkpoint?.observedStateTrust, "server_observed");
   assertReadText(await conversationA.callTool({
     name: "read_files",
-    arguments: { executionRef: resumedExecutionRef, files: [{ path: "task-note.txt" }] },
+    arguments: { files: [{ path: "task-note.txt" }] },
+    _meta: resumedAlphaHostMeta,
   }), "shared state");
 
   const status = await conversationA.callTool({
-    name: "project_control",
+    name: "project_thread_control",
     arguments: { action: "status", threadRef: alphaThreadRef },
+    _meta: alphaHostMeta,
   });
   assertSucceeded(status);
   assert.equal(
@@ -336,6 +346,7 @@ try {
       projectRef: betaRef,
       operationId: "fresh-beta",
     },
+    _meta: freshBetaHostMeta,
   });
   assertSucceeded(freshBeta);
   assert.equal(
@@ -344,6 +355,33 @@ try {
     } | undefined)?.thread?.checkpoint,
     undefined,
   );
+
+  const closedBetaA = await conversationA.callTool({
+    name: "project_thread_control",
+    arguments: {
+      action: "close",
+      threadRef: betaThreadRefA,
+      operationId: "close-beta-a",
+    },
+    _meta: betaAHostMeta,
+  });
+  assertSucceeded(closedBetaA);
+  const resolvedAfterClose = await conversationA.callTool({
+    name: "project_thread_control",
+    arguments: { action: "resolve" },
+    _meta: betaAHostMeta,
+  });
+  assertSucceeded(resolvedAfterClose);
+  assert.equal(
+    (resolvedAfterClose.structuredContent as { binding?: unknown } | undefined)?.binding,
+    "none",
+    "closing a Thread must release the exact session execution binding immediately",
+  );
+  assertErrorCode(await conversationA.callTool({
+    name: "read_files",
+    arguments: { files: [{ path: "beta.txt" }] },
+    _meta: betaAHostMeta,
+  }), "project_execution_required");
 } finally {
   while (clients.length > 0) await closeClient(clients[clients.length - 1]!);
   await closeHttpServer(httpServer);
@@ -413,18 +451,17 @@ async function closeClient(client: Client): Promise<void> {
   await client.close().catch(() => undefined);
 }
 
-function projectExecutionRef(result: Awaited<ReturnType<Client["callTool"]>>): string {
-  const value = String((result.structuredContent as {
-    project?: { executionRef?: unknown };
-  } | undefined)?.project?.executionRef ?? "");
-  assert.match(value, /^pex1_/u);
-  return value;
+function hostMeta(session: string): Readonly<Record<string, string>> {
+  return {
+    "openai/subject": "project-execution-simulation-subject",
+    "openai/session": `project-execution-simulation-${session}`,
+  };
 }
 
 function savedThreadRef(result: Awaited<ReturnType<Client["callTool"]>>): string {
   const value = String((result.structuredContent as {
-    thread?: { ref?: unknown };
-  } | undefined)?.thread?.ref ?? "");
+    thread?: { threadRef?: unknown };
+  } | undefined)?.thread?.threadRef ?? "");
   assert.match(value, /^pth1_/u);
   return value;
 }

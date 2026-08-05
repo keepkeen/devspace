@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { isExpandableCard, toolResultCard } from "./card-types.js";
+import {
+  isExpandableCard,
+  parsePrivateThreadList,
+  toolResultCard,
+} from "./card-types.js";
 
 const firstPagePatch = [
   "diff --git a/src/a.ts b/src/a.ts",
@@ -77,8 +81,8 @@ if (projectList.tool !== "list_projects") throw new Error("Expected a project li
 assert.deepEqual(projectList.projects, [{
   projectRef: "root_alpha",
   label: "alpha",
-  handoffs: [{
-    handoffRef: "phf1_saved",
+  tasks: [{
+    taskRef: "task_saved",
     title: "Continue parser work",
     createdAt: "2026-07-30T01:02:03.000Z",
     updatedAt: "2026-07-31T04:05:06.000Z",
@@ -88,12 +92,8 @@ assert.deepEqual(projectList.projects, [{
 }]);
 assert.equal(projectList.defaultProjectRef, "root_alpha");
 assert.equal(projectList.truncated, false);
-assert.deepEqual(projectList.handoffProvenance, {
-  source: "devspace_saved_progress",
-  trust: "untrusted",
-  authority: "none",
-});
-assert.deepEqual(projectList.handoffLimits, { perProject: 20, total: 100 });
+assert.equal(projectList.taskTrust, "untrusted");
+assert.deepEqual(projectList.taskLimits, { perProject: 20, total: 100 });
 assert.equal(isExpandableCard(projectList), false);
 assert.equal("path" in projectList.projects[0]!, false);
 assert.equal("projectId" in projectList.projects[0]!, false);
@@ -106,14 +106,57 @@ projectListWithUnknownModelContent.content = [{
 }];
 assert.deepEqual(toolResultCard(projectListWithUnknownModelContent), projectList);
 
+const privateThreads = parsePrivateThreadList(privateThreadListResult());
+assert.deepEqual(privateThreads, [{
+  threadRef: "pth1_private-thread.signature",
+  projectRef: "root_alpha",
+  title: "Parser implementation",
+  status: "active",
+  version: 3,
+  checkoutKind: "worktree",
+  updatedAt: "2026-07-31T04:05:06.000Z",
+}]);
+
+for (const mutate of [
+  (result: CallToolResult) => {
+    (result.structuredContent as { threads: Array<Record<string, unknown>> }).threads[0]!.status =
+      "unknown";
+  },
+  (result: CallToolResult) => {
+    (result.structuredContent as { threads: Array<Record<string, unknown>> }).threads[0]!.version = 0;
+  },
+  (result: CallToolResult) => {
+    (result.structuredContent as { threads: Array<Record<string, unknown>> }).threads[0]!.updatedAt =
+      "not-a-date";
+  },
+  (result: CallToolResult) => {
+    const structured = result.structuredContent as { threads: Array<Record<string, unknown>> };
+    structured.threads.push({ ...structured.threads[0] });
+  },
+  (result: CallToolResult) => {
+    (result.structuredContent as { threads: unknown[] }).threads = Array.from(
+      { length: 101 },
+      () => ({}),
+    );
+  },
+] as const) {
+  const invalid = privateThreadListResult();
+  mutate(invalid);
+  assert.equal(parsePrivateThreadList(invalid), undefined);
+}
+
+const failedPrivateThreadList = privateThreadListResult();
+failedPrivateThreadList.isError = true;
+assert.equal(parsePrivateThreadList(failedPrivateThreadList), undefined);
+
 for (const mutate of [
   (result: CallToolResult) => {
     (result.structuredContent as Record<string, unknown>).defaultProjectRef = "root_unknown";
   },
   (result: CallToolResult) => {
     const projects = (result.structuredContent as { projects: Array<Record<string, unknown>> }).projects;
-    projects[0]!.handoffs = Array.from({ length: 21 }, (_, index) => ({
-      handoffRef: `phf1_${index}`,
+    projects[0]!.tasks = Array.from({ length: 21 }, (_, index) => ({
+      taskRef: `task_${index}`,
       title: `Task ${index}`,
       createdAt: "2026-07-30T01:02:03.000Z",
       updatedAt: "2026-07-31T04:05:06.000Z",
@@ -123,17 +166,16 @@ for (const mutate of [
   },
   (result: CallToolResult) => {
     const projects = (result.structuredContent as { projects: Array<Record<string, unknown>> }).projects;
-    (projects[0]!.handoffs as Array<Record<string, unknown>>)[0]!.status = "completed";
+    (projects[0]!.tasks as Array<Record<string, unknown>>)[0]!.status = "completed";
   },
   (result: CallToolResult) => {
     const projects = (result.structuredContent as { projects: Array<Record<string, unknown>> }).projects;
-    (projects[0]!.handoffs as Array<Record<string, unknown>>)[0]!.updatedAt = "not-a-date";
+    (projects[0]!.tasks as Array<Record<string, unknown>>)[0]!.updatedAt = "not-a-date";
   },
   (result: CallToolResult) => {
     (
-      (result.structuredContent as Record<string, unknown>).handoffProvenance as
-        Record<string, unknown>
-    ).trust = "trusted";
+      result.structuredContent as Record<string, unknown>
+    ).taskTrust = "trusted";
   },
 ] as const) {
   const invalid = listProjectsResult();
@@ -178,8 +220,8 @@ function listProjectsResult(): CallToolResult {
       projects: [{
         projectRef: "root_alpha",
         label: "alpha",
-        handoffs: [{
-          handoffRef: "phf1_saved",
+        tasks: [{
+          taskRef: "task_saved",
           title: "Continue parser work",
           createdAt: "2026-07-30T01:02:03.000Z",
           updatedAt: "2026-07-31T04:05:06.000Z",
@@ -189,18 +231,33 @@ function listProjectsResult(): CallToolResult {
       }],
       defaultProjectRef: "root_alpha",
       truncated: false,
-      handoffProvenance: {
-        source: "devspace_saved_progress",
-        trust: "untrusted",
-        authority: "none",
-      },
-      handoffLimits: {
+      taskTrust: "untrusted",
+      taskLimits: {
         perProject: 20,
         total: 100,
       },
     },
     _meta: {
       tool: "list_projects",
+    },
+  };
+}
+
+function privateThreadListResult(): CallToolResult {
+  return {
+    content: [{ type: "text", text: "One private Project Thread is available." }],
+    structuredContent: {
+      ok: true,
+      threads: [{
+        threadRef: "pth1_private-thread.signature",
+        projectRef: "root_alpha",
+        title: "Parser implementation",
+        status: "active",
+        version: 3,
+        checkoutKind: "worktree",
+        updatedAt: "2026-07-31T04:05:06.000Z",
+        ignoredActivity: [{ payload: "must not be retained" }],
+      }],
     },
   };
 }

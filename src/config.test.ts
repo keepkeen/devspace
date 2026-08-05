@@ -124,7 +124,7 @@ assert.deepEqual(loadConfig(baseEnv).resources, {
   maxProcessOutputFileBytes: 64 * 1024 * 1024,
   maxProcessOutputStorageBytes: 1024 * 1024 * 1024,
   completedProcessOutputTtlMs: 24 * 60 * 60 * 1_000,
-  maxCommandRuntimeMs: 3_600_000,
+  maxCommandRuntimeMs: 21_600_000,
   processShutdownGraceMs: 5_000,
   httpDrainTimeoutMs: 30_000,
   workspaceIdleTtlMs: 604_800_000,

@@ -11,6 +11,8 @@ import {
   type ProjectInstructionItem,
 } from "./project-context-protocol.js";
 
+assert.equal(PROJECT_CONTEXT_SCHEMA_VERSION, 8);
+
 const instructionText = "Use the repository's npm scripts.";
 const implementationInstruction = {
   source: "repository",
@@ -23,6 +25,7 @@ const implementationInstruction = {
   revision: "private-instruction-revision-a",
   manifest: { included: true },
   fragment: {
+    partial: true,
     offsetBytes: 0,
     lengthBytes: 12,
     totalBytes: Buffer.byteLength(instructionText, "utf8"),
@@ -58,10 +61,7 @@ assert.deepEqual(copiedInstruction, {
   path: "AGENTS.md",
   content: instructionText,
   fragment: {
-    offsetBytes: 0,
-    lengthBytes: 12,
-    totalBytes: Buffer.byteLength(instructionText, "utf8"),
-    complete: false,
+    partial: true,
   },
 });
 
@@ -87,7 +87,6 @@ assert.notEqual(copiedDelta.instructions[0], createdDelta.instructions[0]);
 const input = {
   project: {
     ref: execution.projectRef,
-    executionRef: execution.executionRef,
     writeAccess: "read_only",
     projectFingerprint: execution.projectFingerprint,
     workspaceId: execution.workspaceId,
@@ -101,7 +100,8 @@ const input = {
     revision: execution.revisions.instructionRevision,
   },
   thread: {
-    ref: execution.threadRef!,
+    threadRef: execution.threadRef!,
+    ref: "pth1_legacy-thread-ref.signature",
     title: "Continue MCP integration",
     status: "active",
     version: 4,
@@ -109,6 +109,7 @@ const input = {
     checkpoint: {
       cause: "patch_applied",
       observedState: { files: 2, additions: 8, removals: 1 },
+      observedStateTrust: "server_observed",
       modelSummary: "Historical summary; revalidate before acting.",
       modelSummaryTrust: "untrusted",
       createdAt: "2026-07-31T04:00:00.000Z",
@@ -161,11 +162,10 @@ assert.deepEqual(context.structuredContent, {
   ok: true,
   project: {
     ref: "project-a",
-    executionRef: execution.executionRef,
     writeAccess: "read_only",
   },
   thread: {
-    ref: execution.threadRef,
+    threadRef: execution.threadRef,
     title: "Continue MCP integration",
     status: "active",
     version: 4,
@@ -173,34 +173,16 @@ assert.deepEqual(context.structuredContent, {
     checkpoint: {
       cause: "patch_applied",
       observedState: { files: 2, additions: 8, removals: 1 },
+      observedStateTrust: "server_observed",
       modelSummary: "Historical summary; revalidate before acting.",
       modelSummaryTrust: "untrusted",
       createdAt: "2026-07-31T04:00:00.000Z",
-      provenance: {
-        source: "devspace_checkpoint",
-        trust: "server_observed",
-        authority: "none",
-      },
     },
   },
   contextDelta: {
     instructions: [copiedInstruction],
     rootInstructionsComplete: false,
     nextCursor: continuationCursor,
-  },
-  handoff: {
-    ref: "phf1_public-handoff.signature",
-    title: "Continue MCP integration",
-    progress: "Historical snapshot: re-read server.ts before editing.",
-    status: "resumable",
-    version: 3,
-    updatedAt: "2026-07-31T03:00:00.000Z",
-    mustRevalidate: true,
-    provenance: {
-      source: "devspace_saved_progress",
-      trust: "untrusted",
-      authority: "none",
-    },
   },
   diagnostics: {
     instructions: {
@@ -219,6 +201,7 @@ for (const privateValue of [
   execution.workspaceId,
   String(execution.generation),
   execution.instructionContextId,
+  execution.executionRef,
   execution.threadId!,
   execution.revisions.instructionRevision,
   execution.revisions.skillRevision,
@@ -227,7 +210,8 @@ for (const privateValue of [
 }
 assert.doesNotMatch(
   serialized,
-  /hash|manifest|skillId|workspaceId|generation|instructionContextId|projectFingerprint|executionId|threadId|privateHandoffId|privateOwner|privateField/u,
+  /hash|manifest|skillId|workspaceId|generation|instructionContextId|projectFingerprint|executionId|executionRef|threadId|privateHandoffId|privateOwner|privateField|handoff|mustRevalidate|provenance|offsetBytes|lengthBytes|totalBytes|complete/u,
 );
+assert.equal("ref" in context.structuredContent.thread!, false);
 
 console.log("project context protocol tests passed");

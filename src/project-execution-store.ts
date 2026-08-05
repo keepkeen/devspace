@@ -44,6 +44,12 @@ export interface ProjectExecution {
   updatedAt: string;
 }
 
+export interface ProjectExecutionRecoveryIdentity {
+  projectRef: string;
+  projectFingerprint: string;
+  canonicalSourceRoot: string;
+}
+
 export interface ReserveProjectExecutionInput extends ProjectExecutionAuthorization {
   projectRef: string;
   projectFingerprint: string;
@@ -328,6 +334,28 @@ export class ProjectExecutionStore {
         and execution.authorization_epoch = ? and execution.status = 'active'
     `).get(id, ...authorizationValues(auth)) as ProjectExecutionRow | undefined;
     return row ? mapRow(row) : undefined;
+  }
+
+  findRecoveryIdentity(
+    executionId: string,
+  ): ProjectExecutionRecoveryIdentity | undefined {
+    this.assertOpen();
+    const id = boundedString(executionId, "executionId", MAX_ID_LENGTH);
+    const row = this.database.sqlite.prepare(`
+      select project_ref, project_fingerprint, canonical_source_root
+      from project_executions
+      where execution_id = ?
+    `).get(id) as Pick<
+      ProjectExecutionRow,
+      "project_ref" | "project_fingerprint" | "canonical_source_root"
+    > | undefined;
+    return row
+      ? {
+          projectRef: row.project_ref,
+          projectFingerprint: row.project_fingerprint,
+          canonicalSourceRoot: row.canonical_source_root,
+        }
+      : undefined;
   }
 
   touch(

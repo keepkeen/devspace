@@ -39,6 +39,8 @@ const config = loadConfig({
   DEVSPACE_LOG_LEVEL: "silent",
   PORT: "1",
 });
+const auditEntries: Array<Readonly<Record<string, unknown>>> = [];
+config.logging.auditSink = (entry) => auditEntries.push(entry);
 (config as typeof config & {
   instructionIoHooksForTests: {
     beforeFileOpen(path: string): void;
@@ -72,6 +74,92 @@ try {
     new RegExp(escapeRegExp(projectRoot), "u"),
   );
 
+  const subjectMeta = {
+    "openai/subject": "stable-project-thread-subject",
+    "openai/session": "stable-project-thread-session",
+  };
+  const mainMeta = {
+    "openai/subject": "chatgpt-flow-subject",
+    "openai/session": "chatgpt-flow-main-session",
+  };
+  const parallelMeta = {
+    "openai/subject": "chatgpt-flow-subject",
+    "openai/session": "chatgpt-flow-parallel-session",
+  };
+  const subjectSelection = await first.callTool({
+    name: "project_control",
+    arguments: {
+      action: "open",
+      projectRef: projects[0]?.projectRef,
+      operationId: "subject-create-execution",
+    },
+    _meta: subjectMeta,
+  });
+  assertSucceeded(subjectSelection);
+  const subjectThreadRef = String(
+    (subjectSelection.structuredContent as {
+      thread?: { threadRef?: unknown };
+    } | undefined)?.thread?.threadRef ?? "",
+  );
+  assert.match(subjectThreadRef, /^pth1_/u);
+
+  assertSucceeded(await first.callTool({
+    name: "exec_command",
+    arguments: {
+      operationId: "subject-command-checkpoint",
+      program: process.execPath,
+      args: ["-e", "console.log('subject-command-ok')"],
+    },
+    _meta: subjectMeta,
+  }));
+  assertThreadCheckpoint(
+    await first.callTool({
+      name: "project_thread_control",
+      arguments: { action: "status", threadRef: subjectThreadRef },
+      _meta: subjectMeta,
+    }),
+    subjectThreadRef,
+    "command_completed",
+  );
+
+  assertSucceeded(await first.callTool({
+    name: "apply_patch",
+    arguments: {
+      operationId: "subject-patch-checkpoint",
+      patch: "*** Begin Patch\n*** Add File: subject-patched.txt\n+subject patch\n*** End Patch\n",
+      ifMatch: { "subject-patched.txt": null },
+    },
+    _meta: subjectMeta,
+  }));
+  assertThreadCheckpoint(
+    await first.callTool({
+      name: "project_thread_control",
+      arguments: { action: "status", threadRef: subjectThreadRef },
+      _meta: subjectMeta,
+    }),
+    subjectThreadRef,
+    "patch_applied",
+  );
+
+  const subjectThreads = await first.callTool({
+    name: "project_thread_control",
+    arguments: { action: "list", projectRef: projects[0]?.projectRef },
+    _meta: subjectMeta,
+  });
+  assertSucceeded(subjectThreads);
+  assert.deepEqual(
+    (subjectThreads.structuredContent as {
+      threads?: Array<{ threadRef?: unknown }>;
+    } | undefined)?.threads?.map((thread) => thread.threadRef),
+    [subjectThreadRef],
+    "leased calls with a stable host subject must retain one execution-to-Thread binding",
+  );
+  assert.equal(
+    auditEntries.some((entry) => entry.event === "project_thread_checkpoint_failed"),
+    false,
+    "automatic checkpoints must not emit profile-mismatch warnings",
+  );
+
   const selected = await first.callTool({
     name: "project_control",
     arguments: {
@@ -79,15 +167,11 @@ try {
       projectRef: projects[0]?.projectRef,
       operationId: "create-execution-a",
     },
+    _meta: mainMeta,
   });
   assertSucceeded(selected);
   assertProjectOnly(selected);
-  const executionRef = String(
-    (selected.structuredContent as {
-      project?: { executionRef?: unknown };
-    } | undefined)?.project?.executionRef ?? "",
-  );
-  assert.match(executionRef, /^pex1_/u);
+  assert.doesNotMatch(JSON.stringify(selected.structuredContent), /executionRef/u);
   assert.equal(
     (selected.structuredContent as {
       project?: { ref?: unknown; writeAccess?: unknown };
@@ -103,6 +187,7 @@ try {
       projectRef: projects[0]?.projectRef,
       operationId: "recover-context-failure",
     },
+    _meta: mainMeta,
   });
   assert.equal(contextFailure.isError, true);
   const recoveredContext = await first.callTool({
@@ -112,14 +197,13 @@ try {
       projectRef: projects[0]?.projectRef,
       operationId: "recover-context-failure",
     },
+    _meta: mainMeta,
   });
   assertSucceeded(recoveredContext);
-  assert.match(
-    String((recoveredContext.structuredContent as {
-      project?: { executionRef?: unknown };
-    } | undefined)?.project?.executionRef ?? ""),
-    /^pex1_/u,
-    "an instruction-context failure must leave the shared Project context recoverable",
+  assert.doesNotMatch(
+    JSON.stringify(recoveredContext.structuredContent),
+    /executionRef/u,
+    "an instruction-context failure must leave the shared Project context recoverable without exposing its execution",
   );
   const replayedSelection = await first.callTool({
     name: "project_control",
@@ -128,18 +212,15 @@ try {
       projectRef: projects[0]?.projectRef,
       operationId: "create-execution-a",
     },
+    _meta: mainMeta,
   });
   assertSucceeded(replayedSelection);
-  assert.equal(
-    (replayedSelection.structuredContent as {
-      project?: { executionRef?: unknown };
-    } | undefined)?.project?.executionRef,
-    executionRef,
-  );
+  assert.deepEqual(replayedSelection.structuredContent, selected.structuredContent);
 
   const read = await first.callTool({
     name: "read_files",
-    arguments: { executionRef, files: [{ path: "payload.txt" }] },
+    arguments: { files: [{ path: "payload.txt" }] },
+    _meta: mainMeta,
   });
   assertSucceeded(read);
   assert.match(JSON.stringify(read.structuredContent), /chatgpt-flow-ready/u);
@@ -147,7 +228,6 @@ try {
   const command = await first.callTool({
     name: "exec_command",
     arguments: {
-      executionRef,
       operationId: "chatgpt-flow-command",
       program: process.execPath,
       args: [
@@ -155,6 +235,7 @@ try {
         "require('node:fs').writeFileSync('execution-a-visible.txt', 'shared-a\\n'); console.log('chatgpt-command-ok')",
       ],
     },
+    _meta: mainMeta,
   });
   assertSucceeded(command);
   assert.match(
@@ -170,9 +251,9 @@ try {
   const readAfterReconnect = await reconnected.callTool({
     name: "read_files",
     arguments: {
-      executionRef,
       files: [{ path: "payload.txt" }, { path: "execution-a-visible.txt" }],
     },
+    _meta: mainMeta,
   });
   assertSucceeded(readAfterReconnect);
 
@@ -180,8 +261,9 @@ try {
   const unboundNewConversation = await newConversation.callTool({
     name: "read_files",
     arguments: { files: [{ path: "payload.txt" }] },
+    _meta: parallelMeta,
   });
-  assertErrorCode(unboundNewConversation, "invalid_tool_input");
+  assertErrorCode(unboundNewConversation, "project_execution_required");
   const secondSelection = await newConversation.callTool({
     name: "project_control",
     arguments: {
@@ -189,41 +271,70 @@ try {
       projectRef: projects[0]?.projectRef,
       operationId: "create-execution-b",
     },
+    _meta: parallelMeta,
   });
   assertSucceeded(secondSelection);
-  const secondExecutionRef = String(
-    (secondSelection.structuredContent as {
-      project?: { executionRef?: unknown };
-    } | undefined)?.project?.executionRef ?? "",
-  );
-  assert.match(secondExecutionRef, /^pex1_/u);
-  assert.notEqual(secondExecutionRef, executionRef);
+  assert.doesNotMatch(JSON.stringify(secondSelection.structuredContent), /executionRef/u);
   assertSucceeded(await newConversation.callTool({
     name: "read_files",
-    arguments: { executionRef: secondExecutionRef, files: [{ path: "payload.txt" }] },
+    arguments: {
+      executionRef: "pex1_caller-supplied-override-must-be-ignored",
+      files: [{ path: "payload.txt" }],
+    },
+    _meta: parallelMeta,
   }));
   const sharedRead = await newConversation.callTool({
     name: "read_files",
     arguments: {
-      executionRef: secondExecutionRef,
       files: [{ path: "execution-a-visible.txt" }],
     },
+    _meta: parallelMeta,
   });
   assertSucceeded(sharedRead);
 
   const applied = await reconnected.callTool({
     name: "apply_patch",
     arguments: {
-      executionRef,
       operationId: "chatgpt-flow-apply",
       patch: "*** Begin Patch\n*** Add File: patched-by-devspace.txt\n+recorded change\n*** End Patch\n",
       ifMatch: { "patched-by-devspace.txt": null },
     },
+    _meta: mainMeta,
   });
   assertSucceeded(applied);
+  const largeHistoryPatch =
+    "*** Begin Patch\n*** Add File: paged-history.txt\n" +
+    Array.from({ length: 2_000 }, (_, index) => `+history line ${index.toString().padStart(4, "0")} payload\n`).join("") +
+    "*** End Patch\n";
+  assertSucceeded(await reconnected.callTool({
+    name: "apply_patch",
+    arguments: {
+      operationId: "chatgpt-flow-paged-apply",
+      patch: largeHistoryPatch,
+      ifMatch: { "paged-history.txt": null },
+    },
+    _meta: mainMeta,
+  }));
+  const missingSource = await reconnected.callTool({
+    name: "show_changes",
+    arguments: {},
+    _meta: mainMeta,
+  });
+  assertErrorCode(missingSource, "invalid_tool_input");
+  const unavailableRepository = await reconnected.callTool({
+    name: "show_changes",
+    arguments: { source: "repository" },
+    _meta: mainMeta,
+  });
+  assertErrorCode(unavailableRepository, "repository_review_unavailable");
+  assert.match(
+    JSON.stringify(unavailableRepository.structuredContent),
+    /apply_patch_history/u,
+  );
   const firstHistory = await reconnected.callTool({
     name: "show_changes",
-    arguments: { executionRef },
+    arguments: { source: "apply_patch_history" },
+    _meta: mainMeta,
   });
   assertSucceeded(firstHistory);
   assert.equal(
@@ -238,10 +349,28 @@ try {
     "non-Git review returns the successful apply_patch operation log",
   );
   assert.doesNotMatch(firstHistorySerialized, /execution-a-visible\.txt/u);
+  const historyCursor = String(
+    (firstHistory.structuredContent as {
+      diff?: { nextCursor?: unknown };
+    }).diff?.nextCursor ?? "",
+  );
+  assert.ok(historyCursor, "the large apply-patch history must produce a continuation cursor");
+  const changedSourceContinuation = await reconnected.callTool({
+    name: "show_changes",
+    arguments: { source: "repository", cursor: historyCursor },
+    _meta: mainMeta,
+  });
+  assertErrorCode(changedSourceContinuation, "diff_cursor_stale");
+  assertSucceeded(await reconnected.callTool({
+    name: "show_changes",
+    arguments: { source: "apply_patch_history", cursor: historyCursor },
+    _meta: mainMeta,
+  }));
 
   const secondHistory = await newConversation.callTool({
     name: "show_changes",
-    arguments: { executionRef: secondExecutionRef },
+    arguments: { source: "apply_patch_history" },
+    _meta: parallelMeta,
   });
   assertSucceeded(secondHistory);
   assert.equal(
@@ -262,32 +391,34 @@ try {
   const gatedAfterRestart = await afterRestart.callTool({
     name: "read_files",
     arguments: {
-      executionRef,
       files: [{ path: "payload.txt" }],
     },
+    _meta: mainMeta,
   });
   assertErrorCode(gatedAfterRestart, "root_instructions_required");
   const resumed = await afterRestart.callTool({
     name: "project_control",
-    arguments: { action: "hydrate", executionRef },
+    arguments: { action: "hydrate" },
+    _meta: mainMeta,
   });
   assertSucceeded(resumed);
   assertProjectOnly(resumed);
   const readAfterRestart = await afterRestart.callTool({
     name: "read_files",
     arguments: {
-      executionRef,
       files: [
         { path: "payload.txt" },
         { path: "execution-a-visible.txt" },
         { path: "patched-by-devspace.txt" },
       ],
     },
+    _meta: mainMeta,
   });
   assertSucceeded(readAfterRestart);
   const historyAfterRestart = await afterRestart.callTool({
     name: "show_changes",
-    arguments: { executionRef },
+    arguments: { source: "apply_patch_history" },
+    _meta: mainMeta,
   });
   assertSucceeded(historyAfterRestart);
   assert.match(
@@ -407,6 +538,22 @@ function assertErrorCode(
     } | undefined)?.error?.code,
     code,
   );
+}
+
+function assertThreadCheckpoint(
+  result: Awaited<ReturnType<Client["callTool"]>>,
+  threadRef: string,
+  cause: string,
+): void {
+  assertSucceeded(result);
+  const thread = (result.structuredContent as {
+    thread?: {
+      threadRef?: unknown;
+      checkpoint?: { cause?: unknown };
+    };
+  } | undefined)?.thread;
+  assert.equal(thread?.threadRef, threadRef);
+  assert.equal(thread?.checkpoint?.cause, cause);
 }
 
 function toolText(result: Awaited<ReturnType<Client["callTool"]>>): string {

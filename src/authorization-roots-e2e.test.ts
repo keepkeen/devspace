@@ -78,6 +78,10 @@ const clients: Client[] = [];
 
 try {
   const client = await connect("authorization-root", accessToken);
+  const hostMeta = {
+    "openai/subject": "authorization-root-subject",
+    "openai/session": "authorization-root-session",
+  };
   const initialList = await client.callTool({ name: "list_projects", arguments: {} });
   assertSucceeded(initialList);
   assert.equal(
@@ -92,21 +96,17 @@ try {
   const selected = await client.callTool({
     name: "project_control",
     arguments: { action: "open", operationId: "authorization-root-execution" },
+    _meta: hostMeta,
   });
   assertSucceeded(selected);
   assert.doesNotMatch(
     JSON.stringify(selected.structuredContent),
     /workspace|receipt|continuation|contextChanged|phase/iu,
   );
-  const executionRef = String(
-    (selected.structuredContent as {
-      project?: { executionRef?: unknown };
-    } | undefined)?.project?.executionRef ?? "",
-  );
-  assert.match(executionRef, /^pex1_/u);
   const read = await client.callTool({
     name: "read_files",
-    arguments: { executionRef, files: [{ path: "payload.txt" }] },
+    arguments: { files: [{ path: "payload.txt" }] },
+    _meta: hostMeta,
   });
   assertSucceeded(read);
   assert.match(JSON.stringify(read.structuredContent), /authorized/u);
@@ -122,6 +122,7 @@ try {
       projectRef: ungrantedProjectRef,
       operationId: "ungranted-root-execution",
     },
+    _meta: hostMeta,
   }));
 } finally {
   for (const client of clients.reverse()) await client.close().catch(() => undefined);

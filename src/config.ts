@@ -290,8 +290,8 @@ function parseResourceLimits(
         "DEVSPACE_COMPLETED_PROCESS_OUTPUT_TTL_SECONDS",
       ),
     maxCommandRuntimeMs: env.DEVSPACE_MAX_COMMAND_RUNTIME_SECONDS === undefined
-      ? configured?.maxCommandRuntimeMs ?? 60 * 60 * 1_000
-      : seconds(env.DEVSPACE_MAX_COMMAND_RUNTIME_SECONDS, 60 * 60, "DEVSPACE_MAX_COMMAND_RUNTIME_SECONDS"),
+      ? configured?.maxCommandRuntimeMs ?? 6 * 60 * 60 * 1_000
+      : seconds(env.DEVSPACE_MAX_COMMAND_RUNTIME_SECONDS, 6 * 60 * 60, "DEVSPACE_MAX_COMMAND_RUNTIME_SECONDS"),
     processShutdownGraceMs: seconds(env.DEVSPACE_PROCESS_SHUTDOWN_GRACE_SECONDS, 5, "DEVSPACE_PROCESS_SHUTDOWN_GRACE_SECONDS"),
     httpDrainTimeoutMs: seconds(env.DEVSPACE_HTTP_DRAIN_TIMEOUT_SECONDS, 30, "DEVSPACE_HTTP_DRAIN_TIMEOUT_SECONDS"),
     workspaceIdleTtlMs: seconds(env.DEVSPACE_WORKSPACE_IDLE_TTL_SECONDS, 7 * 24 * 60 * 60, "DEVSPACE_WORKSPACE_IDLE_TTL_SECONDS"),

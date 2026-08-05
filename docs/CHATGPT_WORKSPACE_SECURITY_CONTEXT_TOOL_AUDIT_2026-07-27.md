@@ -32,24 +32,25 @@ The following conclusions remain relevant:
   identifiers.
 - OAuth grant identity is sufficient; account and conversation hints should not
   become a second identity system.
-- Project executions must be explicit and never guessed from recency.
+- Project selection must be explicit and never guessed from recency; execution
+  identity remains server-held behind an exact trusted session+Actor binding.
 - Tool output, instruction context, diff data, and process output must remain
   bounded.
-- A backend restart cannot preserve live process state, while durable Project
-  executions should be recoverable by explicit reference.
+- A backend restart cannot preserve live process state, while a durable Project
+  execution may be recovered by hydrating its stable trusted session binding.
 
 ## Resolution in the ChatGPT-only contract
 
 | Audit concern | Current resolution |
 | --- | --- |
-| Ambiguous multi-account/principal behavior | One hidden local Owner with multiple concurrent OAuth grants. Each bearer is isolated by client, grant, authorization epoch, scopes, and approved Projects without storing ChatGPT account/conversation IDs. |
-| Host metadata treated as optional compatibility hints | Account and conversation metadata were removed; every call uses the active OAuth bearer grant. |
-| Transport recovery conflated with conversation recovery | Durable grant-bound `executionRef` values handle transport recovery. Private grant-profile Threads and bounded checkpoints provide explicit cross-conversation continuity without persisting ChatGPT identity or full transcripts. |
-| Model-provided absolute paths and implicit current state | `list_projects` returns opaque approved references; `project_control` uses explicit lifecycle actions and opaque Thread/execution references; every Project tool explicitly carries `executionRef`. |
-| Large public lifecycle/tool vocabulary | The public vocabulary remains exactly eleven names: `list_projects`, `project_control`, `save_progress`, `read_files`, `inspect`, `skills`, `apply_patch`, `show_changes`, optional `exec_command`, `write_stdin`, and `read_process_output`. |
+| Ambiguous multi-account/principal behavior | One hidden local Owner with multiple concurrent OAuth grants. Each bearer is isolated by client, grant, authorization epoch, scopes, and approved Projects; anonymous host IDs are stored only as HMAC-derived references for private Actor/session continuity. |
+| Host metadata treated as optional compatibility hints | Trusted Actor/session references key private Thread UX and implicit execution selection, while every authorization decision still revalidates the active OAuth bearer grant and approved Project. Missing session metadata fails closed for model Project tools. |
+| Transport recovery conflated with conversation recovery | A durable server-held execution binding keyed by exact session+Actor handles stable-session transport recovery. Project-level saved Tasks support explicit cross-conversation or reauthorization continuity without persisting full transcripts. |
+| Model-provided absolute paths and implicit current state | `list_projects` returns opaque approved Project/Task references; model-visible `project_control` explicitly opens, resumes, hydrates, or interrupts; subsequent Project tools omit execution identity and resolve only the trusted session+Actor selection. |
+| Large public lifecycle/tool vocabulary | Raw `tools/list` has 12 names, but App-only `project_thread_control` owns Actor-private Thread discovery/status/activity/lifecycle actions and is hidden from the 11-tool model surface. |
 | Eager instruction and Skill context | `project_control` returns compact root instruction pages without the Skill catalog. Target tools return only newly applicable instruction deltas; `skills` lazily searches and loads one selected Skill. |
 | Ambiguous process polling | `write_stdin` is mutation-only and requires `operationId`. Live polling belongs to read-only `read_process_output`. |
-| Continuations requiring the model to reconstruct query state | Signed continuation cursors retain query state; continuation calls pass the same `executionRef` plus the cursor. |
+| Continuations requiring the model to reconstruct query state | Signed continuation cursors retain query state; continuation calls use the cursor under the same trusted session+Actor selection. |
 | Command policy described as a security boundary | `process:execute` is explicit opt-in. Commands have the full file and network authority of the DevSpace OS user; there is no process sandbox or per-command network policy. |
 | Overstated process cleanup | Shutdown and interrupt provide best-effort coverage only for process groups DevSpace started and still tracks. Detached or untracked descendants may survive. |
 | Concurrent conversations sharing mutable files | Checkout Threads may deliberately share the approved Project directory. An explicit managed-worktree mode provides one writable worktree per active Thread; dirty worktrees are never removed automatically. |
@@ -80,9 +81,9 @@ The resolved public contract does not remove the underlying host risks:
 - use a dedicated OS account, container, or VM when stronger isolation is
   required;
 - rescan or rebuild the ChatGPT App after tool-schema changes;
-- preserve the relevant `executionRef` for transport recovery; use an explicit
-  private `threadRef` to continue semantic work in another conversation under
-  the same grant profile;
+- hydrate the stable trusted session binding for transport recovery; explicitly
+  open or select `tasks[].taskRef` from `list_projects` when the binding is
+  missing/stale or for cross-conversation work;
 - use managed worktree mode only for a Git top-level Project and review or hand
   off dirty changes before closing the Thread.
 

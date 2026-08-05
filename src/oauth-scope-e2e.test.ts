@@ -28,6 +28,10 @@ const tokens = {
   full: "oauth-scope-full-token",
 };
 const execFileAsync = promisify(execFile);
+const readHostMeta = hostMeta("read");
+const writeHostMeta = hostMeta("write");
+const processHostMeta = hostMeta("process");
+const fullHostMeta = hostMeta("full");
 
 await mkdir(workspaceRoot, { recursive: true });
 await writeFile(join(workspaceRoot, "payload.txt"), "scope-ready\n");
@@ -82,6 +86,7 @@ try {
   for (const name of [
     "list_projects",
     "project_control",
+    "project_thread_control",
     "skills",
     "read_files",
     "inspect",
@@ -139,17 +144,19 @@ try {
   const readOpen = await readClient.callTool({
     name: "project_control",
     arguments: { action: "open", operationId: "read-scope-execution" },
+    _meta: readHostMeta,
   });
   assertSucceeded(readOpen);
   assertNoWorkspaceProtocol(readOpen);
-  const readExecutionRef = projectExecutionRef(readOpen);
   assertSucceeded(await readClient.callTool({
     name: "read_files",
-    arguments: { executionRef: readExecutionRef, files: [{ path: "payload.txt" }] },
+    arguments: { files: [{ path: "payload.txt" }] },
+    _meta: readHostMeta,
   }));
   const readOnlyChangePreview = await readClient.callTool({
     name: "show_changes",
-    arguments: { executionRef: readExecutionRef },
+    arguments: { source: "repository" },
+    _meta: readHostMeta,
   });
   assertSucceeded(readOnlyChangePreview);
   assert.ok(
@@ -170,10 +177,12 @@ try {
       ifMatch: { "read-denied.txt": null },
       patch: "*** Begin Patch\n*** Add File: read-denied.txt\n+denied\n*** End Patch",
     },
+    _meta: readHostMeta,
   }), "apply_patch");
   assertInvalidInput(await readClient.callTool({
     name: "project_control",
     arguments: { legacyWorkspaceChoice: "unsupported" },
+    _meta: readHostMeta,
   }));
   seedToken(tokens.write, ["project:read", "project:write"]);
   const writeClient = await connect("scope-write", tokens.write);
@@ -185,22 +194,23 @@ try {
   const writeOpen = await writeClient.callTool({
     name: "project_control",
     arguments: { action: "open", operationId: "write-scope-execution" },
+    _meta: writeHostMeta,
   });
   assertSucceeded(writeOpen);
   assertNoWorkspaceProtocol(writeOpen);
-  const writeExecutionRef = projectExecutionRef(writeOpen);
   assertSucceeded(await writeClient.callTool({
     name: "apply_patch",
     arguments: {
-      executionRef: writeExecutionRef,
       operationId: "write-scope-patch",
       ifMatch: { "write-ok.txt": null },
       patch: "*** Begin Patch\n*** Add File: write-ok.txt\n+ok\n*** End Patch",
     },
+    _meta: writeHostMeta,
   }));
   const writePreview = await writeClient.callTool({
     name: "show_changes",
-    arguments: { executionRef: writeExecutionRef },
+    arguments: { source: "repository" },
+    _meta: writeHostMeta,
   });
   assertSucceeded(writePreview);
   assert.equal(
@@ -223,6 +233,7 @@ try {
       program: process.execPath,
       args: ["-e", "console.log('denied')"],
     },
+    _meta: writeHostMeta,
   }), "exec_command");
 
   seedToken(tokens.process, [
@@ -237,6 +248,7 @@ try {
   const processOpen = await processClient.callTool({
     name: "project_control",
     arguments: { action: "open", operationId: "process-scope-execution" },
+    _meta: processHostMeta,
   });
   assertSucceeded(processOpen);
   await assertToolUnavailable(processClient.callTool({
@@ -246,6 +258,7 @@ try {
       program: process.execPath,
       args: ["-e", "console.log('write required')"],
     },
+    _meta: processHostMeta,
   }), "exec_command");
 
   seedToken(tokens.full, [...DEVSPACE_CAPABILITY_SCOPES]);
@@ -254,18 +267,18 @@ try {
     const opened = await client.callTool({
       name: "project_control",
       arguments: { action: "open", operationId: `${name}-execution` },
+      _meta: fullHostMeta,
     });
     assertSucceeded(opened);
     assertNoWorkspaceProtocol(opened);
-    const executionRef = projectExecutionRef(opened);
     assertSucceeded(await client.callTool({
       name: "exec_command",
       arguments: {
-        executionRef,
         operationId: `${name}-exec`,
         program: process.execPath,
         args: ["-e", "console.log('scope-ok')"],
       },
+      _meta: fullHostMeta,
     }));
   }
 } finally {
@@ -335,19 +348,15 @@ function assertNoWorkspaceProtocol(
 ): void {
   const serialized = JSON.stringify(result.structuredContent ?? {});
   assert.doesNotMatch(serialized, /workspace|receipt|continuation|contextChanged|phase/iu);
+  assert.doesNotMatch(serialized, /executionRef/u);
   assert.match(serialized, /"project"/u);
 }
 
-function projectExecutionRef(
-  result: Awaited<ReturnType<Client["callTool"]>>,
-): string {
-  const executionRef = String(
-    (result.structuredContent as {
-      project?: { executionRef?: unknown };
-    } | undefined)?.project?.executionRef ?? "",
-  );
-  assert.match(executionRef, /^pex1_/u);
-  return executionRef;
+function hostMeta(scope: string): Readonly<Record<string, string>> {
+  return {
+    "openai/subject": `oauth-scope-${scope}-subject`,
+    "openai/session": `oauth-scope-${scope}-session`,
+  };
 }
 
 function assertSucceeded(result: Awaited<ReturnType<Client["callTool"]>>): void {
