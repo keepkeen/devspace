@@ -106,7 +106,7 @@ try {
   });
   assertSucceeded(savedByA);
   const threadRef = String(
-    (savedByA.structuredContent as {
+    (savedByA._meta as {
       thread?: { threadRef?: unknown };
     } | undefined)?.thread?.threadRef ?? "",
   );
@@ -142,6 +142,68 @@ try {
     } | undefined)?.task?.version,
     2,
   );
+
+  const globalProjectsVisibleToC = await accountC.callTool({
+    name: "list_projects",
+    arguments: {},
+  });
+  assertSucceeded(globalProjectsVisibleToC);
+  const globalCSerialized = JSON.stringify(globalProjectsVisibleToC.structuredContent);
+  assert.equal(globalCSerialized.includes(projectRef), false);
+  assert.equal(globalCSerialized.includes(savedTaskRef), false);
+  assert.equal(globalCSerialized.includes("Shared Project task"), false);
+  assert.deepEqual(
+    (globalProjectsVisibleToC.structuredContent as {
+      projects?: Array<{
+        projectRef?: unknown;
+        resumableTaskCount?: unknown;
+        tasks?: unknown;
+      }>;
+    } | undefined)?.projects,
+    [{
+      projectRef: otherProjectRef,
+      label: "other-project",
+      resumableTaskCount: 0,
+    }],
+  );
+
+  const scopedOtherProjectVisibleToC = await accountC.callTool({
+    name: "list_projects",
+    arguments: { projectRef: otherProjectRef },
+  });
+  assertSucceeded(scopedOtherProjectVisibleToC);
+  const scopedCSerialized = JSON.stringify(scopedOtherProjectVisibleToC.structuredContent);
+  assert.equal(scopedCSerialized.includes(projectRef), false);
+  assert.equal(scopedCSerialized.includes(savedTaskRef), false);
+  assert.equal(scopedCSerialized.includes("Shared Project task"), false);
+  assert.deepEqual(
+    (scopedOtherProjectVisibleToC.structuredContent as {
+      projects?: Array<{
+        projectRef?: unknown;
+        resumableTaskCount?: unknown;
+        tasks?: unknown[];
+      }>;
+    } | undefined)?.projects,
+    [{
+      projectRef: otherProjectRef,
+      label: "other-project",
+      resumableTaskCount: 0,
+      tasks: [],
+    }],
+  );
+
+  const unauthorizedSharedProjectList = await accountC.callTool({
+    name: "list_projects",
+    arguments: { projectRef },
+  });
+  assertErrorCode(unauthorizedSharedProjectList, "project_not_authorized");
+  const unauthorizedCSerialized = JSON.stringify({
+    content: unauthorizedSharedProjectList.content,
+    structuredContent: unauthorizedSharedProjectList.structuredContent,
+  });
+  assert.equal(unauthorizedCSerialized.includes(savedTaskRef), false);
+  assert.equal(unauthorizedCSerialized.includes("Shared Project task"), false);
+  assert.equal(unauthorizedCSerialized.includes("resumableTaskCount"), false);
 
   const projectHandoffsVisibleToB = await accountB.callTool({
     name: "list_projects",
@@ -189,7 +251,7 @@ try {
     },
     _meta: accountBHostMeta,
   });
-  assertErrorCode(resumedByB, "project_thread_not_found");
+  assertErrorCode(resumedByB, "invalid_tool_input");
   const resumedHandoffByB = await accountB.callTool({
     name: "project_control",
     arguments: {
@@ -203,7 +265,7 @@ try {
   assertSucceeded(resumedHandoffByB);
   assert.doesNotMatch(JSON.stringify(resumedHandoffByB.structuredContent), /executionRef/u);
   const resumedThreadRefB = String(
-    (resumedHandoffByB.structuredContent as {
+    (resumedHandoffByB._meta as {
       thread?: { threadRef?: unknown };
     } | undefined)?.thread?.threadRef ?? "",
   );
@@ -311,7 +373,7 @@ try {
   });
   assertSucceeded(overflowExecution);
   const overflowThreadRef = String(
-    (overflowExecution.structuredContent as {
+    (overflowExecution._meta as {
       thread?: { threadRef?: unknown };
     } | undefined)?.thread?.threadRef ?? "",
   );
@@ -385,7 +447,7 @@ try {
       },
       _meta: accountCHostMeta,
     }),
-    "project_thread_not_found",
+    "invalid_tool_input",
   );
   assertErrorCode(
     await accountC.callTool({
@@ -569,9 +631,9 @@ function hostMeta(account: string, session: string): Readonly<Record<string, str
 function changeSource(
   result: Awaited<ReturnType<Client["callTool"]>>,
 ): unknown {
-  return (result.structuredContent as {
-    changeSource?: unknown;
-  } | undefined)?.changeSource;
+  return (result._meta as {
+    card?: { changeSource?: unknown };
+  } | undefined)?.card?.changeSource;
 }
 
 function changeFileCount(

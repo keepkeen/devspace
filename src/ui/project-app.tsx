@@ -23,6 +23,7 @@ import {
   getToolDisplay,
   getToolHeaderSummary,
   newProjectTaskMessage,
+  projectListTruncationMessage,
   projectThreadListCall,
   projectThreadMutationCall,
   resumeProjectTaskMessage,
@@ -198,11 +199,12 @@ function renderProjectPicker(projectCard: ProjectListCard): void {
   }
   section.append(projects);
 
-  if (projectCard.truncated) {
+  const truncationMessage = projectListTruncationMessage(projectCard);
+  if (truncationMessage) {
     section.append(element("div", {
       className: "picker-notice",
       role: "status",
-      text: "Only the most recently updated resumable tasks are shown.",
+      text: truncationMessage,
     }));
   }
   if (deliveryStatus) {
@@ -258,7 +260,14 @@ function renderProjectSection(
     className: "handoff-list",
     ariaLabel: `Saved tasks for ${project.label}`,
   });
-  if (project.tasks.length === 0) {
+  if (project.tasks === undefined) {
+    tasks.append(element("p", {
+      className: "no-handoffs",
+      text: project.resumableTaskCount === 0
+        ? "No resumable saved tasks."
+        : `${project.resumableTaskCount} resumable saved task${project.resumableTaskCount === 1 ? "" : "s"}; select this Project in chat to load them.`,
+    }));
+  } else if (project.tasks.length === 0) {
     tasks.append(element("p", {
       className: "no-handoffs",
       text: "No resumable saved tasks.",

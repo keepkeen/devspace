@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { authorizationRootId } from "./authorization-roots.js";
+import { AuditEventStore, type AuditEventQuery } from "./audit-events.js";
 import { loadConfig } from "./config.js";
 import { DEVSPACE_CAPABILITY_SCOPES } from "./oauth-scopes.js";
 import { SqliteOAuthClientsStore, SqliteOAuthStore } from "./oauth-store.js";
@@ -97,13 +98,13 @@ try {
   });
   assertSucceeded(subjectSelection);
   const subjectThreadRef = String(
-    (subjectSelection.structuredContent as {
+    (subjectSelection._meta as {
       thread?: { threadRef?: unknown };
     } | undefined)?.thread?.threadRef ?? "",
   );
   assert.match(subjectThreadRef, /^pth1_/u);
 
-  assertSucceeded(await first.callTool({
+  const subjectCommand = await first.callTool({
     name: "exec_command",
     arguments: {
       operationId: "subject-command-checkpoint",
@@ -111,7 +112,149 @@ try {
       args: ["-e", "console.log('subject-command-ok')"],
     },
     _meta: subjectMeta,
-  }));
+  });
+  assertSucceeded(subjectCommand);
+  const subjectToolCall = queryAudit({ event: "tool_call", tool: "exec_command" })[0];
+  assert.equal(subjectToolCall?.details.commandMode, "program");
+  assert.equal(subjectToolCall?.details.outcome, "exited");
+  assert.equal(subjectToolCall?.details.exitCode, 0);
+  assert.equal(subjectToolCall?.details.timedOut, false);
+  assert.equal(typeof subjectToolCall?.details.durationMs, "number");
+  const subjectTerminal = queryAudit({
+    event: "command_execution_terminal",
+    tool: "exec_command",
+  })[0];
+  assert.equal(subjectTerminal?.details.commandMode, "program");
+  assert.equal(subjectTerminal?.details.outcome, "exited");
+  assert.equal(subjectTerminal?.details.exitCode, 0);
+  assert.equal(subjectTerminal?.details.timedOut, false);
+  assert.equal(typeof subjectTerminal?.details.durationMs, "number");
+  assert.equal("sessionId" in (subjectTerminal ?? {}), false);
+  assert.equal("outputId" in (subjectTerminal ?? {}), false);
+  assert.equal("operationId" in (subjectTerminal ?? {}), false);
+
+  const asyncSubjectCommand = await first.callTool({
+    name: "exec_command",
+    arguments: {
+      operationId: "subject-async-terminal-checkpoint",
+      program: process.execPath,
+      args: ["-e", "console.log('async-output'); setInterval(() => {}, 1000)"],
+      timeoutMs: 1_300,
+    },
+    _meta: subjectMeta,
+  });
+  assertSucceeded(asyncSubjectCommand);
+  assert.equal(
+    (asyncSubjectCommand.structuredContent as { status?: unknown } | undefined)?.status,
+    "running",
+  );
+  let asyncCheckpoint: Record<string, unknown> | undefined;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const status = await first.callTool({
+      name: "project_thread_control",
+      arguments: { action: "status", threadRef: subjectThreadRef },
+      _meta: subjectMeta,
+    });
+    assertSucceeded(status);
+    const checkpoint = (status.structuredContent as {
+      thread?: { checkpoint?: { observedState?: Record<string, unknown> } };
+    } | undefined)?.thread?.checkpoint?.observedState;
+    if (checkpoint?.outcome === "timed_out") {
+      asyncCheckpoint = checkpoint;
+      break;
+    }
+    await new Promise((resolveWait) => setTimeout(resolveWait, 25));
+  }
+  assert.equal(asyncCheckpoint?.commandMode, "program");
+  assert.equal(asyncCheckpoint?.workingDirectory, ".");
+  assert.equal(asyncCheckpoint?.outcome, "timed_out");
+  assert.equal(asyncCheckpoint?.timedOut, true);
+  assert.equal(typeof asyncCheckpoint?.wallTimeMs, "number");
+  assert.equal(asyncCheckpoint?.outputRetained, true);
+  assert.equal(asyncCheckpoint?.outputPartiallyLost, false);
+  assert.equal(asyncCheckpoint?.outputUnavailable, false);
+  const resumedTransport = await connect(active.origin, "subject-async-resume");
+  const resumedAfterAsyncTerminal = await resumedTransport.callTool({
+    name: "project_control",
+    arguments: { action: "hydrate" },
+    _meta: subjectMeta,
+  });
+  assertSucceeded(resumedAfterAsyncTerminal);
+  const resumedObservedState = (resumedAfterAsyncTerminal.structuredContent as {
+    checkpoint?: { serverObserved?: Record<string, unknown> };
+  } | undefined)?.checkpoint?.serverObserved;
+  assert.equal(resumedObservedState?.outcome, "timed_out");
+  assert.equal(resumedObservedState?.timedOut, true);
+  assert.equal(resumedObservedState?.outputRetained, true);
+  assert.doesNotMatch(
+    JSON.stringify(resumedObservedState),
+    /sessionId|outputId|eventKey|itemId|threadId|profileId/u,
+  );
+
+  const spawnCanary = "devspace-e2e-spawn-canary-2c81b7";
+  const capturedConsole: string[] = [];
+  const originalConsole = {
+    log: console.log,
+    warn: console.warn,
+    error: console.error,
+  };
+  config.logging.level = "info";
+  console.log = (...values: unknown[]) => capturedConsole.push(values.join(" "));
+  console.warn = (...values: unknown[]) => capturedConsole.push(values.join(" "));
+  console.error = (...values: unknown[]) => capturedConsole.push(values.join(" "));
+  let spawnFailure: Awaited<ReturnType<Client["callTool"]>>;
+  try {
+    spawnFailure = await first.callTool({
+      name: "exec_command",
+      arguments: {
+        operationId: "subject-command-spawn-failure",
+        program: spawnCanary,
+        args: ["--canary-secret-argument"],
+      },
+      _meta: subjectMeta,
+    });
+  } finally {
+    config.logging.level = "silent";
+    console.log = originalConsole.log;
+    console.warn = originalConsole.warn;
+    console.error = originalConsole.error;
+  }
+  assert.equal(spawnFailure.isError, true);
+  const spawnStructured = spawnFailure.structuredContent as {
+    status?: unknown;
+    commandExecuted?: unknown;
+    error?: { code?: unknown; operationId?: unknown; phase?: unknown; effectsKnown?: unknown };
+    operation?: { phase?: unknown; effectsKnown?: unknown };
+  } | undefined;
+  assert.equal(spawnStructured?.status, "exited");
+  assert.equal(spawnStructured?.commandExecuted, false);
+  assert.equal(spawnStructured?.error?.code, "command_spawn_failed");
+  assert.equal(spawnStructured?.error?.operationId, "subject-command-spawn-failure");
+  assert.equal(spawnStructured?.error?.phase, "not_started");
+  assert.equal(spawnStructured?.error?.effectsKnown, true);
+  assert.equal(spawnStructured?.operation, undefined);
+  const spawnToolCall = queryAudit({ event: "tool_call", tool: "exec_command" })[0];
+  assert.equal(spawnToolCall?.errorCode, "ENOENT");
+  assert.equal(spawnToolCall?.errorCategory, "process_spawn");
+  assert.equal(spawnToolCall?.details.success, false);
+  assert.equal(spawnToolCall?.details.phase, "spawn");
+  assert.equal(spawnToolCall?.details.outcome, "spawn_failed");
+  const spawnTerminal = queryAudit({
+    event: "command_execution_terminal",
+    tool: "exec_command",
+  })[0];
+  assert.equal(spawnTerminal?.errorCode, "ENOENT");
+  assert.equal(spawnTerminal?.errorCategory, "process_spawn");
+  assert.equal(spawnTerminal?.details.success, false);
+  assert.equal(spawnTerminal?.details.phase, "spawn");
+  assert.equal(spawnTerminal?.details.outcome, "spawn_failed");
+  assert.equal(
+    queryAudit({ event: "command_execution_terminal", tool: "exec_command" })
+      .filter((entry) => entry.errorCode === "ENOENT").length,
+    1,
+  );
+  assert.doesNotMatch(JSON.stringify(queryAudit({ limit: 1_000 })), /2c81b7|canary-secret-argument/u);
+  assert.doesNotMatch(capturedConsole.join("\n"), /2c81b7|canary-secret-argument/u);
   assertThreadCheckpoint(
     await first.callTool({
       name: "project_thread_control",
@@ -275,14 +418,14 @@ try {
   });
   assertSucceeded(secondSelection);
   assert.doesNotMatch(JSON.stringify(secondSelection.structuredContent), /executionRef/u);
-  assertSucceeded(await newConversation.callTool({
+  assertErrorCode(await newConversation.callTool({
     name: "read_files",
     arguments: {
       executionRef: "pex1_caller-supplied-override-must-be-ignored",
       files: [{ path: "payload.txt" }],
     },
     _meta: parallelMeta,
-  }));
+  }), "invalid_tool_input");
   const sharedRead = await newConversation.callTool({
     name: "read_files",
     arguments: {
@@ -320,7 +463,7 @@ try {
     arguments: {},
     _meta: mainMeta,
   });
-  assertErrorCode(missingSource, "invalid_tool_input");
+  assertErrorCode(missingSource, "diff_fields_invalid");
   const unavailableRepository = await reconnected.callTool({
     name: "show_changes",
     arguments: { source: "repository" },
@@ -331,6 +474,17 @@ try {
     JSON.stringify(unavailableRepository.structuredContent),
     /apply_patch_history/u,
   );
+  const invalidHistoryCursor = await reconnected.callTool({
+    name: "show_changes",
+    arguments: { cursor: "not-a-signed-diff-cursor" },
+    _meta: mainMeta,
+  });
+  assertDiffRestart(invalidHistoryCursor, "invalid_diff_cursor");
+  assertSucceeded(await reconnected.callTool({
+    name: "show_changes",
+    arguments: { source: "apply_patch_history" },
+    _meta: mainMeta,
+  }));
   const firstHistory = await reconnected.callTool({
     name: "show_changes",
     arguments: { source: "apply_patch_history" },
@@ -338,7 +492,8 @@ try {
   });
   assertSucceeded(firstHistory);
   assert.equal(
-    (firstHistory.structuredContent as { changeSource?: unknown }).changeSource,
+    ((firstHistory._meta as { card?: { changeSource?: unknown } } | undefined)?.card)
+      ?.changeSource,
     "apply_patch_history",
   );
   const firstHistorySerialized = JSON.stringify(firstHistory.structuredContent);
@@ -355,18 +510,24 @@ try {
     }).diff?.nextCursor ?? "",
   );
   assert.ok(historyCursor, "the large apply-patch history must produce a continuation cursor");
-  const changedSourceContinuation = await reconnected.callTool({
+  const repeatedSourceContinuation = await reconnected.callTool({
     name: "show_changes",
     arguments: { source: "repository", cursor: historyCursor },
     _meta: mainMeta,
   });
-  assertErrorCode(changedSourceContinuation, "diff_cursor_stale");
+  assertErrorCode(repeatedSourceContinuation, "diff_fields_invalid");
   assertSucceeded(await reconnected.callTool({
     name: "show_changes",
-    arguments: { source: "apply_patch_history", cursor: historyCursor },
+    arguments: { cursor: historyCursor },
     _meta: mainMeta,
   }));
 
+  const staleHistoryCursor = await newConversation.callTool({
+    name: "show_changes",
+    arguments: { cursor: historyCursor },
+    _meta: parallelMeta,
+  });
+  assertDiffRestart(staleHistoryCursor, "diff_cursor_stale", "apply_patch_history");
   const secondHistory = await newConversation.callTool({
     name: "show_changes",
     arguments: { source: "apply_patch_history" },
@@ -540,6 +701,31 @@ function assertErrorCode(
   );
 }
 
+function assertDiffRestart(
+  result: Awaited<ReturnType<Client["callTool"]>>,
+  code: string,
+  source?: "repository" | "apply_patch_history",
+): void {
+  assertErrorCode(result, code);
+  const error = (result.structuredContent as {
+    error?: {
+      recovery?: unknown;
+      source?: unknown;
+      requiresSource?: unknown;
+      omitCursor?: unknown;
+    };
+  } | undefined)?.error;
+  assert.equal(error?.recovery, "restart_diff_paging_with_source");
+  assert.equal(error?.omitCursor, true);
+  if (source) {
+    assert.equal(error?.source, source);
+    assert.match(toolText(result), new RegExp(`source=${source}`, "u"));
+  } else {
+    assert.equal(error?.requiresSource, true);
+    assert.match(toolText(result), /explicit source and no cursor/u);
+  }
+}
+
 function assertThreadCheckpoint(
   result: Awaited<ReturnType<Client["callTool"]>>,
   threadRef: string,
@@ -567,6 +753,15 @@ function toolText(result: Awaited<ReturnType<Client["callTool"]>>): string {
 
 function hashToken(token: string): string {
   return createHash("sha256").update(token).digest("base64url");
+}
+
+function queryAudit(query: AuditEventQuery) {
+  const store = new AuditEventStore(stateDir);
+  try {
+    return store.query(query);
+  } finally {
+    store.close();
+  }
 }
 
 function escapeRegExp(value: string): string {

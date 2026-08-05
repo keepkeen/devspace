@@ -103,6 +103,16 @@ try {
     operationId: "patch-a",
     payload: { files: 2 },
   });
+  for (const operationId of ["a".repeat(129), `${"界".repeat(42)}abc`, "nul\0id"]) {
+    assert.throws(() => store.appendEvent({
+      threadId: "thread-a",
+      type: "patch_applied",
+      source: "server",
+      trust: "server_observed",
+      operationId,
+      payload: {},
+    }), /operationId must be/u);
+  }
   assert.equal(first.sequence, 1);
   assert.equal(store.appendEvent({
     threadId: "thread-a",

@@ -39,7 +39,7 @@ import {
   InvalidPatchError,
   preparePatch,
 } from "./apply-patch.js";
-import { readFileVersion, type FileVersion } from "./file-version.js";
+import { FILE_MTIME_NS_PATTERN, readFileVersion, type FileVersion } from "./file-version.js";
 import { loadConfig, type ServerConfig, type WidgetMode } from "./config.js";
 import {
   logEvent,
@@ -89,8 +89,11 @@ import {
 } from "./mcp-sessions.js";
 import {
   MAX_PROCESS_INPUT_BYTES,
+  ProcessSpawnError,
   ProcessSessionManager,
   UnknownProcessSessionError,
+  safeProcessSignal,
+  type ProcessCommandMode,
   type ProcessSnapshot,
 } from "./process-sessions.js";
 import {
@@ -116,6 +119,7 @@ import {
   type MutationOperationKey,
   type MutationOperationSettlementOptions,
 } from "./mutation-operation-store.js";
+import { isValidOperationId, operationIdSchema } from "./operation-id.js";
 import {
   formatAgentsPath,
   InstructionBudgetError,
@@ -166,11 +170,10 @@ import {
 import { devspaceConfigPath } from "./user-config.js";
 import {
   createProjectContextDelta,
-  PROJECT_CONTEXT_SCHEMA_VERSION,
   serializeProjectContext,
+  type ProjectCheckpointContext,
   type ProjectExecutionRecord,
   type ProjectInstructionItem,
-  type ProjectThreadContext,
 } from "./project-context-protocol.js";
 import {
   ProjectExecutionStore,
@@ -187,7 +190,6 @@ import {
   MAX_PROJECT_HANDOFF_PROGRESS_UTF8_BYTES,
   MAX_PROJECT_HANDOFF_TITLE_UTF8_BYTES,
   MAX_RESUMABLE_PROJECT_HANDOFFS,
-  MAX_LISTED_PROJECT_HANDOFFS,
   ProjectHandoffStore,
   projectHandoffModelTextJsonBytes,
   type ProjectHandoff,
@@ -300,6 +302,15 @@ interface PublicToolError {
   effectsKnown?: boolean;
   operationId?: string;
   details?: Record<string, unknown>;
+}
+
+interface StructuredToolError extends Record<string, unknown> {
+  code: string;
+  safeToRetry: boolean;
+  recovery: string;
+  operationId?: string;
+  phase?: OperationPhase;
+  effectsKnown?: boolean;
 }
 
 type OperationPhase = "not_started" | "committed" | "outcome_unknown";
@@ -465,11 +476,18 @@ function publicToolError(error: unknown, toolName: string): PublicToolError | un
   if (error instanceof ReviewPagingExpiredError) {
     return {
       code: "diff_paging_expired",
-      text: "diff_paging_expired: The reviewed diff is no longer retained; repeat show_changes without a cursor to start a new page sequence.",
+      text:
+        "diff_paging_expired: The reviewed diff is no longer retained; restart " +
+        `show_changes with source=${error.source} and no cursor.`,
       retryable: true,
       safeToRetry: true,
-      recovery: "restart_diff_paging",
+      recovery: "restart_diff_paging_with_source",
       phase: "not_started",
+      effectsKnown: true,
+      details: {
+        source: error.source,
+        omitCursor: true,
+      },
     };
   }
   if (error instanceof RepositoryReviewUnavailableError) {
@@ -587,7 +605,10 @@ function publicToolError(error: unknown, toolName: string): PublicToolError | un
   return undefined;
 }
 
-function structuredToolError(error: PublicToolError) {
+function structuredToolError(
+  error: PublicToolError,
+  options: { mutation?: boolean } = {},
+): StructuredToolError {
   const defaults = error.code === "instructions_required"
     ? {
         retryable: true,
@@ -616,15 +637,20 @@ function structuredToolError(error: PublicToolError) {
         phase: "not_started" as const,
       };
   const phase = error.phase ?? defaults.phase;
-  return {
+  const common = {
     code: error.code,
-    retryable: error.retryable ?? defaults.retryable,
     safeToRetry: error.safeToRetry ?? defaults.safeToRetry,
     recovery: error.recovery ?? defaults.recovery,
-    phase,
-    effectsKnown: error.effectsKnown ?? phase !== "outcome_unknown",
     ...(error.details ?? {}),
   };
+  return options.mutation
+    ? {
+        ...common,
+        ...(error.operationId ? { operationId: error.operationId } : {}),
+        phase,
+        effectsKnown: error.effectsKnown ?? phase !== "outcome_unknown",
+      }
+    : common;
 }
 
 function retainedStructuredToolErrorDetails(
@@ -660,7 +686,89 @@ function retainedStructuredToolErrorDetails(
   if (error.requiresNewOperationId === true) {
     details.requiresNewOperationId = true;
   }
+  if (typeof error.path === "string" && error.path.length >= 1 && error.path.length <= 4_096) {
+    details.path = error.path;
+  }
+  if (typeof error.source === "string" && error.source.length >= 1 && error.source.length <= 128) {
+    details.source = error.source;
+  }
+  if (error.omitCursor === true) {
+    details.omitCursor = true;
+  }
+  if (error.requiresSource === true) {
+    details.requiresSource = true;
+  }
+  if (
+    typeof error.limitingFactor === "string" &&
+    error.limitingFactor.length >= 1 &&
+    error.limitingFactor.length <= 128
+  ) {
+    details.limitingFactor = error.limitingFactor;
+  }
   return Object.keys(details).length > 0 ? details : undefined;
+}
+
+function isMutationToolInput(toolName: string, input: unknown): boolean {
+  if (
+    toolName === "apply_patch" ||
+    toolName === "exec_command" ||
+    toolName === "write_stdin" ||
+    toolName === "save_progress"
+  ) return true;
+  const action = input && typeof input === "object" && !Array.isArray(input)
+    ? (input as { action?: unknown }).action
+    : undefined;
+  if (toolName === "project_control") {
+    return action === "open" || action === "resume" || action === "interrupt";
+  }
+  return toolName === "project_thread_control" &&
+    (action === "pause" || action === "archive" || action === "complete" || action === "close");
+}
+
+function canonicalizeToolErrorResult<T>(
+  value: T,
+  options: { mutation: boolean; operationId?: string },
+): T {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const record = value as Record<string, unknown>;
+  const existingStructured = record.structuredContent &&
+      typeof record.structuredContent === "object" &&
+      !Array.isArray(record.structuredContent)
+    ? record.structuredContent as Record<string, unknown>
+    : {};
+  const existingError = existingStructured.error &&
+      typeof existingStructured.error === "object" &&
+      !Array.isArray(existingStructured.error)
+    ? existingStructured.error as Record<string, unknown>
+    : {};
+  const details = retainedStructuredToolErrorDetails(existingError);
+  const error = structuredToolError({
+    code: typeof existingError.code === "string" ? existingError.code : "tool_rejected",
+    text: "",
+    ...(typeof existingError.safeToRetry === "boolean"
+      ? { safeToRetry: existingError.safeToRetry }
+      : {}),
+    ...(typeof existingError.recovery === "string" ? { recovery: existingError.recovery } : {}),
+    ...(existingError.phase === "not_started" ||
+        existingError.phase === "committed" ||
+        existingError.phase === "outcome_unknown"
+      ? { phase: existingError.phase }
+      : {}),
+    ...(typeof existingError.effectsKnown === "boolean"
+      ? { effectsKnown: existingError.effectsKnown }
+      : {}),
+    ...(options.operationId
+      ? { operationId: options.operationId }
+      : typeof existingError.operationId === "string"
+        ? { operationId: existingError.operationId }
+        : {}),
+    ...(details ? { details } : {}),
+  }, { mutation: options.mutation });
+  const { ok: _ok, operation: _operation, ...remainingStructured } = existingStructured;
+  return {
+    ...record,
+    structuredContent: { ...remainingStructured, error },
+  } as T;
 }
 
 function operationEnvelope(
@@ -716,7 +824,7 @@ function operationSemanticsFromResult(value: unknown): Omit<OperationEnvelope, "
           ? { phase: error.phase }
           : {}),
         ...(typeof error.effectsKnown === "boolean" ? { effectsKnown: error.effectsKnown } : {}),
-      })
+      }, { mutation: true })
     : undefined;
   const phase = normalizedError?.phase ?? "committed";
   return {
@@ -748,6 +856,7 @@ const RELEASABLE_MUTATION_PREFLIGHT_CODES = new Set([
   "task_context_too_large",
   "handoff_revision_conflict",
   "project_task_revision_conflict",
+  "process_revision_conflict",
   "project_task_capacity",
   "review_confirmation_required",
   "invalid_review_token",
@@ -815,12 +924,17 @@ async function runMutationOperation<T>(options: {
         !Array.isArray(record.structuredContent)
       ? record.structuredContent as Record<string, unknown>
       : undefined;
-    return structured?.operation
-      ? replayed
-      : attachOperationEnvelope(
-          replayed,
-          operationEnvelope(options.key.operationId, "committed", false, true),
-        );
+    return structured?.error
+      ? canonicalizeToolErrorResult(replayed, {
+          mutation: true,
+          operationId: options.key.operationId,
+        })
+      : structured?.operation
+        ? replayed
+        : attachOperationEnvelope(
+            replayed,
+            operationEnvelope(options.key.operationId, "committed", false, true),
+          );
   }
   if (reservation.status === "conflict") {
     throw new PublicActionError(
@@ -895,12 +1009,28 @@ async function runMutationOperation<T>(options: {
       const value = await options.execute();
       if (releasableMutationPreflightCode(value)) {
         options.store.cancelPending(options.key, requestHash);
-        return attachOperationEnvelope(
-          value,
-          operationEnvelope(options.key.operationId, "not_started", true, true),
-        );
+        return canonicalizeToolErrorResult(value, {
+          mutation: true,
+          operationId: options.key.operationId,
+        });
       }
       const semantics = operationSemanticsFromResult(value);
+      if (
+        value && typeof value === "object" && !Array.isArray(value) &&
+        (value as { isError?: unknown }).isError === true
+      ) {
+        const errored = canonicalizeToolErrorResult(value, {
+          mutation: true,
+          operationId: options.key.operationId,
+        });
+        options.store.settle(
+          options.key,
+          requestHash,
+          errored,
+          options.settlementOptions?.(value),
+        );
+        return errored;
+      }
       const enveloped = attachOperationEnvelope(
         value,
         operationEnvelope(
@@ -923,27 +1053,18 @@ async function runMutationOperation<T>(options: {
         const structuredError = structuredToolError({
           ...knownFailure,
           operationId: options.key.operationId,
-        });
+        }, { mutation: true });
         const response = {
           content: [textBlock(knownFailure.text)],
           isError: true as const,
-          structuredContent: { ok: false, error: structuredError },
+          structuredContent: { error: structuredError },
         };
-        const enveloped = attachOperationEnvelope(
-          response,
-          operationEnvelope(
-            options.key.operationId,
-            structuredError.phase,
-            structuredError.safeToRetry,
-            structuredError.effectsKnown,
-          ),
-        );
         if (RELEASABLE_MUTATION_PREFLIGHT_CODES.has(knownFailure.code)) {
           options.store.cancelPending(options.key, requestHash);
         } else {
-          options.store.settle(options.key, requestHash, enveloped);
+          options.store.settle(options.key, requestHash, response);
         }
-        return enveloped as T;
+        return response as T;
       }
       options.store.markOutcomeUnknown(options.key, requestHash);
       throw new MutationExecutionError(options.key.operationId, error);
@@ -962,22 +1083,7 @@ export function isExpectedPiToolError(error: unknown): boolean {
   return code === "ENOENT" || code === "ENOTDIR" || code === "EISDIR";
 }
 
-const PROJECT_CONTEXT_TOOL_NAMES = new Set<string>([
-  "list_projects",
-  "project_control",
-  "project_thread_control",
-  "save_progress",
-]);
 const enabledToolsByServer = new WeakMap<McpServer, ReadonlySet<string>>();
-
-function attachToolContractVersion(
-  toolName: string,
-  structured: Record<string, unknown>,
-): Record<string, unknown> {
-  return PROJECT_CONTEXT_TOOL_NAMES.has(toolName)
-    ? { schemaVersion: PROJECT_CONTEXT_SCHEMA_VERSION, ...structured }
-    : structured;
-}
 
 // The MCP SDK validates tool input before the handler runs, so a schema failure
 // never reaches the wrapper that produces DevSpace's structured errors: the
@@ -1007,7 +1113,7 @@ function recordToolInputSchema(
   try {
     schemas.set(
       toolName,
-      isZodInputSchema(shape) ? shape : z.object(shape as z.ZodRawShape),
+      isZodInputSchema(shape) ? shape : z.strictObject(shape as z.ZodRawShape),
     );
   } catch {
     schemas.delete(toolName);
@@ -1057,6 +1163,12 @@ const registerAppTool: typeof registerSdkAppTool = ((...args: unknown[]) => {
   const barrier = toolHandlerBarriers.get(server);
   if (typeof handler === "function") {
     const invoke = async (handlerArgs: unknown[]) => {
+      const mutation = isMutationToolInput(toolName, handlerArgs[0]);
+      const inputOperationId = mutation && handlerArgs[0] &&
+          typeof handlerArgs[0] === "object" && !Array.isArray(handlerArgs[0]) &&
+          isValidOperationId((handlerArgs[0] as { operationId?: unknown }).operationId)
+        ? (handlerArgs[0] as { operationId: string }).operationId
+        : undefined;
       try {
         assertToolOAuthScopes(toolName);
         const result: unknown = await handler(...handlerArgs);
@@ -1066,51 +1178,9 @@ const registerAppTool: typeof registerSdkAppTool = ((...args: unknown[]) => {
           ? record._meta as Record<string, unknown>
           : {};
         if (record.isError === true) {
-          const existingStructured = record.structuredContent &&
-              typeof record.structuredContent === "object" &&
-              !Array.isArray(record.structuredContent)
-            ? record.structuredContent as Record<string, unknown>
-            : {};
-          const existingError = existingStructured.error &&
-              typeof existingStructured.error === "object" &&
-              !Array.isArray(existingStructured.error)
-            ? existingStructured.error as Record<string, unknown>
-            : {};
-          const code = typeof existingError.code === "string" ? existingError.code : "tool_rejected";
-          const retryable = typeof existingError.retryable === "boolean"
-            ? existingError.retryable
-            : undefined;
-          const safeToRetry = typeof existingError.safeToRetry === "boolean"
-            ? existingError.safeToRetry
-            : undefined;
-          const recovery = typeof existingError.recovery === "string"
-            ? existingError.recovery
-            : undefined;
-          const phase = existingError.phase === "not_started" ||
-              existingError.phase === "committed" ||
-              existingError.phase === "outcome_unknown"
-            ? existingError.phase
-            : undefined;
-          const effectsKnown = typeof existingError.effectsKnown === "boolean"
-            ? existingError.effectsKnown
-            : undefined;
-          const details = retainedStructuredToolErrorDetails(existingError);
-          const error = structuredToolError({
-            code,
-            text: "",
-            ...(retryable === undefined ? {} : { retryable }),
-            ...(safeToRetry === undefined ? {} : { safeToRetry }),
-            ...(recovery === undefined ? {} : { recovery }),
-            ...(phase === undefined ? {} : { phase }),
-            ...(effectsKnown === undefined ? {} : { effectsKnown }),
-            ...(details === undefined ? {} : { details }),
-          });
+          const canonical = canonicalizeToolErrorResult(record, { mutation }) as Record<string, unknown>;
           return {
-            ...record,
-            structuredContent: attachToolContractVersion(
-              toolName,
-              { ...existingStructured, ok: false, error },
-            ),
+            ...canonical,
             _meta: { ...meta, tool: toolName },
           };
         }
@@ -1123,7 +1193,7 @@ const registerAppTool: typeof registerSdkAppTool = ((...args: unknown[]) => {
           ...record,
           ...(structured
             ? {
-                structuredContent: attachToolContractVersion(toolName, structured),
+                structuredContent: structured,
               }
             : {}),
           _meta: { ...meta, tool: toolName },
@@ -1136,27 +1206,19 @@ const registerAppTool: typeof registerSdkAppTool = ((...args: unknown[]) => {
         if (publicError.code === "tool_failed") {
           toolErrorReporters.get(server)?.(toolName, error);
         }
-        const structuredError = structuredToolError(publicError);
+        const structuredError = structuredToolError({
+          ...publicError,
+          ...(publicError.operationId ?? inputOperationId
+            ? { operationId: publicError.operationId ?? inputOperationId }
+            : {}),
+        }, { mutation });
         const result = {
           content: [{ type: "text" as const, text: publicError.text }],
           isError: true,
-          structuredContent: attachToolContractVersion(
-            toolName,
-            { ok: false, error: structuredError },
-          ),
+          structuredContent: { error: structuredError },
           _meta: { tool: toolName },
         };
-        return publicError.operationId
-          ? attachOperationEnvelope(
-              result,
-              operationEnvelope(
-                publicError.operationId,
-                structuredError.phase,
-                structuredError.safeToRetry,
-                structuredError.effectsKnown,
-              ),
-            )
-          : result;
+        return result;
       }
     };
     args[handlerIndex] = (...handlerArgs: unknown[]) => barrier
@@ -1301,6 +1363,27 @@ const REPOSITORY_PROVENANCE = {
   trust: "untrusted",
   authority: "none",
 } as const;
+export type ModelReadProvenance =
+  | typeof REPOSITORY_PROVENANCE
+  | {
+      source: "user" | "admin" | "bundled" | "devspace" | "explicit";
+      trust: "trusted";
+      authority: "none";
+    };
+
+export function modelReadProvenanceForSkillSource(
+  source: Skill["source"],
+): ModelReadProvenance {
+  return source === "repo"
+    ? REPOSITORY_PROVENANCE
+    : { source, trust: "trusted", authority: "none" };
+}
+
+function modelReadProvenance(readPath: WorkspaceReadPath): ModelReadProvenance {
+  return readPath.skillRead
+    ? modelReadProvenanceForSkillSource(readPath.skillRead.skill.source)
+    : REPOSITORY_PROVENANCE;
+}
 const DEVSPACE_APPLY_PATCH_PROVENANCE = {
   source: "devspace",
   trust: "server_observed",
@@ -1685,10 +1768,18 @@ interface ToolLogFields {
   path?: string;
   workingDirectory?: string;
   command?: string;
+  commandMode?: ProcessCommandMode;
   commandLength?: number;
   stdinBytes?: number;
   success: boolean;
   durationMs: number;
+  outcome?: "exited" | "signaled" | "timed_out" | "interrupted" | "spawn_failed";
+  exitCode?: number;
+  signal?: string;
+  timedOut?: boolean;
+  phase?: string;
+  errorCode?: string;
+  errorCategory?: string;
   error?: string;
 }
 
@@ -1734,10 +1825,12 @@ function modelInstructionRecord(
     : "user-instructions";
   const relativeScope = repositoryInstruction ? dirname(path) : ".";
   return {
-    ...(repositoryInstruction
-      ? { source: "repository" as const, trust: "repository_untrusted" as const }
-      : { source: "user" as const, trust: "user_trusted" as const }),
-    scope: relativeScope === "." ? "." : relativeScope.split(sep).join("/"),
+    trustClass: repositoryInstruction
+      ? "repository_untrusted"
+      : "user_trusted",
+    ...(relativeScope === "."
+      ? {}
+      : { scope: relativeScope.split(sep).join("/") }),
     path,
     content: file.content,
   };
@@ -1854,6 +1947,7 @@ function decodedCursorOrError(
   key: string | Uint8Array,
   code: string,
   message: string,
+  semantics: Omit<PublicToolError, "code" | "text"> = {},
 ): CursorEnvelope {
   try {
     return decodeCursor(cursor, key);
@@ -1865,6 +1959,7 @@ function decodedCursorOrError(
         recovery: "restart_without_cursor",
         phase: "not_started",
         effectsKnown: true,
+        ...semantics,
       });
     }
     throw error;
@@ -1959,46 +2054,71 @@ function renderProjectContext(
   projectRef: string,
   page: RootInstructionPage,
   nextCursor: string | undefined,
-  thread?: ProjectThreadContext,
+  continuation: boolean,
+  bootstrap?: {
+    checkoutKind: "checkout" | "worktree";
+    checkpoint?: ProjectCheckpointContext;
+  },
 ) {
   const {
     workspace,
     instructionScan,
   } = context;
   return serializeProjectContext({
-    project: {
-      ref: projectRef,
-      writeAccess: workspace.writeAccess,
-    },
-    ...(thread ? { thread } : {}),
-    contextDelta: createProjectContextDelta(
-      page.instructions,
-      nextCursor === undefined,
-      nextCursor,
-    ),
-    ...(
-      instructionScan.reason
-        ? {
-            diagnostics: {
-              instructions: { reason: instructionScan.reason },
-            },
-          }
-        : {}
-    ),
+    ...(continuation
+      ? {
+          page: "continuation" as const,
+          contextDelta: createProjectContextDelta(page.instructions, nextCursor),
+        }
+      : {
+          page: "bootstrap" as const,
+          project: {
+            ref: projectRef,
+            writeAccess: workspace.writeAccess,
+            checkoutKind: bootstrap?.checkoutKind ?? "checkout",
+          },
+          ...(bootstrap?.checkpoint ? { checkpoint: bootstrap.checkpoint } : {}),
+          contextDelta: createProjectContextDelta(page.instructions, nextCursor),
+          ...(
+            instructionScan.reason
+              ? {
+                  diagnostics: {
+                    instructions: { reason: instructionScan.reason },
+                  },
+                }
+              : {}
+          ),
+        }),
   });
 }
 
-function modelProjectThread(
+function modelProjectCheckpoint(
+  checkpoint: ProjectCheckpoint | undefined,
+): ProjectCheckpointContext | undefined {
+  return checkpoint
+    ? {
+        cause: checkpoint.cause,
+        serverObserved: checkpoint.observedState,
+        ...(checkpoint.modelSummary
+          ? { untrustedSummary: checkpoint.modelSummary }
+          : {}),
+      }
+    : undefined;
+}
+
+function appProjectThread(
   thread: ProjectThread,
   checkpoint: ProjectCheckpoint | undefined,
   key: string | Uint8Array,
-): ProjectThreadContext {
+) {
   return {
     threadRef: encodeProjectThreadRef(thread.threadId, key),
+    projectRef: thread.projectRef,
     title: thread.title,
     status: thread.status,
     version: thread.revision,
     checkoutKind: thread.checkoutKind,
+    updatedAt: thread.updatedAt,
     ...(checkpoint
       ? {
           checkpoint: {
@@ -2034,6 +2154,7 @@ const DEFAULT_PROCESS_OUTPUT_SCAN_BYTES = 256_000;
 const MAX_PROCESS_OUTPUT_SCAN_BYTES = 1_000_000;
 const DEFAULT_PROCESS_OUTPUT_SEARCH_MATCHES = 20;
 const MAX_PROCESS_OUTPUT_SEARCH_MATCHES = 50;
+const MODEL_PROCESS_WAIT_MS = 1_000;
 
 interface StableWorkspaceFileRead {
   response: Awaited<ReturnType<typeof readFileTool>>;
@@ -2184,6 +2305,7 @@ function sendCallToolErrorResult(
   code?: string,
   options: {
     operationId?: string;
+    mutation?: boolean;
     recovery?: string;
     wwwAuthenticate?: string;
     retryable?: boolean;
@@ -2204,24 +2326,12 @@ function sendCallToolErrorResult(
         ...(options.safeToRetry === undefined ? {} : { safeToRetry: options.safeToRetry }),
         ...(options.phase === undefined ? {} : { phase: options.phase }),
         ...(options.effectsKnown === undefined ? {} : { effectsKnown: options.effectsKnown }),
+        ...(options.mutation && options.operationId ? { operationId: options.operationId } : {}),
         ...(options.details === undefined ? {} : { details: options.details }),
-      })
+      }, { mutation: options.mutation })
     : undefined;
   const structuredContent = structuredError
-    ? {
-        ok: false,
-        error: structuredError,
-        ...(options.operationId
-          ? {
-              operation: operationEnvelope(
-                options.operationId,
-                structuredError.phase,
-                structuredError.safeToRetry,
-                structuredError.effectsKnown,
-              ),
-            }
-          : {}),
-      }
+    ? { error: structuredError }
     : undefined;
   res.status(200).json({
     jsonrpc: "2.0",
@@ -2371,12 +2481,15 @@ export function projectToolRootLockMode(
 
 export function toolCallOperationId(body: unknown): string | undefined {
   const operationId = toolCallRequest(body)?.arguments.operationId;
-  return typeof operationId === "string" && operationId.length > 0 && operationId.length <= 128
-    ? operationId
-    : undefined;
+  return isValidOperationId(operationId) ? operationId : undefined;
 }
 
-function implicitProjectExecutionRequired(): PublicActionError {
+function toolCallIsMutation(body: unknown): boolean {
+  const request = toolCallRequest(body);
+  return request ? isMutationToolInput(request.name, request.arguments) : false;
+}
+
+function implicitProjectExecutionRequired(operationId?: string): PublicActionError {
   return new PublicActionError(
     "project_execution_required",
     "Open or reselect a Project with project_control in this ChatGPT session.",
@@ -2386,6 +2499,7 @@ function implicitProjectExecutionRequired(): PublicActionError {
       recovery: "project_control_open_or_resume",
       phase: "not_started",
       effectsKnown: true,
+      ...(operationId ? { operationId } : {}),
     },
   );
 }
@@ -2451,7 +2565,7 @@ function requestLogFields(req: Request, config: ServerConfig): Record<string, un
 }
 
 function logToolCall(config: ServerConfig, fields: ToolLogFields): void {
-  const { command, ...safeFields } = fields;
+  const { command, workingDirectory, ...safeFields } = fields;
   const context = requestContext.getStore();
   const workspaceId = fields.workspaceId ?? context?.correlation.workspaceId;
   if (context && workspaceId) {
@@ -2472,8 +2586,44 @@ function logToolCall(config: ServerConfig, fields: ToolLogFields): void {
       context?.oauthClientId,
     ),
     ...safeFields,
+    workingDirectory: workingDirectory && !isAbsolute(workingDirectory)
+      ? workingDirectory
+      : undefined,
     commandPreview: config.logging.shellCommands && command ? commandPreview(command) : undefined,
   });
+}
+
+function terminalProcessLogFields(
+  snapshot: ProcessSnapshot,
+  commandMode: ProcessCommandMode,
+): Pick<
+  ToolLogFields,
+  | "commandMode"
+  | "outcome"
+  | "exitCode"
+  | "signal"
+  | "timedOut"
+  | "durationMs"
+  | "phase"
+  | "errorCode"
+  | "errorCategory"
+> {
+  const signal = safeProcessSignal(snapshot.signal);
+  return {
+    commandMode,
+    outcome: snapshot.startFailure
+      ? "spawn_failed"
+      : snapshot.timedOut
+        ? "timed_out"
+        : signal
+          ? "signaled"
+          : "exited",
+    ...(Number.isSafeInteger(snapshot.exitCode) ? { exitCode: snapshot.exitCode } : {}),
+    ...(signal ? { signal } : {}),
+    timedOut: snapshot.timedOut,
+    durationMs: snapshot.wallTimeMs,
+    ...(snapshot.startFailure ?? {}),
+  };
 }
 
 function contentText(content: ToolContent[]): string {
@@ -2497,7 +2647,7 @@ function rejectedToolResult(
   return {
     content: [textBlock(text)],
     isError: true as const,
-    structuredContent: { ok: false, error: { code }, ...details },
+    structuredContent: { error: { code }, ...details },
   };
 }
 
@@ -2630,6 +2780,16 @@ function projectPickerLabels(
   return labels;
 }
 
+export function modelProjectListingPage<T>(
+  candidates: readonly T[],
+): { projects: T[]; truncated: boolean } {
+  const projects = candidates.slice(0, 100);
+  return {
+    projects,
+    truncated: candidates.length > projects.length,
+  };
+}
+
 function projectFingerprintForRoot(
   root: string,
   key: string | Uint8Array,
@@ -2700,26 +2860,42 @@ function recordAutomaticThreadCheckpoint(
     cause: "patch_applied" | "command_completed" | "execution_idle" | "service_shutdown";
     sourceOperationId: string;
     observedState: Record<string, unknown>;
+    target?: {
+      threadId: string;
+      profileId: string;
+      connectionPrincipalId: string;
+      workspaceId: string;
+    };
   },
 ): void {
   const request = requestContext.getStore();
   const execution = request?.projectExecution;
-  if (!request || !execution?.threadId) return;
+  const target = input.target ?? (
+    request && execution?.threadId
+      ? {
+          threadId: execution.threadId,
+          profileId: projectThreadProfileId({
+            principalId: request.connectionPrincipalId,
+            clientId: request.oauthClientId,
+            grantId: request.oauthGrantId,
+            authorizationEpoch: request.authorizationEpoch,
+          }),
+          connectionPrincipalId: request.connectionPrincipalId,
+          workspaceId: execution.workspaceId,
+        }
+      : undefined
+  );
+  if (!target) return;
   try {
     runtime.threads.appendCheckpoint({
-      threadId: execution.threadId,
-      profileId: projectThreadProfileId({
-        principalId: request.connectionPrincipalId,
-        clientId: request.oauthClientId,
-        grantId: request.oauthGrantId,
-        authorizationEpoch: request.authorizationEpoch,
-      }),
+      threadId: target.threadId,
+      profileId: target.profileId,
       cause: input.cause,
       sourceOperationId: input.sourceOperationId,
       observedState: input.observedState,
     });
     runtime.continuity.appendEvent({
-      threadId: execution.threadId,
+      threadId: target.threadId,
       type: input.cause,
       source: "server",
       trust: "server_observed",
@@ -2727,16 +2903,16 @@ function recordAutomaticThreadCheckpoint(
       payload: input.observedState,
     });
     runtime.continuity.saveSnapshot({
-      threadId: execution.threadId,
+      threadId: target.threadId,
       observedState: input.observedState,
     });
   } catch (error) {
     logEvent(config.logging, "warn", "project_thread_checkpoint_failed", {
       ...correlationLogFields(
-        request.connectionPrincipalId,
-        execution.workspaceId,
-        request.oauthClientId,
-        request.auditReferenceKey,
+        target.connectionPrincipalId,
+        target.workspaceId,
+        request?.oauthClientId,
+        request?.auditReferenceKey,
       ),
       cause: input.cause,
       ...errorFields(error),
@@ -2759,6 +2935,19 @@ function ensureExecutionThread(input: {
   let thread = boundThreadId
     ? input.runtime.threads.get(boundThreadId, profileId)
     : undefined;
+  if (boundThreadId && !thread) {
+    throw new PublicActionError(
+      "operation_id_conflict",
+      "This Project execution is already bound to another Actor; use a new operationId.",
+      {
+        safeToRetry: false,
+        recovery: "new_operation_id",
+        phase: "not_started",
+        effectsKnown: true,
+        ...(input.sourceOperationId ? { operationId: input.sourceOperationId } : {}),
+      },
+    );
+  }
   if (!thread) {
     thread = input.runtime.threads.create({
       profileId,
@@ -2940,22 +3129,25 @@ async function hydrateActiveProjectExecution(input: {
 
   const profileId = input.profileId ?? projectThreadProfileId(input.authorization);
   const boundThreadId = input.runtime.threads.threadIdForExecution(execution.executionId);
-  let boundThread = boundThreadId
+  const boundThread = boundThreadId
     ? input.runtime.threads.get(boundThreadId, profileId)
     : undefined;
-  if (boundThreadId && !boundThread && !input.deferStateUpdates) {
-    const legacyProfileId = legacyProjectThreadProfileId(input.authorization);
-    if (legacyProfileId !== profileId) {
-      boundThread = input.runtime.threads.reassignProfile(
-        boundThreadId,
-        legacyProfileId,
-        profileId,
-      );
-    }
+  if (boundThreadId && !boundThread) {
+    throw new PublicActionError(
+      "project_execution_recovery_required",
+      "The session-bound Project thread is unavailable to the current Actor. Open or resume the Project with a new operationId.",
+      {
+        retryable: false,
+        safeToRetry: false,
+        recovery: "project_control_open_or_resume",
+        phase: "not_started",
+        effectsKnown: true,
+      },
+    );
   }
   if (
     input.deferStateUpdates &&
-    (!boundThread || !input.expectedThreadId || boundThread.threadId !== input.expectedThreadId)
+    (!input.expectedThreadId || boundThread?.threadId !== input.expectedThreadId)
   ) {
     throw new PublicActionError(
       "project_execution_recovery_required",
@@ -3289,39 +3481,26 @@ export function processResult(snapshot: ProcessSnapshot): string {
 }
 
 export function processContentSummary(snapshot: ProcessSnapshot): string {
-  const status = snapshot.managedDaemon
-    ? "Managed daemon running after the root process exited." +
-      (snapshot.rootLeaseDetached
-        ? " Root serialization is detached; daemon writes are untracked and may race other Project writes."
-        : " Root serialization remains held.")
-    : snapshot.running
-      ? "Process running." +
-        (snapshot.stdinClosed ? " Stdin is closed." : "")
-    : snapshot.signal
-      ? `Process exited (signal ${snapshot.signal}).`
-      : `Process exited (code ${snapshot.exitCode ?? "unknown"}).`;
-  const outputNote = snapshot.output
-    ? " Combined output is available in structuredContent.output."
-    : " No combined output was produced.";
-  const timeoutNote = snapshot.timedOut
-    ? " Process exceeded its runtime limit."
-    : "";
-  const recoverableOutputId = snapshot.outputStorageError ? undefined : snapshot.outputId;
-  const truncationNote = snapshot.outputTruncated
-    ? recoverableOutputId
-      ? " Inline output is truncated; use read_process_output with structuredContent.output.outputId."
-      : " Inline output is truncated."
-    : "";
-  const durableNote = snapshot.droppedBytes > 0
-    ? ` ${snapshot.droppedBytes} durable byte(s) were irrecoverably dropped.`
-    : snapshot.outputStorageError
-      ? " Durable output is unavailable."
-      : "";
-  return `${status}${outputNote}${timeoutNote}${truncationNote}${durableNote}`;
+  if (snapshot.startFailure) {
+    return "Process failed to start.";
+  }
+  if (snapshot.managedDaemon) {
+    return "Managed daemon running.";
+  }
+  if (snapshot.running) {
+    return snapshot.stdinClosed ? "Process running; stdin closed." : "Process running.";
+  }
+  if (snapshot.timedOut) {
+    return "Process timed out.";
+  }
+  return snapshot.signal
+    ? `Process exited (signal ${snapshot.signal}).`
+    : `Process exited (code ${snapshot.exitCode ?? "unknown"}).`;
 }
 
 export function processCallSucceeded(snapshot: ProcessSnapshot): boolean {
   return snapshot.running || (
+    snapshot.startFailure === undefined &&
     snapshot.exitCode === 0 &&
     snapshot.signal === undefined &&
     !snapshot.timedOut
@@ -3329,17 +3508,10 @@ export function processCallSucceeded(snapshot: ProcessSnapshot): boolean {
 }
 
 export function processModelState(snapshot: ProcessSnapshot) {
-  const failed = !snapshot.running && (
-    snapshot.timedOut ||
-    snapshot.signal !== undefined ||
-    (snapshot.exitCode !== undefined && snapshot.exitCode !== 0)
-  );
   const recoverableOutputId = snapshot.outputStorageError ? undefined : snapshot.outputId;
   return {
-    ok: !failed,
     status: snapshot.running ? "running" as const : "exited" as const,
-    terminationCoverage: "tracked_process_group" as const,
-    commandExecuted: true as const,
+    provenance: PROCESS_PROVENANCE,
     ...(snapshot.running && snapshot.sessionId !== undefined
       ? { sessionId: snapshot.sessionId }
       : {}),
@@ -3347,16 +3519,13 @@ export function processModelState(snapshot: ProcessSnapshot) {
       ? { outputId: recoverableOutputId }
       : {}),
     output: {
-      stream: "combined" as const,
       text: snapshot.output,
-      provenance: PROCESS_PROVENANCE,
-      truncated: snapshot.outputTruncated,
-      originalTokenCount: snapshot.originalTokenCount,
-      omittedBytes: snapshot.outputOmittedBytes,
-      ...(recoverableOutputId ? { outputId: recoverableOutputId } : {}),
+      ...(snapshot.outputTruncated ? { truncated: true as const } : {}),
+      ...(snapshot.outputOmittedBytes > 0 ? { omittedBytes: snapshot.outputOmittedBytes } : {}),
       ...(snapshot.droppedBytes > 0 ? { droppedBytes: snapshot.droppedBytes } : {}),
+      ...(snapshot.outputStorageError ? { unavailable: true as const } : {}),
     },
-    ...(!snapshot.running && snapshot.exitCode !== undefined && snapshot.exitCode !== 0
+    ...(!snapshot.running && snapshot.exitCode !== undefined
       ? { exitCode: snapshot.exitCode }
       : {}),
     ...(!snapshot.running && snapshot.signal ? { signal: snapshot.signal } : {}),
@@ -3364,6 +3533,22 @@ export function processModelState(snapshot: ProcessSnapshot) {
     ...(snapshot.rootExited ? { rootExited: true as const } : {}),
     ...(snapshot.managedDaemon ? { managedDaemon: true as const } : {}),
     ...(snapshot.rootLeaseDetached ? { rootLeaseDetached: true as const } : {}),
+    ...(snapshot.startFailure
+      ? {
+          commandExecuted: false as const,
+          error: {
+            code: "command_spawn_failed",
+            retryable: true,
+            safeToRetry: true,
+            recovery: "new_operation_id",
+            phase: "not_started" as const,
+            effectsKnown: true,
+            errorCode: snapshot.startFailure.errorCode,
+            errorCategory: snapshot.startFailure.errorCategory,
+            spawnPhase: snapshot.startFailure.phase,
+          },
+        }
+      : {}),
   };
 }
 
@@ -3371,7 +3556,7 @@ function extensibleOutputSchema<T extends z.ZodRawShape>(shape: T) {
   return z.object(shape).passthrough();
 }
 
-function processToolResponse(
+export function processToolResponse(
   tool: "exec_command" | "write_stdin",
   snapshot: ProcessSnapshot,
   summary: Record<string, unknown>,
@@ -3380,15 +3565,13 @@ function processToolResponse(
   const content = [textBlock(result)];
   const structuredContent = {
     ...processModelState(snapshot),
-    ...(tool === toolNames.writeStdin && summary.processInteracted === false
-      ? { commandExecuted: false as const }
-      : {}),
     ...(typeof summary.inputRevision === "number"
       ? { inputRevision: summary.inputRevision }
       : {}),
   };
   return {
     content,
+    ...(snapshot.startFailure ? { isError: true as const } : {}),
     _meta: { tool },
     structuredContent,
   };
@@ -3404,16 +3587,12 @@ function registerProcessInteractionTools(
   connectionPrincipalId: string,
 ): void {
   const writeStdinInputSchema = z.strictObject({
-    operationId: z.string().min(1).max(128),
+    operationId: operationIdSchema,
     sessionId: z.number(),
     chars: z.string().max(MAX_PROCESS_INPUT_BYTES).optional(),
     closeStdin: z.boolean().optional(),
     interrupt: z.boolean().optional(),
-    columns: z.number().int().min(1).max(1_000).optional(),
-    rows: z.number().int().min(1).max(1_000).optional(),
     expectedRevision: z.number().int().nonnegative().optional(),
-    yieldTimeMs: z.number().int().min(0).max(600_000).optional(),
-    maxOutputTokens: z.number().int().positive().max(100_000).optional(),
   });
   registerProjectTool(
     server,
@@ -3421,7 +3600,7 @@ function registerProcessInteractionTools(
     {
       title: "Write stdin",
       description: toolDescription({
-        use: "sending input, interrupt, close, or terminal resize to a live exec_command session.",
+        use: "sending input, interrupt, or close to a live exec_command session.",
         avoid: "reusing an operationId for a different interaction.",
         requires: "a selected Project, sessionId, and a fresh operationId for each new interaction.",
         returns: "the process snapshot after that interaction; use read_process_output to poll.",
@@ -3439,11 +3618,7 @@ function registerProcessInteractionTools(
         chars?: string;
         closeStdin?: boolean;
         interrupt?: boolean;
-        columns?: number;
-        rows?: number;
         expectedRevision?: number;
-        yieldTimeMs?: number;
-        maxOutputTokens?: number;
       };
       const {
         workspaceId,
@@ -3453,11 +3628,7 @@ function registerProcessInteractionTools(
         chars,
         closeStdin,
         interrupt,
-        columns,
-        rows,
         expectedRevision,
-        yieldTimeMs,
-        maxOutputTokens,
       } = input;
       const startedAt = performance.now();
       if (chars?.includes("\u0003")) {
@@ -3483,9 +3654,7 @@ function registerProcessInteractionTools(
         const submittedChars = `${interrupt === true ? "\u0003" : ""}${chars ?? ""}`;
         const interactionRequested =
           submittedChars.length > 0 ||
-          closeStdin === true ||
-          columns !== undefined ||
-          rows !== undefined;
+          closeStdin === true;
         if (!interactionRequested) {
           throw new PublicActionError(
             "process_interaction_required",
@@ -3521,10 +3690,6 @@ function registerProcessInteractionTools(
           sessionId,
           chars: submittedChars,
           closeStdin,
-          columns,
-          rows,
-          yieldTimeMs,
-          maxOutputTokens,
           preparedInput: {
             expectedRevision: expectedRevision ?? processContext.inputRevision,
             pendingInput: "",
@@ -3566,11 +3731,7 @@ function registerProcessInteractionTools(
           chars,
           closeStdin,
           interrupt,
-          ...(columns === undefined ? {} : { columns }),
-          ...(rows === undefined ? {} : { rows }),
           expectedRevision,
-          yieldTimeMs,
-          maxOutputTokens,
         },
         execute,
       });
@@ -3592,7 +3753,7 @@ function registerReadProcessOutputTool(
     {
       title: "Read process output",
       description: toolDescription({
-        use: "polling a live session or paging, tailing, and searching retained output; when a process is expected to remain quiet for longer, use a larger yieldTimeMs for a longer bounded wait.",
+        use: "polling a live session or paging, tailing, and searching retained output.",
         avoid: "sending process input.",
         requires: "a selected Project plus sessionId for a live poll, or outputId/cursor for retained output.",
         returns: "one process snapshot, or bounded output/matches with a signed continuation cursor.",
@@ -3600,42 +3761,16 @@ function registerReadProcessOutputTool(
       inputSchema: {
         ...privateProjectExecutionInputSchema,
         sessionId: z.number().int().positive().optional(),
-        yieldTimeMs: z.number().int().min(0).max(600_000).optional(),
-        maxOutputTokens: z.number().int().positive().max(100_000).optional(),
         outputId: z.string().optional(),
         mode: z.enum(["page", "tail", "search", "errors"]).optional(),
-        cursor: z.string().max(4_096).optional(),
+        cursor: z.string().min(1).max(4_096).optional(),
         offset: z
           .number()
           .int()
           .nonnegative()
           .optional(),
-        limit: z
-          .number()
-          .int()
-          .positive()
-          .max(MAX_PROCESS_OUTPUT_READ_BYTES)
-          .optional(),
-        tailBytes: z
-          .number()
-          .int()
-          .positive()
-          .max(MAX_PROCESS_OUTPUT_READ_BYTES)
-          .optional(),
         query: z.string().max(512).optional(),
         ignoreCase: z.boolean().optional(),
-        maxMatches: z
-          .number()
-          .int()
-          .positive()
-          .max(MAX_PROCESS_OUTPUT_SEARCH_MATCHES)
-          .optional(),
-        scanBytes: z
-          .number()
-          .int()
-          .positive()
-          .max(MAX_PROCESS_OUTPUT_SCAN_BYTES)
-          .optional(),
       },
       ...toolWidgetDescriptorMeta(config, "shell"),
       annotations: READ_TOOL_ANNOTATIONS,
@@ -3644,18 +3779,12 @@ function registerReadProcessOutputTool(
       workspaceId,
       workspaceGeneration,
       sessionId,
-      yieldTimeMs,
-      maxOutputTokens,
       outputId,
       mode,
       cursor,
       offset,
-      limit,
-      tailBytes,
       query,
       ignoreCase,
-      maxMatches,
-      scanBytes,
     }) => {
       const startedAt = performance.now();
       workspaces.getWorkspace(connectionPrincipalId, workspaceId);
@@ -3665,16 +3794,12 @@ function registerReadProcessOutputTool(
           cursor !== undefined ||
           mode !== undefined ||
           offset !== undefined ||
-          limit !== undefined ||
-          tailBytes !== undefined ||
           query !== undefined ||
-          ignoreCase !== undefined ||
-          maxMatches !== undefined ||
-          scanBytes !== undefined
+          ignoreCase !== undefined
         ) {
           throw new PublicActionError(
             "process_output_fields_invalid",
-            "A live session poll accepts sessionId, yieldTimeMs, and maxOutputTokens only.",
+            "A live session poll accepts sessionId only.",
           );
         }
         const processContext = processSessions.instructionContext(
@@ -3687,8 +3812,7 @@ function registerReadProcessOutputTool(
           workspaceId,
           sessionId,
           chars: "",
-          yieldTimeMs,
-          maxOutputTokens,
+          yieldTimeMs: MODEL_PROCESS_WAIT_MS,
         });
         logToolCall(config, {
           tool: toolNames.readProcessOutput,
@@ -3700,36 +3824,15 @@ function registerReadProcessOutputTool(
           content: [textBlock(processContentSummary(snapshot))],
           structuredContent: {
             ...processModelState(snapshot),
-            commandExecuted: false as const,
             inputRevision: processContext.inputRevision,
           },
         };
       }
       const principalRef = currentCursorCallerRef(config.oauth.keys.cursor);
-      const decoded = cursor
-        ? decodedCursorOrError(
-            cursor,
-            config.oauth.keys.cursor,
-            "invalid_process_cursor",
-            "The process output cursor is invalid or expired; restart with outputId.",
-          )
-        : undefined;
-      if (
-        decoded &&
-        (
-          outputId !== undefined ||
-          mode !== undefined ||
-          offset !== undefined ||
-          limit !== undefined ||
-          tailBytes !== undefined ||
-          query !== undefined ||
-          ignoreCase !== undefined ||
-          maxMatches !== undefined ||
-          scanBytes !== undefined ||
-          yieldTimeMs !== undefined ||
-          maxOutputTokens !== undefined
-        )
-      ) {
+      if (cursor !== undefined && (
+        outputId !== undefined || mode !== undefined || offset !== undefined ||
+        query !== undefined || ignoreCase !== undefined
+      )) {
         throw new PublicActionError(
           "process_cursor_fields_invalid",
           "A continuation cursor is self-contained; pass cursor only.",
@@ -3742,6 +3845,14 @@ function registerReadProcessOutputTool(
           },
         );
       }
+      const decoded = cursor !== undefined
+        ? decodedCursorOrError(
+            cursor,
+            config.oauth.keys.cursor,
+            "invalid_process_cursor",
+            "The process output cursor is invalid or expired; restart with outputId.",
+          )
+        : undefined;
       const cursorMode = decoded?.parameters?.mode;
       const effectiveMode = decoded
         ? cursorMode === "page" ||
@@ -3765,21 +3876,9 @@ function registerReadProcessOutputTool(
       const effectiveIgnoreCase = decoded
         ? decoded.parameters?.ignoreCase === true
         : ignoreCase === true;
-      const effectiveScanBytes = decoded
-        ? typeof decoded.parameters?.scanBytes === "number"
-          ? decoded.parameters.scanBytes
-          : DEFAULT_PROCESS_OUTPUT_SCAN_BYTES
-        : scanBytes ?? DEFAULT_PROCESS_OUTPUT_SCAN_BYTES;
-      const effectiveMaxMatches = decoded
-        ? typeof decoded.parameters?.maxMatches === "number"
-          ? decoded.parameters.maxMatches
-          : DEFAULT_PROCESS_OUTPUT_SEARCH_MATCHES
-        : maxMatches ?? DEFAULT_PROCESS_OUTPUT_SEARCH_MATCHES;
-      const effectiveReadLimit = decoded
-        ? typeof decoded.parameters?.limit === "number"
-          ? decoded.parameters.limit
-          : DEFAULT_PROCESS_OUTPUT_READ_BYTES
-        : limit ?? DEFAULT_PROCESS_OUTPUT_READ_BYTES;
+      const effectiveScanBytes = DEFAULT_PROCESS_OUTPUT_SCAN_BYTES;
+      const effectiveMaxMatches = DEFAULT_PROCESS_OUTPUT_SEARCH_MATCHES;
+      const effectiveReadLimit = DEFAULT_PROCESS_OUTPUT_READ_BYTES;
       const searchMode = effectiveMode === "search" || effectiveMode === "errors";
       if (effectiveMode === "search" && !normalizedQuery) {
         throw new PublicActionError(
@@ -3787,22 +3886,10 @@ function registerReadProcessOutputTool(
           "mode=search requires a non-empty query.",
         );
       }
-      if (!searchMode && (query !== undefined || ignoreCase !== undefined || maxMatches !== undefined || scanBytes !== undefined)) {
+      if (!searchMode && (query !== undefined || ignoreCase !== undefined)) {
         throw new PublicActionError(
           "process_output_mode_fields_invalid",
-          "query, ignoreCase, maxMatches, and scanBytes are available only in search or errors mode.",
-        );
-      }
-      if (searchMode && (limit !== undefined || tailBytes !== undefined)) {
-        throw new PublicActionError(
-          "process_output_mode_fields_invalid",
-          "Search and errors mode use scanBytes/maxMatches, not limit or tailBytes.",
-        );
-      }
-      if (effectiveMode !== "tail" && tailBytes !== undefined) {
-        throw new PublicActionError(
-          "process_output_mode_fields_invalid",
-          "tailBytes is available only in mode=tail.",
+          "query and ignoreCase are available only in search or errors mode.",
         );
       }
       if (effectiveMode === "tail" && !cursor && offset !== undefined) {
@@ -3811,7 +3898,7 @@ function registerReadProcessOutputTool(
           "Omit offset for the initial tail read; use the returned signed cursor to follow new output.",
         );
       }
-      const effectiveTailBytes = tailBytes ?? DEFAULT_PROCESS_OUTPUT_READ_BYTES;
+      const effectiveTailBytes = DEFAULT_PROCESS_OUTPUT_READ_BYTES;
       // tailBytes is deliberately absent: it only sizes the initial tail window,
       // and continuation reads from the cursor offset instead. Binding it here
       // would reject a follow-up that simply omitted the parameter. The search
@@ -3823,10 +3910,8 @@ function registerReadProcessOutputTool(
           ? {
               query: normalizedQuery ?? "",
               ignoreCase: effectiveIgnoreCase,
-              maxMatches: effectiveMaxMatches,
-              scanBytes: effectiveScanBytes,
             }
-          : { limit: effectiveReadLimit }),
+          : {}),
       });
       const revision = cursorRevision({ outputId: effectiveOutputId });
       if (
@@ -3878,25 +3963,8 @@ function registerReadProcessOutputTool(
                 mode: effectiveMode,
                 query: normalizedQuery ?? "",
                 ignoreCase: effectiveIgnoreCase,
-                maxMatches: effectiveMaxMatches,
-                scanBytes: effectiveScanBytes,
               },
             }, config.oauth.keys.cursor);
-        const notes = [
-          search.matchesTruncated
-            ? `[${search.totalMatches - search.matches.length} additional match(es) omitted in this scan window]`
-            : undefined,
-          search.droppedBytes > 0
-            ? `[${search.droppedBytes} durable byte(s) unavailable]`
-            : undefined,
-          search.status === "unknown"
-            ? "[completion unknown; verify side effects before rerun]"
-            : undefined,
-        ].filter((value): value is string => Boolean(value));
-        const result = [
-          `${effectiveMode === "errors" ? "Indexed" : "Found"} ${search.totalMatches} matching line(s) while scanning ${search.scannedBytes} retained byte(s). Matches are in structuredContent.search.matches.`,
-          ...notes,
-        ].join("\n");
         logToolCall(config, {
           tool: toolNames.readProcessOutput,
           workspaceId,
@@ -3904,28 +3972,14 @@ function registerReadProcessOutputTool(
           durationMs: Math.round(performance.now() - startedAt),
         });
         return {
-          content: [textBlock(result)],
+          content: [textBlock("Process matches ready.")],
           structuredContent: {
-            ok: true,
-            mode: effectiveMode,
-            ...(!terminalEof ? { nextOffset: search.nextOffset } : {}),
+            provenance: PROCESS_PROVENANCE,
+            status: search.status,
             ...(nextCursor ? { nextCursor } : {}),
-            ...(terminalEof ? { eof: true as const } : {}),
-            ...(search.status === "active" || search.status === "unknown"
-              ? { status: search.status }
-              : {}),
             search: {
-              provenance: PROCESS_PROVENANCE,
               matches: search.matches,
-              categories: search.categories,
-              totalMatches: search.totalMatches,
-              matchesTruncated: search.matchesTruncated,
-              offset: search.offset,
-              nextOffset: search.nextOffset,
-              scannedBytes: search.scannedBytes,
-              eof: terminalEof,
-              totalBytes: search.totalBytes,
-              storedBytes: search.storedBytes,
+              ...(search.matchesTruncated ? { truncated: true as const } : {}),
               ...(search.droppedBytes > 0 ? { droppedBytes: search.droppedBytes } : {}),
             },
           },
@@ -3944,22 +3998,6 @@ function registerReadProcessOutputTool(
             limit: effectiveReadLimit,
           });
       const status = page.status;
-      const notes = [
-        page.droppedBytes > 0
-          ? `[${page.droppedBytes} durable byte(s) unavailable]`
-          : undefined,
-        status === "unknown"
-          ? "[completion unknown; verify side effects before rerun]"
-          : undefined,
-      ].filter((value): value is string => Boolean(value));
-      const result = [
-        page.content
-          ? `${effectiveMode === "tail" ? "Tailed" : "Read"} ${Buffer.byteLength(page.content, "utf8")} retained byte(s). Combined output is available in structuredContent.page.`
-          : "No retained output is available at this offset.",
-        ...notes,
-      ]
-        .filter((value): value is string => Boolean(value))
-        .join("\n");
       const terminalEof = page.eof && status !== "active";
       const nextCursor = terminalEof
         ? undefined
@@ -3973,7 +4011,6 @@ function registerReadProcessOutputTool(
             resourceId: effectiveOutputId,
             parameters: {
               mode: effectiveMode,
-              limit: effectiveReadLimit,
             },
           }, config.oauth.keys.cursor);
       logToolCall(config, {
@@ -3983,22 +4020,13 @@ function registerReadProcessOutputTool(
         durationMs: Math.round(performance.now() - startedAt),
       });
       return {
-        content: [textBlock(result)],
+        content: [textBlock("Process output ready.")],
         structuredContent: {
-          ok: true,
-          mode: effectiveMode,
-          ...(!page.eof || status === "active" ? { nextOffset: page.nextOffset } : {}),
+          provenance: PROCESS_PROVENANCE,
+          status,
           ...(nextCursor ? { nextCursor } : {}),
-          ...(terminalEof ? { eof: true as const } : {}),
-          ...(status === "active" || status === "unknown" ? { status } : {}),
-          page: {
-            stream: "combined" as const,
+          output: {
             text: page.content,
-            provenance: PROCESS_PROVENANCE,
-            offset: page.offset,
-            nextOffset: page.nextOffset,
-            eof: terminalEof,
-            ...(status === "active" || status === "unknown" ? { status } : {}),
             ...(page.droppedBytes > 0 ? { droppedBytes: page.droppedBytes } : {}),
           },
         },
@@ -4018,22 +4046,17 @@ function registerProcessTools(
   projectExecutionRuntime: ProjectExecutionRuntime,
 ): void {
   const execCommandInputSchema = z.strictObject({
-    operationId: z.string().min(1).max(128),
+    operationId: operationIdSchema,
     program: z.string().min(1).max(4_096).optional(),
     args: z.array(z.string().max(16_384)).max(1_024).optional(),
     shell: z.literal(true).optional(),
     command: z.string().min(1).max(SHELL_COMMAND_MAX_CHARACTERS).optional(),
-    approvalReason: z.string().min(1).max(1_000).optional(),
     workingDirectory: z.string().max(4_096).optional(),
     stdin: z.string().max(MAX_PROCESS_INPUT_BYTES).optional(),
     closeStdin: z.boolean().optional(),
     tty: z.boolean().optional(),
-    columns: z.number().int().min(1).max(1_000).optional(),
-    rows: z.number().int().min(1).max(1_000).optional(),
     environment: z.record(z.string(), z.string().max(65_536)).optional(),
-    yieldTimeMs: z.number().int().min(0).max(600_000).optional(),
     timeoutMs: z.number().int().positive().max(config.resources.maxCommandRuntimeMs).optional(),
-    maxOutputTokens: z.number().int().positive().max(100_000).optional(),
   });
   registerProjectTool(
     server,
@@ -4041,10 +4064,10 @@ function registerProcessTools(
     {
       title: "Execute command",
       description: toolDescription({
-        use: "running a direct program with argv, or an explicitly requested shell command in one Project context; for long work, start one fixed foreground Project runner with a short initial yield, then use read_process_output across turns and increase yieldTimeMs when a longer bounded wait is useful.",
+        use: "running a direct program with argv, or an explicitly requested shell command in one Project context; use read_process_output for a retained or live process.",
         avoid: "reusing an operationId for a different command, unmanaged background or detach wrappers used only to survive a host turn, or repeatedly renaming and repackaging rejected launch commands; prefer direct argv and let one runner own preflight, fan-out, PID and log verification, and completion.",
-        requires: "a selected Project, operationId, and either program plus args, or shell=true plus command and approvalReason.",
-        returns: "process state, structured combined output, and effect limits.",
+        requires: "a selected Project, operationId, and either program plus args, or shell=true plus command.",
+        returns: "compact process state and combined output.",
       }),
       inputSchema: execCommandInputSchema,
       ...toolWidgetDescriptorMeta(config, "shell"),
@@ -4059,17 +4082,12 @@ function registerProcessTools(
         args?: string[];
         shell?: true;
         command?: string;
-        approvalReason?: string;
         workingDirectory?: string;
         stdin?: string;
         closeStdin?: boolean;
         tty?: boolean;
-        columns?: number;
-        rows?: number;
         environment?: Record<string, string>;
-        yieldTimeMs?: number;
         timeoutMs?: number;
-        maxOutputTokens?: number;
       };
       const {
         workspaceId,
@@ -4079,36 +4097,31 @@ function registerProcessTools(
         args,
         shell,
         command,
-        approvalReason,
         workingDirectory,
         stdin,
         closeStdin,
         tty,
-        columns,
-        rows,
         environment,
-        yieldTimeMs,
         timeoutMs,
-        maxOutputTokens,
       } = input;
       const direct = program !== undefined;
       const shellCommand = shell === true;
       if (direct === shellCommand) {
         throw new PublicActionError(
           "command_mode_invalid",
-          "Choose exactly one command mode: program plus args, or shell=true plus command and approvalReason.",
+          "Choose exactly one command mode: program plus args, or shell=true plus command.",
         );
       }
-      if (direct && (command !== undefined || approvalReason !== undefined)) {
+      if (direct && command !== undefined) {
         throw new PublicActionError(
           "command_mode_invalid",
-          "Direct program mode does not accept command or approvalReason.",
+          "Direct program mode does not accept command.",
         );
       }
-      if (shellCommand && (!command || !approvalReason || program !== undefined || args !== undefined)) {
+      if (shellCommand && (!command || program !== undefined || args !== undefined)) {
         throw new PublicActionError(
           "command_mode_invalid",
-          "Shell mode requires command and approvalReason and does not accept program or args.",
+          "Shell mode requires command and does not accept program or args.",
         );
       }
       const processCommand = direct
@@ -4141,7 +4154,11 @@ function registerProcessTools(
         if (!retainWorkspaceRootLease) {
           throw new Error("The command could not retain its Project root lease.");
         }
-        const activityThreadId = requestContext.getStore()?.projectExecution?.threadId;
+        const activityExecution = requestContext.getStore()?.projectExecution;
+        const activityThreadId = activityExecution?.threadId;
+        const activityProfileId = activityThreadId
+          ? projectThreadProfileId(projectExecutionAuthorizationFromContext())
+          : undefined;
         if (activityThreadId) {
           projectExecutionRuntime.continuity.appendEvent({
             threadId: activityThreadId,
@@ -4165,11 +4182,8 @@ function registerProcessTools(
             command: processCommand,
             cwd,
             tty,
-            columns,
-            rows,
-            yieldTimeMs,
+            yieldTimeMs: MODEL_PROCESS_WAIT_MS,
             runtimeLimitMs: timeoutMs,
-            maxOutputTokens,
             instructionScopePaths,
             instructionInputMode: "opaque",
             environment,
@@ -4180,7 +4194,10 @@ function registerProcessTools(
               ? {
                   activity: {
                     threadId: activityThreadId,
+                    profileId: activityProfileId!,
+                    executionId: activityExecution!.executionId,
                     operationId,
+                    workingDirectory: workingDirectory ?? ".",
                     summary: direct ? `Running ${program}.` : "Running shell command.",
                   },
                 }
@@ -4199,22 +4216,24 @@ function registerProcessTools(
               payload: { summary: "Command failed before it could start." },
             });
           }
-          throw error;
-        }
-        if (!snapshot.running) {
-          recordAutomaticThreadCheckpoint(config, projectExecutionRuntime, {
-            cause: "command_completed",
-            sourceOperationId: operationId,
-            observedState: {
-              commandMode: direct ? "program" : "shell",
+          if (error instanceof ProcessSpawnError) {
+            logToolCall(config, {
+              tool: "exec_command",
+              workspaceId,
               workingDirectory: workingDirectory ?? ".",
-              exitCode: snapshot.exitCode,
-              ...(snapshot.signal ? { signal: snapshot.signal } : {}),
-              timedOut: snapshot.timedOut,
-              wallTimeMs: snapshot.wallTimeMs,
-              outputRetained: Boolean(snapshot.outputId),
-            },
-          });
+              command: auditCommand,
+              commandMode: direct ? "program" : "shell",
+              commandLength: auditCommand.length,
+              stdinBytes: stdin === undefined ? 0 : Buffer.byteLength(stdin, "utf8"),
+              success: false,
+              durationMs: Math.round(performance.now() - startedAt),
+              outcome: "spawn_failed",
+              phase: error.phase,
+              errorCode: error.code,
+              errorCategory: error.category,
+            });
+          }
+          throw error;
         }
         logToolCall(config, {
           tool: "exec_command",
@@ -4224,7 +4243,12 @@ function registerProcessTools(
           commandLength: auditCommand.length,
           stdinBytes: stdin === undefined ? 0 : Buffer.byteLength(stdin, "utf8"),
           success: processCallSucceeded(snapshot),
-          durationMs: Math.round(performance.now() - startedAt),
+          ...(snapshot.running
+            ? {
+                commandMode: direct ? "program" as const : "shell" as const,
+                durationMs: Math.round(performance.now() - startedAt),
+              }
+            : terminalProcessLogFields(snapshot, direct ? "program" : "shell")),
         });
         return processToolResponse("exec_command", snapshot, {
           command: auditCommand,
@@ -4245,19 +4269,12 @@ function registerProcessTools(
           args,
           shell,
           command,
-          // approvalReason explains why shell mode is needed, but it does not
-          // change the process side effect. Excluding it lets a lost-response
-          // retry replay safely even when the model rephrases the explanation.
           workingDirectory,
           stdin,
           closeStdin,
           tty,
-          columns,
-          rows,
           environment,
-          yieldTimeMs,
           timeoutMs,
-          maxOutputTokens,
         },
         execute,
       });
@@ -4443,7 +4460,7 @@ function createMcpServer(
     requestState.projectExecution = record;
     const principalRef = currentCursorCallerRef(config.oauth.keys.cursor);
     const queryHash = cursorQueryHash({ kind: "root_instructions" });
-    const decoded = cursor
+    const decoded = cursor !== undefined
       ? decodedCursorOrError(
           cursor,
           config.oauth.keys.cursor,
@@ -4506,7 +4523,7 @@ function createMcpServer(
     if (enabledTools.has("show_changes")) {
       await reviewCheckpoints.initializeWorkspace({ workspaceId: workspace.id, root: workspace.root });
     }
-    if (!cursor) {
+    if (cursor === undefined) {
       workspaces.resetRootAgentsFilesAcknowledgement(
         workspace,
         record.instructionContextId,
@@ -4516,9 +4533,9 @@ function createMcpServer(
       delete record.revisions.acknowledgedRootInstructionRevision;
       record.revisions.acknowledgedInstructionScopes = [];
     }
-    const modelThread = modelProjectThread(
+    const privateThread = appProjectThread(
       hydratedThread,
-      cursor ? undefined : hydratedCheckpoint,
+      undefined,
       config.oauth.keys.projectFingerprint,
     );
     let pageContentBudget = ROOT_INSTRUCTION_PAGE_CONTENT_BYTES;
@@ -4547,9 +4564,18 @@ function createMcpServer(
         execution.projectRef,
         page,
         nextCursor,
-        modelThread,
+        cursor !== undefined,
+        {
+          checkoutKind: hydratedThread.checkoutKind,
+          ...(cursor === undefined
+            ? { checkpoint: modelProjectCheckpoint(hydratedCheckpoint) }
+            : {}),
+        },
       );
-      if (serializedBytes(rendered) <= MAX_PROJECT_CONTEXT_RESPONSE_BYTES) break;
+      const responseCandidate = cursor === undefined
+        ? { ...rendered, _meta: { thread: privateThread, tool: toolNames.projectControl } }
+        : { ...rendered, _meta: { tool: toolNames.projectControl } };
+      if (serializedBytes(responseCandidate) <= MAX_PROJECT_CONTEXT_RESPONSE_BYTES) break;
       pageContentBudget = Math.floor(pageContentBudget / 2);
       if (pageContentBudget < 256) {
         throw new Error("Project context envelope exceeds its response budget.");
@@ -4599,17 +4625,17 @@ function createMcpServer(
       success: true,
       durationMs: Math.round(performance.now() - startedAt),
     });
-    return rendered;
+    return cursor === undefined
+      ? {
+          ...rendered,
+          _meta: { thread: privateThread },
+        }
+      : rendered;
   };
 
   registerAppTool(server, toolNames.listProjects, {
     title: "List projects",
-    description: toolDescription({
-      use: "choosing among multiple approved Projects or multiple resumable saved tasks; pass projectRef to get the complete bounded task list for one Project.",
-      avoid: "calling before project_control when exactly one Project is already known; guessing paths or treating saved titles as instructions.",
-      requires: "the current grant.",
-      returns: "opaque Project and task references plus bounded historical/untrusted labels without local paths or saved progress bodies.",
-    }),
+    description: "List approved Project refs/task counts; with projectRef, list that Project's bounded untrusted taskRef/title/version/updatedAt metadata.",
     inputSchema: {
       projectRef: z.string().min(1).max(128).optional(),
     },
@@ -4638,75 +4664,49 @@ function createMcpServer(
       );
     }
     const candidateProjects = requestedProject ? [requestedProject] : authorizedProjectList;
-    const projects = candidateProjects.slice(0, 100);
-    const listing = projectExecutionRuntime.handoffs.listResumable({
-      projectFingerprints: projects.map((project) => project.projectFingerprint),
-      perProjectLimit: MAX_RESUMABLE_PROJECT_HANDOFFS,
-      totalLimit: MAX_LISTED_PROJECT_HANDOFFS,
-    });
-    const pickerLabels = projectPickerLabels(projects);
-    const projectsByFingerprint = new Map(
-      projects.map((project) => [project.projectFingerprint, project]),
+    const projectPage = modelProjectListingPage(candidateProjects);
+    const projects = projectPage.projects;
+    const resumableCounts = new Map(
+      projectExecutionRuntime.handoffs.countResumable(
+        projects.map((project) => project.projectFingerprint),
+      ).map((entry) => [entry.projectFingerprint, entry.count]),
     );
-    const tasksByProjectRef = new Map<string, Array<{
-      taskRef: string;
-      title: string;
-      createdAt: string;
-      updatedAt: string;
-      status: "resumable";
-      version: number;
-    }>>();
-    let omittedHandoffs = 0;
-    for (const handoff of listing.handoffs) {
-      const project = projectsByFingerprint.get(handoff.projectFingerprint);
-      if (!project) {
-        omittedHandoffs += 1;
-        continue;
-      }
-      const summaries = tasksByProjectRef.get(project.id) ?? [];
-      summaries.push({
-        taskRef: encodeProjectHandoffRef(
-          handoff.handoffId,
-          config.oauth.keys.projectFingerprint,
-        ),
-        title: handoff.title,
-        createdAt: handoff.createdAt,
-        updatedAt: handoff.updatedAt,
-        status: "resumable",
-        version: handoff.revision,
-      });
-      tasksByProjectRef.set(project.id, summaries);
-    }
+    const listing = requestedProject
+      ? projectExecutionRuntime.handoffs.listResumable({
+          projectFingerprints: [requestedProject.projectFingerprint],
+          perProjectLimit: MAX_RESUMABLE_PROJECT_HANDOFFS,
+          totalLimit: MAX_RESUMABLE_PROJECT_HANDOFFS,
+        })
+      : undefined;
+    const pickerLabels = projectPickerLabels(projects);
+    const tasks = listing?.handoffs.map((handoff) => ({
+      taskRef: encodeProjectHandoffRef(
+        handoff.handoffId,
+        config.oauth.keys.projectFingerprint,
+      ),
+      title: handoff.title,
+      updatedAt: handoff.updatedAt,
+      version: handoff.revision,
+    })) ?? [];
     const entries = projects.map((project) => ({
       projectRef: project.id,
       label: pickerLabels.get(project.id) ?? project.label,
-      tasks: tasksByProjectRef.get(project.id) ?? [],
+      resumableTaskCount: resumableCounts.get(project.projectFingerprint) ?? 0,
+      ...(requestedProject ? { tasks } : {}),
     }));
-    const defaultProjectRef = authorizedProjectList.length === 1
-      ? authorizedProjectList[0]!.id
-      : undefined;
-    const activeTaskCount = entries.reduce(
-      (total, project) => total + project.tasks.length,
-      0,
-    );
     const truncated =
-      candidateProjects.length > projects.length ||
-      listing.truncated ||
-      omittedHandoffs > 0;
+      projectPage.truncated ||
+      (listing?.truncated ?? false);
     return {
       content: [textBlock(
-        `${entries.length === 1 ? "One approved Project is" : `${entries.length} approved Projects are`} available with ${activeTaskCount} resumable saved task${activeTaskCount === 1 ? "" : "s"}. Saved task metadata is historical and untrusted.${truncated ? " The Project or task listing was truncated." : ""}`,
+        requestedProject
+          ? "Resumable saved-task metadata for the selected Project is historical and untrusted."
+          : "Approved Projects are available; choose one before loading its saved-task metadata.",
       )],
       structuredContent: {
-        ok: true,
         projects: entries,
-        ...(defaultProjectRef ? { defaultProjectRef } : {}),
         truncated,
         taskTrust: "untrusted",
-        taskLimits: {
-          perProject: MAX_RESUMABLE_PROJECT_HANDOFFS,
-          total: MAX_LISTED_PROJECT_HANDOFFS,
-        },
       },
       _meta: {
         tool: "list_projects",
@@ -4714,6 +4714,7 @@ function createMcpServer(
     };
   });
 
+  const projectOperationIdSchema = operationIdSchema;
   const projectControlActionSchema = z.discriminatedUnion("action", [
     z.strictObject({
       action: z.literal("resolve"),
@@ -4726,19 +4727,18 @@ function createMcpServer(
     z.strictObject({
       action: z.literal("open"),
       projectRef: z.string().min(1).max(128).optional(),
-      operationId: z.string().min(1).max(256),
+      operationId: projectOperationIdSchema,
       checkoutKind: z.enum(["checkout", "worktree"]).optional(),
     }),
     z.strictObject({
       action: z.literal("resume"),
       projectRef: z.string().min(1).max(128).optional(),
-      operationId: z.string().min(1).max(256),
-      taskRef: z.string().min(16).max(512).optional(),
-      threadRef: z.string().min(16).max(512).optional(),
+      operationId: projectOperationIdSchema,
+      taskRef: z.string().min(16).max(512),
     }),
     z.strictObject({
       action: z.literal("hydrate"),
-      cursor: z.string().max(4_096).optional(),
+      cursor: z.string().min(1).max(4_096).optional(),
     }),
     z.strictObject({
       action: z.literal("status"),
@@ -4753,50 +4753,43 @@ function createMcpServer(
     }),
     z.strictObject({
       action: z.literal("interrupt"),
-      threadRef: z.string().min(16).max(512),
-      operationId: z.string().min(1).max(128),
+      operationId: operationIdSchema,
     }),
     z.strictObject({
       action: z.literal("pause"),
       threadRef: z.string().min(16).max(512),
-      operationId: z.string().min(1).max(128),
+      operationId: operationIdSchema,
       ifMatch: z.number().int().positive().optional(),
     }),
     z.strictObject({
       action: z.literal("archive"),
       threadRef: z.string().min(16).max(512),
-      operationId: z.string().min(1).max(128),
+      operationId: operationIdSchema,
       ifMatch: z.number().int().positive().optional(),
     }),
     z.strictObject({
       action: z.literal("complete"),
       threadRef: z.string().min(16).max(512),
-      operationId: z.string().min(1).max(128),
+      operationId: operationIdSchema,
       ifMatch: z.number().int().positive().optional(),
     }),
     z.strictObject({
       action: z.literal("close"),
       threadRef: z.string().min(16).max(512),
-      operationId: z.string().min(1).max(128),
+      operationId: operationIdSchema,
       ifMatch: z.number().int().positive().optional(),
     }),
   ]);
-  // registerAppTool expects a raw Zod shape for tools/list serialization.
-  // Keep the public shape compact, then enforce action-specific requirements
-  // with projectControlActionSchema inside the handler.
+  // The MCP SDK currently serializes only object-shaped tool schemas. Keep the
+  // public vocabulary minimal, then enforce each action's strict object shape
+  // with projectControlActionSchema at both the HTTP boundary and handler.
   const projectControlPublicInputSchema = {
-    action: z.enum([
-      "open",
-      "resume",
-      "hydrate",
-      "interrupt",
-    ]),
+    action: z.enum(["open", "resume", "hydrate", "interrupt"]),
     projectRef: z.string().min(1).max(128).optional(),
-    operationId: z.string().min(1).max(256).optional(),
+    operationId: projectOperationIdSchema.optional(),
     checkoutKind: z.enum(["checkout", "worktree"]).optional(),
     taskRef: z.string().min(16).max(512).optional(),
-    threadRef: z.string().min(16).max(512).optional(),
-    cursor: z.string().max(4_096).optional(),
+    cursor: z.string().min(1).max(4_096).optional(),
   } satisfies z.ZodRawShape;
   const projectThreadControlInputSchema = {
     action: z.enum([
@@ -4810,7 +4803,7 @@ function createMcpServer(
       "close",
     ]),
     projectRef: z.string().min(1).max(128).optional(),
-    operationId: z.string().min(1).max(256).optional(),
+    operationId: projectOperationIdSchema.optional(),
     threadRef: z.string().min(16).max(512).optional(),
     cursor: z.string().max(4_096).optional(),
     waitMs: z.number().int().min(0).max(20_000).optional(),
@@ -4837,15 +4830,19 @@ function createMcpServer(
     const startedAt = performance.now();
     const authorization = projectExecutionAuthorizationFromContext();
     const profileId = projectThreadProfileId(authorization);
-    const legacyProfileId = legacyProjectThreadProfileId(authorization);
     const authorizedProjectList = authorizedProjects(config);
     const hostIdentity = requestContext.getStore()?.hostIdentity;
     if (
       toolName === toolNames.projectControl &&
-      (input.action === "open" || input.action === "resume" || input.action === "hydrate") &&
+      (input.action === "open" ||
+        input.action === "resume" ||
+        input.action === "hydrate" ||
+        input.action === "interrupt") &&
       !hostIdentity?.sessionRef
     ) {
-      throw implicitProjectExecutionRequired();
+      throw implicitProjectExecutionRequired(
+        "operationId" in input ? input.operationId : undefined,
+      );
     }
     if (input.action === "resolve") {
       const hostIdentity = requestContext.getStore()?.hostIdentity;
@@ -4877,7 +4874,7 @@ function createMcpServer(
         structuredContent: {
           ok: true,
           binding: "resolved",
-          thread: modelProjectThread(thread, checkpoint, config.oauth.keys.projectFingerprint),
+          thread: appProjectThread(thread, checkpoint, config.oauth.keys.projectFingerprint),
           ...(snapshot
             ? {
                 resume: {
@@ -4918,21 +4915,6 @@ function createMcpServer(
         (requestedProject ? [requestedProject] : authorizedProjectList)
           .map((project) => project.projectFingerprint),
       );
-      if (legacyProfileId !== profileId) {
-        for (const legacyThread of projectExecutionRuntime.threads.list({
-          profileId: legacyProfileId,
-          ...(requestedProject
-            ? { projectFingerprint: requestedProject.projectFingerprint }
-            : {}),
-          limit: 100,
-        })) {
-          projectExecutionRuntime.threads.reassignProfile(
-            legacyThread.threadId,
-            legacyProfileId,
-            profileId,
-          );
-        }
-      }
       const threads = projectExecutionRuntime.threads.list({
         profileId,
         ...(requestedProject
@@ -4959,19 +4941,85 @@ function createMcpServer(
         },
       };
     }
-    if (input.action === "activity" || input.action === "interrupt") {
+    if (input.action === "interrupt") {
+      assertOAuthScopes(["project:read", "process:execute"]);
+      if (!hostIdentity?.sessionRef) throw implicitProjectExecutionRequired(input.operationId);
+      const binding = projectExecutionRuntime.continuity.resolveSession(
+        hostIdentity.sessionRef,
+        hostIdentity.actorId,
+      );
+      if (!binding?.executionId) throw implicitProjectExecutionRequired(input.operationId);
+      const execution = projectExecutionRuntime.store.resolveActive(
+        binding.executionId,
+        authorization,
+      );
+      if (!execution?.workspaceId) throw implicitProjectExecutionRequired(input.operationId);
+      if (
+        projectExecutionRuntime.threads.threadIdForExecution(binding.executionId) !==
+          binding.threadId
+      ) {
+        throw implicitProjectExecutionRequired(input.operationId);
+      }
+      const thread = projectExecutionRuntime.threads.get(binding.threadId, profileId);
+      const selected = thread && authorizedProjectList.find((project) =>
+        project.id === thread.projectRef &&
+        project.projectFingerprint === thread.projectFingerprint &&
+        execution.projectRef === thread.projectRef &&
+        execution.projectFingerprint === thread.projectFingerprint
+      );
+      if (!thread || !selected) throw implicitProjectExecutionRequired(input.operationId);
+      const workspace = workspaces.getWorkspace(connectionPrincipalId, execution.workspaceId);
+      return runMutationOperation({
+        store: mutationOperations,
+        pending: pendingMutationOperations,
+        key: {
+          connectionPrincipalId,
+          workspaceId: workspace.id,
+          tool: toolNames.projectControl,
+          operationId: input.operationId,
+        },
+        workspaceGeneration: workspace.stateGeneration,
+        request: { action: "interrupt" },
+        execute: async () => {
+          const interruptedSessionIds = processSessions.interruptWorkspace(
+            connectionPrincipalId,
+            workspace.id,
+          );
+          projectExecutionRuntime.continuity.appendEvent({
+            threadId: thread.threadId,
+            eventKey: `interrupt:${input.operationId}`,
+            type: "operation.interrupt_requested",
+            source: "server",
+            trust: "server_observed",
+            visibility: "widget",
+            operationId: input.operationId,
+            payload: {
+              summary: interruptedSessionIds.length > 0
+                ? `Interrupt requested for ${interruptedSessionIds.length} running command(s).`
+                : "No running commands required interruption.",
+              sessionCount: interruptedSessionIds.length,
+              sessionIds: interruptedSessionIds,
+            },
+          });
+          return {
+            content: [textBlock(
+              interruptedSessionIds.length > 0
+                ? `Interrupt requested for ${interruptedSessionIds.length} running command(s).`
+                : "No running commands required interruption.",
+            )],
+            structuredContent: {
+              interrupted: interruptedSessionIds.length,
+            },
+          };
+        },
+      });
+    }
+    if (input.action === "activity") {
       const threadId = decodeThreadRefOrPublicError(
         input.threadRef,
         config.oauth.keys.projectFingerprint,
       );
-      let thread = projectExecutionRuntime.threads.get(threadId, profileId);
-      if (!thread && legacyProfileId !== profileId) {
-        thread = projectExecutionRuntime.threads.reassignProfile(
-          threadId,
-          legacyProfileId,
-          profileId,
-        );
-      }
+      const thread = projectExecutionRuntime.threads.get(threadId, profileId);
       if (
         !thread ||
         !authorizedProjectList.some((project) =>
@@ -4990,49 +5038,6 @@ function createMcpServer(
             effectsKnown: true,
           },
         );
-      }
-      if (input.action === "interrupt") {
-        assertOAuthScopes(["project:read", "process:execute"]);
-        const interruptedSessionIds: number[] = [];
-        for (const executionId of projectExecutionRuntime.threads.executionIdsForThread(
-          thread.threadId,
-          profileId,
-        )) {
-          const execution = projectExecutionRuntime.store.resolveActive(executionId, authorization);
-          if (!execution?.workspaceId) continue;
-          interruptedSessionIds.push(...processSessions.interruptWorkspace(
-            connectionPrincipalId,
-            execution.workspaceId,
-          ));
-        }
-        projectExecutionRuntime.continuity.appendEvent({
-          threadId: thread.threadId,
-          eventKey: `interrupt:${input.operationId}`,
-          type: "operation.interrupt_requested",
-          source: "server",
-          trust: "server_observed",
-          visibility: "widget",
-          operationId: input.operationId,
-          payload: {
-            summary: interruptedSessionIds.length > 0
-              ? `Interrupt requested for ${interruptedSessionIds.length} running command(s).`
-              : "No running commands required interruption.",
-            sessionCount: interruptedSessionIds.length,
-            sessionIds: interruptedSessionIds,
-          },
-        });
-        return {
-          content: [textBlock(
-            interruptedSessionIds.length > 0
-              ? `Interrupt requested for ${interruptedSessionIds.length} running command(s).`
-              : "No running commands required interruption.",
-          )],
-          structuredContent: {
-            ok: true,
-            interrupted: interruptedSessionIds.length,
-            sessionIds: interruptedSessionIds,
-          },
-        };
       }
       const afterSequence = input.cursor === undefined ? 0 : Number(input.cursor);
       const limit = input.limit ?? 50;
@@ -5086,14 +5091,7 @@ function createMcpServer(
         input.threadRef,
         config.oauth.keys.projectFingerprint,
       );
-      let thread = projectExecutionRuntime.threads.get(threadId, profileId);
-      if (!thread && legacyProfileId !== profileId) {
-        thread = projectExecutionRuntime.threads.reassignProfile(
-          threadId,
-          legacyProfileId,
-          profileId,
-        );
-      }
+      const thread = projectExecutionRuntime.threads.get(threadId, profileId);
       if (
         !thread ||
         !authorizedProjectList.some((project) =>
@@ -5146,7 +5144,7 @@ function createMcpServer(
           content: [textBlock("Project thread status ready.")],
           structuredContent: {
             ok: true,
-            thread: modelProjectThread(
+            thread: appProjectThread(
               thread,
               checkpoint,
               config.oauth.keys.projectFingerprint,
@@ -5425,62 +5423,13 @@ function createMcpServer(
     }
 
     const { projectRef, operationId } = input;
-    if (
-      input.action === "resume" &&
-      (input.taskRef === undefined) === (input.threadRef === undefined)
-    ) {
-      throw new PublicActionError(
-        "invalid_tool_input",
-        "Resume requires exactly one of taskRef or threadRef.",
-      );
-    }
-    let resumedThread = input.action === "resume" && input.threadRef
-      ? projectExecutionRuntime.threads.resume(
-          decodeThreadRefOrPublicError(
-            input.threadRef,
-            config.oauth.keys.projectFingerprint,
-          ),
-          profileId,
-        )
-      : undefined;
-    if (!resumedThread && input.action === "resume" && input.threadRef && legacyProfileId !== profileId) {
-      const threadId = decodeThreadRefOrPublicError(
-        input.threadRef,
-        config.oauth.keys.projectFingerprint,
-      );
-      const migrated = projectExecutionRuntime.threads.reassignProfile(
-        threadId,
-        legacyProfileId,
-        profileId,
-      );
-      resumedThread = migrated
-        ? projectExecutionRuntime.threads.resume(migrated.threadId, profileId)
-        : undefined;
-    }
-    if (input.action === "resume" && input.threadRef && !resumedThread) {
-      throw new PublicActionError(
-        "project_thread_not_found",
-        "The threadRef is unavailable or closed. Choose a saved task from list_projects or open a new task.",
-      );
-    }
-    if (resumedThread && resumedThread.thread.status !== "active") {
-      projectExecutionRuntime.threads.setStatus(
-        resumedThread.thread.threadId,
-        profileId,
-        "active",
-      );
-      resumedThread = projectExecutionRuntime.threads.resume(
-        resumedThread.thread.threadId,
-        profileId,
-      );
-    }
     const taskRef = input.action === "resume" ? input.taskRef : undefined;
     const projects = authorizedProjects(config);
     const existingCreation = projectExecutionRuntime.store.findCreation(
       authorization,
       operationId,
     );
-    const requestedProjectRef = projectRef ?? resumedThread?.thread.projectRef ?? existingCreation?.projectRef;
+    const requestedProjectRef = projectRef ?? existingCreation?.projectRef;
     const selected = requestedProjectRef
       ? projects.find((project) => project.id === requestedProjectRef)
       : projects.length === 1
@@ -5496,25 +5445,6 @@ function createMcpServer(
           retryable: true,
           safeToRetry: true,
           recovery: "list_projects",
-          phase: "not_started",
-          effectsKnown: true,
-        },
-      );
-    }
-    if (
-      resumedThread &&
-      (
-        resumedThread.thread.projectRef !== selected.id ||
-        resumedThread.thread.projectFingerprint !== selected.projectFingerprint
-      )
-    ) {
-      throw new PublicActionError(
-        "project_thread_not_found",
-        "The threadRef does not belong to the selected Project.",
-        {
-          retryable: true,
-          safeToRetry: true,
-          recovery: "project_thread_control_list",
           phase: "not_started",
           effectsKnown: true,
         },
@@ -5548,17 +5478,29 @@ function createMcpServer(
         selectedHandoffId = handoff.handoffId;
       }
     }
-    const createRequestHash = mutationRequestHash({
+    const createRequest = {
       action: input.action,
       projectRef: selected.id,
       ...(taskRef === undefined ? {} : { taskRef }),
-      ...(input.action === "resume" && input.threadRef
-        ? { threadRef: input.threadRef }
-        : {}),
       ...(input.action === "open"
         ? { checkoutKind: input.checkoutKind ?? "checkout" }
         : {}),
+    };
+    const actorBoundCreateRequestHash = mutationRequestHash({
+      actorId: profileId,
+      ...createRequest,
     });
+    const legacyCreateRequestHash = mutationRequestHash(createRequest);
+    const legacyBoundThreadId = existingCreation?.requestHash === legacyCreateRequestHash
+      ? projectExecutionRuntime.threads.threadIdForExecution(existingCreation.executionId)
+      : undefined;
+    const legacyReplayOwnedByActor = Boolean(
+      legacyBoundThreadId &&
+      projectExecutionRuntime.threads.get(legacyBoundThreadId, profileId),
+    );
+    const createRequestHash = legacyReplayOwnedByActor
+      ? legacyCreateRequestHash
+      : actorBoundCreateRequestHash;
     let reservation: ProjectExecutionReservation;
     try {
       reservation = projectExecutionRuntime.store.reserve({
@@ -5652,21 +5594,12 @@ function createMcpServer(
       );
     }
 
-    let executionThread = resumedThread?.thread;
+    let executionThread: ProjectThread | undefined;
     const existingThreadId = projectExecutionRuntime.threads.threadIdForExecution(
       execution.executionId,
     );
     if (existingThreadId) {
       executionThread = projectExecutionRuntime.threads.get(existingThreadId, profileId);
-    }
-    if (resumedThread && !existingThreadId) {
-      projectExecutionRuntime.threads.bindExecution(
-        resumedThread.thread.threadId,
-        profileId,
-        execution.executionId,
-        authorization.grantId,
-      );
-      executionThread = resumedThread.thread;
     }
     const requestedCheckoutKind = executionThread?.checkoutKind ??
       (input.action === "open" ? input.checkoutKind ?? "checkout" : "checkout");
@@ -5877,6 +5810,7 @@ function createMcpServer(
       "open",
       "resume",
       "hydrate",
+      "interrupt",
       "pause",
       "archive",
       "complete",
@@ -5893,7 +5827,7 @@ function createMcpServer(
   };
 
   registerAppTool(server, toolNames.projectControl, {
-    description: "Open, resume, hydrate, or interrupt a Project task.",
+    description: "Open(operationId), resume(operationId+taskRef), hydrate(cursor?), or interrupt(operationId) for the current session-bound execution.",
     inputSchema: projectControlPublicInputSchema,
     _meta: {},
     annotations: USE_PROJECT_ANNOTATIONS,
@@ -5914,11 +5848,11 @@ function createMcpServer(
       use: "saving one bounded semantic Project task summary so work can continue after a new conversation or OAuth reconnection.",
       avoid: "full chat transcripts, raw tool logs, file contents, diffs, credentials, secrets, or hidden reasoning.",
       requires: `a selected Project, operationId, title, progress, and the current saved-task version as ifMatch after the first save; title and progress must also fit ${MAX_PROJECT_HANDOFF_MODEL_TEXT_JSON_BYTES} serialized context bytes.`,
-      returns: "opaque taskRef and threadRef values with new versions, without echoing the saved progress.",
+      returns: "the opaque Task reference, status, and version, without echoing the saved progress.",
     }),
       inputSchema: {
         ...privateProjectExecutionInputSchema,
-        operationId: z.string().min(1).max(128),
+        operationId: operationIdSchema,
         title: z.string()
           .min(1)
           .max(MAX_PROJECT_HANDOFF_TITLE_UTF8_BYTES)
@@ -6141,23 +6075,19 @@ function createMcpServer(
           durationMs: Math.round(performance.now() - startedAt),
         });
         return {
-          content: [textBlock(
-            savedHandoff.handoff.status === "completed"
-              ? "Project task marked complete."
-              : "Project task progress saved.",
-          )],
+          content: [textBlock("Progress saved.")],
           structuredContent: {
-            ok: true,
             task: {
               taskRef: encodeProjectHandoffRef(
                 savedHandoff.handoff.handoffId,
                 config.oauth.keys.projectFingerprint,
               ),
-              title: savedHandoff.handoff.title,
               status: savedHandoff.handoff.status,
               version: savedHandoff.handoff.revision,
-              updatedAt: savedHandoff.handoff.updatedAt,
             },
+          },
+          _meta: {
+            tool: toolNames.saveProgress,
             ...(outputThread
               ? {
                   thread: {
@@ -6173,7 +6103,6 @@ function createMcpServer(
                 }
               : {}),
           },
-          _meta: { tool: toolNames.saveProgress },
         };
       };
       return runMutationOperation({
@@ -6205,48 +6134,28 @@ function createMcpServer(
       title: "Search or load skills",
       description: toolDescription({
         use: "searching available Skills or loading one selected Skill.",
-        avoid: "loading by an ambiguous name.",
-        requires: "a selected Project plus action=search, or action=load with skillId or a unique exact name.",
-        returns: "bounded Skill metadata, or one trusted/untrusted manifest and skill:// root.",
+        avoid: "passing search and load fields together.",
+        requires: "a selected Project plus query, a returned cursor by itself, or one selected skillId.",
+        returns: "bounded Skill metadata, or one manifest with its trust class and skill:// root.",
       }),
       inputSchema: {
         ...privateProjectExecutionInputSchema,
-        action: z.enum(["search", "load"]).optional(),
-        query: z.string().max(200).optional(),
-        cursor: z.string().max(4_096).optional(),
+        query: z.string().min(1).max(200).optional(),
+        cursor: z.string().min(1).max(4_096).optional(),
         limit: z.number().int().min(1).max(50).optional(),
         skillId: z
           .string()
-          .optional(),
-        name: z
-          .string()
+          .regex(/^skill_[a-f0-9]{64}$/u)
           .optional(),
       },
       ...toolWidgetDescriptorMeta(config, "read"),
       annotations: READ_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, action, query, cursor, limit, skillId, name }) => {
+    async ({ workspaceId, query, cursor, limit, skillId }) => {
       const startedAt = performance.now();
       const workspace = workspaces.getWorkspace(connectionPrincipalId, workspaceId);
       const principalCursorRef = currentCursorCallerRef(config.oauth.keys.cursor);
-      const decodedSkillCursor = cursor
-        ? decodedCursorOrError(
-            cursor,
-            config.oauth.keys.cursor,
-            "invalid_skill_cursor",
-            "The Skill cursor is invalid or expired; restart the search without it.",
-          )
-        : undefined;
-      if (
-        decodedSkillCursor &&
-        (
-          action !== undefined ||
-          query !== undefined ||
-          limit !== undefined ||
-          skillId !== undefined ||
-          name !== undefined
-        )
-      ) {
+      if (cursor !== undefined && (query !== undefined || limit !== undefined || skillId !== undefined)) {
         throw new PublicActionError(
           "skill_cursor_fields_invalid",
           "A Skill continuation cursor is self-contained; pass cursor only.",
@@ -6259,14 +6168,10 @@ function createMcpServer(
           },
         );
       }
-      const cursorAction = decodedSkillCursor?.parameters?.action;
-      const effectiveAction = decodedSkillCursor
-        ? cursorAction === "search" ? "search" : undefined
-        : action;
-      if (!effectiveAction) {
+      if (skillId !== undefined && (query !== undefined || limit !== undefined)) {
         throw new PublicActionError(
-          "skill_action_required",
-          "Provide action=search or action=load, or pass a returned search cursor by itself.",
+          "skill_fields_invalid",
+          "Pass skillId by itself when loading a Skill.",
           {
             retryable: true,
             safeToRetry: true,
@@ -6276,18 +6181,34 @@ function createMcpServer(
           },
         );
       }
-      if (effectiveAction === "search") {
-        if (!decodedSkillCursor && (skillId !== undefined || name !== undefined)) {
-          throw new PublicActionError(
-            "skill_fields_invalid",
-            "action=search accepts query, cursor, and limit; omit skillId and name.",
-          );
-        }
+      const decodedSkillCursor = cursor !== undefined
+        ? decodedCursorOrError(
+            cursor,
+            config.oauth.keys.cursor,
+            "invalid_skill_cursor",
+            "The Skill cursor is invalid or expired; restart the search without it.",
+          )
+        : undefined;
+      const searching = decodedSkillCursor !== undefined || query !== undefined;
+      if (!searching && skillId === undefined) {
+        throw new PublicActionError(
+          "skill_selection_required",
+          "Provide a query to search, a returned cursor to continue, or a skillId to load.",
+          {
+            retryable: true,
+            safeToRetry: true,
+            recovery: "correct_and_retry",
+            phase: "not_started",
+            effectsKnown: true,
+          },
+        );
+      }
+      if (searching) {
         const revision = workspaces.skillRevision(workspace);
         const cursorQuery = decodedSkillCursor?.parameters?.query;
         const normalizedQuery = decodedSkillCursor
           ? typeof cursorQuery === "string" ? cursorQuery : ""
-          : (query ?? "").trim().toLocaleLowerCase("en-US");
+          : query!.trim().toLocaleLowerCase("en-US");
         const cursorLimit = decodedSkillCursor?.parameters?.limit;
         const pageSize = decodedSkillCursor
           ? typeof cursorLimit === "number" ? cursorLimit : undefined
@@ -6306,10 +6227,10 @@ function createMcpServer(
           );
         }
         const queryHash = cursorQueryHash({ query: normalizedQuery });
-        if (!normalizedQuery && workspace.skills.length > 25) {
+        if (!normalizedQuery) {
           throw new PublicActionError(
             "skill_query_required",
-            "This Project has a large Skill catalog; provide a query.",
+            "Provide a non-empty Skill query.",
             { retryable: true, safeToRetry: true, recovery: "add_skill_query", phase: "not_started" },
           );
         }
@@ -6387,57 +6308,25 @@ function createMcpServer(
               revision,
               offset: nextOffset,
               parameters: {
-                action: "search",
                 query: normalizedQuery,
                 limit: pageSize,
               },
             }, config.oauth.keys.cursor)
           : undefined;
         return {
-          content: [textBlock(`Found ${allEntries.length} matching Skill(s); returned ${skills.length}.`)],
+          content: [textBlock("Skills found.")],
           structuredContent: {
-            ok: true,
-            action: "search" as const,
             skills,
             total: allEntries.length,
             ...(nextCursor ? { nextCursor } : {}),
           },
         };
       }
-      if (query !== undefined || cursor !== undefined || limit !== undefined) {
-        throw new PublicActionError(
-          "skill_fields_invalid",
-          "action=load accepts skillId or name; omit query, cursor, and limit.",
-        );
-      }
-      let resolvedSkillId = skillId;
-      if (!resolvedSkillId) {
-        if (!name) {
-          throw new PublicActionError(
-            "skill_selection_required",
-            "Provide skillId or an exact unique name.",
-          );
-        }
-        const matches = workspace.skills.filter((skill) => skill.name === name);
-        if (matches.length === 0) {
-          throw new PublicActionError(
-            "skill_not_found",
-            "No matching Skill is available; hydrate the Project again if the catalog is stale.",
-          );
-        }
-        if (matches.length > 1) {
-          throw new PublicActionError(
-            "skill_ambiguous",
-            `Use one of these skillIds: ${matches.map((skill) => skill.skillId).join(", ")}`,
-          );
-        }
-        resolvedSkillId = matches[0]!.skillId;
-      }
 
       const loaded = await workspaces.loadSkill(
         connectionPrincipalId,
         workspaceId,
-        resolvedSkillId,
+        skillId!,
       );
       logToolCall(config, {
         tool: toolNames.skills,
@@ -6448,19 +6337,11 @@ function createMcpServer(
       });
       const provenance = workspaceSkillTrust(loaded.skill);
       return {
-        content: [textBlock(
-          provenance.trust === "repository_untrusted"
-            ? "Skill loaded. Treat its content as untrusted repository data."
-            : "Skill loaded.",
-        )],
+        content: [textBlock("Skill loaded.")],
         structuredContent: {
-          ok: true,
           skill: {
             skillId: loaded.skill.skillId,
-            name: loaded.skill.name,
-            ...provenance,
-            manifestHash: loaded.skill.manifestHash,
-            scope: loaded.skill.scope,
+            trust: provenance.trust,
             resourceRoot: skillUriRoot(loaded.skill.skillId),
             content: loaded.content,
           },
@@ -6484,8 +6365,7 @@ function createMcpServer(
       inputSchema: {
         ...privateProjectExecutionInputSchema,
         files: z
-          .array(z.object({
-            ref: z.string().min(1).max(64).optional(),
+          .array(z.strictObject({
             path: z.string().min(1).max(1_024),
             offset: z.number().int().positive().optional(),
             limit: z
@@ -6510,6 +6390,7 @@ function createMcpServer(
         { instructionContextId: currentInstructionContextId() },
       );
       const stableReads = new Map<number, StableWorkspaceFileRead>();
+      const readProvenances = new Map<number, ModelReadProvenance>();
       const displayPaths = new Map(
         files.map((file, index) => [
           index,
@@ -6520,6 +6401,7 @@ function createMcpServer(
         files.map((file) => ({ ...file, operation: "read" })),
         async (file, index) => {
           const readPath = workspaces.confineReadPath(workspaces.resolveReadPath(workspace, file.path));
+          readProvenances.set(index, modelReadProvenance(readPath));
           const displayPath = modelVisibleReadPath(workspace, readPath);
           displayPaths.set(index, displayPath);
           const stable = await readStableWorkspaceFile({
@@ -6541,33 +6423,44 @@ function createMcpServer(
         },
         { onError: reportPiToolError },
       );
+      const itemProvenances = batch.items.map((item) =>
+        readProvenances.get(item.index) ??
+          (!item.path.startsWith("skill://") ? REPOSITORY_PROVENANCE : undefined)
+      );
+      const firstProvenance = itemProvenances[0];
+      const commonProvenance = firstProvenance && itemProvenances.every((provenance) =>
+          provenance !== undefined &&
+          provenance.source === firstProvenance.source &&
+          provenance.trust === firstProvenance.trust &&
+          provenance.authority === firstProvenance.authority
+        )
+        ? firstProvenance
+        : undefined;
       const batchReadItems = batch.items.map((item) => {
         const stable = stableReads.get(item.index);
-        const truncated = item.truncated || stable?.truncated === true;
+        const provenance = itemProvenances[item.index];
         return {
-          ok: item.ok,
-          ...(item.ref ? { ref: item.ref } : {}),
           path: displayPaths.get(item.index) ?? item.path,
-          provenance: REPOSITORY_PROVENANCE,
-          ...(item.ok ? { content: item.result } : { error: item.result }),
+          ...(!commonProvenance && provenance ? { provenance } : {}),
+          ...(item.ok
+            ? { content: item.result }
+            : { error: item.error ?? item.result }),
           ...(stable?.version
             ? {
-                contentHash: stable.version.hash,
-                mtimeNs: stable.version.mtimeNs,
-                offset: stable.offset,
+                version: {
+                  contentHash: stable.version.hash,
+                  ...(stable.version.mtimeNs
+                    ? { mtimeNs: stable.version.mtimeNs }
+                    : {}),
+                },
               }
             : {}),
           ...(stable?.nextOffset ? { nextOffset: stable.nextOffset } : {}),
-          ...(truncated ? { truncated: true as const } : {}),
           ...(item.omitted ? { omitted: true as const } : {}),
-          ...(item.omittedReason ? { omittedReason: item.omittedReason } : {}),
         };
       });
       const failed = batch.items.filter((item) => !item.ok).length;
-      const succeeded = batch.items.length - failed;
       const allFailed = failed === batch.items.length;
-      const status = allFailed ? "failed" as const : failed > 0 ? "partial" as const : "completed" as const;
-      const truncated = batchReadItems.some((item) => item.truncated === true);
       if (newlyLoadedAgentsFiles.length > 0) {
         await workspaces.markAgentsFilesAcknowledged(
           workspace,
@@ -6576,8 +6469,7 @@ function createMcpServer(
         );
       }
       const content = [textBlock(
-        `${allFailed ? "read_files failed." : failed > 0 ? `read_files partial: ${failed} failed.` : "read_files completed."}` +
-        `${truncated ? " Results truncated." : ""}`,
+        allFailed ? "Files failed." : failed > 0 ? "Some files failed." : "Files read.",
       )];
       logToolCall(config, {
         tool: toolNames.readFiles,
@@ -6589,11 +6481,19 @@ function createMcpServer(
         content,
         ...(allFailed ? { isError: true as const } : {}),
         structuredContent: {
-          ok: !allFailed,
-          ...(allFailed ? { error: { code: "read_files_failed" } } : {}),
-          status,
-          succeeded,
-          failed,
+          ...(allFailed
+            ? {
+                error: {
+                  code: "read_files_failed",
+                  retryable: true,
+                  safeToRetry: true,
+                  recovery: "correct_paths_and_retry",
+                  phase: "not_started" as const,
+                  effectsKnown: true,
+                },
+              }
+            : {}),
+          ...(commonProvenance ? { provenance: commonProvenance } : {}),
           items: batchReadItems,
           ...(newlyLoadedAgentsFiles.length > 0
             ? {
@@ -6601,7 +6501,6 @@ function createMcpServer(
                   modelInstructionRecord(file, workspace.root)),
               }
             : {}),
-          ...(truncated ? { truncated: true as const } : {}),
         },
       };
     },
@@ -6621,8 +6520,7 @@ function createMcpServer(
       inputSchema: {
         ...privateProjectExecutionInputSchema,
         operations: z.array(z.discriminatedUnion("operation", [
-            z.object({
-              ref: z.string().min(1).max(64).optional(),
+            z.strictObject({
               operation: z.literal("grep"),
               pattern: z.string().min(1).max(1_000),
               path: z.string().min(1).max(1_024).optional(),
@@ -6632,17 +6530,15 @@ function createMcpServer(
               ignoreCase: z.boolean().optional(),
               literal: z.boolean().optional(),
             }),
-            z.object({
-              ref: z.string().min(1).max(64).optional(),
+            z.strictObject({
               operation: z.literal("glob"),
               pattern: z.string().min(1).max(1_000),
               path: z.string().min(1).max(1_024).optional(),
               limit: z.number().int().min(1).max(5_000).optional(),
             }),
-            z.object({
-              ref: z.string().min(1).max(64).optional(),
+            z.strictObject({
               operation: z.literal("ls"),
-              path: z.string().min(1).max(1_024),
+              path: z.string().min(1).max(1_024).optional(),
               limit: z.number().int().min(1).max(5_000).optional(),
             }),
           ])).min(1).max(BATCH_MAX_ITEMS),
@@ -6709,9 +6605,7 @@ function createMcpServer(
         );
       }
       const failed = batch.items.filter((item) => !item.ok).length;
-      const succeeded = batch.items.length - failed;
       const allFailed = failed === batch.items.length;
-      const status = allFailed ? "failed" as const : failed > 0 ? "partial" as const : "completed" as const;
       logToolCall(config, {
         tool: toolNames.inspect,
         workspaceId,
@@ -6720,28 +6614,32 @@ function createMcpServer(
       });
       return {
         content: [textBlock(
-          allFailed ? "inspect failed." : failed > 0 ? `inspect partial: ${failed} failed.` : "inspect completed.",
+          allFailed ? "Inspection failed." : failed > 0 ? "Some inspections failed." : "Inspection complete.",
         )],
         ...(allFailed ? { isError: true as const } : {}),
         structuredContent: {
-          ok: !allFailed,
-          ...(allFailed ? { error: { code: "inspect_failed" } } : {}),
-          status,
-          succeeded,
-          failed,
+          ...(allFailed
+            ? {
+                error: {
+                  code: "inspect_failed",
+                  retryable: true,
+                  safeToRetry: true,
+                  recovery: "correct_operations_and_retry",
+                  phase: "not_started" as const,
+                  effectsKnown: true,
+                },
+              }
+            : {}),
+          provenance: REPOSITORY_PROVENANCE,
           items: batch.items.map((item) => ({
-            ok: item.ok,
-            ...(item.ref ? { ref: item.ref } : {}),
             operation: item.operation,
             path: item.path,
-            ...(item.ok ? {} : { error: item.error ?? { code: "inspect_failed" } }),
-            result: {
-              text: item.result,
-              provenance: REPOSITORY_PROVENANCE,
-            },
-            ...(item.truncated ? { truncated: true as const } : {}),
-            ...(item.omitted ? { omitted: true as const } : {}),
-            ...(item.omittedReason ? { omittedReason: item.omittedReason } : {}),
+            ...(item.omitted
+              ? { omitted: true as const }
+              : item.ok
+                ? { result: item.result }
+                : { error: item.error ?? item.result }),
+            ...(!item.omitted && item.truncated ? { truncated: true as const } : {}),
           })),
           ...(newlyLoadedAgentsFiles.length > 0
             ? {
@@ -6768,7 +6666,7 @@ function createMcpServer(
         }),
         inputSchema: {
           ...privateProjectExecutionInputSchema,
-          operationId: z.string().min(1).max(128),
+          operationId: operationIdSchema,
           ifMatch: z.union([
             z.string().regex(/^sha256:[a-f0-9]{64}$/u),
             z.record(
@@ -6777,7 +6675,7 @@ function createMcpServer(
                 z.string().regex(/^sha256:[a-f0-9]{64}$/u),
                 z.object({
                   contentHash: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
-                  mtimeNs: z.string().regex(/^\d+$/u).optional(),
+                  mtimeNs: z.string().regex(FILE_MTIME_NS_PATTERN).optional(),
                 }),
                 z.null(),
               ]),
@@ -6815,7 +6713,13 @@ function createMcpServer(
             : (() => {
                 throw new PublicActionError(
                   "if_match_ambiguous",
-                  "A scalar ifMatch is valid only for a one-path patch; use a path-to-version object.",
+                  "A scalar ifMatch is valid only for a one-path patch; provide a path-to-version map and retry with the same operationId.",
+                  {
+                    safeToRetry: true,
+                    recovery: "provide_path_version_map_retry_same_operation_id",
+                    phase: "not_started",
+                    effectsKnown: true,
+                  },
                 );
               })()
           : ifMatch
@@ -6973,11 +6877,7 @@ function createMcpServer(
           return {
             content,
             structuredContent: {
-              ok: true,
-              effects: createApplyPatchEffects(new Date().toISOString(), applied.files),
-              preconditions: {
-                complete: true,
-              },
+              effects: createApplyPatchEffects(applied.files),
             },
             _meta: {
               tool: "apply_patch",
@@ -7019,13 +6919,13 @@ function createMcpServer(
         description: toolDescription({
           use: "reviewing either the repository working-tree diff or this execution's successful DevSpace apply_patch history.",
           avoid: "ordinary file discovery.",
-          requires: "a selected Project and an explicit source: repository or apply_patch_history.",
-          returns: "a read-only bounded patch page, explicit source provenance, signed continuation, and file summary.",
+          requires: "a selected Project plus source on the first call, or a returned cursor by itself.",
+          returns: "a read-only bounded patch page, source provenance, compact summary, and optional continuation.",
         }),
         inputSchema: {
           ...privateProjectExecutionInputSchema,
-          source: z.enum(["repository", "apply_patch_history"]),
-          cursor: z.string().max(4_096).optional(),
+          source: z.enum(["repository", "apply_patch_history"]).optional(),
+          cursor: z.string().min(1).max(4_096).optional(),
         },
         ...toolWidgetDescriptorMeta(config, "show_changes", {
           invoking: "Preparing changes…",
@@ -7042,24 +6942,59 @@ function createMcpServer(
         const workspace = workspaces.getWorkspace(connectionPrincipalId, workspaceId);
         const execute = async () => {
           const principalRef = currentCursorCallerRef(config.oauth.keys.cursor);
+          if ((source === undefined) === (cursor === undefined)) {
+            throw new PublicActionError(
+              "diff_fields_invalid",
+              "Pass source on the first call or a returned cursor by itself.",
+              {
+                retryable: true,
+                safeToRetry: true,
+                recovery: "correct_and_retry",
+                phase: "not_started",
+                effectsKnown: true,
+              },
+            );
+          }
+          const decoded = cursor !== undefined
+            ? decodedCursorOrError(
+                cursor,
+                config.oauth.keys.cursor,
+                "invalid_diff_cursor",
+                "The diff cursor is invalid or expired; restart show_changes with an explicit source and no cursor.",
+                {
+                  recovery: "restart_diff_paging_with_source",
+                  details: { requiresSource: true, omitCursor: true },
+                },
+              )
+            : undefined;
+          const cursorSource = decoded?.parameters?.source;
+          const effectiveSource = source ?? (
+              cursorSource === "repository" || cursorSource === "apply_patch_history"
+                ? cursorSource
+                : undefined
+            );
+          if (!effectiveSource) {
+            throw new PublicActionError(
+              "invalid_diff_cursor",
+              "The diff cursor has invalid continuation settings; restart show_changes with an explicit source and no cursor.",
+              {
+                retryable: true,
+                safeToRetry: true,
+                recovery: "restart_diff_paging_with_source",
+                phase: "not_started",
+                effectsKnown: true,
+                details: { requiresSource: true, omitCursor: true },
+              },
+            );
+          }
           const queryHash = cursorQueryHash({
             workspaceId,
-            source,
+            source: effectiveSource,
           });
           const pagingScope = {
             principalRef,
             workspaceGeneration: workspace.stateGeneration,
           };
-          // Decoded first so a continuation can ask for the diff its cursor was
-          // issued against instead of forcing a fresh repository snapshot per page.
-          const decoded = cursor
-            ? decodedCursorOrError(
-                cursor,
-                config.oauth.keys.cursor,
-                "invalid_diff_cursor",
-                "The diff cursor is invalid or expired; repeat show_changes without it.",
-              )
-            : undefined;
           if (
             decoded &&
             (
@@ -7071,12 +7006,20 @@ function createMcpServer(
           ) {
             throw new PublicActionError(
               "diff_cursor_stale",
-              "The diff cursor belongs to another caller, Project generation, or query; repeat show_changes without it.",
-              { retryable: true, safeToRetry: true, recovery: "restart_diff_paging" },
+              "The diff cursor belongs to another caller, Project generation, or query; " +
+                `restart show_changes with source=${effectiveSource} and no cursor.`,
+              {
+                retryable: true,
+                safeToRetry: true,
+                recovery: "restart_diff_paging_with_source",
+                phase: "not_started",
+                effectsKnown: true,
+                details: { source: effectiveSource, omitCursor: true },
+              },
             );
           }
           let observedChanges: ReviewChangesResult | undefined;
-          if (source === "apply_patch_history") {
+          if (effectiveSource === "apply_patch_history") {
             try {
               observedChanges = applyPatchHistoryReview(
                 mutationOperations.listApplyPatchChanges({
@@ -7104,7 +7047,7 @@ function createMcpServer(
           const review = await reviewCheckpoints.reviewChanges({
             workspaceId,
             root: workspace.root,
-            source,
+            source: effectiveSource,
             pagingScope,
             ...(observedChanges ? { observedChanges } : {}),
             ...(decoded ? { continueRevision: decoded.revision } : {}),
@@ -7118,8 +7061,16 @@ function createMcpServer(
           ) {
             throw new PublicActionError(
               "diff_cursor_stale",
-              "Project changes changed while paging; repeat show_changes without a cursor.",
-              { retryable: true, safeToRetry: true, recovery: "restart_diff_paging" },
+              "Project changes changed while paging; " +
+                `restart show_changes with source=${effectiveSource} and no cursor.`,
+              {
+                retryable: true,
+                safeToRetry: true,
+                recovery: "restart_diff_paging_with_source",
+                phase: "not_started",
+                effectsKnown: true,
+                details: { source: effectiveSource, omitCursor: true },
+              },
             );
           }
           const page = buildModelVisibleDiffPage(review.patch, decoded?.offset ?? 0);
@@ -7131,14 +7082,10 @@ function createMcpServer(
                 queryHash,
                 revision,
                 offset: page.nextOffset,
+                parameters: { source: effectiveSource },
               }, config.oauth.keys.cursor)
             : undefined;
-          const content = [textBlock(
-            `${review.result} Diff bytes ${page.offset}-${page.nextOffset} of ${page.totalBytes} are in structuredContent.diff.` +
-            (page.eof
-              ? " Review complete."
-              : " Pass the same source and structuredContent.diff.nextCursor as cursor to show_changes."),
-          )];
+          const content = [textBlock(nextCursor ? "Changes ready; continue with cursor." : "Changes ready.")];
           logToolCall(config, {
             tool: "show_changes",
             workspaceId,
@@ -7149,22 +7096,12 @@ function createMcpServer(
           return {
             content,
             structuredContent: {
-              ok: true,
-              revision,
-              // Sent once, with the first page: summary.files still carries the
-              // total, so later pages lose nothing by omitting the list.
-              ...modelVisibleReviewFiles(review.files, page.offset === 0),
               summary: review.summary,
-              changeSource: source,
               diff: {
                 patch: page.content,
-                provenance: source === "repository"
+                provenance: effectiveSource === "repository"
                   ? REPOSITORY_PROVENANCE
                   : DEVSPACE_APPLY_PATCH_PROVENANCE,
-                offsetBytes: page.offset,
-                lengthBytes: Buffer.byteLength(page.content, "utf8"),
-                totalBytes: page.totalBytes,
-                eof: page.eof,
                 ...(nextCursor ? { nextCursor } : {}),
               },
             },
@@ -7172,8 +7109,15 @@ function createMcpServer(
               tool: "show_changes",
               card: {
                 workspaceId,
+                changeSource: effectiveSource,
                 summary: review.summary,
                 files: review.files.slice(0, MAX_SHOW_CHANGES_FILES),
+                page: {
+                  offsetBytes: page.offset,
+                  lengthBytes: Buffer.byteLength(page.content, "utf8"),
+                  totalBytes: page.totalBytes,
+                  eof: page.eof,
+                },
                 payload: {
                   patch: page.content,
                 },
@@ -7403,6 +7347,58 @@ function createServerWithStateLease(
         operationId: event.operationId,
         itemId: event.itemId,
         payload: event.payload,
+      });
+    },
+    onTerminal: (event) => {
+      if (
+        event.activity &&
+        event.outcome !== "spawn_failed" &&
+        projectExecutionRuntime.threads.threadIdForExecution(event.activity.executionId) ===
+          event.activity.threadId
+      ) {
+        recordAutomaticThreadCheckpoint(config, projectExecutionRuntime, {
+          cause: "command_completed",
+          sourceOperationId: event.activity.operationId,
+          target: {
+            threadId: event.activity.threadId,
+            profileId: event.activity.profileId,
+            connectionPrincipalId: event.connectionPrincipalId,
+            workspaceId: event.workspaceId,
+          },
+          observedState: {
+            commandMode: event.commandMode,
+            workingDirectory: event.activity.workingDirectory,
+            outcome: event.outcome,
+            ...(event.exitCode !== undefined ? { exitCode: event.exitCode } : {}),
+            ...(event.signal ? { signal: event.signal } : {}),
+            timedOut: event.timedOut,
+            wallTimeMs: event.durationMs,
+            outputRetained: event.outputRetained,
+            outputPartiallyLost: event.outputPartiallyLost,
+            outputUnavailable: event.outputUnavailable,
+          },
+        });
+      }
+      if (!config.logging.toolCalls) return;
+      const success = event.outcome === "exited" && event.exitCode === 0;
+      logEvent(config.logging, success ? "info" : "warn", "command_execution_terminal", {
+        ...correlationLogFields(
+          event.connectionPrincipalId,
+          event.workspaceId,
+          undefined,
+          auditReferenceKey,
+        ),
+        tool: "exec_command",
+        success,
+        commandMode: event.commandMode,
+        outcome: event.outcome,
+        ...(event.exitCode !== undefined ? { exitCode: event.exitCode } : {}),
+        ...(event.signal ? { signal: event.signal } : {}),
+        timedOut: event.timedOut,
+        durationMs: event.durationMs,
+        ...(event.phase ? { phase: event.phase } : {}),
+        ...(event.errorCode ? { errorCode: event.errorCode } : {}),
+        ...(event.errorCategory ? { errorCategory: event.errorCategory } : {}),
       });
     },
     onOutputStorageError: (error, context) => {
@@ -8285,6 +8281,7 @@ function createServerWithStateLease(
           "tool_unavailable",
           {
             operationId: toolCallOperationId(req.body),
+            mutation: toolCallIsMutation(req.body),
             recovery: "refresh_tools_or_reauthorize",
           },
         );
@@ -8303,6 +8300,7 @@ function createServerWithStateLease(
           "insufficient_scope",
           {
             operationId: toolCallOperationId(req.body),
+            mutation: toolCallIsMutation(req.body),
             recovery: "reauthorize_oauth",
             wwwAuthenticate: oauthBearerChallenge(
               resourceMetadataUrl,
@@ -8346,6 +8344,7 @@ function createServerWithStateLease(
           "invalid_tool_input",
           {
             operationId: toolCallOperationId(req.body),
+            mutation: toolCallIsMutation(req.body),
             recovery: "correct_and_retry",
           },
         );
@@ -8416,6 +8415,7 @@ function createServerWithStateLease(
             publicError.code,
             {
               operationId: toolCallOperationId(req.body),
+              mutation: toolCallIsMutation(req.body),
               recovery: publicError.recovery ?? "project_control_hydrate",
               retryable: publicError.retryable,
               safeToRetry: publicError.safeToRetry,
@@ -8484,6 +8484,7 @@ function createServerWithStateLease(
           "project_busy",
           {
             operationId: toolCallOperationId(req.body),
+            mutation: toolCallIsMutation(req.body),
             recovery: "retry_after_project_process",
           },
         );
@@ -8507,6 +8508,7 @@ function createServerWithStateLease(
           "project_execution_required",
           {
             operationId: toolCallOperationId(req.body),
+            mutation: toolCallIsMutation(req.body),
             recovery: "project_control_hydrate",
           },
         );

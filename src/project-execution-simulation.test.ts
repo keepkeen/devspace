@@ -141,7 +141,18 @@ try {
   });
   assertSucceeded(alphaSave);
   assert.doesNotMatch(JSON.stringify(alphaSave.structuredContent), /Created task-note/u);
+  assert.deepEqual(
+    Object.keys((alphaSave.structuredContent ?? {}) as Record<string, unknown>).sort(),
+    ["operation", "task"],
+  );
+  assert.deepEqual(
+    Object.keys((alphaSave.structuredContent as {
+      task?: Record<string, unknown>;
+    }).task ?? {}).sort(),
+    ["status", "taskRef", "version"],
+  );
   const alphaThreadRef = savedThreadRef(alphaSave);
+  const alphaTaskRef = savedTaskRef(alphaSave);
   assert.equal(savedThreadVersion(alphaSave), 2);
 
   const alphaActivity = await conversationA.callTool({
@@ -260,6 +271,47 @@ try {
   const betaThreadRefB = savedThreadRef(betaSaveB);
   assert.notEqual(betaThreadRefA, betaThreadRefB);
 
+  const globalAfterSaves = await conversationA.callTool({
+    name: "list_projects",
+    arguments: {},
+  });
+  assertSucceeded(globalAfterSaves);
+  const globalSerialized = JSON.stringify(globalAfterSaves.structuredContent);
+  assert.doesNotMatch(globalSerialized, /Alpha task|Beta task|createdAt|updatedAt|taskRef|tasks/u);
+  const globalProjects = (globalAfterSaves.structuredContent as {
+    projects?: Array<{
+      projectRef?: unknown;
+      resumableTaskCount?: unknown;
+    }>;
+  } | undefined)?.projects ?? [];
+  assert.equal(
+    globalProjects.find((project) => project.projectRef === alphaRef)?.resumableTaskCount,
+    1,
+  );
+  assert.equal(
+    globalProjects.find((project) => project.projectRef === betaRef)?.resumableTaskCount,
+    2,
+  );
+
+  const scopedAlpha = await conversationA.callTool({
+    name: "list_projects",
+    arguments: { projectRef: alphaRef },
+  });
+  assertSucceeded(scopedAlpha);
+  const scopedAlphaSerialized = JSON.stringify(scopedAlpha.structuredContent);
+  assert.match(scopedAlphaSerialized, /Alpha task/u);
+  assert.doesNotMatch(
+    scopedAlphaSerialized,
+    /Beta task|createdAt|"status"\s*:|defaultProjectRef|taskLimits/u,
+  );
+  const scopedAlphaTasks = (scopedAlpha.structuredContent as {
+    projects?: Array<{ tasks?: Array<Record<string, unknown>> }>;
+  } | undefined)?.projects?.[0]?.tasks ?? [];
+  assert.deepEqual(
+    Object.keys(scopedAlphaTasks[0] ?? {}).sort(),
+    ["taskRef", "title", "updatedAt", "version"],
+  );
+
   const threadListing = await conversationA.callTool({
     name: "project_thread_control",
     arguments: { action: "list" },
@@ -297,31 +349,35 @@ try {
     arguments: {
       action: "resume",
       projectRef: alphaRef,
-      threadRef: alphaThreadRef,
+      taskRef: alphaTaskRef,
       operationId: "resume-alpha",
     },
     _meta: resumedAlphaHostMeta,
   });
   assertSucceeded(resumedAlpha);
   assert.doesNotMatch(JSON.stringify(resumedAlpha.structuredContent), /executionRef/u);
-  const resumedThread = (resumedAlpha.structuredContent as {
+  const resumedThread = (resumedAlpha._meta as {
     thread?: {
       threadRef?: unknown;
       title?: unknown;
       version?: unknown;
-      checkpoint?: {
-        modelSummary?: unknown;
-        modelSummaryTrust?: unknown;
-        observedStateTrust?: unknown;
-      };
     };
   }).thread;
-  assert.equal(resumedThread?.threadRef, alphaThreadRef);
+  assert.notEqual(resumedThread?.threadRef, alphaThreadRef);
   assert.equal(resumedThread?.title, "Alpha task");
-  assert.equal(resumedThread?.version, 3);
-  assert.match(String(resumedThread?.checkpoint?.modelSummary), /Version three/u);
-  assert.equal(resumedThread?.checkpoint?.modelSummaryTrust, "untrusted");
-  assert.equal(resumedThread?.checkpoint?.observedStateTrust, "server_observed");
+  assert.equal(resumedThread?.version, 1);
+  const resumedCheckpoint = (resumedAlpha.structuredContent as {
+    checkpoint?: { untrustedSummary?: unknown; serverObserved?: unknown };
+  }).checkpoint;
+  assert.match(String(resumedCheckpoint?.untrustedSummary), /Version three/u);
+  assert.equal(typeof resumedCheckpoint?.serverObserved, "object");
+  assert.equal(
+    Object.hasOwn(
+      (resumedAlpha.structuredContent ?? {}) as Record<string, unknown>,
+      "thread",
+    ),
+    false,
+  );
   assertReadText(await conversationA.callTool({
     name: "read_files",
     arguments: { files: [{ path: "task-note.txt" }] },
@@ -351,8 +407,8 @@ try {
   assertSucceeded(freshBeta);
   assert.equal(
     (freshBeta.structuredContent as {
-      thread?: { checkpoint?: unknown };
-    } | undefined)?.thread?.checkpoint,
+      checkpoint?: unknown;
+    } | undefined)?.checkpoint,
     undefined,
   );
 
@@ -459,15 +515,23 @@ function hostMeta(session: string): Readonly<Record<string, string>> {
 }
 
 function savedThreadRef(result: Awaited<ReturnType<Client["callTool"]>>): string {
-  const value = String((result.structuredContent as {
+  const value = String((result._meta as {
     thread?: { threadRef?: unknown };
   } | undefined)?.thread?.threadRef ?? "");
   assert.match(value, /^pth1_/u);
   return value;
 }
 
-function savedThreadVersion(result: Awaited<ReturnType<Client["callTool"]>>): number {
+function savedTaskRef(result: Awaited<ReturnType<Client["callTool"]>>): string {
   const value = (result.structuredContent as {
+    task?: { taskRef?: unknown };
+  } | undefined)?.task?.taskRef;
+  if (typeof value !== "string") throw new Error("Expected saved taskRef");
+  return value;
+}
+
+function savedThreadVersion(result: Awaited<ReturnType<Client["callTool"]>>): number {
+  const value = (result._meta as {
     thread?: { version?: unknown };
   } | undefined)?.thread?.version;
   assert.equal(typeof value, "number");

@@ -5,6 +5,7 @@ import {
   SHOW_CHANGES_ANNOTATIONS,
   MAX_SKILL_CATALOG_BYTES,
   buildWorkspaceSkillCatalog,
+  modelReadProvenanceForSkillSource,
   containsBatchedToolCall,
   jsonRpcRequestId,
   isExpectedPiToolError,
@@ -139,6 +140,18 @@ assert.equal(boundedCatalog.skills[0]?.trust, "repository_untrusted");
 assert.equal(boundedCatalog.skills[1]?.source, "user");
 assert.equal(boundedCatalog.skills[1]?.trust, "user_trusted");
 assert.doesNotMatch(JSON.stringify(boundedCatalog.skills), /\/tmp\/catalog/);
+assert.deepEqual(modelReadProvenanceForSkillSource("repo"), {
+  source: "repository",
+  trust: "untrusted",
+  authority: "none",
+});
+for (const source of ["user", "admin", "bundled", "devspace", "explicit"] as const) {
+  assert.deepEqual(modelReadProvenanceForSkillSource(source), {
+    source,
+    trust: "trusted",
+    authority: "none",
+  });
+}
 
 const sanitizedCatalog = buildWorkspaceSkillCatalog([{
   ...catalogSkills[0]!,
@@ -196,18 +209,15 @@ const recoverableProcessState = processModelState({
   stdinClosed: true,
 });
 assert.equal(recoverableProcessState.outputId, "output-test-id");
+assert.deepEqual(recoverableProcessState.provenance, {
+  source: "process",
+  trust: "untrusted",
+  authority: "none",
+});
 assert.deepEqual(recoverableProcessState.output, {
-  stream: "combined",
   text: "head\ntail\n",
-  provenance: {
-    source: "process",
-    trust: "untrusted",
-    authority: "none",
-  },
   truncated: true,
-  originalTokenCount: 50_000,
   omittedBytes: 100_000,
-  outputId: "output-test-id",
 });
 const recoverableProcessSummary = processContentSummary({
   output: "head\ntail\n",
@@ -224,9 +234,7 @@ const recoverableProcessSummary = processContentSummary({
   timedOut: false,
   stdinClosed: true,
 });
-assert.match(recoverableProcessSummary, /structuredContent\.output/);
-assert.match(recoverableProcessSummary, /structuredContent\.output\.outputId/);
-assert.doesNotMatch(recoverableProcessSummary, /head|tail|output-test-id/);
+assert.equal(recoverableProcessSummary, "Process exited (code 0).");
 const failedProcessSnapshot = {
   output: "ModuleNotFoundError: No module named 'numpy'",
   outputTruncated: false,
@@ -246,6 +254,15 @@ assert.doesNotMatch(processResult(failedProcessSnapshot), /partial effects|side 
 assert.equal(processCallSucceeded(failedProcessSnapshot), false);
 assert.equal(processCallSucceeded({ ...failedProcessSnapshot, running: true, exitCode: undefined }), true);
 assert.equal(processCallSucceeded({ ...failedProcessSnapshot, exitCode: 0 }), true);
+assert.equal(processCallSucceeded({
+  ...failedProcessSnapshot,
+  exitCode: 0,
+  startFailure: {
+    phase: "spawn",
+    errorCode: "ENOENT",
+    errorCategory: "process_spawn",
+  },
+}), false);
 assert.match(processResult({
   output: "tail",
   outputTruncated: false,
@@ -313,6 +330,7 @@ const failedStorageState = processModelState({
 assert.equal("outputId" in failedStorageState, false);
 assert.equal("outputId" in failedStorageState.output, false);
 assert.equal(failedStorageState.output.text, "head\ntail");
+assert.equal(failedStorageState.output.unavailable, true);
 assert.doesNotMatch(processResult({
   output: "head\ntail",
   outputTruncated: true,
@@ -402,6 +420,21 @@ assert.equal(toolCallOperationId({
   method: "tools/call",
   params: { name: "exec_command", arguments: { operationId: "x".repeat(129) } },
 }), undefined);
+assert.equal(toolCallOperationId({
+  method: "tools/call",
+  params: { name: "save_progress", arguments: { operationId: `${"界".repeat(42)}ab` } },
+}), `${"界".repeat(42)}ab`);
+for (const operationId of [
+  `${"界".repeat(42)}abc`,
+  "nul\0operation",
+  "\uD800",
+  "\uDC00",
+]) {
+  assert.equal(toolCallOperationId({
+    method: "tools/call",
+    params: { name: "apply_patch", arguments: { operationId } },
+  }), undefined);
+}
 assert.equal(projectToolRootLockMode({
   method: "tools/call",
   params: { name: "read_files", arguments: {} },

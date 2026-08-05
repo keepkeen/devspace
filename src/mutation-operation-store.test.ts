@@ -27,8 +27,39 @@ try {
   testApplyPatchJournalAtomicSettlement(join(root, "patch-journal-atomic"));
   testApplyPatchJournalCapacity(join(root, "patch-journal-capacity"));
   testDuplicateMigration(join(root, "duplicate-migration"));
+  testOperationIdValidation(join(root, "operation-id-validation"));
 } finally {
   rmSync(root, { recursive: true, force: true });
+}
+
+function testOperationIdValidation(stateDir: string): void {
+  prepareStateDir(stateDir);
+  const store = new MutationOperationStore(stateDir);
+  try {
+    assert.deepEqual(
+      store.reserve(operationKey({ operationId: `${"界".repeat(42)}ab` }), "hash"),
+      { status: "new" },
+    );
+    for (const operationId of [
+      "a".repeat(129),
+      `${"界".repeat(42)}abc`,
+      "nul\0id",
+      "\uD800",
+      "\uDC00",
+    ]) {
+      assert.throws(
+        () => store.reserve(operationKey({ operationId }), "hash"),
+        /operationId must be/u,
+      );
+    }
+    assert.deepEqual(
+      store.reserve(operationKey({ operationId: "\uFFFD" }), "replacement-hash"),
+      { status: "new" },
+      "malformed Unicode must not reserve or alias the valid replacement character",
+    );
+  } finally {
+    store.close();
+  }
 }
 
 function testOutcomeResolution(stateDir: string): void {

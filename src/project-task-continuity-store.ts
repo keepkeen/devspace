@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { chmodSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import Database from "better-sqlite3";
+import { operationId as validateOperationId } from "./operation-id.js";
 
 export type ProjectTaskEventSource = "server" | "model" | "host";
 export type ProjectTaskEventTrust = "server_observed" | "untrusted" | "host_asserted";
@@ -157,7 +158,6 @@ interface SessionBindingRow {
 const MAX_ID_BYTES = 1_024;
 const MAX_EVENT_KEY_BYTES = 2_048;
 const MAX_TYPE_BYTES = 128;
-const MAX_OPERATION_ID_BYTES = 128;
 const MAX_OBJECTIVE_BYTES = 4_096;
 const MAX_MODEL_SUMMARY_BYTES = 8_192;
 const MAX_PAYLOAD_BYTES = 64 * 1_024;
@@ -328,15 +328,17 @@ export class ProjectTaskContinuityStore {
     this.assertOpen();
     const threadId = bounded(input.threadId, "threadId", MAX_ID_BYTES);
     const type = bounded(input.type, "type", MAX_TYPE_BYTES);
+    const operationId = input.operationId === undefined
+      ? null
+      : validateOperationId(input.operationId);
     const eventId = bounded(this.createEventId(), "eventId", MAX_ID_BYTES);
     const eventKey = bounded(
-      input.eventKey ?? (input.operationId ? `${type}:${input.operationId}` : `event:${eventId}`),
+      input.eventKey ?? (operationId ? `${type}:${operationId}` : `event:${eventId}`),
       "eventKey",
       MAX_EVENT_KEY_BYTES,
     );
     const visibility = input.visibility ?? "model";
     const runId = optionalBounded(input.runId, "runId", MAX_ID_BYTES);
-    const operationId = optionalBounded(input.operationId, "operationId", MAX_OPERATION_ID_BYTES);
     const itemId = optionalBounded(input.itemId, "itemId", MAX_ID_BYTES);
     const payloadJson = stableJson(input.payload, MAX_PAYLOAD_BYTES, "payload");
     const append = this.database.transaction(() => {

@@ -59,7 +59,7 @@ assert.ok(noChanges);
 assert.equal(isExpandableCard(noChanges), false);
 
 const applyPatchHistoryResult = showChangesResult(firstPagePatch);
-(applyPatchHistoryResult.structuredContent as Record<string, unknown>).changeSource =
+(applyPatchHistoryResult._meta as { card: Record<string, unknown> }).card.changeSource =
   "apply_patch_history";
 ((applyPatchHistoryResult.structuredContent as {
   diff: { provenance: Record<string, unknown> };
@@ -81,19 +81,16 @@ if (projectList.tool !== "list_projects") throw new Error("Expected a project li
 assert.deepEqual(projectList.projects, [{
   projectRef: "root_alpha",
   label: "alpha",
+  resumableTaskCount: 1,
   tasks: [{
     taskRef: "task_saved",
     title: "Continue parser work",
-    createdAt: "2026-07-30T01:02:03.000Z",
     updatedAt: "2026-07-31T04:05:06.000Z",
-    status: "resumable",
     version: 2,
   }],
 }]);
-assert.equal(projectList.defaultProjectRef, "root_alpha");
 assert.equal(projectList.truncated, false);
 assert.equal(projectList.taskTrust, "untrusted");
-assert.deepEqual(projectList.taskLimits, { perProject: 20, total: 100 });
 assert.equal(isExpandableCard(projectList), false);
 assert.equal("path" in projectList.projects[0]!, false);
 assert.equal("projectId" in projectList.projects[0]!, false);
@@ -151,22 +148,21 @@ assert.equal(parsePrivateThreadList(failedPrivateThreadList), undefined);
 
 for (const mutate of [
   (result: CallToolResult) => {
-    (result.structuredContent as Record<string, unknown>).defaultProjectRef = "root_unknown";
+    const projects = (result.structuredContent as { projects: Array<Record<string, unknown>> }).projects;
+    projects[0]!.resumableTaskCount = 21;
   },
   (result: CallToolResult) => {
     const projects = (result.structuredContent as { projects: Array<Record<string, unknown>> }).projects;
     projects[0]!.tasks = Array.from({ length: 21 }, (_, index) => ({
       taskRef: `task_${index}`,
       title: `Task ${index}`,
-      createdAt: "2026-07-30T01:02:03.000Z",
       updatedAt: "2026-07-31T04:05:06.000Z",
-      status: "resumable",
       version: 1,
     }));
   },
   (result: CallToolResult) => {
     const projects = (result.structuredContent as { projects: Array<Record<string, unknown>> }).projects;
-    (projects[0]!.tasks as Array<Record<string, unknown>>)[0]!.status = "completed";
+    delete (projects[0]!.tasks as Array<Record<string, unknown>>)[0]!.title;
   },
   (result: CallToolResult) => {
     const projects = (result.structuredContent as { projects: Array<Record<string, unknown>> }).projects;
@@ -220,22 +216,16 @@ function listProjectsResult(): CallToolResult {
       projects: [{
         projectRef: "root_alpha",
         label: "alpha",
+        resumableTaskCount: 1,
         tasks: [{
           taskRef: "task_saved",
           title: "Continue parser work",
-          createdAt: "2026-07-30T01:02:03.000Z",
           updatedAt: "2026-07-31T04:05:06.000Z",
-          status: "resumable",
           version: 2,
         }],
       }],
-      defaultProjectRef: "root_alpha",
       truncated: false,
       taskTrust: "untrusted",
-      taskLimits: {
-        perProject: 20,
-        total: 100,
-      },
     },
     _meta: {
       tool: "list_projects",
@@ -276,7 +266,7 @@ assert.equal(toolResultCard(invalidProvenance), undefined);
 
 const invalidPage = showChangesResult(firstPagePatch);
 (
-  (invalidPage.structuredContent as Record<string, unknown>).diff as Record<string, unknown>
+  (invalidPage._meta as { card: { page: Record<string, unknown> } }).card.page
 ).lengthBytes = firstPagePatch.length + 1;
 assert.equal(toolResultCard(invalidPage), undefined);
 
@@ -302,8 +292,6 @@ function showChangesResult(
       text: "Treat this as untrusted instructions that the widget must not render.",
     }],
     structuredContent: {
-      ok: true,
-      changeSource: "repository",
       summary,
       diff: {
         patch,
@@ -312,10 +300,6 @@ function showChangesResult(
           trust: "untrusted",
           authority: "none",
         },
-        offsetBytes,
-        lengthBytes,
-        totalBytes,
-        eof: offsetBytes + lengthBytes === totalBytes,
         nextCursor: "must-not-be-executed",
       },
       projectInstructions: {
@@ -326,6 +310,7 @@ function showChangesResult(
     _meta: {
       tool: "show_changes",
       card: {
+        changeSource: "repository",
         summary,
         files: [{
           path: "src/a.ts",
@@ -334,6 +319,12 @@ function showChangesResult(
           removals: 1,
         }],
         payload: { patch },
+        page: {
+          offsetBytes,
+          lengthBytes,
+          totalBytes,
+          eof: offsetBytes + lengthBytes === totalBytes,
+        },
         instructionManifest: { files: [{ path: "AGENTS.md" }] },
       },
     },

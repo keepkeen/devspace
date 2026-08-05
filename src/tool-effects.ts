@@ -1,20 +1,20 @@
 import type { AppliedPatchFile, PatchOperation } from "./apply-patch.js";
-import type { FileVersion } from "./file-version.js";
 import type { ProcessSnapshot } from "./process-sessions.js";
 
 export interface ToolEffects {
   observedAt: string;
-  files?: FileEffect[];
   process?: ProcessEffect;
 }
 
-export interface FileEffect {
-  confidence: "observed";
+export interface ApplyPatchEffects {
+  files: ApplyPatchEffect[];
+}
+
+export interface ApplyPatchEffect {
   path: string;
   previousPath?: string;
   operation: PatchOperation;
-  observedBefore: FileVersion | null;
-  observedAfter: FileVersion | null;
+  version: { contentHash: string; mtimeNs: string } | null;
   fuzzyMatch?: AppliedPatchFile["fuzzyMatch"];
 }
 
@@ -57,41 +57,21 @@ export interface ProcessEffectsInput {
 }
 
 export function createApplyPatchEffects(
-  observedAt: string,
   files: readonly AppliedPatchFile[],
-): ToolEffects {
+): ApplyPatchEffects {
   return {
-    observedAt,
-    files: files.flatMap((file): FileEffect[] => {
-      if (file.operation !== "move" || file.previousPath === undefined) {
-        return [{
-          confidence: "observed",
-          path: file.path,
-          operation: file.operation,
-          observedBefore: cloneFileVersion(file.observedBefore),
-          observedAfter: cloneFileVersion(file.observedAfter),
-          ...(file.fuzzyMatch ? { fuzzyMatch: file.fuzzyMatch } : {}),
-        }];
-      }
-      return [
-        {
-          confidence: "observed",
-          path: file.previousPath,
-          operation: "delete",
-          observedBefore: cloneFileVersion(file.observedBefore),
-          observedAfter: null,
-        },
-        {
-          confidence: "observed",
-          path: file.path,
-          previousPath: file.previousPath,
-          operation: file.overwrittenBefore ? "update" : "add",
-          observedBefore: cloneFileVersion(file.overwrittenBefore ?? null),
-          observedAfter: cloneFileVersion(file.observedAfter),
-          ...(file.fuzzyMatch ? { fuzzyMatch: file.fuzzyMatch } : {}),
-        },
-      ];
-    }),
+    files: files.map((file): ApplyPatchEffect => ({
+      path: file.path,
+      ...(file.previousPath ? { previousPath: file.previousPath } : {}),
+      operation: file.operation,
+      version: file.observedAfter
+        ? {
+            contentHash: file.observedAfter.hash,
+            mtimeNs: file.observedAfter.mtimeNs,
+          }
+        : null,
+      ...(file.fuzzyMatch ? { fuzzyMatch: file.fuzzyMatch } : {}),
+    })),
   };
 }
 
@@ -141,8 +121,4 @@ function createProcessEffects(
       untrackedSideEffects: true,
     },
   };
-}
-
-function cloneFileVersion<T extends { hash: string; mtimeNs: string } | null>(version: T): T {
-  return (version === null ? null : { ...version }) as T;
 }

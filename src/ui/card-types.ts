@@ -38,28 +38,22 @@ export interface ToolResultCard {
 export interface ResumableTaskCard {
   taskRef: string;
   title: string;
-  createdAt: string;
   updatedAt: string;
-  status: "resumable";
   version: number;
 }
 
 export interface ProjectCardEntry {
   projectRef: string;
   label: string;
-  tasks: ResumableTaskCard[];
+  resumableTaskCount: number;
+  tasks?: ResumableTaskCard[];
 }
 
 export interface ProjectListCard {
   tool: "list_projects";
   projects: ProjectCardEntry[];
-  defaultProjectRef?: string;
   truncated: boolean;
   taskTrust: "untrusted";
-  taskLimits: {
-    perProject: number;
-    total: number;
-  };
 }
 
 export type PrivateThreadStatus =
@@ -90,7 +84,6 @@ const MAX_PROJECT_REF_LENGTH = 128;
 const MAX_TASK_REF_LENGTH = 512;
 const MAX_TASK_TITLE_LENGTH = 256;
 const MAX_TASKS_PER_PROJECT = 20;
-const MAX_TOTAL_TASKS = 100;
 const MAX_PRIVATE_THREADS = 100;
 const MAX_THREAD_REF_LENGTH = 512;
 const MIN_THREAD_REF_LENGTH = 16;
@@ -109,8 +102,9 @@ function showChangesCard(result: CallToolResult): ToolResultCard | undefined {
   const structured = objectRecord(result.structuredContent);
   const structuredDiff = objectRecord(structured?.diff);
   const metaPayload = objectRecord(metaCard?.payload);
+  const metaPage = objectRecord(metaCard?.page);
   const provenance = objectRecord(structuredDiff?.provenance);
-  const changeSource = structured?.changeSource;
+  const changeSource = metaCard?.changeSource;
   const validRepositoryProvenance =
     changeSource === "repository" &&
     provenance?.source === "repository" &&
@@ -124,9 +118,9 @@ function showChangesCard(result: CallToolResult): ToolResultCard | undefined {
     provenance.scope === "successful_apply_patch_history";
   if (
     !metaCard ||
+    !metaPage ||
     !structured ||
     !structuredDiff ||
-    structured?.ok !== true ||
     (!validRepositoryProvenance && !validApplyPatchProvenance)
   ) {
     return undefined;
@@ -148,7 +142,7 @@ function showChangesCard(result: CallToolResult): ToolResultCard | undefined {
   const summary = reviewSummary(metaCard?.summary);
   const structuredSummary = reviewSummary(structured.summary);
   const files = reviewFiles(metaCard?.files);
-  const page = diffPage(structuredDiff, patchBytes);
+  const page = diffPage(metaPage, patchBytes);
   if (
     !summary ||
     !structuredSummary ||
@@ -228,17 +222,10 @@ export function parsePrivateThreadList(
 
 function projectListCard(result: CallToolResult): ProjectListCard | undefined {
   const structured = objectRecord(result.structuredContent);
-  const limits = objectRecord(structured?.taskLimits);
-  const perProject = safePositiveInteger(limits?.perProject);
-  const total = safePositiveInteger(limits?.total);
   if (
-    structured?.ok !== true ||
+    !structured ||
     typeof structured.truncated !== "boolean" ||
     structured.taskTrust !== "untrusted" ||
-    perProject === undefined ||
-    total === undefined ||
-    perProject > MAX_TASKS_PER_PROJECT ||
-    total > MAX_TOTAL_TASKS ||
     !Array.isArray(structured.projects) ||
     structured.projects.length > MAX_PROJECTS
   ) {
@@ -248,41 +235,41 @@ function projectListCard(result: CallToolResult): ProjectListCard | undefined {
   const projects: ProjectCardEntry[] = [];
   const projectRefs = new Set<string>();
   const taskRefs = new Set<string>();
-  let taskCount = 0;
   for (const value of structured.projects) {
     const project = objectRecord(value);
     const projectRef = boundedString(project?.projectRef, MAX_PROJECT_REF_LENGTH);
     const label = boundedString(project?.label, MAX_PROJECT_LABEL_LENGTH);
+    const resumableTaskCount = safeNonNegativeInteger(project?.resumableTaskCount);
     if (
+      !project ||
       !projectRef ||
       !label ||
       projectRefs.has(projectRef) ||
-      !Array.isArray(project?.tasks) ||
-      project.tasks.length > perProject
+      resumableTaskCount === undefined ||
+      resumableTaskCount > MAX_TASKS_PER_PROJECT ||
+      (project?.tasks !== undefined && !Array.isArray(project.tasks)) ||
+      (Array.isArray(project?.tasks) && project.tasks.length > MAX_TASKS_PER_PROJECT)
     ) {
       return undefined;
     }
     projectRefs.add(projectRef);
 
     const tasks: ResumableTaskCard[] = [];
-    for (const taskValue of project.tasks) {
+    for (const taskValue of Array.isArray(project.tasks) ? project.tasks : []) {
       const task = objectRecord(taskValue);
       const taskRef = boundedString(
         task?.taskRef,
         MAX_TASK_REF_LENGTH,
       );
       const title = boundedString(task?.title, MAX_TASK_TITLE_LENGTH);
-      const createdAt = isoTimestamp(task?.createdAt);
       const updatedAt = isoTimestamp(task?.updatedAt);
       const version = safePositiveInteger(task?.version);
       if (
         !taskRef ||
         taskRefs.has(taskRef) ||
         !title ||
-        !createdAt ||
         !updatedAt ||
-        version === undefined ||
-        task?.status !== "resumable"
+        version === undefined
       ) {
         return undefined;
       }
@@ -290,34 +277,24 @@ function projectListCard(result: CallToolResult): ProjectListCard | undefined {
       tasks.push({
         taskRef,
         title,
-        createdAt,
         updatedAt,
-        status: "resumable",
         version,
       });
     }
-    taskCount += tasks.length;
-    if (taskCount > total) return undefined;
-    projects.push({ projectRef, label, tasks });
-  }
-
-  const defaultProjectRef = structured.defaultProjectRef === undefined
-    ? undefined
-    : boundedString(structured.defaultProjectRef, MAX_PROJECT_REF_LENGTH);
-  if (
-    (structured.defaultProjectRef !== undefined && !defaultProjectRef) ||
-    (defaultProjectRef !== undefined && !projectRefs.has(defaultProjectRef))
-  ) {
-    return undefined;
+    if (project.tasks !== undefined && tasks.length > resumableTaskCount) return undefined;
+    projects.push({
+      projectRef,
+      label,
+      resumableTaskCount,
+      ...(project.tasks === undefined ? {} : { tasks }),
+    });
   }
 
   return {
     tool: "list_projects",
     projects,
-    ...(defaultProjectRef ? { defaultProjectRef } : {}),
     truncated: structured.truncated,
     taskTrust: "untrusted",
-    taskLimits: { perProject, total },
   };
 }
 

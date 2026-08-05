@@ -28,6 +28,19 @@ try {
 
   store.bindExecution(created.threadId, "profile-a", "execution-a", "grant-a");
   assert.equal(store.threadIdForExecution("execution-a"), created.threadId);
+  const otherThread = store.create({
+    threadId: "thread-b",
+    profileId: "profile-b",
+    projectRef: "project-a",
+    projectFingerprint: "fingerprint-a",
+    checkoutKind: "checkout",
+    checkoutRoot: "/tmp/project-a",
+  });
+  assert.throws(
+    () => store.bindExecution(otherThread.threadId, "profile-b", "execution-a", "grant-a"),
+    /already bound to another thread/u,
+  );
+  assert.equal(store.threadIdForExecution("execution-a"), created.threadId);
 
   now += 1_000;
   const automatic = store.appendCheckpoint({
@@ -65,15 +78,26 @@ try {
   assert.equal(firstSave.checkpoint.modelSummaryTrust, "untrusted");
   assert.equal(store.resume(created.threadId, "profile-a")?.modelSummary, firstSave.checkpoint.modelSummary);
 
-  const migrated = store.reassignProfile(created.threadId, "profile-a", "actor-profile-a");
-  assert.equal(migrated?.profileId, "actor-profile-a");
-  assert.equal(store.get(created.threadId, "profile-a"), undefined);
-  assert.equal(store.setStatus(created.threadId, "actor-profile-a", "archived"), true);
-  assert.equal(store.setStatus(created.threadId, "actor-profile-a", "active"), true);
+  for (const sourceOperationId of [
+    "a".repeat(129),
+    `${"界".repeat(42)}abc`,
+    "nul\0id",
+  ]) {
+    assert.throws(() => store.appendCheckpoint({
+      threadId: created.threadId,
+      profileId: "profile-a",
+      cause: "patch_applied",
+      sourceOperationId,
+      observedState: {},
+    }), /sourceOperationId must be/u);
+  }
+
+  assert.equal(store.setStatus(created.threadId, "profile-a", "archived"), true);
+  assert.equal(store.setStatus(created.threadId, "profile-a", "active"), true);
 
   assert.equal(store.saveProgress({
     threadId: created.threadId,
-    profileId: "actor-profile-a",
+    profileId: "profile-a",
     title: "Stale",
     modelSummary: "stale",
     observedState: {},
@@ -82,15 +106,15 @@ try {
   }).status, "revision_conflict");
   assert.equal(store.saveProgress({
     threadId: created.threadId,
-    profileId: "actor-profile-a",
+    profileId: "profile-a",
     title: "Missing precondition",
     modelSummary: "missing",
     observedState: {},
     sourceOperationId: "save-missing",
   }).status, "if_match_required");
 
-  assert.equal(store.setStatus(created.threadId, "actor-profile-a", "closed"), true);
-  assert.equal(store.resume(created.threadId, "actor-profile-a"), undefined);
+  assert.equal(store.setStatus(created.threadId, "profile-a", "closed"), true);
+  assert.equal(store.resume(created.threadId, "profile-a"), undefined);
 } finally {
   store.close();
   rmSync(root, { recursive: true, force: true });

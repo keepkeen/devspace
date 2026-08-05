@@ -73,7 +73,19 @@ a slower earlier request cannot overwrite or release the result of a later one.
 Each new operation creates a different logical context on the same approved
 directory. Retrying the identical `project_control(action=open)` request replays
 the same execution, which makes a lost response safe without creating another
-context.
+context. Project creation identity includes the HMAC-derived Actor, and an
+execution-to-Thread mapping cannot be overwritten; sharing a grant and guessing
+another Actor's operation ID therefore cannot replay, rebind, or interrupt that
+Actor's execution. Older grant-wide Thread ownership records are not migrated or
+claimed during reads, hydration, replay, interrupt, activity, or lifecycle
+operations. Unless a Thread is already verifiably owned by the current Actor,
+legacy ownership remains unknown and access fails closed.
+
+Mutation operation IDs are validated as exact opaque strings before any
+reservation or effect: they must be well-formed Unicode, non-empty, contain no
+NUL, and occupy at most 128 UTF-8 bytes. DevSpace does not trim or normalize
+them, and applies the same rule at the HTTP/MCP boundary and mutation,
+execution, Thread, and continuity stores.
 DevSpace never selects an execution by recency, a sole candidate, caller input,
 or process-global “current Project.”
 
@@ -115,9 +127,9 @@ capacity for a shared saved Task. Only
 Do not place secrets, credentials, hidden reasoning, complete file contents,
 full diffs, transcripts, or raw logs in a Task. Task text is durable state and
 should be treated as sensitive. On resume, DevSpace returns it once as
-`thread.checkpoint.modelSummary` with the scalar
-`modelSummaryTrust:"untrusted"`; the model must reread relevant files and Git
-state before acting on it. A completed Task is removed from resume selection but
+`checkpoint.untrustedSummary`, separately from `checkpoint.serverObserved`; the
+model must reread relevant files and Git state before acting on it. A completed
+Task is removed from resume selection but
 its bounded record remains until it ages out of the per-Project completed
 retention set. Pruning replaces obsolete execution links with a terminal marker
 so those executions cannot create a new Task; it removes metadata only,
@@ -217,16 +229,21 @@ grant, or execution.
 `exec_command` is intentionally a full local command facility. It accepts:
 
 Direct mode accepts `program` and `args`; shell mode instead requires
-`shell:true`, `command`, and `approvalReason`. Both modes use camelCase common
-fields such as `operationId`, `workingDirectory`, `environment`,
-`yieldTimeMs`, `maxOutputTokens`, and `tty`.
+`shell:true` and `command`. Both modes use camelCase common fields such as
+`operationId`, `workingDirectory`, `environment`, `timeoutMs`, and `tty`.
+Wait and output budgets are server-owned rather than model-authored.
 
 DevSpace validates that `workingDirectory` is inside the Project bound to the execution and bounds
 returned output. `write_stdin` is mutation-only and requires `operationId` to
-send input, close stdin, interrupt, or resize a terminal.
+send input, close stdin, or interrupt.
 `read_process_output` performs live polling and retained-output reads without
 mutating process input. Process count, retention, and cleanup limits prevent
 unbounded server-side accumulation.
+The process session captures trusted execution/Thread/Actor identity at start.
+When a running command later reaches a terminal state, DevSpace writes only a
+sanitized outcome and retained/lost-output recovery state to that exact Thread's
+server-observed checkpoint; raw process, output, event, and private identity
+references are excluded from the model checkpoint.
 
 After process creation, the OS is the enforcement boundary. The command runs
 with the privileges of the OS user running DevSpace and can:

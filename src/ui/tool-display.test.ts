@@ -5,6 +5,7 @@ import {
   getToolDisplay,
   getToolHeaderSummary,
   newProjectTaskMessage,
+  projectListTruncationMessage,
   projectThreadListCall,
   projectThreadMutationCall,
   resumeProjectTaskMessage,
@@ -14,6 +15,22 @@ import {
 assert.deepEqual(
   getToolDisplay(reviewCard({ files: 0, additions: 0, removals: 0 })),
   { icon: toolIcons.diff, title: "No changes", tone: "review" },
+);
+
+const completeProjectList = projectListCard(1);
+assert.equal(projectListTruncationMessage(completeProjectList), undefined);
+const truncatedGlobalList = projectListCard(2);
+truncatedGlobalList.truncated = true;
+assert.equal(
+  projectListTruncationMessage(truncatedGlobalList),
+  "Only the first approved Projects are shown.",
+);
+const truncatedScopedList = projectListCard(1);
+truncatedScopedList.truncated = true;
+truncatedScopedList.projects[0]!.tasks = [];
+assert.equal(
+  projectListTruncationMessage(truncatedScopedList),
+  "Only the most recently updated resumable tasks are shown.",
 );
 
 assert.deepEqual(
@@ -47,7 +64,7 @@ assert.match(newMessage, /Call project_control with action open/u);
 assert.match(newMessage, /projectRef "root_opaque"/u);
 assert.match(newMessage, /operationId "ui-stable"/u);
 assert.doesNotMatch(newMessage, /startFresh/u);
-assert.match(newMessage, /rootInstructionsComplete is true/u);
+assert.match(newMessage, /until no nextCursor remains/u);
 assert.match(newMessage, /without an execution reference/u);
 assert.match(newMessage, /trusted ChatGPT session and Actor/u);
 assert.doesNotMatch(newMessage, /executionRef|pex1_/u);
@@ -62,7 +79,7 @@ assert.match(resumeMessage, /projectRef "root_opaque"/u);
 assert.match(resumeMessage, /action resume/u);
 assert.match(resumeMessage, /taskRef "task_opaque"/u);
 assert.match(resumeMessage, /operationId "ui-resume"/u);
-assert.match(resumeMessage, /rootInstructionsComplete is true/u);
+assert.match(resumeMessage, /until no nextCursor remains/u);
 assert.match(resumeMessage, /without an execution reference/u);
 assert.match(resumeMessage, /trusted ChatGPT session and Actor/u);
 assert.doesNotMatch(resumeMessage, /executionRef|pex1_/u);
@@ -126,13 +143,9 @@ function projectListCard(projectCount: number): ProjectListCard {
     projects: Array.from({ length: projectCount }, (_, index) => ({
       projectRef: `root_${index}`,
       label: `Project ${index}`,
-      tasks: [],
+      resumableTaskCount: 0,
     })),
     truncated: false,
     taskTrust: "untrusted",
-    taskLimits: {
-      perProject: 20,
-      total: 100,
-    },
   };
 }

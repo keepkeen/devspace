@@ -17,7 +17,6 @@ import {
   MAX_PROJECT_HANDOFF_PROGRESS_UTF8_BYTES,
   projectHandoffModelTextJsonBytes,
 } from "./project-handoff-store.js";
-import { PROJECT_CONTEXT_SCHEMA_VERSION } from "./project-context-protocol.js";
 import { createServer } from "./server.js";
 
 const root = await realpath(await mkdtemp(join(tmpdir(), "devspace-instruction-pagination-e2e-")));
@@ -100,18 +99,28 @@ try {
   });
   assertSucceeded(selected);
   assert.match(JSON.stringify(selected.structuredContent), /ROOT_PAGE/u);
-  assert.equal(
-    (selected.structuredContent as { schemaVersion?: unknown } | undefined)?.schemaVersion,
-    PROJECT_CONTEXT_SCHEMA_VERSION,
+  assert.doesNotMatch(
+    JSON.stringify(selected.structuredContent),
+    /schemaVersion|rootInstructionsComplete|"ok"\s*:/u,
   );
-  assert.equal(PROJECT_CONTEXT_SCHEMA_VERSION, 8);
   assert.doesNotMatch(JSON.stringify(selected.structuredContent), /executionRef/u);
   assertNoLegacyContextProtocol(selected);
-  assert.equal(rootInstructionsComplete(selected), false);
   assert.equal(typeof rootInstructionCursor(selected), "string");
   assert.ok(serializedBytes(selected) < 16_000);
 
   const stateBeforeInvalidCursor = selectedSessionRuntimeTimestamps();
+  const emptyCursor = await client.callTool({
+    name: "project_control",
+    arguments: { action: "hydrate", cursor: "" },
+    _meta: mainHostMeta,
+  });
+  assert.equal(emptyCursor.isError, true);
+  assert.equal(errorCode(emptyCursor), "invalid_tool_input");
+  assert.deepEqual(
+    selectedSessionRuntimeTimestamps(),
+    stateBeforeInvalidCursor,
+    "an empty hydrate cursor must be rejected before touching execution or Thread state",
+  );
   await new Promise((resolveWait) => setTimeout(resolveWait, 10));
   const invalidCursor = await client.callTool({
     name: "project_control",
@@ -142,7 +151,6 @@ try {
   assert.equal(gatedRead.isError, true);
   assert.equal(errorCode(gatedRead), "root_instructions_required");
   assert.deepEqual(errorSemantics(gatedRead), {
-    retryable: true,
     safeToRetry: true,
     recovery: "continue_or_restart_root_instructions",
   });
@@ -153,7 +161,7 @@ try {
     _meta: mainHostMeta,
   });
   assertSucceeded(restarted);
-  assert.equal(rootInstructionsComplete(restarted), false);
+  assert.equal(typeof (restarted.structuredContent as { project?: unknown })?.project, "object");
   assert.equal(typeof rootInstructionCursor(restarted), "string");
   const rootContent = await finishRootInstructions(client, mainHostMeta, restarted);
   assert.equal(rootContent, expectedInstructions.get("AGENTS.md"));
@@ -167,11 +175,15 @@ try {
   assertInstructionDelta(read);
   assert.doesNotMatch(JSON.stringify(read.content), /NESTED_PAGE|DEEP_PAGE/u);
   const readItems = (read.structuredContent as {
-    items?: Array<{ path?: unknown; contentHash?: unknown; content?: unknown }>;
+    items?: Array<{
+      path?: unknown;
+      version?: { contentHash?: unknown; mtimeNs?: unknown };
+      content?: unknown;
+    }>;
   } | undefined)?.items ?? [];
   const payload = readItems.find((item) => item.path === "nested/deep/payload.txt");
   assert.equal(payload?.content, "before\n");
-  assert.equal(typeof payload?.contentHash, "string");
+  assert.equal(typeof payload?.version?.contentHash, "string");
   const escapeHeavyProgress = "\\".repeat(MAX_PROJECT_HANDOFF_PROGRESS_UTF8_BYTES);
   const rejectedProgress = await client.callTool({
     name: "save_progress",
@@ -214,12 +226,12 @@ try {
     _meta: mainHostMeta,
   });
   assertSucceeded(savedProgress);
-  const savedThreadRef = String(
+  const savedTaskRef = String(
     (savedProgress.structuredContent as {
-      thread?: { threadRef?: unknown };
-    } | undefined)?.thread?.threadRef ?? "",
+      task?: { taskRef?: unknown };
+    } | undefined)?.task?.taskRef ?? "",
   );
-  assert.match(savedThreadRef, /^pth1_/u);
+  assert.match(savedTaskRef, /^phf1_/u);
 
   const mutationClient = new Client({
     name: "instruction-mutation-gate",
@@ -234,7 +246,7 @@ try {
     arguments: {
       action: "resume",
       projectRef,
-      threadRef: savedThreadRef,
+      taskRef: savedTaskRef,
       operationId: "instruction-mutation-execution",
     },
     _meta: mutationHostMeta,
@@ -246,27 +258,59 @@ try {
   );
   assert.equal(
     (mutationSelection.structuredContent as {
-      thread?: { checkpoint?: { modelSummary?: unknown } };
-    }).thread?.checkpoint?.modelSummary,
+      checkpoint?: { untrustedSummary?: unknown };
+    }).checkpoint?.untrustedSummary,
     maximumHandoffProgress,
   );
   assert.equal(
+    typeof
     (mutationSelection.structuredContent as {
-      thread?: { checkpoint?: { modelSummaryTrust?: unknown } };
-    }).thread?.checkpoint?.modelSummaryTrust,
-    "untrusted",
+      checkpoint?: { serverObserved?: unknown };
+    }).checkpoint?.serverObserved,
+    "object",
   );
   assert.equal(
-    (mutationSelection.structuredContent as {
-      thread?: { checkpoint?: { observedStateTrust?: unknown } };
-    }).thread?.checkpoint?.observedStateTrust,
-    "server_observed",
+    Object.hasOwn(
+      (mutationSelection.structuredContent ?? {}) as Record<string, unknown>,
+      "thread",
+    ),
+    false,
   );
   assert.doesNotMatch(JSON.stringify(mutationSelection.structuredContent), /executionRef/u);
-  await finishRootInstructions(mutationClient, mutationHostMeta, mutationSelection);
+  const mutationStateBeforeEmptyCursor = selectedSessionRuntimeTimestamps();
+  const emptyResumeCursor = await mutationClient.callTool({
+    name: "project_control",
+    arguments: { action: "hydrate", cursor: "" },
+    _meta: mutationHostMeta,
+  });
+  assert.equal(emptyResumeCursor.isError, true);
+  assert.equal(errorCode(emptyResumeCursor), "invalid_tool_input");
+  assert.deepEqual(
+    selectedSessionRuntimeTimestamps(),
+    mutationStateBeforeEmptyCursor,
+    "an empty cursor must not consume or mutate resumed checkpoint state",
+  );
+  const restartedMutationSelection = await mutationClient.callTool({
+    name: "project_control",
+    arguments: { action: "hydrate" },
+    _meta: mutationHostMeta,
+  });
+  assertSucceeded(restartedMutationSelection);
+  assert.equal(
+    (restartedMutationSelection.structuredContent as {
+      checkpoint?: { untrustedSummary?: unknown };
+    }).checkpoint?.untrustedSummary,
+    maximumHandoffProgress,
+    "cursorless restart must retain the resumed checkpoint on its first page",
+  );
+  await finishRootInstructions(
+    mutationClient,
+    mutationHostMeta,
+    restartedMutationSelection,
+  );
   const patchArguments = {
     operationId: "instruction-delta-patch",
-    ifMatch: { "nested/deep/payload.txt": String(payload?.contentHash) },
+    ifMatch: { "nested/deep/payload.txt": payload?.version },
     patch: "*** Begin Patch\n*** Update File: nested/deep/payload.txt\n@@\n-before\n+after\n*** End Patch",
   };
   const gated = await mutationClient.callTool({
@@ -351,8 +395,7 @@ function assertInstructionDelta(
 ): void {
   const instructions = (result.structuredContent as {
     instructionsDelta?: Array<{
-      source?: unknown;
-      trust?: unknown;
+      trustClass?: unknown;
       scope?: unknown;
       path?: unknown;
       content?: unknown;
@@ -363,8 +406,8 @@ function assertInstructionDelta(
   for (const [path, expected] of expectedInstructions) {
     if (path === "AGENTS.md") continue;
     const item = byPath.get(path);
-    assert.equal(item?.source, "repository");
-    assert.equal(item?.trust, "repository_untrusted");
+    assert.equal(item?.trustClass, "repository_untrusted");
+    assert.equal(item?.scope, path === "nested/AGENTS.md" ? "nested" : "nested/deep");
     assert.equal(item?.content, expected);
   }
   assert.doesNotMatch(
@@ -377,15 +420,13 @@ function assertNoLegacyContextProtocol(
   result: Awaited<ReturnType<Client["callTool"]>>,
 ): void {
   const structuredContent = result.structuredContent as {
-    thread?: Record<string, unknown> & { checkpoint?: Record<string, unknown> };
+    thread?: Record<string, unknown>;
   } | undefined;
   assert.doesNotMatch(
     JSON.stringify(structuredContent ?? {}),
     /"(?:workspace|receipt|continuation|contextChanged|state|instructionToken|handoff|mustRevalidate|provenance|offsetBytes|lengthBytes|totalBytes|complete)"\s*:/iu,
   );
-  if (structuredContent?.thread) {
-    assert.equal("ref" in structuredContent.thread, false);
-  }
+  assert.equal("thread" in (structuredContent ?? {}), false);
 }
 
 async function finishRootInstructions(
@@ -402,36 +443,29 @@ async function finishRootInstructions(
     assert.ok(serializedBytes(page) < 16_000, "project_control pages must remain below 16 KiB");
     assertNoLegacyContextProtocol(page);
     if (pages > 1) {
-      assert.equal(
-        (page.structuredContent as {
-          thread?: { checkpoint?: unknown };
-        } | undefined)?.thread?.checkpoint,
-        undefined,
-        "saved Thread summary must appear only on the first Project-context page",
+      const continuation = page.structuredContent as Record<string, unknown> | undefined;
+      assert.deepEqual(
+        Object.keys(continuation ?? {}).sort(),
+        rootInstructionCursor(page) ? ["instructions", "nextCursor"] : ["instructions"],
+        "continuation pages must contain only instruction material and an optional cursor",
       );
     }
     const items = (page.structuredContent as {
-      contextDelta?: {
-        instructions?: Array<{
-          path?: unknown;
-          content?: unknown;
-          fragment?: {
-            partial?: unknown;
-          };
-        }>;
-      };
-    } | undefined)?.contextDelta?.instructions ?? [];
+      instructions?: Array<{
+        path?: unknown;
+        content?: unknown;
+        fragment?: {
+          partial?: unknown;
+        };
+      }>;
+    } | undefined)?.instructions ?? [];
     for (const item of items) {
       assert.equal(item.path, "AGENTS.md");
       assert.equal(item.fragment?.partial, true);
       combined += String(item.content ?? "");
     }
     const cursor = rootInstructionCursor(page);
-    if (!cursor) {
-      assert.equal(rootInstructionsComplete(page), true);
-      break;
-    }
-    assert.equal(rootInstructionsComplete(page), false);
+    if (!cursor) break;
     page = await activeClient.callTool({
       name: "project_control",
       arguments: { action: "hydrate", cursor },
@@ -447,17 +481,9 @@ function rootInstructionCursor(
   result: Awaited<ReturnType<Client["callTool"]>>,
 ): string | undefined {
   const cursor = (result.structuredContent as {
-    contextDelta?: { nextCursor?: unknown };
-  } | undefined)?.contextDelta?.nextCursor;
+    nextCursor?: unknown;
+  } | undefined)?.nextCursor;
   return typeof cursor === "string" ? cursor : undefined;
-}
-
-function rootInstructionsComplete(
-  result: Awaited<ReturnType<Client["callTool"]>>,
-): unknown {
-  return (result.structuredContent as {
-    contextDelta?: { rootInstructionsComplete?: unknown };
-  } | undefined)?.contextDelta?.rootInstructionsComplete;
 }
 
 function errorCode(
@@ -475,7 +501,6 @@ function errorSemantics(
     error?: Record<string, unknown>;
   } | undefined)?.error ?? {};
   return {
-    retryable: error.retryable,
     safeToRetry: error.safeToRetry,
     recovery: error.recovery,
   };

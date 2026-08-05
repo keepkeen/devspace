@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { chmodSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import Database from "better-sqlite3";
+import { operationId as validateOperationId } from "./operation-id.js";
 
 export type ProjectThreadStatus = "active" | "paused" | "archived" | "completed" | "closed";
 export type ProjectThreadVisibility = "private" | "shared";
@@ -133,7 +134,6 @@ const MAX_ROOT_BYTES = 16_384;
 const MAX_REVISION_BYTES = 1_024;
 const MAX_MODEL_SUMMARY_BYTES = 8_192;
 const MAX_OBSERVED_STATE_BYTES = 64 * 1_024;
-const MAX_SOURCE_OPERATION_ID_BYTES = 128;
 
 export class ProjectThreadStore {
   private readonly database: Database.Database;
@@ -271,9 +271,9 @@ export class ProjectThreadStore {
           execution_id, thread_id, grant_id, bound_at, last_used_at
         ) values (?, ?, ?, ?, ?)
         on conflict(execution_id) do update set
-          thread_id = excluded.thread_id,
-          grant_id = excluded.grant_id,
           last_used_at = excluded.last_used_at
+        where project_thread_executions.thread_id = excluded.thread_id
+          and project_thread_executions.grant_id = excluded.grant_id
       `).run(
         bounded(executionId, "executionId", MAX_ID_BYTES),
         bounded(threadId, "threadId", MAX_ID_BYTES),
@@ -281,6 +281,12 @@ export class ProjectThreadStore {
         timestamp,
         timestamp,
       );
+      const boundThreadId = this.database.prepare(`
+        select thread_id from project_thread_executions where execution_id = ?
+      `).pluck().get(bounded(executionId, "executionId", MAX_ID_BYTES));
+      if (boundThreadId !== threadId) {
+        throw new Error("Project execution is already bound to another thread.");
+      }
     });
     transaction.immediate();
   }
@@ -322,11 +328,9 @@ export class ProjectThreadStore {
     this.assertOpen();
     const observedState = stableJson(input.observedState, MAX_OBSERVED_STATE_BYTES, "observedState");
     const modelSummary = optionalBounded(input.modelSummary, "modelSummary", MAX_MODEL_SUMMARY_BYTES);
-    const sourceOperationId = optionalBounded(
-      input.sourceOperationId,
-      "sourceOperationId",
-      MAX_SOURCE_OPERATION_ID_BYTES,
-    );
+    const sourceOperationId = input.sourceOperationId === undefined
+      ? null
+      : validateOperationId(input.sourceOperationId, "sourceOperationId");
     const normalizedThreadId = bounded(input.threadId, "threadId", MAX_ID_BYTES);
     const normalizedProfileId = bounded(input.profileId, "profileId", MAX_ID_BYTES);
     const existing = sourceOperationId
@@ -389,11 +393,7 @@ export class ProjectThreadStore {
     const profileId = bounded(input.profileId, "profileId", MAX_ID_BYTES);
     const title = bounded(input.title, "title", MAX_TITLE_BYTES);
     const summary = bounded(input.modelSummary, "modelSummary", MAX_MODEL_SUMMARY_BYTES);
-    const operationId = bounded(
-      input.sourceOperationId,
-      "sourceOperationId",
-      MAX_SOURCE_OPERATION_ID_BYTES,
-    );
+    const operationId = validateOperationId(input.sourceOperationId, "sourceOperationId");
     const observedState = stableJson(input.observedState, MAX_OBSERVED_STATE_BYTES, "observedState");
     const save = this.database.transaction((): SaveProjectThreadProgressResult => {
       const row = this.database.prepare(`
@@ -531,22 +531,6 @@ export class ProjectThreadStore {
       }
     }
     return write().changes === 1;
-  }
-
-  reassignProfile(threadId: string, fromProfileId: string, toProfileId: string): ProjectThread | undefined {
-    this.assertOpen();
-    const normalizedThreadId = bounded(threadId, "threadId", MAX_ID_BYTES);
-    const from = bounded(fromProfileId, "fromProfileId", MAX_ID_BYTES);
-    const to = bounded(toProfileId, "toProfileId", MAX_ID_BYTES);
-    if (from === to) return this.get(normalizedThreadId, to);
-    const timestamp = this.timestamp();
-    const result = this.database.prepare(`
-      update project_threads
-      set profile_id = ?, revision = revision + 1,
-        updated_at = ?, last_activity_at = ?
-      where thread_id = ? and profile_id = ?
-    `).run(to, timestamp, timestamp, normalizedThreadId, from);
-    return result.changes === 1 ? this.get(normalizedThreadId, to) : undefined;
   }
 
   close(): void {

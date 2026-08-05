@@ -82,10 +82,8 @@ try {
   assert.ok(execTool);
   assert.ok(writeStdinTool);
   assert.ok(readProcessOutputTool);
-  assert.match(String(execTool.description), /one fixed foreground Project runner/u);
-  assert.match(String(execTool.description), /increase yieldTimeMs/u);
+  assert.match(String(execTool.description), /read_process_output/u);
   assert.match(String(execTool.description), /unmanaged background or detach wrappers/u);
-  assert.match(String(readProcessOutputTool.description), /use a larger yieldTimeMs/u);
   assert.deepEqual(execTool.inputSchema?.required, ["operationId"]);
   assert.deepEqual(
     writeStdinTool.inputSchema?.required,
@@ -103,9 +101,8 @@ try {
     assert.equal(execTool.inputSchema?.properties?.[removed], undefined, removed);
   }
   for (const current of [
-    "program", "args", "shell", "command", "approvalReason",
-    "workingDirectory", "stdin", "closeStdin", "tty", "columns", "rows",
-    "environment", "yieldTimeMs", "timeoutMs", "maxOutputTokens",
+    "program", "args", "shell", "command", "workingDirectory", "stdin",
+    "closeStdin", "tty", "environment", "timeoutMs",
   ]) {
     assert.ok(execTool.inputSchema?.properties?.[current], current);
   }
@@ -122,11 +119,9 @@ try {
     operationId: "codex-exec",
     shell: true,
     command: "printf '%s' \"$CODEX_TEST_VALUE\" > codex-exec.txt",
-    approvalReason: "The test verifies explicit shell mode for output redirection.",
     workingDirectory: "nested",
     environment: { CODEX_TEST_VALUE: "codex-style" },
     timeoutMs: 5_000,
-    yieldTimeMs: 5_000,
   }));
   assert.notEqual(executed.isError, true, JSON.stringify(executed));
   assert.equal(await readFile(marker, "utf8"), "codex-style");
@@ -140,11 +135,9 @@ try {
     operationId: "codex-exec",
     shell: true,
     command: "printf '%s' \"$CODEX_TEST_VALUE\" > codex-exec.txt",
-    approvalReason: "The test verifies idempotent replay of the same shell request.",
     workingDirectory: "nested",
     environment: { CODEX_TEST_VALUE: "codex-style" },
     timeoutMs: 5_000,
-    yieldTimeMs: 5_000,
   }));
   assert.notEqual(replay.isError, true, JSON.stringify(replay));
 
@@ -152,11 +145,9 @@ try {
     operationId: "codex-exec",
     shell: true,
     command: "printf changed > codex-exec.txt",
-    approvalReason: "The command changed and must not replay under the old operation id.",
     workingDirectory: "nested",
     environment: { CODEX_TEST_VALUE: "codex-style" },
     timeoutMs: 5_000,
-    yieldTimeMs: 5_000,
   }));
   assert.equal(conflictingReplay.isError, true);
   assert.equal(
@@ -172,8 +163,6 @@ try {
     operationId: "outside-write",
     shell: true,
     command: `printf policy-removed > ${shellQuote(formerlyProtected)}`,
-    approvalReason: "The test verifies that process sandbox policy is unchanged.",
-    yieldTimeMs: 5_000,
   }));
   assert.notEqual(outsideWrite.isError, true, JSON.stringify(outsideWrite));
   assert.equal(await readFile(formerlyProtected, "utf8"), "policy-removed");
@@ -182,9 +171,7 @@ try {
     operationId: "interactive",
     shell: true,
     command: "while IFS= read -r line; do printf 'seen:%s\\n' \"$line\"; [ \"$line\" = quit ] && break; done",
-    approvalReason: "The test requires a shell loop for an interactive stdin session.",
     closeStdin: false,
-    yieldTimeMs: 0,
   }));
   assert.notEqual(interactive.isError, true, JSON.stringify(interactive));
   const sessionId = Number(
@@ -197,7 +184,6 @@ try {
     sessionId,
     chars: "hello\n",
     expectedRevision: 0,
-    yieldTimeMs: 25,
   }));
   assert.notEqual(firstWrite.isError, true, JSON.stringify(firstWrite));
   assert.match(
@@ -213,6 +199,7 @@ try {
     operationId: "stdin-stale",
     sessionId,
     chars: "quit\n",
+    closeStdin: true,
     expectedRevision: 0,
   }));
   assert.equal(staleWrite.isError, true);
@@ -222,14 +209,44 @@ try {
     } | undefined)?.error?.code,
     "process_revision_conflict",
   );
+  const staleStructured = staleWrite.structuredContent as {
+    error?: {
+      operationId?: unknown;
+      safeToRetry?: unknown;
+      phase?: unknown;
+      effectsKnown?: unknown;
+    };
+    operation?: {
+      id?: unknown;
+      safeToRetry?: unknown;
+      phase?: unknown;
+      effectsKnown?: unknown;
+    };
+  } | undefined;
+  assert.deepEqual(staleStructured?.error, {
+    code: "process_revision_conflict",
+    operationId: "stdin-stale",
+    safeToRetry: true,
+    recovery: "read_process_output",
+    phase: "not_started",
+    effectsKnown: true,
+  });
+  assert.equal(staleStructured?.operation, undefined);
+  const currentProcess = resultOf(await rawToolCall(origin, 80, "read_process_output", {
+    sessionId,
+  }));
+  assert.notEqual(currentProcess.isError, true, JSON.stringify(currentProcess));
+  const currentRevision = Number(
+    (currentProcess.structuredContent as { inputRevision?: unknown } | undefined)?.inputRevision,
+  );
+  assert.equal(currentRevision, 1);
 
   const finalWrite = resultOf(await rawToolCall(origin, 9, "write_stdin", {
-    operationId: "stdin-2",
+    operationId: "stdin-stale",
     sessionId,
     chars: "quit\n",
     closeStdin: true,
-    expectedRevision: 1,
-    yieldTimeMs: 1_000,
+    expectedRevision: currentRevision,
   }));
   assert.notEqual(finalWrite.isError, true, JSON.stringify(finalWrite));
   assert.match(
@@ -243,10 +260,8 @@ try {
 
   const polling = resultOf(await rawToolCall(origin, 10, "exec_command", {
     operationId: "polling",
-    shell: true,
-    command: "sleep 0.1; printf done",
-    approvalReason: "The test needs shell sequencing to exercise live polling.",
-    yieldTimeMs: 0,
+    program: process.execPath,
+    args: ["-e", "setTimeout(() => process.stdout.write('done' + 'x'.repeat(50000)), 1500)"],
   }));
   assert.notEqual(polling.isError, true, JSON.stringify(polling));
   const pollingSessionId = Number(
@@ -257,7 +272,6 @@ try {
     operationId: "poll-empty",
     sessionId: pollingSessionId,
     chars: "",
-    yieldTimeMs: 1_000,
   }));
   assert.equal(emptyInteraction.isError, true);
   assert.equal(
@@ -268,14 +282,13 @@ try {
   );
   const polled = resultOf(await rawToolCall(origin, 12, "read_process_output", {
     sessionId: pollingSessionId,
-    yieldTimeMs: 1_000,
   }));
   assert.notEqual(polled.isError, true, JSON.stringify(polled));
   assert.equal(
     (polled.structuredContent as {
-      commandExecuted?: unknown;
-    } | undefined)?.commandExecuted,
-    false,
+      provenance?: { source?: unknown };
+    } | undefined)?.provenance?.source,
+    "process",
   );
   assert.match(
     String(
@@ -289,11 +302,44 @@ try {
     (polled.structuredContent as { outputId?: unknown } | undefined)?.outputId ?? "",
   );
   assert.ok(pollingOutputId);
+  const polledSerialized = JSON.stringify(polled.structuredContent);
+  assert.doesNotMatch(
+    polledSerialized,
+    /commandExecuted|terminationCoverage|originalTokenCount|stream|"ok"\s*:/u,
+  );
+  assert.equal(
+    (polled.structuredContent as {
+      output?: { outputId?: unknown; provenance?: unknown };
+    } | undefined)?.output?.outputId,
+    undefined,
+  );
+  assert.equal(
+    (polled.structuredContent as {
+      output?: { provenance?: unknown };
+    } | undefined)?.output?.provenance,
+    undefined,
+  );
+  const retainedSearch = resultOf(await rawToolCall(origin, 199, "read_process_output", {
+    outputId: pollingOutputId,
+    mode: "search",
+    query: "done",
+  }));
+  assert.notEqual(retainedSearch.isError, true, JSON.stringify(retainedSearch));
+  assert.deepEqual(
+    Object.keys((retainedSearch.structuredContent ?? {}) as Record<string, unknown>).sort(),
+    ["provenance", "search", "status"],
+  );
+  assert.deepEqual(
+    Object.keys(((retainedSearch.structuredContent as {
+      search?: Record<string, unknown>;
+    } | undefined)?.search) ?? {}).sort(),
+    ["matches"],
+  );
   const retainedFirstPage = resultOf(await rawToolCall(
     origin,
     13,
     "read_process_output",
-    { outputId: pollingOutputId, mode: "page", limit: 2 },
+    { outputId: pollingOutputId, mode: "page" },
   ));
   const retainedCursor = String(
     (retainedFirstPage.structuredContent as {
@@ -350,10 +396,10 @@ try {
   assert.match(
     String(
       (retainedSecondPage.structuredContent as {
-        page?: { text?: unknown };
-      } | undefined)?.page?.text ?? "",
+        output?: { text?: unknown };
+      } | undefined)?.output?.text ?? "",
     ),
-    /ne/u,
+    /x/u,
   );
 
   const escapedWorkdir = resultOf(await rawToolCall(origin, 18, "exec_command", {
@@ -383,6 +429,84 @@ try {
     network: "inherit",
   }));
   assertInvalidInput(networkOption);
+
+  for (const [id, field, value] of [
+    [171, "approvalReason", "removed"],
+    [172, "columns", 100],
+    [173, "rows", 40],
+    [174, "yieldTimeMs", 0],
+    [175, "maxOutputTokens", 100],
+  ] as const) {
+    assertInvalidInput(resultOf(await rawToolCall(origin, id, "exec_command", {
+      operationId: `removed-exec-${field}`,
+      program: "true",
+      args: [],
+      [field]: value,
+    })));
+  }
+  for (const [id, tool, args] of [
+    [176, "write_stdin", { operationId: "removed-columns", sessionId: 1, columns: 80 }],
+    [177, "write_stdin", { operationId: "removed-rows", sessionId: 1, rows: 24 }],
+    [178, "write_stdin", { operationId: "removed-yield", sessionId: 1, yieldTimeMs: 0 }],
+    [179, "read_process_output", { sessionId: 1, yieldTimeMs: 0 }],
+    [180, "read_process_output", { outputId: "x", limit: 1 }],
+    [191, "read_process_output", { outputId: "x", tailBytes: 1 }],
+    [192, "read_process_output", { outputId: "x", scanBytes: 1 }],
+    [193, "read_process_output", { outputId: "x", maxMatches: 1 }],
+    [194, "read_process_output", { outputId: "x", maxOutputTokens: 1 }],
+  ] as const) {
+    assertInvalidInput(resultOf(await rawToolCall(origin, id, tool, args)));
+  }
+
+  for (const [id, args] of [
+    [181, { action: "search", query: "testing" }],
+    [182, { name: "testing" }],
+    [183, { cursor: "" }],
+    [184, { skillId: "skill_invalid" }],
+    [186, { query: "testing", unexpected: true }],
+  ] as const) {
+    assertInvalidInput(resultOf(await rawToolCall(origin, id, "skills", args)));
+  }
+  const mixedSkillFields = resultOf(await rawToolCall(origin, 185, "skills", {
+    cursor: "not-a-signed-cursor",
+    query: "testing",
+  }));
+  assert.equal(mixedSkillFields.isError, true);
+  assert.equal(
+    (mixedSkillFields.structuredContent as { error?: { code?: unknown } } | undefined)
+      ?.error?.code,
+    "skill_cursor_fields_invalid",
+  );
+
+  for (const [id, tool, args] of [
+    [187, "read_files", { files: [{ path: "complete", ref: "legacy" }] }],
+    [188, "read_files", { files: [{ path: "complete", unexpected: true }] }],
+    [189, "inspect", { operations: [{ operation: "ls", ref: "legacy" }] }],
+    [190, "inspect", { operations: [{ operation: "glob", pattern: "*", unexpected: true }] }],
+  ] as const) {
+    assertInvalidInput(resultOf(await rawToolCall(origin, id, tool, args)));
+  }
+
+  assertInvalidInput(resultOf(await rawToolCall(origin, 195, "show_changes", {
+    cursor: "",
+  })));
+  assertInvalidInput(resultOf(await rawToolCall(origin, 196, "show_changes", {
+    source: "repository",
+    unexpected: true,
+  })));
+  for (const [id, args] of [
+    [197, {}],
+    [198, { source: "repository", cursor: "not-a-signed-cursor" }],
+  ] as const) {
+    const invalidFields = resultOf(await rawToolCall(origin, id, "show_changes", args));
+    assert.equal(invalidFields.isError, true);
+    assert.equal(
+      (invalidFields.structuredContent as {
+        error?: { code?: unknown };
+      } | undefined)?.error?.code,
+      "diff_fields_invalid",
+    );
+  }
 
   const oversizedInput = "x".repeat(1024 * 1024 + 1);
   const oversized = resultOf(await rawToolCall(origin, 21, "exec_command", {

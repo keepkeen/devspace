@@ -148,6 +148,24 @@ try {
   });
   assertSucceeded(readOpen);
   assertNoWorkspaceProtocol(readOpen);
+  const readInterrupt = await readClient.callTool({
+    name: "project_control",
+    arguments: { action: "interrupt", operationId: "read-scope-interrupt" },
+    _meta: readHostMeta,
+  });
+  assert.equal(readInterrupt.isError, true);
+  assert.equal(
+    (readInterrupt.structuredContent as {
+      error?: { code?: unknown; recovery?: unknown };
+    } | undefined)?.error?.code,
+    "insufficient_scope",
+  );
+  assert.equal(
+    (readInterrupt.structuredContent as {
+      error?: { recovery?: unknown };
+    } | undefined)?.error?.recovery,
+    "reauthorize_oauth",
+  );
   assertSucceeded(await readClient.callTool({
     name: "read_files",
     arguments: { files: [{ path: "payload.txt" }] },
@@ -222,9 +240,15 @@ try {
   );
   assert.equal(
     (writePreview.structuredContent as {
-      diff?: { eof?: unknown };
-    } | undefined)?.diff?.eof,
-    true,
+      diff?: { provenance?: { source?: unknown }; nextCursor?: unknown };
+    } | undefined)?.diff?.provenance?.source,
+    "repository",
+  );
+  assert.equal(
+    (writePreview.structuredContent as {
+      diff?: { nextCursor?: unknown };
+    } | undefined)?.diff?.nextCursor,
+    undefined,
   );
   await assertToolUnavailable(writeClient.callTool({
     name: "exec_command",

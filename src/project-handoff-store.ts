@@ -39,6 +39,11 @@ export interface ProjectHandoffListing {
   truncated: boolean;
 }
 
+export interface ResumableProjectHandoffCount {
+  projectFingerprint: string;
+  count: number;
+}
+
 export interface SaveProjectHandoffInput {
   executionId: string;
   projectRef: string;
@@ -180,6 +185,42 @@ export class ProjectHandoffStore {
       perProjectCounts.set(row.project_fingerprint, count + 1);
     }
     return { handoffs, truncated };
+  }
+
+  countResumable(
+    requestedProjectFingerprints: readonly string[],
+  ): ResumableProjectHandoffCount[] {
+    this.assertOpen();
+    const projectFingerprints = [...new Set(requestedProjectFingerprints.map((value) =>
+      boundedUtf8String(
+        value,
+        "projectFingerprint",
+        MAX_PROJECT_FINGERPRINT_UTF8_BYTES,
+      )
+    ))];
+    if (projectFingerprints.length > MAX_PROJECT_FINGERPRINTS_PER_LIST) {
+      throw new Error(
+        `projectFingerprints must contain at most ${MAX_PROJECT_FINGERPRINTS_PER_LIST} entries`,
+      );
+    }
+    if (projectFingerprints.length === 0) return [];
+
+    const placeholders = projectFingerprints.map(() => "?").join(", ");
+    const rows = this.database.sqlite.prepare(`
+      select project_fingerprint, count(*) as count
+      from project_handoffs
+      where status = 'resumable'
+        and project_fingerprint in (${placeholders})
+      group by project_fingerprint
+    `).all(...projectFingerprints) as Array<{
+      project_fingerprint: string;
+      count: number;
+    }>;
+    const counts = new Map(rows.map((row) => [row.project_fingerprint, row.count]));
+    return projectFingerprints.map((projectFingerprint) => ({
+      projectFingerprint,
+      count: counts.get(projectFingerprint) ?? 0,
+    }));
   }
 
   listSelection(projectFingerprint: string): ProjectHandoff[] {

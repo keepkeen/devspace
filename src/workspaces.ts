@@ -219,7 +219,7 @@ export class UnknownWorkspaceError extends Error {
 
 export class SkillNotLoadedError extends Error {
   readonly code = "skill_not_loaded";
-  readonly publicText = "Call skills with action=load for the selected Project, then retry.";
+  readonly publicText = "Call skills with the selected skillId for the Project, then retry.";
 
   constructor() {
     super("A Skill must be loaded before its files can be read.");

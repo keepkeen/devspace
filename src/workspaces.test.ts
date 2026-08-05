@@ -579,7 +579,7 @@ try {
       "code" in error &&
       error.code === "skill_not_loaded" &&
       "publicText" in error &&
-      error.publicText === "Call skills with action=load for the selected Project, then retry.",
+      error.publicText === "Call skills with the selected skillId for the Project, then retry.",
   );
   const workspaceSkillReference = join(workspaceSkill.baseDir, "reference.md");
   const workspaceSkillUri = `skill://${workspaceSkill.skillId}/reference.md`;

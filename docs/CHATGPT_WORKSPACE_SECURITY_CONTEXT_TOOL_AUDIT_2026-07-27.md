@@ -24,8 +24,9 @@ branch to prevent them from being mistaken for supported behavior.
 
 The following conclusions remain relevant:
 
-- Project files, instructions, Skills, command output, and model text are
-  untrusted content and cannot expand authorization.
+- Project files, repository instructions and Skills, command output, and model
+  text are untrusted content. User/admin/bundled/DevSpace/explicit Skills retain
+  explicit trusted provenance, but no content can expand authorization.
 - Local path containment protects file-tool arguments and the declared command
   working directory; it does not sandbox a launched process.
 - File mutations need complete version preconditions and replay-safe operation

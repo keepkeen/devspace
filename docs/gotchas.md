@@ -218,9 +218,9 @@ Check:
 - the directory is in a discovered or explicitly configured Skill root;
 - it is not listed in `DEVSPACE_DISABLED_SKILL_PATHS`.
 
-Use `skills` with `action=search` for explicit discovery. Then use the same tool
-with `action=load` and a returned `skillId` before following the selected
-instructions. Skill bodies are intentionally lazy.
+Use `skills` with a `query` for explicit discovery. Then call it with a returned
+`skillId` before following the selected instructions. Skill bodies are
+intentionally lazy.
 
 ## `ifMatch` or file-version conflict
 
@@ -273,7 +273,7 @@ is required. Treat `process:execute` as high-trust access.
 ## Windows command fails
 
 Direct `exec_command` uses `program` and `args`; explicit shell mode uses
-`shell:true`, `command`, and `approvalReason`. Program names and shell syntax
+`shell:true` and `command`. Program names and shell syntax
 differ across operating systems. Use values valid for the OS running DevSpace
 and set `workingDirectory` separately.
 
@@ -281,14 +281,14 @@ Do not assume a Unix shell is present on Windows.
 
 ## Command output is truncated
 
-`maxOutputTokens` bounds the output returned by `exec_command`. A long-running
+DevSpace applies fixed bounded inline-output and wait budgets. A long-running
 command may return a process handle instead of waiting for completion.
 
 Use:
 
 - `read_process_output` with `sessionId` to poll a live process;
-- `write_stdin` with a fresh `operationId` only when input, close, interrupt,
-  or terminal resize is needed;
+- `write_stdin` with a fresh `operationId` only when input, close, or interrupt
+  is needed;
 - `read_process_output` with `outputId` for the first retained-output read;
 - a narrower test or log filter when output is too large.
 
@@ -308,13 +308,16 @@ mutation-only.
 
 Signed cursors are self-contained and bound to the active grant, Project
 generation, resource revision, query, and paging parameters. On continuation,
-use the same session+Actor selection and pass the cursor. Do not repeat or change
-the original `outputId`, mode, query, offset, or limit beside it.
+use the same session+Actor selection and pass only the cursor. Do not repeat or
+change the original `outputId`, mode, query, or offset beside it.
 
-For `show_changes`, also repeat the same required `source`; changing it makes
-the cursor stale.
+For `show_changes`, the first call supplies `source`; continuation supplies only
+the cursor. Repeating either source beside the cursor is rejected. If that
+cursor is invalid, expired, or stale, restart with an explicit `source` and no
+cursor. Use the returned recovery `source` when one is available.
 
-If the resource or Project changed, restart the read without the stale cursor.
+For other resources, if the resource or Project changed, restart the read
+without the stale cursor.
 
 ## `show_changes` is empty
 
@@ -334,8 +337,8 @@ even though those files are visible in the shared directory. It is a bounded
 chronological operation log, not a net filesystem diff. If it is full, create a
 new logical context for the same Project.
 
-`show_changes` is read-only and bounded. A very large result may return a
-summary; narrow inspection to the reported files.
+`show_changes` is read-only and bounded. A very large result returns an optional
+next cursor; continue with that cursor alone.
 
 ## `read_files` or `inspect` returns a summary
 

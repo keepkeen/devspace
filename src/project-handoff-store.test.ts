@@ -198,6 +198,20 @@ function testBoundedListingAndCapacity(stateDir: string): void {
     assert.equal(listing.handoffs.length, 2);
     assert.equal(listing.truncated, true);
     assert.ok(listing.handoffs[0]!.updatedAt > listing.handoffs[1]!.updatedAt);
+    assert.deepEqual(handoffs.countResumable([
+      "fingerprint-a",
+      "fingerprint-missing",
+      "fingerprint-a",
+    ]), [
+      {
+        projectFingerprint: "fingerprint-a",
+        count: MAX_RESUMABLE_PROJECT_HANDOFFS,
+      },
+      {
+        projectFingerprint: "fingerprint-missing",
+        count: 0,
+      },
+    ]);
 
     const overflowExecution = createActiveExecution(
       stateDir,

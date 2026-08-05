@@ -5,6 +5,19 @@ supports ChatGPT web only. It does not accept model-supplied absolute Project
 roots. When ChatGPT supplies anonymous host metadata, DevSpace uses HMAC-derived
 Actor and session references without storing the original values.
 
+## Tool-result visibility
+
+The published ChatGPT contract exposes result `content` and
+`structuredContent` to both the model and the App component and includes them in
+the conversation transcript. Result `_meta` is delivered only to the component
+and is hidden from the model. DevSpace uses `_meta` for UI-only projection data;
+model decisions and recovery state remain in `content` or
+`structuredContent`. Model-hidden does not mean trusted: `_meta` never grants
+authority and is not a substitute for OAuth checks, secure storage, Project
+containment, or server-side validation.
+
+Reference: https://developers.openai.com/plugins/reference#tool-results
+
 ## Authorization and identity
 
 Every request is authorized by its OAuth bearer grant:
@@ -55,7 +68,7 @@ reserves that one tool for the Project App:
 | `apply_patch` | `project:read project:write` | Apply a version-guarded Project-relative patch. |
 | `show_changes` | `project:read` | Read a bounded repository diff or execution patch journal selected by `source`. |
 | `exec_command` | all three scopes | Start a direct program or an explicitly approved shell command. |
-| `write_stdin` | `project:read process:execute` | Send input, close, interrupt, or resize a tracked process. |
+| `write_stdin` | `project:read process:execute` | Send input, close, or interrupt a tracked process. |
 | `read_process_output` | `project:read process:execute` | Poll a process or read retained output without mutating it. |
 
 After `project_control` selects an execution, model-facing file, process, patch,
@@ -63,12 +76,13 @@ review, Skill, and progress tools are called without an execution reference.
 
 ## Project bootstrap and App task controls
 
-`list_projects` returns only opaque references and labels for approved roots;
-it never exposes local paths. Each Project entry includes a bounded `tasks`
-array whose entries contain `taskRef`, title, timestamps, status, and version.
-The top-level `taskTrust:"untrusted"` marks all saved labels as historical
-model input, and `taskLimits` reports the per-Project and total listing bounds.
-Passing `projectRef` requests the complete bounded Task list for that Project.
+Global `list_projects` returns only opaque references, labels, and exact
+`resumableTaskCount` values for approved roots; it never exposes local paths or
+Task titles/timestamps for unselected Projects. Passing `projectRef` requests
+that Project's bounded `tasks` array. Each Task contains only `taskRef`, title,
+version, and `updatedAt`, and top-level `taskTrust:"untrusted"` marks the saved
+labels as historical model input. `truncated` reports a bounded Project or
+scoped Task listing; fixed listing limits are not model-visible.
 
 The model-facing `project_control` accepts exactly four actions:
 
@@ -87,6 +101,19 @@ construction succeeds. With exactly one approved Project,
 top-level Project and a grant with `project:write`, `checkoutKind:"worktree"`
 creates a managed per-Thread worktree under the private DevSpace state
 directory. Identical retries reuse the same execution and worktree.
+Project mutation operation IDs are opaque, well-formed, non-empty Unicode
+strings without NUL and are limited to 128 UTF-8 bytes. DevSpace preserves the
+exact submitted value;
+it does not trim or normalize before hashing or persistence. The same shared
+validation runs at the public tool boundary and every durable store entry, so an
+invalid ID fails before reservation, process start, or another mutation effect.
+Creation identity is also
+bound to the trusted Actor derived from host subject/organization metadata, so
+two Actors sharing one OAuth grant cannot replay or rebind each other's
+execution by choosing the same operation ID. Grant-wide legacy Thread owners
+are never reassigned by list, hydrate, replay, activity, interrupt, or lifecycle
+calls; an ownership record that cannot be verified for the current Actor fails
+closed.
 
 ```json
 {
@@ -98,9 +125,8 @@ directory. Identical retries reuse the same execution and worktree.
 ```
 
 Creates and binds a new execution from one explicitly selected saved Task after
-bootstrap context construction succeeds. `resume` accepts exactly one `taskRef`
-or current Actor-private `threadRef`; the public
-cross-chat and reauthorization recovery flow uses `tasks[].taskRef`. DevSpace
+bootstrap context construction succeeds. Model-side `resume` requires exactly
+one `taskRef`; private Thread discovery and lifecycle remain App-only. DevSpace
 never chooses a Task by recency or because it is the only one.
 
 ```json
@@ -110,21 +136,22 @@ never chooses a Task by recency or because it is the only one.
 Resolves the execution selected for this trusted session+Actor, revalidates it,
 refreshes the binding after successful context construction, and returns the
 next bounded root instruction page. Continue with the same action and returned
-cursor until `rootInstructionsComplete` is true. If a cursor is lost, hydrate
-without it to restart the sequence safely.
+`nextCursor` until no cursor remains. If a cursor is lost, hydrate without it to
+restart the sequence safely.
 
 ```json
 {
   "action":"interrupt",
-  "threadRef":"pth1_...",
   "operationId":"interrupt-001"
 }
 ```
 
-Requests an interrupt for running commands belonging to the selected private
-Thread. This action additionally requires `process:execute`. The journal
+Requests an interrupt only for running commands in the execution bound to the
+trusted current session+Actor. Model input cannot select a private Thread or a
+different execution. A missing binding returns open/resume recovery. This action
+additionally requires `process:execute`. The private journal
 distinguishes the request event from the later authoritative process terminal
-event.
+event; the model result contains only the interrupted count, not raw session IDs.
 
 The separate `project_thread_control` is an App-only control-plane tool. Its
 `resolve`, `list`, `status`, `activity`, `pause`, `archive`, `complete`, and
@@ -141,20 +168,25 @@ worktrees are never removed automatically. These lifecycle actions do not
 complete or release capacity for the shared `tasks[].taskRef` record. The model
 does that from an active execution with `save_progress(status:"completed")`.
 
-## Bootstrap context schema v8
+## Bootstrap context
 
-Open, resume, and hydrate return `schemaVersion:8`, `project`, optional `thread`,
-and `contextDelta`. No execution identity appears in the bootstrap object.
-`thread.threadRef` is the only Thread reference there. If a checkpoint exists,
-`observedStateTrust` is the scalar `"server_observed"`; an optional model summary
-has the separate scalar
-`modelSummaryTrust:"untrusted"`.
+The first open, resume, or cursorless hydrate page returns `project`, optional
+`checkpoint`, `instructions`, and optional `nextCursor`/diagnostics. `project`
+contains only its ref, write access, and checkout kind. No private Thread,
+execution identity, success constant, schema version, or redundant completion
+boolean appears in the model bootstrap object. Cursor continuation pages contain only new
+`instructions` and an optional `nextCursor`; absence of the cursor means root
+hydration is complete. Private Thread identity and presentation fields remain in
+model-hidden `_meta` or the App-only control plane. If a checkpoint exists, its
+trusted facts are nested under `serverObserved`; an optional historical model
+summary is separately named `untrustedSummary`.
 
-Each instruction contains only `source`, its matching trust value, `scope`,
-`path`, and `content`. A page that cuts an instruction adds only
+Each instruction contains `trustClass`, `path`, and `content`. Repository
+instructions use `repository_untrusted`. A nested instruction also contains its
+non-root `scope`; the redundant root scope is omitted. A page that cuts an instruction adds only
 `fragment:{"partial":true}`. Internal range and paging metadata are
 not model-visible. A resumed saved Task is projected once into
-`thread.checkpoint.modelSummary`; bootstrap does not duplicate it in a second
+`checkpoint.untrustedSummary`; bootstrap does not duplicate it in a Thread or
 Task object.
 
 ## Task continuity, events, snapshots, and checkpoints
@@ -208,9 +240,10 @@ distinct from DevSpace saved progress.
 ```
 
 The first semantic save omits `ifMatch`; later saves require the current saved
-Task version. The result returns a `task` object containing `taskRef`, title,
-status, version, and update time, plus optional private `thread` metadata when
-that projection is available. It never echoes the saved summary. On a Task
+Task version. The model result returns only a `task` object containing
+`taskRef`, status, and version, plus the mutation recovery envelope. Optional
+private Thread projection data is App-only metadata. The result never echoes
+the saved title or summary. On a Task
 revision conflict, call `list_projects(projectRef)`, reconcile the latest Task,
 then retry with the same `operationId` and current `ifMatch`; the rejected
 attempt did not start an effect. `status:"completed"` removes the Task from
@@ -237,9 +270,15 @@ Open, resume, and hydrate return bounded effective root instruction pages. All
 other Project tools remain gated until the final page is delivered. Targeted
 reads and inspection return only newly applicable nested instruction deltas.
 
-`skills` uses lazy `search` and `load` actions. Repository instructions, files,
-process output, checkpoints, and Skills are untrusted content and cannot expand
-OAuth scopes or approved roots.
+`skills` infers the operation from one of three mutually exclusive shapes:
+search with `{query,limit?}`, continue with `{cursor}`, or load with `{skillId}`.
+The cursor is non-empty, the Skill ID uses the advertised `skill_` plus SHA-256
+form, and removed or unknown fields are rejected before handler dispatch.
+Repository instructions, files, and repository Skills are untrusted. User,
+admin, bundled, DevSpace, and explicitly configured Skills retain their explicit
+trusted provenance. All Skill content remains guidance only: regardless of
+trust, it cannot expand OAuth scopes, approved roots, or tool authority. Process
+output and model-authored checkpoint summaries also remain untrusted content.
 
 ## Versioned and idempotent effects
 
@@ -251,8 +290,30 @@ after list/reconcile, retry that unstarted operation with the same ID and curren
 `ifMatch`.
 
 `apply_patch` requires an `ifMatch` value for every touched path. Existing
-files use the latest `contentHash`; a path expected not to exist uses `null`.
+files can reuse the latest `read_files` item `version` object directly; a path
+expected not to exist uses `null`.
 Stale content must be reread and reconciled.
+For a patch touching multiple paths, scalar `ifMatch` is a verified-not-started
+preflight rejection. Replace it with the complete path-to-version map and retry
+the same `operationId`.
+On success, each touched path has one compact semantic effect containing its
+operation and post-write version; move remains one move effect, deletion uses a
+null post-version, and fuzzy-match evidence appears only when it was used.
+
+`read_files` hoists provenance only when every item has the same source and
+trust. Mixed repository/Skill reads carry provenance per item, using the actual
+Skill source. If every `read_files` or `inspect` item fails, the result keeps all
+item errors and adds a tool-specific read-only error envelope with safe
+correct-and-retry guidance.
+
+An error result has one authoritative `error` object. Mutation errors carry
+`operationId` when the failure must be associated with a retry/idempotency
+decision, plus `phase`, `effectsKnown`, `safeToRetry`, `recovery`, and bounded
+corrective details. They never duplicate that state in a top-level `operation`
+object, and the obsolete `retryable` alias is absent. Read-only errors omit the
+invariant mutation fields `phase:not_started` and `effectsKnown:true` while
+retaining useful safe-retry and recovery guidance. Successful mutations keep
+their compact `operation` identity envelope.
 
 ## Commands and processes
 
@@ -265,8 +326,6 @@ Direct argv mode is the default:
   "args":["run","typecheck"],
   "workingDirectory":".",
   "environment":{"CI":"1"},
-  "yieldTimeMs":10000,
-  "maxOutputTokens":12000,
   "tty":false
 }
 ```
@@ -277,8 +336,7 @@ Shell syntax is explicit:
 {
   "operationId":"command-002",
   "shell":true,
-  "command":"npm test | tee test.log",
-  "approvalReason":"The pipeline is required to retain a disposable test log."
+  "command":"npm test | tee test.log"
 }
 ```
 
@@ -287,16 +345,26 @@ checkout or worktree. Commands have the full file and inherited network
 authority of the DevSpace OS user; there is no process sandbox or per-command
 network policy.
 
-All process fields use camelCase: `sessionId`, `closeStdin`, `expectedRevision`,
-`yieldTimeMs`, `timeoutMs`, and `maxOutputTokens`. `read_process_output` performs
-read-only polling. `write_stdin` requires an operation ID only when it mutates
-the process.
+All process fields use camelCase. `exec_command` accepts semantic command intent,
+working directory, environment, timeout, initial stdin, and TTY choice; output
+and wait budgets are server-owned. `read_process_output` performs read-only
+polling. `write_stdin` always requires an operation ID because it mutates the
+process.
+If `expectedRevision` conflicts before input is written, poll
+`read_process_output(sessionId)` for the current `inputRevision`, then retry the
+corrected interaction with the same `operationId`; the rejected preflight has
+known zero effects.
 
-For long work, prefer one fixed foreground Project runner in direct argv mode.
-Give it a short initial `yieldTimeMs`, then poll the returned session with
-`read_process_output` across turns. Increase `yieldTimeMs` when the process is
-expected to remain quiet for longer and a longer bounded wait is useful. Let
-that runner own preflight, fan-out, PID/log verification, and completion instead
+If a command initially returns `running`, its later exit, signal, timeout, or
+interrupt writes a sanitized server-observed terminal checkpoint to the exact
+Actor-owned Thread captured at process start. A later hydrate can distinguish
+the terminal outcome and whether output was retained, partially lost, or
+unavailable without exposing raw session, event, output, execution, or Thread
+identifiers in the model checkpoint.
+
+For long work, prefer one fixed foreground Project runner in direct argv mode,
+then poll the returned session with `read_process_output` across turns. Let that
+runner own preflight, fan-out, PID/log verification, and completion instead
 of constructing repeated shell, background, detach, or renamed launcher
 wrappers merely to survive a host turn.
 
@@ -315,8 +383,11 @@ wrappers merely to survive a host turn.
   only successful DevSpace `apply_patch` requests from this execution, not
   command writes, external edits, or patches from another execution.
 
-Continuation cursors are bound to the selected source. Keep the same `source`
-when paging.
+The first call supplies exactly one `source`. A continuation call supplies only
+the returned non-empty `cursor`; the signed cursor restores the source and
+rejects repeated or changed first-page fields. The model receives only a compact
+summary, patch, provenance, and optional next cursor; file/page details are
+App-only metadata.
 
 ## Recovery principles
 

@@ -17,8 +17,35 @@ try {
   testAuthorizationLifecycle(join(root, "authorization"));
   testStartupAuthorizationReconciliation(join(root, "startup-reconciliation"));
   testQuarantineAndClose(join(root, "terminal"));
+  testOperationIdUnicodeValidation(join(root, "operation-id-unicode"));
 } finally {
   rmSync(root, { recursive: true, force: true });
+}
+
+function testOperationIdUnicodeValidation(stateDir: string): void {
+  seedAuthorization(stateDir);
+  const store = new ProjectExecutionStore(stateDir, {
+    createExecutionId: () => "execution-unicode",
+  });
+  try {
+    for (const createOperationId of ["\uD800", "\uDC00"]) {
+      assert.throws(
+        () => store.reserve(reservation({ createOperationId })),
+        /createOperationId must be/u,
+      );
+    }
+    const replacement = store.reserve(reservation({ createOperationId: "\uFFFD" }));
+    assert.equal(replacement.status, "new");
+    assert.equal(store.findCreation(authorization(), "\uFFFD")?.createOperationId, "\uFFFD");
+    for (const createOperationId of ["\uD800", "\uDC00"]) {
+      assert.throws(
+        () => store.findCreation(authorization(), createOperationId),
+        /createOperationId must be/u,
+      );
+    }
+  } finally {
+    store.close();
+  }
 }
 
 function testReservationActivationAndExactAuthorization(stateDir: string): void {
@@ -45,6 +72,20 @@ function testReservationActivationAndExactAuthorization(stateDir: string): void 
     assert.deepEqual(store.reserve({ ...input, requestHash: "different" }), {
       status: "conflict",
     });
+    assert.equal(
+      store.findCreation(authorization(), `${"界".repeat(42)}ab`),
+      undefined,
+    );
+    for (const createOperationId of [
+      "a".repeat(129),
+      `${"界".repeat(42)}abc`,
+      "nul\0id",
+    ]) {
+      assert.throws(
+        () => store.reserve(reservation({ createOperationId })),
+        /createOperationId must be/u,
+      );
+    }
 
     now = 2_000;
     createWorkspace(

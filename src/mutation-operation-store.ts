@@ -1,5 +1,6 @@
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
 import type { AppliedPatchFile } from "./apply-patch.js";
+import { operationId as validateOperationId } from "./operation-id.js";
 
 export interface MutationOperationKey {
   connectionPrincipalId: string;
@@ -438,11 +439,7 @@ export class MutationOperationStore {
       "connectionPrincipalId",
       MAX_KEY_PART_LENGTH,
     );
-    const normalizedOperationId = boundedNonEmptyString(
-      operationId,
-      "operationId",
-      MAX_KEY_PART_LENGTH,
-    );
+    const normalizedOperationId = validateOperationId(operationId);
     const normalizedWorkspaceId = boundedNonEmptyString(
       workspaceId,
       "workspaceId",
@@ -527,11 +524,7 @@ export class MutationOperationStore {
       "connectionPrincipalId",
       MAX_KEY_PART_LENGTH,
     );
-    const operationId = boundedNonEmptyString(
-      input.operationId,
-      "operationId",
-      MAX_KEY_PART_LENGTH,
-    );
+    const operationId = validateOperationId(input.operationId);
     const workspaceId = boundedNonEmptyString(
       input.workspaceId,
       "workspaceId",
@@ -787,7 +780,7 @@ function validateKey(key: MutationOperationKey): MutationOperationKey {
     ),
     workspaceId: boundedNonEmptyString(key.workspaceId, "workspaceId", MAX_KEY_PART_LENGTH),
     tool: boundedNonEmptyString(key.tool, "tool", MAX_TOOL_LENGTH),
-    operationId: boundedNonEmptyString(key.operationId, "operationId", MAX_KEY_PART_LENGTH),
+    operationId: validateOperationId(key.operationId),
   };
 }
 

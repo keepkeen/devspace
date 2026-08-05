@@ -649,7 +649,7 @@ export function resolveSkillReadPath(
     if (!skill) {
       throw new SkillUriError(
         "skill_not_found",
-        "The Skill is not available in the selected Project; call skills with action=search and use its current skillId.",
+        "The Skill is not available in the selected Project; call skills with a query and use its current skillId.",
       );
     }
     const absolutePath = resolve(skill.baseDir, skillUri.relativePath);

@@ -6,6 +6,8 @@ export interface FileVersion {
   mtimeNs: string;
 }
 
+export const FILE_MTIME_NS_PATTERN = /^-?\d+$/u;
+
 const MAX_STABLE_READ_ATTEMPTS = 3;
 
 export async function readFileVersion(path: string): Promise<FileVersion | null> {

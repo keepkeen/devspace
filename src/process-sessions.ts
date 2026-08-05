@@ -1,7 +1,8 @@
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { constants as osConstants } from "node:os";
 import { resolve } from "node:path";
-import type { Writable } from "node:stream";
+import type { Readable, Writable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import {
   isProcessTreeAlive,
@@ -52,9 +53,48 @@ export interface StartCommandInput {
   retainWorkspaceRootLease?: () => WorkspaceRootLease;
   activity?: {
     threadId: string;
+    profileId: string;
+    executionId: string;
     operationId: string;
+    workingDirectory: string;
     summary: string;
   };
+}
+
+export type ProcessCommandMode = "program" | "shell";
+
+export interface ProcessTerminalEvent {
+  connectionPrincipalId: string;
+  workspaceId: string;
+  commandMode: ProcessCommandMode;
+  outcome: "exited" | "signaled" | "timed_out" | "interrupted" | "spawn_failed";
+  exitCode?: number;
+  signal?: string;
+  timedOut: boolean;
+  durationMs: number;
+  phase?: "spawn";
+  errorCode?: string;
+  errorCategory?: "process_spawn";
+  activity?: StartCommandInput["activity"];
+  outputRetained: boolean;
+  outputPartiallyLost: boolean;
+  outputUnavailable: boolean;
+}
+
+export interface ProcessStartFailure {
+  phase: "spawn";
+  errorCode: string;
+  errorCategory: "process_spawn";
+}
+
+export class ProcessSpawnError extends Error {
+  readonly category = "process_spawn";
+  readonly phase = "spawn";
+
+  constructor(readonly code: string) {
+    super("The command process could not be started.");
+    this.name = "ProcessSpawnError";
+  }
 }
 
 export interface ProcessActivityEvent {
@@ -124,6 +164,7 @@ export interface ProcessSnapshot {
   managedDaemon?: boolean;
   /** The user explicitly released root serialization while the daemon remains tracked. */
   rootLeaseDetached?: boolean;
+  startFailure?: ProcessStartFailure;
 }
 
 export class UnknownProcessSessionError extends Error {
@@ -164,6 +205,7 @@ interface ProcessSession {
   id: number;
   connectionPrincipalId: string;
   workspaceId: string;
+  commandMode: ProcessCommandMode;
   cwd: string;
   instructionScopePaths: string[];
   instructionInputMode: "shell" | "opaque";
@@ -189,6 +231,7 @@ interface ProcessSession {
   rootExited: boolean;
   treeExitPollMs: number;
   rootLeaseDetached: boolean;
+  startFailure?: ProcessStartFailure;
   outputId?: string;
   totalOutputBytes: number;
   quotaDroppedBytes: number;
@@ -216,6 +259,7 @@ export interface ProcessSessionManagerOptions {
     context: { connectionPrincipalId: string; workspaceId: string; outputId?: string },
   ) => void;
   onActivity?: (event: ProcessActivityEvent) => void;
+  onTerminal?: (event: ProcessTerminalEvent) => void;
 }
 
 export interface ProcessSessionUsageSnapshot {
@@ -250,6 +294,67 @@ export function nextTreeExitPollMs(current: number): number {
   if (current < 100) return 100;
   if (current < 500) return 500;
   return MAX_TREE_EXIT_POLL_MS;
+}
+
+const PROCESS_SIGNAL_BY_NUMBER = new Map<number, string>(
+  Object.entries(osConstants.signals).map(([name, number]) => [number, name]),
+);
+
+export function safeProcessSignal(signal: string | undefined): string | undefined {
+  if (!signal) return undefined;
+  if (Object.hasOwn(osConstants.signals, signal)) return signal;
+  if (!/^\d{1,3}$/u.test(signal)) return undefined;
+  return PROCESS_SIGNAL_BY_NUMBER.get(Number(signal));
+}
+
+const SAFE_PROCESS_SPAWN_ERROR_CODES = new Set([
+  "E2BIG",
+  "EACCES",
+  "EAGAIN",
+  "EBADF",
+  "EFAULT",
+  "EIO",
+  "ELOOP",
+  "EMFILE",
+  "ENAMETOOLONG",
+  "ENFILE",
+  "ENOENT",
+  "ENOEXEC",
+  "ENOMEM",
+  "ENOTDIR",
+  "EPERM",
+  "ETXTBSY",
+]);
+
+function safeProcessSpawnErrorCode(error: unknown): string {
+  const candidate = error && typeof error === "object" && "code" in error
+    ? (error as { code?: unknown }).code
+    : undefined;
+  return typeof candidate === "string" && SAFE_PROCESS_SPAWN_ERROR_CODES.has(candidate)
+    ? candidate
+    : "UNKNOWN";
+}
+
+function processSpawnError(error: unknown): ProcessSpawnError {
+  return new ProcessSpawnError(safeProcessSpawnErrorCode(error));
+}
+
+function processStartFailure(errorCode: string): ProcessStartFailure {
+  return {
+    phase: "spawn",
+    errorCode,
+    errorCategory: "process_spawn",
+  };
+}
+
+function processLaunchDiagnostic(value: string): ProcessStartFailure | undefined {
+  const normalized = value.replace(/(?:\r\n|\r|\n)$/u, "");
+  const match = /^spawn:([A-Z0-9]+)$/u.exec(normalized);
+  if (
+    !match ||
+    (match[1] !== "UNKNOWN" && !SAFE_PROCESS_SPAWN_ERROR_CODES.has(match[1]!))
+  ) return undefined;
+  return processStartFailure(match[1]!);
 }
 
 function workspaceKey(connectionPrincipalId: string, workspaceId: string): string {
@@ -505,6 +610,7 @@ export class ProcessSessionManager {
   private readonly outputStore?: ProcessOutputStore;
   private readonly onOutputStorageError?: ProcessSessionManagerOptions["onOutputStorageError"];
   private readonly onActivity?: ProcessSessionManagerOptions["onActivity"];
+  private readonly onTerminal?: ProcessSessionManagerOptions["onTerminal"];
   private nextSessionId = 1;
   private shuttingDown = false;
   private shutdownPromise?: Promise<void>;
@@ -532,6 +638,7 @@ export class ProcessSessionManager {
     this.outputStore = options.outputStore;
     this.onOutputStorageError = options.onOutputStorageError;
     this.onActivity = options.onActivity;
+    this.onTerminal = options.onTerminal;
   }
 
   async start(input: StartCommandInput): Promise<ProcessSnapshot> {
@@ -596,6 +703,14 @@ export class ProcessSessionManager {
       if (closeStdin) this.closeProcessStdin(session);
     } catch (error) {
       launchGate?.abort();
+      if (error instanceof ProcessSpawnError && session.process) {
+        session.startFailure ??= processStartFailure(error.code);
+        await this.waitForExit(session, this.terminationGraceMs);
+        if (session.running) await this.terminateFailedStartup(session);
+        const snapshot = this.consume(session, input.maxOutputTokens);
+        if (!session.running) this.removeSession(session.id);
+        return snapshot;
+      }
       if (session.process) {
         await this.terminateFailedStartup(session);
       } else {
@@ -881,6 +996,7 @@ export class ProcessSessionManager {
       id: this.nextSessionId++,
       connectionPrincipalId: input.connectionPrincipalId,
       workspaceId: input.workspaceId,
+      commandMode: typeof input.command === "string" ? "shell" : "program",
       cwd: input.cwd,
       instructionScopePaths: [...new Set(
         (input.instructionScopePaths ?? [input.cwd]).map((path) => resolve(input.cwd, path)),
@@ -929,13 +1045,18 @@ export class ProcessSessionManager {
     // Spawn the resolved process with its args directly. Using Node's
     // `shell: executable` form drops custom args (e.g. -c) and re-wraps the
     // command inconsistently with the PTY path.
-    const child = spawn(launchCommand.executable, launchCommand.args, {
-      cwd: input.cwd,
-      env: gated ? processLauncherEnvironment() : targetEnvironment,
-      stdio: gated ? ["pipe", "pipe", "pipe", "pipe"] : "pipe",
-      windowsHide: true,
-      detached,
-    });
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(launchCommand.executable, launchCommand.args, {
+        cwd: input.cwd,
+        env: gated ? processLauncherEnvironment() : targetEnvironment,
+        stdio: gated ? ["pipe", "pipe", "pipe", "pipe", "pipe"] : "pipe",
+        windowsHide: true,
+        detached,
+      });
+    } catch (error) {
+      throw processSpawnError(error);
+    }
 
     child.stdin?.on("error", (error: NodeJS.ErrnoException) => {
       session.stdinClosed = true;
@@ -966,10 +1087,26 @@ export class ProcessSessionManager {
     child.stderr?.on("data", (data: Buffer) => this.append(session, stderrDecoder.write(data)));
     child.stdout?.on("end", () => this.append(session, stdoutDecoder.end()));
     child.stderr?.on("end", () => this.append(session, stderrDecoder.end()));
-    child.on("error", (error) => this.append(session, `${error.message}\n`));
+    if (gated) {
+      const diagnostic = child.stdio[4] as Readable | null;
+      let diagnosticText = "";
+      diagnostic?.on("data", (data: Buffer) => {
+        if (diagnosticText.length < 128) diagnosticText += data.toString("utf8").slice(0, 128);
+      });
+      diagnostic?.on("end", () => {
+        session.startFailure = processLaunchDiagnostic(diagnosticText);
+      });
+    }
+    child.on("error", () => this.append(session, "Process failed after launch.\n"));
     child.on("close", (code, signal) => this.finish(session, code ?? undefined, signal ?? undefined));
-    await childSpawned(child);
     session.process = managedProcess;
+    try {
+      await childSpawned(child);
+    } catch (error) {
+      const failure = processSpawnError(error);
+      session.startFailure = processStartFailure(failure.code);
+      throw failure;
+    }
     if (session.cancelRequested) session.process.kill("SIGTERM");
     if (!gateToken) return undefined;
     const gate = child.stdio[3] as Writable | null;
@@ -1026,8 +1163,11 @@ export class ProcessSessionManager {
     const gateToken = gated ? randomBytes(24).toString("base64url") : undefined;
     const readyToken = gateToken ? `devspace-ready-${randomBytes(24).toString("base64url")}` : undefined;
     const launchedToken = gateToken ? `devspace-launched-${randomBytes(24).toString("base64url")}` : undefined;
-    const launchCommand = gateToken && readyToken && launchedToken
-      ? gatedSupervisorCommand("pty", gateToken, readyToken, launchedToken)
+    const spawnFailureToken = gateToken
+      ? `devspace-spawn-failed-${randomBytes(24).toString("base64url")}`
+      : undefined;
+    const launchCommand = gateToken && readyToken && launchedToken && spawnFailureToken
+      ? gatedSupervisorCommand("pty", gateToken, readyToken, launchedToken, spawnFailureToken)
       : command;
     let pty: import("node-pty").IPty;
     try {
@@ -1039,7 +1179,7 @@ export class ProcessSessionManager {
         rows: session.rows,
       });
     } catch (error) {
-      throw error;
+      throw processSpawnError(error);
     }
 
     session.process = {
@@ -1067,9 +1207,32 @@ export class ProcessSessionManager {
         return;
       }
       pendingOutput += data;
+      if (expectedHandshake === launchedToken && spawnFailureToken) {
+        const failurePrefix = `${spawnFailureToken}:`;
+        const failureOffset = pendingOutput.indexOf(failurePrefix);
+        if (failureOffset >= 0) {
+          const failureEnd = pendingOutput.indexOf("\n", failureOffset + failurePrefix.length);
+          if (failureEnd < 0) return;
+          const failureCode = pendingOutput.slice(
+            failureOffset + failurePrefix.length,
+            failureEnd,
+          );
+          session.startFailure = processLaunchDiagnostic(`spawn:${failureCode}`);
+          this.append(session, pendingOutput.slice(0, failureOffset));
+          const trailing = pendingOutput.slice(failureEnd + 1);
+          pendingOutput = "";
+          expectedHandshake = undefined;
+          rejectHandshake(new ProcessSpawnError(session.startFailure?.errorCode ?? "UNKNOWN"));
+          if (trailing) this.append(session, trailing);
+          return;
+        }
+      }
       const markerOffset = pendingOutput.indexOf(expectedHandshake);
       if (markerOffset < 0) {
-        const safeLength = Math.max(0, pendingOutput.length - expectedHandshake.length + 1);
+        const reservedMarkerLength = expectedHandshake === launchedToken && spawnFailureToken
+          ? Math.max(expectedHandshake.length, spawnFailureToken.length + 1)
+          : expectedHandshake.length;
+        const safeLength = Math.max(0, pendingOutput.length - reservedMarkerLength + 1);
         if (safeLength > 0) {
           this.append(session, pendingOutput.slice(0, safeLength));
           pendingOutput = pendingOutput.slice(safeLength);
@@ -1086,7 +1249,12 @@ export class ProcessSessionManager {
     pty.onExit(({ exitCode, signal }) => {
       if (expectedHandshake) {
         if (pendingOutput) this.append(session, pendingOutput);
-        rejectHandshake(new Error("PTY launch gate exited before completing its handshake."));
+        if (expectedHandshake === launchedToken) {
+          session.startFailure ??= processStartFailure("UNKNOWN");
+          rejectHandshake(new ProcessSpawnError(session.startFailure.errorCode));
+        } else {
+          rejectHandshake(new Error("PTY launch gate exited before completing its handshake."));
+        }
       }
       this.finish(session, exitCode, signal === 0 ? undefined : String(signal));
     });
@@ -1146,11 +1314,45 @@ export class ProcessSessionManager {
     session.running = false;
     this.releaseWorkspaceRootLease(session);
     this.finalizeDurableOutput(session);
-    const terminalType = session.cancelRequested
-      ? "command.interrupted"
-      : session.exitCode === 0 && !session.signal && !session.timedOut
-        ? "command.completed"
-        : "command.failed";
+    const terminalType = session.startFailure
+      ? "command.failed"
+      : session.cancelRequested
+        ? "command.interrupted"
+        : session.exitCode === 0 && !session.signal && !session.timedOut
+          ? "command.completed"
+          : "command.failed";
+    const safeSignal = safeProcessSignal(session.signal);
+    const durationMs = Date.now() - session.startedAt;
+    const outcome = session.startFailure
+      ? "spawn_failed"
+      : session.timedOut
+        ? "timed_out"
+        : session.cancelRequested
+          ? "interrupted"
+          : safeSignal
+            ? "signaled"
+            : "exited";
+    const durable = this.durableMetadata(session);
+    const outputRetained = Boolean(session.outputId && !session.outputStorageError);
+    try {
+      this.onTerminal?.({
+        connectionPrincipalId: session.connectionPrincipalId,
+        workspaceId: session.workspaceId,
+        commandMode: session.commandMode,
+        outcome,
+        ...(Number.isSafeInteger(session.exitCode) ? { exitCode: session.exitCode } : {}),
+        ...(safeSignal ? { signal: safeSignal } : {}),
+        timedOut: session.timedOut,
+        durationMs,
+        ...(session.startFailure ?? {}),
+        ...(session.activity ? { activity: { ...session.activity } } : {}),
+        outputRetained,
+        outputPartiallyLost: durable.droppedBytes > 0,
+        outputUnavailable: durable.totalBytes > 0 && !outputRetained,
+      });
+    } catch {
+      // Terminal observability must never change process execution semantics.
+    }
     this.emitActivity(session, terminalType, `command:${session.id}:terminal`, {
       summary: terminalType === "command.completed"
         ? "Command completed."
@@ -1161,9 +1363,9 @@ export class ProcessSessionManager {
       exitCode: session.exitCode,
       ...(session.signal ? { signal: session.signal } : {}),
       timedOut: session.timedOut,
-      wallTimeMs: Date.now() - session.startedAt,
+      wallTimeMs: durationMs,
       outputId: session.outputId,
-      ...this.durableMetadata(session),
+      ...durable,
     });
     session.resolveExit();
     if (session.runtimeTimer) clearTimeout(session.runtimeTimer);
@@ -1234,6 +1436,7 @@ export class ProcessSessionManager {
       rootExited: session.rootExited,
       managedDaemon: session.running && session.rootExited,
       rootLeaseDetached: session.rootLeaseDetached,
+      startFailure: session.startFailure,
     };
   }
 
@@ -1569,6 +1772,7 @@ function gatedSupervisorCommand(
   gateToken: string,
   readyToken?: string,
   launchedToken?: string,
+  spawnFailureToken?: string,
 ): ShellCommand {
   return {
     executable: process.execPath,
@@ -1579,6 +1783,7 @@ function gatedSupervisorCommand(
       gateToken,
       ...(readyToken ? [readyToken] : []),
       ...(launchedToken ? [launchedToken] : []),
+      ...(spawnFailureToken ? [spawnFailureToken] : []),
     ],
   };
 }
@@ -1604,6 +1809,8 @@ const GATED_PROCESS_SUPERVISOR_SOURCE = [
   "const expectedToken=process.argv[2];",
   "const readyToken=process.argv[3];",
   "const launchedToken=process.argv[4];",
+  "const spawnFailureToken=process.argv[5];",
+  `const safeSpawnCodes=new Set(${JSON.stringify([...SAFE_PROCESS_SPAWN_ERROR_CODES])});`,
   "function fail(message){if(message)process.stderr.write(message+'\\n');process.exit(125);}",
   "function start(source){",
   " let spec;",
@@ -1614,7 +1821,12 @@ const GATED_PROCESS_SUPERVISOR_SOURCE = [
   " if(mode==='pty'&&process.stdin.setRawMode)process.stdin.setRawMode(false);",
   " const child=spawn(spec.executable,spec.args,{stdio:'inherit',env:spec.environment,windowsHide:true});",
   " child.once('spawn',()=>{if(mode==='pty')process.stdout.write(launchedToken);});",
-  " child.once('error',error=>{process.stderr.write(error.message+'\\n');process.exit(127);});",
+  " child.once('error',error=>{",
+  "  const code=typeof error.code==='string'&&safeSpawnCodes.has(error.code)?error.code:'UNKNOWN';",
+  "  if(mode==='pipe'){try{fs.writeSync(4,'spawn:'+code+'\\n');}catch{}}",
+  "  else if(mode==='pty')process.stdout.write(spawnFailureToken+':'+code+'\\n');",
+  "  process.stderr.write('Process could not be started.\\n');process.exit(127);",
+  " });",
   " child.once('exit',(code,signal)=>{",
   "  if(signal){try{process.kill(process.pid,signal);}catch{process.exit(1);}}",
   "  else process.exit(code??1);",

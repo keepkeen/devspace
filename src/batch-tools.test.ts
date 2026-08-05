@@ -20,17 +20,16 @@ const ordered = await runBoundedBatch(
 );
 assert.deepEqual(ordered.items.map((item) => item.path), ["slow", "fast"]);
 
-const referencedDuplicates = await runBoundedBatch(
+const duplicates = await runBoundedBatch(
   [
-    { operation: "read", path: "same", ref: "first" },
-    { operation: "read", path: "same", ref: "second" },
+    { operation: "read", path: "same" },
+    { operation: "read", path: "same" },
   ],
   async () => ({ ok: true, result: "content" }),
 );
-assert.deepEqual(referencedDuplicates.items.map((item) => item.ref), ["first", "second"]);
-assert.equal(referencedDuplicates.items[0]?.ok, true);
-assert.equal(referencedDuplicates.items[1]?.ok, false);
-assert.match(referencedDuplicates.items[1]?.result ?? "", /Duplicate batch item skipped/);
+assert.equal(duplicates.items[0]?.ok, true);
+assert.equal(duplicates.items[1]?.ok, false);
+assert.match(duplicates.items[1]?.result ?? "", /Duplicate batch item skipped/);
 
 const partialFailure = await runBoundedBatch(
   [
@@ -121,13 +120,13 @@ const publicRecoveryError = await runBoundedBatch(
   async () => {
     throw Object.assign(new Error("private diagnostic"), {
       code: "skill_not_loaded",
-      publicText: "Call skills with action=load for the selected Project, then retry.",
+      publicText: "Call skills with the selected skillId for the Project, then retry.",
     });
   },
 );
 assert.equal(
   publicRecoveryError.items[0]?.result,
-  "skill_not_loaded: Call skills with action=load for the selected Project, then retry.",
+  "skill_not_loaded: Call skills with the selected skillId for the Project, then retry.",
 );
 assert.doesNotMatch(publicRecoveryError.items[0]?.result ?? "", /private diagnostic/);
 

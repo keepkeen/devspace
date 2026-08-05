@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
+import { operationId as validateOperationId } from "./operation-id.js";
 
 export type ProjectExecutionStatus =
   | "provisioning"
@@ -240,11 +241,7 @@ export class ProjectExecutionStore {
   ): ProjectExecution | undefined {
     this.assertOpen();
     const auth = validateAuthorization(authorization);
-    const operationId = boundedString(
-      createOperationId,
-      "createOperationId",
-      MAX_ID_LENGTH,
-    );
+    const operationId = validateOperationId(createOperationId, "createOperationId");
     const row = this.database.sqlite.prepare(`
       select *
       from project_executions
@@ -680,11 +677,7 @@ function validateReservation(
     ...(input.handoffId === undefined
       ? {}
       : { handoffId: boundedString(input.handoffId, "handoffId", MAX_ID_LENGTH) }),
-    createOperationId: boundedString(
-      input.createOperationId,
-      "createOperationId",
-      MAX_ID_LENGTH,
-    ),
+    createOperationId: validateOperationId(input.createOperationId, "createOperationId"),
     requestHash: boundedString(input.requestHash, "requestHash", MAX_HASH_LENGTH),
   };
 }

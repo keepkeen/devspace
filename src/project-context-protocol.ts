@@ -1,15 +1,14 @@
-export const PROJECT_CONTEXT_SCHEMA_VERSION = 8 as const;
 export const PROJECT_CONTEXT_TEXT = "Project context ready.";
 
-export type ProjectInstructionSource = "repository" | "user" | "admin" | "bundled";
-export type ProjectInstructionTrust =
+export type ProjectInstructionTrustClass =
   | "repository_untrusted"
   | "user_trusted"
   | "admin_trusted"
   | "bundled_trusted";
 
 interface ProjectInstructionItemBase {
-  scope: string;
+  trustClass: ProjectInstructionTrustClass;
+  scope?: string;
   path: string;
   content: string;
   fragment?: {
@@ -21,43 +20,29 @@ interface ProjectInstructionItemBase {
  * The complete model-visible representation of one applicable instruction.
  * Server-only discovery and paging fields must not be added to this type.
  */
-export type ProjectInstructionItem = ProjectInstructionItemBase & (
-  | { source: "repository"; trust: "repository_untrusted" }
-  | { source: "user"; trust: "user_trusted" }
-  | { source: "admin"; trust: "admin_trusted" }
-  | { source: "bundled"; trust: "bundled_trusted" }
-);
+export type ProjectInstructionItem = ProjectInstructionItemBase;
 
 export interface ProjectDescriptor {
   ref: string;
   writeAccess: "read_only" | "read_write";
+  checkoutKind: "checkout" | "worktree";
 }
 
-export interface ProjectThreadContext {
-  threadRef: string;
-  title: string;
-  status: "active" | "paused" | "archived" | "completed" | "closed";
-  version: number;
-  checkoutKind: "checkout" | "worktree";
-  checkpoint?: {
-    cause:
-      | "patch_applied"
-      | "command_completed"
-      | "execution_idle"
-      | "service_shutdown"
-      | "thread_left"
-      | "manual";
-    observedState: Record<string, unknown>;
-    observedStateTrust: "server_observed";
-    modelSummary?: string;
-    modelSummaryTrust?: "untrusted";
-    createdAt: string;
-  };
+export interface ProjectCheckpointContext {
+  cause:
+    | "patch_applied"
+    | "command_completed"
+    | "execution_idle"
+    | "service_shutdown"
+    | "thread_left"
+    | "manual";
+  serverObserved: Record<string, unknown>;
+  untrustedSummary?: string;
 }
 
 export interface ProjectContextDelta {
+  [key: string]: unknown;
   instructions: readonly ProjectInstructionItem[];
-  rootInstructionsComplete: boolean;
   nextCursor?: string;
 }
 
@@ -100,10 +85,22 @@ export interface ProjectExecutionRecord {
   revisions: ProjectContextRevisionState;
 }
 
-export interface ProjectContextProtocolInput {
+export type ProjectContextProtocolInput =
+  | {
+      page: "bootstrap";
+      project: ProjectDescriptor;
+      checkpoint?: ProjectCheckpointContext;
+      contextDelta: ProjectContextDelta;
+      diagnostics?: ProjectContextDiagnostics;
+    }
+  | {
+      page: "continuation";
+      contextDelta: ProjectContextDelta;
+    };
+
+export interface ProjectContextBootstrap extends ProjectContextDelta {
   project: ProjectDescriptor;
-  thread?: ProjectThreadContext;
-  contextDelta: ProjectContextDelta;
+  checkpoint?: ProjectCheckpointContext;
   diagnostics?: ProjectContextDiagnostics;
 }
 
@@ -113,14 +110,7 @@ export interface ProjectContextProtocolResult {
     type: "text";
     text: typeof PROJECT_CONTEXT_TEXT;
   }];
-  structuredContent: {
-    schemaVersion: typeof PROJECT_CONTEXT_SCHEMA_VERSION;
-    ok: true;
-    project: ProjectDescriptor;
-    thread?: ProjectThreadContext;
-    contextDelta: ProjectContextDelta;
-    diagnostics?: ProjectContextDiagnostics;
-  };
+  structuredContent: ProjectContextBootstrap | ProjectContextDelta;
 }
 
 /**
@@ -131,9 +121,8 @@ export function copyProjectInstruction(
   instruction: ProjectInstructionItem,
 ): ProjectInstructionItem {
   return {
-    source: instruction.source,
-    trust: instruction.trust,
-    scope: instruction.scope,
+    trustClass: instruction.trustClass,
+    ...(instruction.scope ? { scope: instruction.scope } : {}),
     path: instruction.path,
     content: instruction.content,
     ...(instruction.fragment
@@ -151,12 +140,10 @@ export function copyProjectInstruction(
  */
 export function createProjectContextDelta(
   instructions: readonly ProjectInstructionItem[],
-  rootInstructionsComplete: boolean,
   nextCursor?: string,
 ): ProjectContextDelta {
   return {
     instructions: instructions.map(copyProjectInstruction),
-    rootInstructionsComplete,
     ...(nextCursor ? { nextCursor } : {}),
   };
 }
@@ -169,7 +156,6 @@ export function copyProjectContextDelta(
 ): ProjectContextDelta {
   return createProjectContextDelta(
     delta.instructions,
-    delta.rootInstructionsComplete,
     delta.nextCursor,
   );
 }
@@ -177,49 +163,39 @@ export function copyProjectContextDelta(
 export function serializeProjectContext(
   input: ProjectContextProtocolInput,
 ): ProjectContextProtocolResult {
+  const contextDelta = copyProjectContextDelta(input.contextDelta);
   return {
     content: [{
       type: "text",
       text: PROJECT_CONTEXT_TEXT,
     }],
-    structuredContent: {
-      schemaVersion: PROJECT_CONTEXT_SCHEMA_VERSION,
-      ok: true,
-      project: {
-        ref: input.project.ref,
-        writeAccess: input.project.writeAccess,
-      },
-      ...(input.thread ? { thread: copyProjectThread(input.thread) } : {}),
-      contextDelta: copyProjectContextDelta(input.contextDelta),
-      ...(input.diagnostics
-        ? { diagnostics: copyProjectContextDiagnostics(input.diagnostics) }
-        : {}),
-    },
+    structuredContent: input.page === "continuation"
+      ? contextDelta
+      : {
+          project: {
+            ref: input.project.ref,
+            writeAccess: input.project.writeAccess,
+            checkoutKind: input.project.checkoutKind,
+          },
+          ...(input.checkpoint
+            ? { checkpoint: copyProjectCheckpoint(input.checkpoint) }
+            : {}),
+          ...contextDelta,
+          ...(input.diagnostics
+            ? { diagnostics: copyProjectContextDiagnostics(input.diagnostics) }
+            : {}),
+        },
   };
 }
 
-function copyProjectThread(thread: ProjectThreadContext): ProjectThreadContext {
+function copyProjectCheckpoint(
+  checkpoint: ProjectCheckpointContext,
+): ProjectCheckpointContext {
   return {
-    threadRef: thread.threadRef,
-    title: thread.title,
-    status: thread.status,
-    version: thread.version,
-    checkoutKind: thread.checkoutKind,
-    ...(thread.checkpoint
-      ? {
-          checkpoint: {
-            cause: thread.checkpoint.cause,
-            observedState: structuredClone(thread.checkpoint.observedState),
-            observedStateTrust: "server_observed",
-            ...(thread.checkpoint.modelSummary
-              ? {
-                  modelSummary: thread.checkpoint.modelSummary,
-                  modelSummaryTrust: "untrusted" as const,
-                }
-              : {}),
-            createdAt: thread.checkpoint.createdAt,
-          },
-        }
+    cause: checkpoint.cause,
+    serverObserved: structuredClone(checkpoint.serverObserved),
+    ...(checkpoint.untrustedSummary
+      ? { untrustedSummary: checkpoint.untrustedSummary }
       : {}),
   };
 }

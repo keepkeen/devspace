@@ -4,7 +4,7 @@ import { access, lstat, mkdir, readFile, realpath, rename, rm, rmdir, stat, writ
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { TextDecoder } from "node:util";
 import { createTwoFilesPatch, FILE_HEADERS_ONLY } from "diff";
-import { readFileVersion, type FileVersion } from "./file-version.js";
+import { FILE_MTIME_NS_PATTERN, readFileVersion, type FileVersion } from "./file-version.js";
 
 export type PatchOperation = "add" | "update" | "delete" | "move";
 
@@ -788,7 +788,7 @@ function assertFilePrecondition(path: string, version: FileVersionPrecondition):
   if (
     typeof version !== "object" ||
     !/^sha256:[0-9a-f]{64}$/.test(version.hash) ||
-    (version.mtimeNs !== undefined && !/^-?\d+$/.test(version.mtimeNs))
+    (version.mtimeNs !== undefined && !FILE_MTIME_NS_PATTERN.test(version.mtimeNs))
   ) {
     throw patchError(`invalid file version precondition for ${path}`, path);
   }

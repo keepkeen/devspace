@@ -46,7 +46,7 @@ export type ReviewSource = "repository" | "apply_patch_history";
  * workspace as changed depending on retention state the caller cannot observe.
  */
 export class ReviewPagingExpiredError extends Error {
-  constructor() {
+  constructor(readonly source: ReviewSource) {
     super("The reviewed diff is no longer retained for paging.");
     this.name = "ReviewPagingExpiredError";
   }
@@ -529,7 +529,7 @@ export function createReviewCheckpointManager(
             pagingScope,
             continueRevision,
           );
-          if (!retained) throw new ReviewPagingExpiredError();
+          if (!retained) throw new ReviewPagingExpiredError(source);
           return retained;
         }
 

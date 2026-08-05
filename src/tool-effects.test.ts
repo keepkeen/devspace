@@ -9,16 +9,15 @@ import {
 const observedAt = "2026-07-23T10:00:00.000Z";
 const before = { hash: `sha256:${"a".repeat(64)}`, mtimeNs: "100" };
 const after = { hash: `sha256:${"b".repeat(64)}`, mtimeNs: "200" };
-const overwritten = { hash: `sha256:${"c".repeat(64)}`, mtimeNs: "150" };
 
-const patchEffects = createApplyPatchEffects(observedAt, [
+const patchEffects = createApplyPatchEffects([
   {
     operation: "move",
     path: "new.txt",
     previousPath: "old.txt",
     observedBefore: before,
     observedAfter: after,
-    overwrittenBefore: overwritten,
+    overwrittenBefore: { hash: `sha256:${"c".repeat(64)}`, mtimeNs: "150" },
   },
   {
     operation: "delete",
@@ -29,34 +28,21 @@ const patchEffects = createApplyPatchEffects(observedAt, [
   },
 ]);
 assert.deepEqual(patchEffects, {
-  observedAt,
   files: [
     {
-      confidence: "observed",
-      operation: "delete",
-      path: "old.txt",
-      observedBefore: before,
-      observedAfter: null,
-    },
-    {
-      confidence: "observed",
-      operation: "update",
+      operation: "move",
       path: "new.txt",
       previousPath: "old.txt",
-      observedBefore: overwritten,
-      observedAfter: after,
+      version: { contentHash: after.hash, mtimeNs: after.mtimeNs },
     },
     {
-      confidence: "observed",
       operation: "delete",
       path: "deleted.txt",
-      observedBefore: before,
-      observedAfter: null,
+      version: null,
       fuzzyMatch: { fuzzy: true, count: 1, modes: ["trim_end"] },
     },
   ],
 });
-assert.notEqual(patchEffects.files?.[0]?.observedBefore, before);
 
 const runningSnapshot: ProcessSnapshot = {
   sessionId: 42,

@@ -179,9 +179,11 @@ Project and selects it for the trusted `openai/session` and Actor. Its internal
 identity is not model-visible. With one approved Project, `projectRef` may be
 omitted; with multiple Projects, choose a reference returned by
 `list_projects`. In `widgets=full` mode, that tool renders an interactive card
-with a new-task action and bounded resumable Tasks for each Project. Card
-actions ask the model to call `project_control` with `open` or `resume`, so the
-model receives and acknowledges every root-instruction page.
+whose global result shows each approved Project and its resumable Task count,
+plus a new-task action. Task rows appear only after a Project-scoped
+`list_projects({projectRef})` call loads that Project's bounded Task metadata.
+Card actions ask the model to call `project_control` with `open` or `resume`, so
+the model receives and acknowledges every root-instruction page.
 
 Model-facing Project tools are called without an execution reference. DevSpace
 resolves their current execution from the exact trusted session+Actor binding
@@ -205,7 +207,8 @@ replay, or execution-private patch history is inherited.
 `save_progress` records a bounded semantic Task for the Project. It does not
 persist a chat transcript or ChatGPT account/session identity. A new task always
 uses explicit `action=open`; recovery always uses explicit `action=resume` with
-one selected `taskRef` (or a current private `threadRef`). DevSpace never
+one selected `taskRef`. Private Thread discovery and lifecycle stay in the
+Project App. DevSpace never
 automatically continues the newest or sole Task. A grant that authorizes the
 same Project can continue its saved Tasks, but continuation always creates a new
 execution bound to that calling grant.
@@ -214,10 +217,12 @@ Task updates use a caller-stable `operationId` and the current integer
 `ifMatch` version. Titles are limited to 256 UTF-8 bytes, progress to 8 KiB,
 their JSON-serialized model text to 12,000 bytes, and each Project to 20
 resumable Tasks plus the newest 80 completed records. `list_projects` returns
-`tasks`, `taskTrust`, and `taskLimits`; use its Project-scoped form to avoid the
-global listing limit. Resumed progress is historical, untrusted context and
+Project refs/labels plus `resumableTaskCount`; its Project-scoped form returns
+bounded `tasks` containing `taskRef`, title, version, and `updatedAt` under
+`taskTrust:"untrusted"`. Resumed progress is historical, untrusted context and
 must be validated against current Project files before use. `save_progress`
-returns a `task` object containing its opaque `taskRef` and current version.
+returns a `task` object containing only its opaque `taskRef`, status, and current
+version to the model. Private Thread projection detail is App-only metadata.
 If an update reports a Task revision conflict, list and reconcile the current
 Task, then retry with the same `operationId` and current `ifMatch`; do not mint a
 new operation identifier for that rejected attempt.
@@ -236,6 +241,9 @@ Open, resume, and hydrate return compact, bounded effective root instruction pag
 `read_files` and `inspect` return any newly applicable nested
 `instructionsDelta` with the target result; a gated mutation or command can
 return the delta with `instructions_required` before any effect starts.
+Each instruction has one `trustClass`; repository instructions are explicitly
+`repository_untrusted`. Root scope is implicit, while nested instructions carry
+their applicable `scope`.
 
 By default the per-directory repository convention is `AGENTS.override.md`
 then `AGENTS.md` (including supported case variants). `CLAUDE.md` is not an
@@ -260,10 +268,12 @@ roots or OAuth capabilities.
 | `DEVSPACE_ADMIN_SKILLS_DIR` | Admin-managed Skill root. |
 
 Project bootstrap does not inject the Skill catalog. The single `skills` tool uses
-`action=search` for bounded discovery and `action=load` with
-a returned `skillId` or exact unique name to load one selected manifest.
-Repository Skills remain untrusted repository content and do not add OAuth
-authority.
+`{query,limit?}` for bounded discovery, `{cursor}` for continuation, and a
+returned `{skillId}` to load one selected manifest.
+Repository Skills remain untrusted repository content. User, admin, bundled,
+DevSpace, and explicitly configured Skills carry explicit trusted provenance.
+No Skill content, trusted or untrusted, adds OAuth authority or expands an
+approved root.
 
 ## Fixed tool surface
 
@@ -303,11 +313,11 @@ The advertised command fields are:
 | --- | --- |
 | `operationId` | Required fresh identifier for a new command effect. |
 | `program` / `args` | Preferred direct argv command mode. |
-| `shell` / `command` / `approvalReason` | Explicit shell mode for syntax that requires it. |
+| `shell` / `command` | Explicit shell mode for syntax that requires it. |
 | `workingDirectory` | Working directory inside the Project selected for the trusted session+Actor. |
 | `environment` | Explicit environment additions. |
-| `yieldTimeMs` | Initial wait before returning a running-process handle. |
-| `maxOutputTokens` | Output bound for the call. |
+| `stdin` / `closeStdin` | Optional initial process input and close intent. |
+| `timeoutMs` | Optional semantic runtime limit. |
 | `tty` | Allocate a pseudo-terminal. |
 
 DevSpace does not expose command-policy or network-policy configuration.
@@ -315,14 +325,14 @@ DevSpace does not expose command-policy or network-policy configuration.
 containment, but the child process itself runs with the full file and network
 authority of the DevSpace OS user.
 
-`write_stdin` is mutation-only: it sends input, closes stdin, interrupts, or
-resizes a terminal, and every call requires `operationId`. Use
+`write_stdin` is mutation-only: it sends input, closes stdin, or interrupts,
+and every call requires `operationId`. Use
 `read_process_output` with `sessionId` for live polling or with `outputId` for
 the first retained-output read.
 
-Signed continuation cursors retain the initial query. A continuation call under
-the same session+Actor selection passes the returned cursor instead of repeating
-or changing the initial resource, query, offset, mode, or limit fields.
+Signed continuation cursors retain the initial query and server-owned paging
+budget. A continuation call under the same session+Actor selection passes only
+the returned cursor instead of repeating or changing initial fields.
 
 DevSpace can attempt shutdown or interrupt only for process groups it started
 and still tracks. Termination is best effort; detached or otherwise untracked
@@ -335,7 +345,8 @@ execution is used. Grant revocation or expiry retires that grant's logical
 contexts, tracked processes, retained output, and temporary review state. It
 does not delete Project files or run Git lifecycle commands.
 
-`show_changes` requires an explicit source. `source:"repository"` reads the
+The first `show_changes` call requires an explicit source. A continuation passes
+only the returned cursor, which restores that source. `source:"repository"` reads the
 current repository diff without writing Git state only when the Project root
 exactly matches the Git top level. `source:"apply_patch_history"` is available
 for every Project and is a bounded durable log of the exact successful DevSpace

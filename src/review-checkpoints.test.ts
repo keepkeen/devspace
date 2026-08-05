@@ -17,6 +17,7 @@ import assert from "node:assert/strict";
 import {
   createReviewCheckpointManager,
   RepositoryReviewUnavailableError,
+  ReviewPagingExpiredError,
   UnsafeGitReviewConfigurationError,
   type ReviewChangesResult,
 } from "./review-checkpoints.js";
@@ -286,6 +287,50 @@ try {
     observedChanges: explicitHistory,
   });
   assert.equal(gitProjectHistory.patch, explicitHistory.patch);
+
+  const expiringManager = createReviewCheckpointManager({ maxRetainedPatches: 1 });
+  const firstExpiringReview = await expiringManager.reviewChanges({
+    workspaceId: "ws_expiring",
+    root,
+    source: "apply_patch_history",
+    observedChanges: explicitHistory,
+  });
+  const currentHistory = {
+    ...observedReview(),
+    revision: "review_current",
+    patch: "*** Begin Patch\n*** Add File: current.txt\n+current\n*** End Patch\n",
+    files: [{
+      path: "current.txt",
+      type: "change" as const,
+      additions: 1,
+      removals: 0,
+    }],
+  };
+  const currentExpiringReview = await expiringManager.reviewChanges({
+    workspaceId: "ws_expiring",
+    root,
+    source: "apply_patch_history",
+    observedChanges: currentHistory,
+  });
+  assert.notEqual(currentExpiringReview.revision, firstExpiringReview.revision);
+  await assert.rejects(
+    expiringManager.reviewChanges({
+      workspaceId: "ws_expiring",
+      root,
+      source: "apply_patch_history",
+      continueRevision: firstExpiringReview.revision,
+    }),
+    (error: unknown) =>
+      error instanceof ReviewPagingExpiredError &&
+      error.source === "apply_patch_history",
+  );
+  const restartedAfterExpiry = await expiringManager.reviewChanges({
+    workspaceId: "ws_expiring",
+    root,
+    source: "apply_patch_history",
+    observedChanges: currentHistory,
+  });
+  assert.equal(restartedAfterExpiry.revision, currentExpiringReview.revision);
 } finally {
   await Promise.all([
     rm(root, { recursive: true, force: true }),

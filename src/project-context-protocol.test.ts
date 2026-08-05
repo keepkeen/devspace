@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import {
-  PROJECT_CONTEXT_SCHEMA_VERSION,
   PROJECT_CONTEXT_TEXT,
   copyProjectContextDelta,
   copyProjectInstruction,
@@ -11,13 +10,9 @@ import {
   type ProjectInstructionItem,
 } from "./project-context-protocol.js";
 
-assert.equal(PROJECT_CONTEXT_SCHEMA_VERSION, 8);
-
 const instructionText = "Use the repository's npm scripts.";
 const implementationInstruction = {
-  source: "repository",
-  trust: "repository_untrusted",
-  scope: ".",
+  trustClass: "repository_untrusted",
   path: "AGENTS.md",
   content: instructionText,
   hash: "sha256-v1:private-instruction-file-a",
@@ -55,9 +50,7 @@ const execution: ProjectExecutionRecord = {
 
 const copiedInstruction = copyProjectInstruction(implementationInstruction);
 assert.deepEqual(copiedInstruction, {
-  source: "repository",
-  trust: "repository_untrusted",
-  scope: ".",
+  trustClass: "repository_untrusted",
   path: "AGENTS.md",
   content: instructionText,
   fragment: {
@@ -68,7 +61,6 @@ assert.deepEqual(copiedInstruction, {
 const continuationCursor = "dcur1.public-root-continuation";
 const createdDelta = createProjectContextDelta(
   [implementationInstruction],
-  false,
   continuationCursor,
 );
 const copiedDelta = copyProjectContextDelta({
@@ -77,7 +69,6 @@ const copiedDelta = copyProjectContextDelta({
 } as typeof createdDelta);
 assert.deepEqual(copiedDelta, {
   instructions: [copiedInstruction],
-  rootInstructionsComplete: false,
   nextCursor: continuationCursor,
 });
 assert.notEqual(copiedDelta, createdDelta);
@@ -85,9 +76,11 @@ assert.notEqual(copiedDelta.instructions, createdDelta.instructions);
 assert.notEqual(copiedDelta.instructions[0], createdDelta.instructions[0]);
 
 const input = {
+  page: "bootstrap",
   project: {
     ref: execution.projectRef,
     writeAccess: "read_only",
+    checkoutKind: "worktree",
     projectFingerprint: execution.projectFingerprint,
     workspaceId: execution.workspaceId,
     generation: execution.generation,
@@ -95,30 +88,19 @@ const input = {
   },
   contextDelta: {
     instructions: [implementationInstruction],
-    rootInstructionsComplete: false,
     nextCursor: continuationCursor,
     revision: execution.revisions.instructionRevision,
   },
-  thread: {
-    threadRef: execution.threadRef!,
-    ref: "pth1_legacy-thread-ref.signature",
-    title: "Continue MCP integration",
-    status: "active",
-    version: 4,
-    checkoutKind: "worktree",
-    checkpoint: {
-      cause: "patch_applied",
-      observedState: { files: 2, additions: 8, removals: 1 },
-      observedStateTrust: "server_observed",
-      modelSummary: "Historical summary; revalidate before acting.",
-      modelSummaryTrust: "untrusted",
-      createdAt: "2026-07-31T04:00:00.000Z",
-      provenance: {
-        source: "devspace_checkpoint",
-        trust: "server_observed",
-        authority: "none",
-        privateField: "must-not-copy",
-      },
+  checkpoint: {
+    cause: "patch_applied",
+    serverObserved: { files: 2, additions: 8, removals: 1 },
+    untrustedSummary: "Historical summary; revalidate before acting.",
+    createdAt: "2026-07-31T04:00:00.000Z",
+    provenance: {
+      source: "devspace_checkpoint",
+      trust: "server_observed",
+      authority: "none",
+      privateField: "must-not-copy",
     },
   },
   handoff: {
@@ -158,32 +140,18 @@ assert.deepEqual(context.content, [{
   text: PROJECT_CONTEXT_TEXT,
 }]);
 assert.deepEqual(context.structuredContent, {
-  schemaVersion: PROJECT_CONTEXT_SCHEMA_VERSION,
-  ok: true,
   project: {
     ref: "project-a",
     writeAccess: "read_only",
-  },
-  thread: {
-    threadRef: execution.threadRef,
-    title: "Continue MCP integration",
-    status: "active",
-    version: 4,
     checkoutKind: "worktree",
-    checkpoint: {
-      cause: "patch_applied",
-      observedState: { files: 2, additions: 8, removals: 1 },
-      observedStateTrust: "server_observed",
-      modelSummary: "Historical summary; revalidate before acting.",
-      modelSummaryTrust: "untrusted",
-      createdAt: "2026-07-31T04:00:00.000Z",
-    },
   },
-  contextDelta: {
-    instructions: [copiedInstruction],
-    rootInstructionsComplete: false,
-    nextCursor: continuationCursor,
+  checkpoint: {
+    cause: "patch_applied",
+    serverObserved: { files: 2, additions: 8, removals: 1 },
+    untrustedSummary: "Historical summary; revalidate before acting.",
   },
+  instructions: [copiedInstruction],
+  nextCursor: continuationCursor,
   diagnostics: {
     instructions: {
       reason: "Instruction scan reached its time limit.",
@@ -212,6 +180,22 @@ assert.doesNotMatch(
   serialized,
   /hash|manifest|skillId|workspaceId|generation|instructionContextId|projectFingerprint|executionId|executionRef|threadId|privateHandoffId|privateOwner|privateField|handoff|mustRevalidate|provenance|offsetBytes|lengthBytes|totalBytes|complete/u,
 );
-assert.equal("ref" in context.structuredContent.thread!, false);
+assert.equal("thread" in context.structuredContent, false);
+
+const continuation = serializeProjectContext({
+  page: "continuation",
+  contextDelta: {
+    instructions: [implementationInstruction],
+    nextCursor: continuationCursor,
+  },
+});
+assert.deepEqual(continuation.structuredContent, {
+  instructions: [copiedInstruction],
+  nextCursor: continuationCursor,
+});
+assert.doesNotMatch(
+  JSON.stringify(continuation.structuredContent),
+  /schemaVersion|ok|project|thread|checkpoint|diagnostics|rootInstructionsComplete/u,
+);
 
 console.log("project context protocol tests passed");

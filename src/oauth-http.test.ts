@@ -151,7 +151,6 @@ try {
       operationId: "oauth-background-process",
       program: process.execPath,
       args: ["-e", "setInterval(() => {}, 1000)"],
-      yieldTimeMs: 0,
     },
     _meta: earlierHostMeta,
   });
@@ -220,7 +219,7 @@ try {
   });
   assert.notEqual(renewedProgress.isError, true, JSON.stringify(renewedProgress.content));
   const renewedThreadRef = String(
-    (renewedProgress.structuredContent as {
+    (renewedProgress._meta as {
       thread?: { threadRef?: unknown };
     } | undefined)?.thread?.threadRef ?? "",
   );
@@ -280,7 +279,7 @@ try {
     (crossGrantHandoffResume.structuredContent as {
       error?: { code?: unknown };
     } | undefined)?.error?.code,
-    "project_thread_not_found",
+    "invalid_tool_input",
   );
   await earlierGrantClient.close();
 
@@ -297,8 +296,7 @@ try {
     arguments: {
       operationId: "oauth-revocation-held-command",
       program: process.execPath,
-      args: ["-e", "setTimeout(() => {}, 750)"],
-      yieldTimeMs: 2_000,
+      args: ["-e", "setTimeout(() => {}, 1500)"],
     },
     _meta: renewedHostMeta,
   }).then(
