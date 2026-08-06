@@ -82,8 +82,9 @@ try {
   assert.ok(execTool);
   assert.ok(writeStdinTool);
   assert.ok(readProcessOutputTool);
-  assert.match(String(execTool.description), /read_process_output/u);
-  assert.match(String(execTool.description), /unmanaged background or detach wrappers/u);
+  assert.match(String(execTool.description), /prefer program plus args/u);
+  assert.match(String(execTool.description), /shell=true only when shell syntax is required/u);
+  assert.match(String(execTool.description), /detached\/background wrappers/u);
   assert.deepEqual(execTool.inputSchema?.required, ["operationId"]);
   assert.deepEqual(
     writeStdinTool.inputSchema?.required,

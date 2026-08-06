@@ -520,7 +520,7 @@ assert.equal(jsonRpcRequestId({ jsonrpc: "2.0", id: "call-1" }), "call-1");
 assert.equal(jsonRpcRequestId([{ jsonrpc: "2.0", id: 42 }]), null);
 assert.match(
   recoverableProjectExecutionError(new UnknownWorkspaceError("ws_stale")) ?? "",
-  /^project_execution_required: Call project_control with action=hydrate in this ChatGPT session\./,
+  /^Call project_control with action=hydrate in this ChatGPT session\./,
 );
 assert.doesNotMatch(
   recoverableProjectExecutionError(new UnknownWorkspaceError("ws_stale")) ?? "",

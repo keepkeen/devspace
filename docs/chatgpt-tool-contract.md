@@ -306,7 +306,9 @@ Skill source. If every `read_files` or `inspect` item fails, the result keeps al
 item errors and adds a tool-specific read-only error envelope with safe
 correct-and-retry guidance.
 
-An error result has one authoritative `error` object. Mutation errors carry
+An error result has one authoritative `error` object. Its `content` contains only
+bounded natural-language guidance and does not repeat the structured error code
+as a text prefix. Mutation errors carry
 `operationId` when the failure must be associated with a retry/idempotency
 decision, plus `phase`, `effectsKnown`, `safeToRetry`, `recovery`, and bounded
 corrective details. They never duplicate that state in a top-level `operation`

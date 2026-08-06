@@ -315,6 +315,11 @@ interface StructuredToolError extends Record<string, unknown> {
 
 type OperationPhase = "not_started" | "committed" | "outcome_unknown";
 
+const PROJECT_EXECUTION_HYDRATE_TEXT =
+  "Call project_control with action=hydrate in this ChatGPT session.";
+const PROJECT_BUSY_TEXT =
+  "Project files are busy with another operation or process; retry after it finishes.";
+
 interface OperationEnvelope {
   id: string;
   phase: OperationPhase;
@@ -354,7 +359,7 @@ function publicToolError(error: unknown, toolName: string): PublicToolError | un
   ) {
     return {
       code: error.code,
-      text: `${error.code}: ${error.publicText}`,
+      text: error.publicText,
       retryable: true,
       safeToRetry: true,
       recovery: "read_fewer_files_or_lines",
@@ -365,7 +370,7 @@ function publicToolError(error: unknown, toolName: string): PublicToolError | un
   if (error instanceof MutationExecutionError) {
     return {
       code: "tool_failed",
-      text: "tool_failed: The mutation may have executed; inspect filesystem or process effects before any rerun.",
+      text: "The mutation may have executed; inspect filesystem or process effects before any rerun.",
       retryable: false,
       safeToRetry: false,
       recovery: "verify_effects",
@@ -375,19 +380,19 @@ function publicToolError(error: unknown, toolName: string): PublicToolError | un
     };
   }
   if (error instanceof PublicActionError) {
-    return { code: error.code, text: `${error.code}: ${error.publicText}`, ...error.semantics };
+    return { code: error.code, text: error.publicText, ...error.semantics };
   }
   if (error instanceof UnknownWorkspaceError) {
     return {
       code: "project_execution_required",
-      text: "project_execution_required: Call project_control with action=hydrate in this ChatGPT session.",
+      text: PROJECT_EXECUTION_HYDRATE_TEXT,
       recovery: "project_control_hydrate",
     };
   }
   if (error instanceof UnknownProcessSessionError) {
     return {
       code: error.code,
-      text: "unknown_process_session: Stop polling; read the prior outputId if available, then verify effects before rerun.",
+      text: "Stop polling; read the prior outputId if available, then verify effects before rerun.",
       safeToRetry: false,
       recovery: "verify_process_effects",
     };
@@ -395,7 +400,7 @@ function publicToolError(error: unknown, toolName: string): PublicToolError | un
   if (error instanceof ProcessOutputNotFoundError) {
     return {
       code: error.code,
-      text: "process_output_not_found: Stop paging this outputId; verify effects before rerun.",
+      text: "Stop paging this outputId; verify effects before rerun.",
       retryable: false,
       recovery: "stop_paging",
     };
@@ -403,14 +408,14 @@ function publicToolError(error: unknown, toolName: string): PublicToolError | un
   if (error instanceof SkillNotLoadedError) {
     return {
       code: error.code,
-      text: `${error.code}: ${error.publicText}`,
+      text: error.publicText,
     };
   }
   if (error instanceof SkillLoadError) {
     const changed = error.code === "skill_manifest_changed" || error.code === "skill_metadata_changed";
     return {
       code: error.code,
-      text: `${error.code}: ${error.publicText}`,
+      text: error.publicText,
       retryable: changed,
       safeToRetry: false,
       recovery: changed ? "skill_reload_required" : "inspect_skill_error",
@@ -420,20 +425,20 @@ function publicToolError(error: unknown, toolName: string): PublicToolError | un
   if (error instanceof SkillUriError) {
     return {
       code: error.code,
-      text: `${error.code}: ${error.publicText}`,
+      text: error.publicText,
     };
   }
   if (error instanceof WorkspaceResumeRequiredError) {
     return {
       code: "project_execution_required",
-      text: "project_execution_required: Call project_control with action=hydrate in this ChatGPT session.",
+      text: PROJECT_EXECUTION_HYDRATE_TEXT,
       recovery: "project_control_hydrate",
     };
   }
   if (error instanceof StaleWorkspaceGenerationError) {
     return {
       code: "project_execution_required",
-      text: "project_execution_required: Hydrate this execution with project_control before retrying.",
+      text: "Hydrate this execution with project_control before retrying.",
       retryable: true,
       safeToRetry: true,
       recovery: "project_control_hydrate",
@@ -443,14 +448,14 @@ function publicToolError(error: unknown, toolName: string): PublicToolError | un
   if (error instanceof UnknownWorkspaceAliasError) {
     return {
       code: "project_execution_required",
-      text: "project_execution_required: Hydrate this execution with project_control.",
+      text: "Hydrate this execution with project_control.",
       recovery: "project_control_hydrate",
     };
   }
   if (error instanceof WorkspaceReadOnlyError) {
     return {
       code: "project_read_only",
-      text: "project_read_only: Reauthorize the Project with write access.",
+      text: "Reauthorize the Project with write access.",
       retryable: false,
       recovery: "reauthorize_oauth",
     };
@@ -459,7 +464,7 @@ function publicToolError(error: unknown, toolName: string): PublicToolError | un
     return {
       code: "file_version_conflict",
       text:
-        `file_version_conflict: ${error.path} changed. Read it again, rebuild the patch, ` +
+        `${error.path} changed. Read it again, rebuild the patch, ` +
         "and retry with a new operationId because the previous operationId is bound to the old request.",
       retryable: true,
       safeToRetry: false,
@@ -477,7 +482,7 @@ function publicToolError(error: unknown, toolName: string): PublicToolError | un
     return {
       code: "diff_paging_expired",
       text:
-        "diff_paging_expired: The reviewed diff is no longer retained; restart " +
+        "The reviewed diff is no longer retained; restart " +
         `show_changes with source=${error.source} and no cursor.`,
       retryable: true,
       safeToRetry: true,
@@ -494,7 +499,7 @@ function publicToolError(error: unknown, toolName: string): PublicToolError | un
     return {
       code: error.code,
       text:
-        `${error.code}: The selected Project root is not an exact Git top level. ` +
+        "The selected Project root is not an exact Git top level. " +
         "Call show_changes again with source=apply_patch_history to review successful DevSpace patches from this execution.",
       retryable: true,
       safeToRetry: true,
@@ -507,7 +512,7 @@ function publicToolError(error: unknown, toolName: string): PublicToolError | un
     return {
       code: error.code,
       text:
-        `${error.code}: Git review is disabled because executable clean/process filters ` +
+        "Git review is disabled because executable clean/process filters " +
         `are active for Project files (${error.filterDrivers.join(", ")}). ` +
         "Remove or disable those filters before calling show_changes.",
       retryable: true,
@@ -520,7 +525,7 @@ function publicToolError(error: unknown, toolName: string): PublicToolError | un
   if (error instanceof InvalidPatchError) {
     return {
       code: error.code,
-      text: `${error.code}: ${error.publicText}`,
+      text: error.publicText,
       retryable: true,
       safeToRetry: true,
       recovery: "read_files",
@@ -530,7 +535,7 @@ function publicToolError(error: unknown, toolName: string): PublicToolError | un
   if (error instanceof WorkspaceQuotaError) {
     return {
       code: "project_capacity_reached",
-      text: "project_capacity_reached: Project capacity is currently exhausted; retry after inactive work is cleaned up.",
+      text: "Project capacity is currently exhausted; retry after inactive work is cleaned up.",
       retryable: true,
       safeToRetry: true,
       recovery: "admin_project_cleanup",
@@ -540,7 +545,7 @@ function publicToolError(error: unknown, toolName: string): PublicToolError | un
   if (error instanceof WorkspaceRootLockTimeoutError) {
     return {
       code: "project_busy",
-      text: "project_busy: Project files are busy with another operation or process; retry after it finishes.",
+      text: PROJECT_BUSY_TEXT,
       retryable: true,
       safeToRetry: true,
       recovery: "retry_after_project_process",
@@ -551,7 +556,7 @@ function publicToolError(error: unknown, toolName: string): PublicToolError | un
   if (error instanceof WorkspaceAliasConflictError) {
     return {
       code: "project_busy",
-      text: "project_busy: This Project already has active work; retry after it finishes.",
+      text: "This Project already has active work; retry after it finishes.",
       retryable: true,
       safeToRetry: true,
       recovery: "retry_after_project_work",
@@ -561,7 +566,7 @@ function publicToolError(error: unknown, toolName: string): PublicToolError | un
   if (error instanceof WorkspaceSelectionRequiredError) {
     return {
       code: "project_execution_required",
-      text: "project_execution_required: Hydrate the intended execution with project_control.",
+      text: "Hydrate the intended execution with project_control.",
       retryable: true,
       safeToRetry: true,
       recovery: "project_control_hydrate",
@@ -571,7 +576,7 @@ function publicToolError(error: unknown, toolName: string): PublicToolError | un
   if (error instanceof WorkspaceRecoveryRequiredError) {
     return {
       code: "project_execution_recovery_required",
-      text: "project_execution_recovery_required: The shared Project context could not be recovered; restore or reauthorize the Project, then create or resume a context.",
+      text: "The shared Project context could not be recovered; restore or reauthorize the Project, then create or resume a context.",
       retryable: true,
       safeToRetry: true,
       recovery: "project_control_hydrate",
@@ -581,7 +586,7 @@ function publicToolError(error: unknown, toolName: string): PublicToolError | un
   if (error instanceof InstructionBudgetError) {
     return {
       code: error.code,
-      text: `${error.code}: ${error.publicText}`,
+      text: error.publicText,
       retryable: false,
       safeToRetry: false,
       recovery: "user_action_required",
@@ -593,13 +598,13 @@ function publicToolError(error: unknown, toolName: string): PublicToolError | un
       ? {
           code: "path_not_allowed",
           text:
-            "path_not_allowed: The requested path is not authorized for this OAuth grant. " +
+            "The requested path is not authorized for this OAuth grant. " +
             "Ask the user to add this Project in the local DevSpace Admin/OAuth approval, then call list_projects and project_control again. " +
             "DevSpace will not enumerate other local roots.",
         }
       : {
           code: "path_denied",
-          text: "path_denied: Use a path inside the selected Project.",
+          text: "Use a path inside the selected Project.",
         };
   }
   return undefined;
@@ -1131,7 +1136,7 @@ export function toolInputValidationText(
     return `${path}: ${issue.message}`;
   });
   const omitted = error.issues.length - issues.length;
-  return `invalid_tool_input: ${toolName} arguments are invalid; nothing was executed. ` +
+  return `${toolName} arguments are invalid; nothing was executed. ` +
     `${issues.join("; ")}${omitted > 0 ? `; and ${omitted} more` : ""}`;
 }
 
@@ -1201,7 +1206,7 @@ const registerAppTool: typeof registerSdkAppTool = ((...args: unknown[]) => {
       } catch (error) {
         const publicError = publicToolError(error, toolName) ?? {
           code: "tool_failed",
-          text: "tool_failed: The tool failed before completion; inspect DevSpace server logs.",
+          text: "The tool failed before completion; inspect DevSpace server logs.",
         };
         if (publicError.code === "tool_failed") {
           toolErrorReporters.get(server)?.(toolName, error);
@@ -4064,8 +4069,8 @@ function registerProcessTools(
     {
       title: "Execute command",
       description: toolDescription({
-        use: "running a direct program with argv, or an explicitly requested shell command in one Project context; use read_process_output for a retained or live process.",
-        avoid: "reusing an operationId for a different command, unmanaged background or detach wrappers used only to survive a host turn, or repeatedly renaming and repackaging rejected launch commands; prefer direct argv and let one runner own preflight, fan-out, PID and log verification, and completion.",
+        use: "running one foreground command; prefer program plus args and use shell=true only when shell syntax is required.",
+        avoid: "reusing an operationId for a different command or detached/background wrappers.",
         requires: "a selected Project, operationId, and either program plus args, or shell=true plus command.",
         returns: "compact process state and combined output.",
       }),
@@ -4635,7 +4640,7 @@ function createMcpServer(
 
   registerAppTool(server, toolNames.listProjects, {
     title: "List projects",
-    description: "List approved Project refs/task counts; with projectRef, list that Project's bounded untrusted taskRef/title/version/updatedAt metadata.",
+    description: "List approved Projects; pass projectRef only when the user wants to inspect resumable Tasks for one selected Project.",
     inputSchema: {
       projectRef: z.string().min(1).max(128).optional(),
     },
@@ -5827,7 +5832,7 @@ function createMcpServer(
   };
 
   registerAppTool(server, toolNames.projectControl, {
-    description: "Open(operationId), resume(operationId+taskRef), hydrate(cursor?), or interrupt(operationId) for the current session-bound execution.",
+    description: "Open a Project, resume an explicitly selected Task, hydrate only after reconnect or while a returned instruction cursor remains, or interrupt the current execution.",
     inputSchema: projectControlPublicInputSchema,
     _meta: {},
     annotations: USE_PROJECT_ANNOTATIONS,
@@ -8276,7 +8281,7 @@ function createServerWithStateLease(
       if (toolCall && enabledTools && !enabledTools.has(toolCall.name)) {
         sendCallToolErrorResult(
           res,
-          `tool_unavailable: ${toolCall.name} is not available to this authorization or static Connector profile.`,
+          `${toolCall.name} is not available to this authorization or static Connector profile.`,
           jsonRpcRequestId(req.body),
           "tool_unavailable",
           {
@@ -8295,7 +8300,7 @@ function createServerWithStateLease(
       if (toolCall && missingCallScopes.length > 0) {
         sendCallToolErrorResult(
           res,
-          `insufficient_scope: Reauthorize DevSpace with the required OAuth scope(s): ${missingCallScopes.join(", ")}.`,
+          `Reauthorize DevSpace with the required OAuth scope(s): ${missingCallScopes.join(", ")}.`,
           jsonRpcRequestId(req.body),
           "insufficient_scope",
           {
@@ -8479,7 +8484,7 @@ function createServerWithStateLease(
       if (error instanceof WorkspaceRootLockTimeoutError && !res.headersSent) {
         sendCallToolErrorResult(
           res,
-          "project_busy: Project files are busy with another operation or process; retry after it finishes.",
+          PROJECT_BUSY_TEXT,
           jsonRpcRequestId(req.body),
           "project_busy",
           {

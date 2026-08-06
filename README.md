@@ -177,8 +177,9 @@ OpenAI 官方文档为准。
 > `package.json`，用三点说明它的用途和主要脚本；不要修改文件，也不要执行命令。
 
 一次完整成功应包含：选择或打开正确的 Project、加载根指令、读取两个文件，并返回
-与文件内容一致的总结。模型会自行完成 `list_projects → open/resume → hydrate`；
-根指令尚未加载完成时，其他 Project 工具会被暂时门控。
+与文件内容一致的总结。只有一个已授权 Project 时，模型可以直接 `open`；有多个 Project
+时才需要先调用 `list_projects`。`open` 或 `resume` 仅在返回 `nextCursor` 时才需要继续
+`hydrate`。根指令尚未加载完成时，其他 Project 工具会被暂时门控。
 
 确认只读流程正确后，再尝试一个可审阅的小修改：
 

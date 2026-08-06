@@ -1416,6 +1416,14 @@ function assertErrorCode(
     } | undefined)?.error?.code,
     expected,
   );
+  const modelText = Array.isArray(result.content)
+    ? result.content.flatMap((item: unknown) => {
+        if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+        const block = item as { type?: unknown; text?: unknown };
+        return block.type === "text" && typeof block.text === "string" ? [block.text] : [];
+      }).join("\n")
+    : "";
+  assert.doesNotMatch(modelText, new RegExp(`^${escapeRegExp(expected)}:`, "u"));
 }
 
 function assertReadCursorRestart(

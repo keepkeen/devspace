@@ -135,9 +135,9 @@ try {
   assert.equal(invalidPattern.error?.code, "invalid_pattern");
   assert.equal(invalidPattern.error?.phase, "not_started");
   assert.equal(invalidPattern.error?.safeToRetry, true);
-  assert.match(
+  assert.equal(
     invalidPattern.content[0]?.type === "text" ? invalidPattern.content[0].text : "",
-    /^invalid_pattern:/u,
+    "The search regular expression is invalid; correct the pattern and retry.",
   );
   assert.ok(new InvalidSearchPatternError() instanceof Error);
 

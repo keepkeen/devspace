@@ -273,7 +273,7 @@ async function runLocalTool<TDetails>(
       return {
         content: [{
           type: "text",
-          text: `${error.structuredError.code}: ${error.publicText}`,
+          text: error.publicText,
         }],
         isError: true,
         error: error.structuredError,
